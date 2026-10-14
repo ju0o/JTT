@@ -1,8 +1,13 @@
 import json
+import os
 import shutil
+import stat
 import subprocess
+import tempfile
+import time
 import uuid
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -16,7 +21,16 @@ pytestmark = pytest.mark.skipif(not shutil.which("tmux"), reason="tmux is not in
 
 
 def _tmux(*args):
+    assert "TMUX" not in os.environ and "TMUX_PANE" not in os.environ
+    assert os.environ.get("TMUX_TMPDIR", "").startswith("/tmp/tower-workset-")
     return subprocess.run(["tmux", *args], check=True, text=True, capture_output=True).stdout.strip()
+
+
+def _private_tmux_socket(socket_dir):
+    sockets = list(socket_dir.glob("tmux-*/default"))
+    assert len(sockets) == 1, sockets
+    assert stat.S_ISSOCK(sockets[0].stat().st_mode), sockets[0]
+    return sockets[0]
 
 
 def _window_geometry(window_id):
@@ -27,11 +41,12 @@ def _window_geometry(window_id):
 
 @pytest.fixture
 def isolated_tower(tmp_path, monkeypatch):
-    socket_dir = tmp_path / "tmux-socket"
-    socket_dir.mkdir()
-    monkeypatch.setenv("TMUX_TMPDIR", str(socket_dir))
+    socket_dir = Path(tempfile.mkdtemp(prefix="tower-workset-", dir="/tmp"))
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
+    monkeypatch.setenv("TMUX_TMPDIR", str(socket_dir))
+    assert "TMUX" not in os.environ and "TMUX_PANE" not in os.environ
+    assert not list(socket_dir.glob("tmux-*/default"))
     from tmux_agent_tower.ui import tower as tower_module
 
     state_dir = tmp_path / "state"
@@ -41,11 +56,36 @@ def isolated_tower(tmp_path, monkeypatch):
     monkeypatch.setattr(tower_module, "HOST_FILE", config_dir / "host")
     monkeypatch.setattr(tower_module, "REMOTE_HOSTS_FILE", config_dir / "remote-hosts.txt")
     session = "workset-" + uuid.uuid4().hex[:8]
-    _tmux("new-session", "-d", "-x", "160", "-y", "60", "-s", session, "sleep 600")
-    base = _tmux("list-panes", "-t", session, "-F", "#{pane_id} #{pane_pid}").split()
-    tower = Tower(session, own_pane_id=base[0])
-    yield tower, state_dir, base
-    _tmux("kill-server")
+    try:
+        _tmux("-f", "/dev/null", "new-session", "-d", "-x", "160", "-y", "60", "-s", session, "sleep 600")
+        socket_path = _private_tmux_socket(socket_dir)
+        base = _tmux("list-panes", "-t", session, "-F", "#{pane_id} #{pane_pid}").split()
+        tower = Tower(session, own_pane_id=base[0])
+        yield tower, state_dir, base
+    finally:
+        sockets = list(socket_dir.glob("tmux-*/default"))
+        assert len(sockets) <= 1, sockets
+        if sockets:
+            socket_path = sockets[0]
+            assert stat.S_ISSOCK(socket_path.stat().st_mode), socket_path
+            subprocess.run(
+                ["tmux", "-S", str(socket_path), "kill-server"],
+                capture_output=True, text=True, check=False,
+            )
+            for _ in range(50):
+                probe = subprocess.run(
+                    ["tmux", "-S", str(socket_path), "list-sessions"],
+                    capture_output=True, text=True, check=False,
+                )
+                if probe.returncode != 0:
+                    assert probe.stderr == f"no server running on {socket_path}\n", probe.stderr
+                    socket_path.unlink(missing_ok=True)
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("isolated tmux server did not stop")
+        assert not list(socket_dir.glob("tmux-*/default"))
+        shutil.rmtree(socket_dir)
 
 
 def _agents():

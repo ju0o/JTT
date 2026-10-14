@@ -1,0 +1,432 @@
+import base64
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+from types import SimpleNamespace
+
+from tmux_agent_tower.remote.opencode import _REMOTE_OPENCODE_SCRIPT, fetch_remote_opencode_result
+
+
+CLIENT = ("198.51.100.23", "43123", "203.0.113.31", "22")
+SESSION_ID = "ses_0123456789abcdef0123456789"
+USER_ID = "msg_user_0123456789"
+ASSISTANT_ID = "msg_assistant_0123456789"
+
+
+def _export(cwd, *, complete=True, finish="stop"):
+    old_user = {"id": "msg_user_old", "sessionID": SESSION_ID, "role": "user", "time": {"created": 1}}
+    old_assistant = {
+        "id": "msg_assistant_old", "sessionID": SESSION_ID, "role": "assistant",
+        "parentID": old_user["id"], "time": {"created": 2, "completed": 3}, "finish": "stop",
+    }
+    user = {"id": USER_ID, "sessionID": SESSION_ID, "role": "user", "time": {"created": 4}}
+    assistant = {
+        "id": ASSISTANT_ID, "sessionID": SESSION_ID, "role": "assistant", "parentID": USER_ID,
+        "time": {"created": 5, **({"completed": 6} if complete else {})}, "finish": finish if complete else None,
+    }
+    return {
+        "info": {"id": SESSION_ID, "title": "Bridge Demo", "directory": str(cwd)},
+        "messages": [
+            {"info": old_user, "parts": []},
+            {"info": old_assistant, "parts": [{"type": "text", "text": "OLD TURN MUST NOT COPY", "messageID": old_assistant["id"], "sessionID": SESSION_ID}]},
+            {"info": user, "parts": []},
+            {"info": assistant, "parts": [
+                {"type": "text", "text": "한글 결과\n```python\nprint('full')\n```", "messageID": ASSISTANT_ID, "sessionID": SESSION_ID},
+                {"type": "tool", "state": {"status": "completed", "output": "TOOL OUTPUT MUST NOT COPY"}},
+                {"type": "text", "text": "다음 문단\n", "messageID": ASSISTANT_ID, "sessionID": SESSION_ID},
+            ]},
+        ],
+    }
+
+
+def _proc_ip(value):
+    return socket.inet_aton(value)[::-1].hex().upper()
+
+
+def _proc_process(proc, pid, ppid, comm, cwd, *, executable="/bin/bash", env=None, argv=None, pgrp=None, tty_nr="34816", tpgid="200"):
+    folder = proc / str(pid)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "stat").write_text(f"{pid} ({comm}) S {ppid} {pgrp or pid} 1000 {tty_nr} {tpgid} " + "0 " * 20)
+    (folder / "comm").write_text(comm)
+    (folder / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in (argv or [comm])) + b"\0")
+    (folder / "environ").write_bytes(b"\0".join(f"{key}={value}".encode() for key, value in (env or {}).items()) + b"\0")
+    (folder / "exe").symlink_to(executable)
+    (folder / "cwd").symlink_to(cwd)
+
+
+def _remote_fixture(tmp_path, *, complete=True, duplicate=False, second_opencode=False, background_opencode=False, config_content=None, process_argv=None, executable_name="opencode", comm_name="opencode", finish="stop"):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    (proc / "net").mkdir()
+    local = f"{_proc_ip(CLIENT[2])}:{int(CLIENT[3]):04X}"
+    peer = f"{_proc_ip(CLIENT[0])}:{int(CLIENT[1]):04X}"
+    (proc / "net" / "tcp").write_text("header\n0: " + local + " " + peer + " 01 0:0 00:0 00000000 1000 0 1\n")
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_exe = fake_bin / executable_name
+    fake_exe.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib, sys\n"
+        "if sys.argv[1:] == ['--version']:\n print('1.19.0')\n"
+        "elif sys.argv[1:3] == ['session', 'list']:\n pathlib.Path('.session-list-called').write_text('yes'); sys.exit(4)\n"
+        "elif len(sys.argv) == 3 and sys.argv[1] == 'export':\n"
+        " pathlib.Path('.export-called').write_text(sys.argv[2])\n"
+        " pathlib.Path('.export-env.json').write_text(json.dumps({key: os.environ.get(key) for key in ('OPENCODE_DB', 'XDG_CACHE_HOME')}))\n"
+        " marker = pathlib.Path('.kill-opencode-stat')\n"
+        " if marker.exists(): pathlib.Path(marker.read_text()).unlink()\n"
+        " print(pathlib.Path('.export.json').read_text())\n"
+        "else: sys.exit(3)\n"
+    )
+    fake_exe.chmod(0o755)
+    session = {"id": SESSION_ID, "title": "Bridge Demo", "directory": str(cwd)}
+    sessions = [session, dict(session, id="ses_abcdef0123456789abcdef0123")] if duplicate else [session]
+    (cwd / ".sessions.json").write_text(json.dumps(sessions))
+    (cwd / ".export.json").write_text(json.dumps(_export(cwd, complete=complete, finish=finish)))
+    ssh_env = {"SSH_CONNECTION": " ".join(CLIENT)}
+    _proc_process(proc, 100, 1, "sshd: test@pts/0", cwd, env=ssh_env)
+    _proc_process(proc, 101, 100, "bash", cwd, env=ssh_env)
+    isolated = tmp_path / "isolated-opencode"
+    opencode_env = {
+        **ssh_env, "HOME": str(tmp_path), "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "OPENCODE_DB": str(isolated / "opencode.db"),
+        "XDG_CACHE_HOME": str(isolated / "cache"),
+    }
+    if config_content is not None:
+        opencode_env["OPENCODE_CONFIG_CONTENT"] = config_content
+    _proc_process(proc, 200, 101, comm_name, cwd, executable=str(fake_exe), env=opencode_env, argv=process_argv or ["opencode", "--session", SESSION_ID], pgrp="201" if background_opencode else "200")
+    if second_opencode:
+        _proc_process(proc, 201, 101, "opencode", cwd, executable=str(fake_exe), env=opencode_env, argv=["opencode"])
+    return proc, cwd
+
+
+def _run_remote(proc):
+    args = [*CLIENT, str(proc)]
+    completed = subprocess.run(
+        [sys.executable, "-c", _REMOTE_OPENCODE_SCRIPT, *args],
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    record = next(line.removeprefix("__TOWER_OPENCODE_RESULT__") for line in completed.stdout.splitlines() if line.startswith("__TOWER_OPENCODE_RESULT__"))
+    return json.loads(record), completed.stdout
+
+
+def test_remote_provider_exports_only_the_explicit_launch_session_and_latest_assistant(tmp_path):
+    proc, _cwd = _remote_fixture(tmp_path)
+    payload, wire = _run_remote(proc)
+    expected = "한글 결과\n```python\nprint('full')\n```\n다음 문단\n"
+
+    assert payload["status"] == "ok"
+    assert payload["session_id"] == SESSION_ID
+    assert payload["user_id"] == USER_ID and payload["message_id"] == ASSISTANT_ID
+    assert payload["turn_complete"] and payload["body_complete"]
+    assert base64.b64decode(payload["body_b64"]).decode() == expected
+    assert payload["native_utf8_bytes"] == len(expected.encode())
+    assert payload["native_sha256"] == hashlib.sha256(expected.encode()).hexdigest()
+    assert "OLD TURN MUST NOT COPY" not in wire and "TOOL OUTPUT MUST NOT COPY" not in wire
+
+
+def test_export_inherits_the_exact_isolated_database_and_cache_from_bound_tui(tmp_path):
+    proc, cwd = _remote_fixture(tmp_path)
+    payload, _ = _run_remote(proc)
+    env = json.loads((cwd / ".export-env.json").read_text())
+
+    assert payload["status"] == "ok"
+    assert env == {
+        "OPENCODE_DB": str(tmp_path / "isolated-opencode" / "opencode.db"),
+        "XDG_CACHE_HOME": str(tmp_path / "isolated-opencode" / "cache"),
+    }
+
+
+def test_remote_provider_ignores_titles_and_requires_one_explicit_session_argument(tmp_path):
+    proc, cwd = _remote_fixture(tmp_path, duplicate=True)
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "ok"
+    assert (cwd / ".export-called").read_text() == SESSION_ID
+    assert not (cwd / ".session-list-called").exists()
+
+    proc, cwd = _remote_fixture(tmp_path / "missing", process_argv=["opencode"])
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert not (cwd / ".export-called").exists()
+
+
+def test_remote_provider_accepts_explicit_pure_session_and_rejects_extra_or_duplicate_args(tmp_path):
+    proc, cwd = _remote_fixture(tmp_path / "pure", process_argv=["opencode", "--session", SESSION_ID, "--pure"])
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "ok"
+    assert (cwd / ".export-called").read_text() == SESSION_ID
+
+    for name, argv in (
+        ("unknown", ["opencode", "--session", SESSION_ID, "--pure", "--unexpected"]),
+        ("duplicate-session", ["opencode", "--session", SESSION_ID, "--pure", "--session", SESSION_ID]),
+        ("duplicate-pure", ["opencode", "--session", SESSION_ID, "--pure", "--pure"]),
+    ):
+        proc, cwd = _remote_fixture(tmp_path / name, process_argv=argv)
+        payload, _ = _run_remote(proc)
+        assert payload["status"] == "AGENT_SESSION_UNBOUND"
+        assert not (cwd / ".export-called").exists()
+
+    proc, cwd = _remote_fixture(tmp_path / "duplicate-arg", process_argv=["opencode", "--session", SESSION_ID, "--session", SESSION_ID])
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert not (cwd / ".export-called").exists()
+
+
+def test_remote_provider_accepts_opencode_exe_and_rejects_other_executable_names(tmp_path):
+    proc, cwd = _remote_fixture(tmp_path / "exe-suffix", executable_name="opencode.exe", comm_name="opencode.exe")
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "ok"
+    assert (cwd / ".export-called").read_text() == SESSION_ID
+
+    proc, cwd = _remote_fixture(tmp_path / "wrong-name", executable_name="not-opencode")
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "REMOTE_PROVIDER_UNAVAILABLE"
+    assert not (cwd / ".export-called").exists()
+
+
+def test_remote_provider_rejects_opencode_exe_comm_without_matching_executable_or_tty(tmp_path):
+    proc, cwd = _remote_fixture(
+        tmp_path / "comm-path-mismatch", executable_name="not-opencode.exe", comm_name="opencode.exe",
+    )
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "REMOTE_PROVIDER_UNAVAILABLE"
+    assert not (cwd / ".export-called").exists()
+
+    proc, cwd = _remote_fixture(
+        tmp_path / "comm-wrong", executable_name="opencode.exe", comm_name="other-agent.exe",
+    )
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "REMOTE_PROVIDER_UNBOUND"
+    assert not (cwd / ".export-called").exists()
+
+    proc, cwd = _remote_fixture(
+        tmp_path / "exe-background", executable_name="opencode.exe", comm_name="opencode.exe",
+        background_opencode=True,
+    )
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert not (cwd / ".export-called").exists()
+
+
+def test_remote_provider_rejects_length_finished_assistant_as_incomplete(tmp_path):
+    proc, _cwd = _remote_fixture(tmp_path, finish="length")
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "REMOTE_RESULT_INCOMPLETE"
+    assert "body_b64" not in payload
+
+
+def test_remote_provider_rejects_incomplete_turn_wrong_socket_and_multiple_processes(tmp_path):
+    proc, _cwd = _remote_fixture(tmp_path / "incomplete", complete=False)
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "REMOTE_RESULT_INCOMPLETE"
+    assert "body_b64" not in payload
+
+    proc, _cwd = _remote_fixture(tmp_path / "wrong-socket")
+    wrong_args = ["198.51.100.24", CLIENT[1], CLIENT[2], CLIENT[3], str(proc)]
+    completed = subprocess.run([sys.executable, "-c", _REMOTE_OPENCODE_SCRIPT, *wrong_args], capture_output=True, text=True)
+    record = next(line.removeprefix("__TOWER_OPENCODE_RESULT__") for line in completed.stdout.splitlines() if line.startswith("__TOWER_OPENCODE_RESULT__"))
+    assert json.loads(record)["status"] == "REMOTE_PROVIDER_UNBOUND"
+
+    proc, _cwd = _remote_fixture(tmp_path / "multiple", second_opencode=True)
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "REMOTE_PROVIDER_UNBOUND"
+
+
+def test_remote_provider_rejects_background_process_and_does_not_return_config_content(tmp_path):
+    proc, _cwd = _remote_fixture(tmp_path / "background", background_opencode=True)
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+
+    secret = "never-copy-this-config-value"
+    proc, _cwd = _remote_fixture(tmp_path / "config", config_content=secret)
+    payload, wire = _run_remote(proc)
+    assert payload["status"] == "REMOTE_PROVIDER_UNAVAILABLE"
+    assert secret not in wire
+
+
+def test_remote_provider_rechecks_opencode_pid_after_export(tmp_path):
+    proc, cwd = _remote_fixture(tmp_path)
+    (cwd / ".kill-opencode-stat").write_text(str(proc / "200" / "stat"))
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+
+
+def test_remote_provider_preserves_long_multiline_korean_markdown(tmp_path):
+    proc, cwd = _remote_fixture(tmp_path)
+    exported_path = cwd / ".export.json"
+    exported = json.loads(exported_path.read_text())
+    assistant_parts = exported["messages"][-1]["parts"]
+    long_text = "\n".join(f"{index:02d}행 한글 **Result** — `item_{index}`" for index in range(100))
+    assistant_parts[0]["text"] = long_text
+    exported_path.write_text(json.dumps(exported, ensure_ascii=False))
+
+    payload, _ = _run_remote(proc)
+    expected = long_text + "\n다음 문단\n"
+    assert payload["status"] == "ok"
+    body = base64.b64decode(payload["body_b64"]).decode("utf-8")
+    assert body == expected and len(body.splitlines()) >= 100
+    assert payload["native_utf8_bytes"] == len(expected.encode("utf-8"))
+    assert payload["native_sha256"] == hashlib.sha256(expected.encode("utf-8")).hexdigest()
+
+
+def test_fetch_decodes_bounded_wire_payload_and_keeps_exact_utf8(monkeypatch):
+    body = "한글 **Markdown**\n```py\nprint(1)\n```\n"
+    encoded = body.encode()
+    record = {
+        "status": "ok", "body_b64": base64.b64encode(encoded).decode(),
+        "native_length": len(body), "native_utf8_bytes": len(encoded),
+        "native_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+    completed = SimpleNamespace(returncode=0, stdout="__TOWER_OPENCODE_RESULT__" + json.dumps(record), stderr="")
+    calls = []
+    monkeypatch.setattr("tmux_agent_tower.remote.opencode._run_ssh", lambda *args: calls.append(args) or completed)
+    payload = fetch_remote_opencode_result("asus", {"ssh_client_pid": "123", **dict(zip(("client_ip", "client_port", "server_ip", "server_port"), CLIENT))})
+
+    assert payload["text"] == body
+    assert calls and "opencode export" not in calls[0][1]
+
+
+class _Tower:
+    session = "isolated"
+    own_pane_id = "%1"
+    results = None
+
+    def __init__(self):
+        self.rows = [{
+            "key": "%9", "pane_id": "%9", "pane_pid": "900", "session": "isolated",
+            "remote": False, "transport": "ssh", "transport_target": "fixture-host",
+            "execution_host": "fixture-host", "agent": "OpenCode", "auto_agent": "OpenCode",
+            "command": "ssh", "pane_title": "OC | Bridge Demo", "status": "IDLE", "attention": "none",
+        }]
+
+    def load(self):
+        pass
+
+
+def _connection():
+    return {
+        "ssh_client_pid": "901", "client_ip": CLIENT[0], "client_port": CLIENT[1],
+        "server_ip": CLIENT[2], "server_port": CLIENT[3],
+        "local_socket": ("192.0.2.23", "57120", CLIENT[2], CLIENT[3]), "connection_mode": "wsl_nat",
+    }
+
+
+def _provider_payload(body):
+    encoded = body.encode()
+    return {
+        "status": "ok", "ssh_connection": list(CLIENT), "remote_session_pid": "100",
+        "remote_sshd_pid": "90", "opencode_pid": "200", "session_id": SESSION_ID,
+        "user_id": USER_ID, "message_id": ASSISTANT_ID, "turn_complete": True,
+        "body_complete": True, "native_length": len(body), "native_utf8_bytes": len(encoded),
+        "native_sha256": hashlib.sha256(encoded).hexdigest(), "text": body,
+    }
+
+
+def _bind_local_ssh(monkeypatch, connection=None, *, after=None):
+    first = connection or _connection()
+    calls = []
+    monkeypatch.setattr("tmux_agent_tower.control.actions._pane_matches_live_identity", lambda *_: True)
+    monkeypatch.setattr("tmux_agent_tower.control.actions.pane_title_and_command", lambda _pane: ("ordinary terminal title", "ssh"))
+    monkeypatch.setattr(
+        "tmux_agent_tower.detection.sshdest.ssh_connection_for_pane",
+        lambda *_: calls.append(1) or (first if len(calls) == 1 or after is None else after),
+    )
+    return calls
+
+
+def test_tower_get_result_uses_bound_ssh_provider_and_rechecks_pane(monkeypatch):
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _Tower()
+    body = "한글 최신 결과\n```python\nprint('ok')\n```"
+    _bind_local_ssh(monkeypatch)
+    monkeypatch.setattr(
+        "tmux_agent_tower.remote.opencode.fetch_remote_opencode_result",
+        lambda host, conn: _provider_payload(body) if (host, conn["ssh_client_pid"]) == ("fixture-host", "901") else None,
+    )
+    ok, reason, payload = get_result(tower, "%9", expected_pane_pid="900")
+
+    assert ok and reason == "" and payload["text"] == body
+    assert payload["complete"] and payload["turn_complete"] and payload["body_complete"]
+    assert payload["source"] == "remote_opencode"
+    assert payload["native_sha256"] == hashlib.sha256(body.encode()).hexdigest()
+
+
+def test_tower_blocks_changed_socket_and_never_falls_back_to_suffix(monkeypatch):
+    import pytest
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _Tower()
+    calls = _bind_local_ssh(monkeypatch, after=dict(_connection(), client_port="43124"))
+    monkeypatch.setattr("tmux_agent_tower.remote.opencode.fetch_remote_opencode_result", lambda *_: _provider_payload("good"))
+    monkeypatch.setattr("tmux_agent_tower.control.actions._recover_result", lambda *_a, **_k: pytest.fail("no SSH suffix fallback"))
+    ok, _, payload = get_result(tower, "%9", expected_pane_pid="900")
+
+    assert ok and not payload["complete"] and payload["text"] == ""
+    assert payload["source"] == "REMOTE_PROVIDER_UNBOUND"
+    assert len(calls) == 2
+
+
+def test_tower_does_not_fallback_when_remote_export_is_length_limited(monkeypatch):
+    import pytest
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _Tower()
+    _bind_local_ssh(monkeypatch)
+    monkeypatch.setattr(
+        "tmux_agent_tower.remote.opencode.fetch_remote_opencode_result",
+        lambda *_: {"status": "REMOTE_RESULT_INCOMPLETE"},
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions._recover_result",
+        lambda *_a, **_k: pytest.fail("length-limited export must not use screen fallback"),
+    )
+    ok, _, payload = get_result(tower, "%9", expected_pane_pid="900")
+
+    assert ok and not payload["complete"] and payload["text"] == ""
+    assert payload["reason_code"] == "REMOTE_RESULT_INCOMPLETE"
+
+
+def test_y_routes_only_verified_opencode_body_through_existing_clipboard_router(monkeypatch):
+    from tmux_agent_tower.clipboard import CopyOutcome
+    from tmux_agent_tower.ui import control_view
+
+    tower = _Tower()
+    body = "한글 **Markdown**\n\n```python\nprint('full')\n```"
+    row = tower.rows[0]
+    payload = {
+        "state": "ready", "text": body, "complete": True, "turn_complete": True,
+        "body_complete": True, "fingerprint": hashlib.sha256(body.encode()).hexdigest(),
+    }
+    routed = []
+    monkeypatch.setattr(control_view, "find_row", lambda *_: row)
+    monkeypatch.setattr(control_view, "get_result", lambda *_a, **kwargs: (True, "", payload) if kwargs.get("expected_pane_pid") == "900" else (False, "stale", {}))
+    monkeypatch.setattr(control_view, "_route_clipboard", lambda _tower, text, _screen: routed.append(text) or (CopyOutcome(True, False, "clip.exe"), ""))
+
+    notice = control_view._copy_result(tower, "%9")
+    assert routed == [body]
+    assert hashlib.sha256(routed[0].encode()).hexdigest() == payload["fingerprint"]
+    assert "복사했습니다" in notice
+
+
+def test_y_does_not_route_unbound_or_incomplete_opencode_payload(monkeypatch):
+    import pytest
+    from tmux_agent_tower.ui import control_view
+
+    tower = _Tower()
+    row = tower.rows[0]
+    monkeypatch.setattr(control_view, "find_row", lambda *_: row)
+    monkeypatch.setattr(control_view, "get_result", lambda *_a, **_k: (True, "", {
+        "state": "none", "text": "", "complete": False, "turn_complete": False,
+        "body_complete": False, "source": "AGENT_SESSION_UNBOUND",
+    }))
+    monkeypatch.setattr(control_view, "_route_clipboard", lambda *_: pytest.fail("unsafe payload reached clipboard"))
+
+    notice = control_view._copy_result(tower, "%9")
+    assert "AGENT_SESSION_UNBOUND" in notice

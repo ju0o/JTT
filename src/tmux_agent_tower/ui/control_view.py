@@ -7,10 +7,14 @@ Live text, prompts, identity, focus, result, and close all call
 from __future__ import annotations
 
 import curses
+import hashlib
+import json
+import os
 import re
+import stat
 import time
 
-from ..clipboard import copy_text
+from ..clipboard import copy_text, plain_clipboard_text
 from ..clipboard_dest import (
     MANUAL,
     SessionChoice,
@@ -46,6 +50,7 @@ from .widgets import is_escape, read_key, run_list_picker, safe_add
 # in the process, and the client is not moved.
 CONTROL_REFRESH_SECONDS = 0.7
 _LOGIN_RE = re.compile(r"\b(?:log\s*in|sign\s*in|authentication required|authenticate|oauth)\b", re.I)
+_COPY_TRACE_ENV = "TOWER_RESULT_COPY_TRACE_FILE"
 
 
 def open_control_view(stdscr, tower, pane_key: str, *, show_result_on_open: bool = False) -> None:
@@ -558,6 +563,27 @@ def _copy_result(tower, pane_key: str, stdscr=None) -> str:
     the result read. An unclear client is asked, never guessed.
     """
 
+    tower._result_copy_trace_failed = False
+    tower.last_result_copy_diagnostic = {
+        "stage": "entered", "outcome": "pending", "reason_code": "UNKNOWN",
+    }
+    if not _result_copy_trace(tower, "Y_HANDLER_ENTERED"):
+        return t("control.clipboard_failed")
+    try:
+        notice = _copy_result_impl(tower, pane_key, stdscr)
+    except Exception as exc:
+        _result_copy_trace(tower, "Y_RETURN_REASON", reason_code="UNKNOWN", error_type=type(exc).__name__)
+        raise
+    last = getattr(tower, "last_result_copy_diagnostic", {}) or {}
+    ok = _result_copy_trace(
+        tower, "Y_RETURN_REASON",
+        reason_code=str(last.get("reason_code") or "NONE"), outcome=str(last.get("outcome") or "UNKNOWN"),
+    )
+    return notice if ok and not getattr(tower, "_result_copy_trace_failed", False) else t("control.clipboard_failed")
+
+
+def _copy_result_impl(tower, pane_key: str, stdscr=None) -> str:
+
     row = find_row(tower, pane_key)
     if row is None or row.get("placeholder"):
         return t("nav.stale")
@@ -570,6 +596,24 @@ def _copy_result(tower, pane_key: str, stdscr=None) -> str:
         tower, pane_key, expected_pane_pid=pane_pid,
     )
     ok, reason, payload = result
+    text = payload.get("text") if isinstance(payload, dict) else None
+    complete = bool(
+        ok and isinstance(payload, dict) and payload.get("complete") is True
+        and isinstance(text, str) and bool(text)
+    )
+    raw = text.encode("utf-8", "strict") if complete else b""
+    if not _result_copy_trace(
+        tower, "GET_RESULT_COMPLETE", result_complete=complete,
+        turn_complete=payload.get("turn_complete") is True if isinstance(payload, dict) else False,
+        body_complete=payload.get("body_complete") is True if isinstance(payload, dict) else False,
+        result_utf8_bytes=len(raw) if complete else 0,
+        result_sha256=hashlib.sha256(raw).hexdigest() if complete else "",
+        provider=str(payload.get("source") or payload.get("result_provider_type") or "UNKNOWN")[:48]
+        if isinstance(payload, dict) else "UNKNOWN",
+        reason_code=_result_failure_code(row, payload if isinstance(payload, dict) else {}, reason) if not complete else "NONE",
+    ):
+        _remember_result_copy(tower, row, payload if isinstance(payload, dict) else {}, "not_entered", "failed", "DIAGNOSTIC_TRACE_FAILED")
+        return t("control.clipboard_failed")
     if not ok:
         code = _result_failure_code(row, payload, reason)
         _remember_result_copy(tower, row, payload, "not_entered", "blocked", code)
@@ -581,12 +625,22 @@ def _copy_result(tower, pane_key: str, stdscr=None) -> str:
         reason_code = _result_failure_code(row, payload)
         _remember_result_copy(tower, row, payload, "not_entered", "blocked", reason_code)
         return t("control.result_copy_unavailable").format(code=reason_code)
+    if payload.get("source") == "remote_opencode" and plain_clipboard_text(text).encode("utf-8", "strict") != raw:
+        reason_code = "CLIPBOARD_TEXT_TRANSFORMED"
+        _remember_result_copy(tower, row, payload, "not_entered", "blocked", reason_code)
+        return t("control.result_copy_unavailable").format(code=reason_code)
     outcome, reason = _route_clipboard(tower, text, stdscr)
     if outcome is None:
+        if reason == "diagnostic_trace_failed":
+            _remember_result_copy(tower, row, payload, "entered", "failed", "DIAGNOSTIC_TRACE_FAILED")
+            return t("control.clipboard_failed")
         if reason == t("copy.choose_destination"):
-            _remember_result_copy(tower, row, payload, "not_entered", "destination_required", "UNKNOWN")
+            _remember_result_copy(tower, row, payload, "not_entered", "destination_required", "DESTINATION_REQUIRED")
             return reason
         _remember_result_copy(tower, row, payload, "entered", "failed", "CLIPBOARD_FAILED")
+        return t("control.clipboard_failed")
+    if getattr(tower, "_result_copy_trace_failed", False):
+        _remember_result_copy(tower, row, payload, "entered", "failed", "DIAGNOSTIC_TRACE_FAILED")
         return t("control.clipboard_failed")
     if outcome.clipboard:
         _mark_shown(tower, pane_key, payload)
@@ -667,9 +721,10 @@ def _truth(value) -> str:
 def _result_failure_code(row: dict, payload: dict, reason: str = "") -> str:
     code = str(payload.get("reason_code") or payload.get("source") or "")
     if code in {
-        "AGENT_UNSUPPORTED", "PROVIDER_UNBOUND", "TURN_NOT_COMPLETE", "SOURCE_PARTIAL",
+        "AGENT_UNSUPPORTED", "AGENT_UNBOUND", "PROVIDER_UNBOUND", "TURN_NOT_COMPLETE", "SOURCE_PARTIAL",
         "OUTPUT_RANGE_EXCEEDED", "CLIPBOARD_FAILED", "UNKNOWN",
         "REMOTE_PROVIDER_UNBOUND", "REMOTE_PROVIDER_UNAVAILABLE", "REMOTE_RESULT_INCOMPLETE",
+        "AGENT_SESSION_UNBOUND", "REMOTE_PROVIDER_TIMEOUT",
     }:
         return code
     if reason == "stale":
@@ -741,8 +796,19 @@ def _copy_screen(tower, pane_key: str, stdscr=None, *, expected_pane_pid: str = 
 def _route_clipboard(tower, text: str, stdscr=None):
     """Route an already-resolved payload to exactly one Access Client."""
 
+    raw = text.encode("utf-8", "strict")
+    if not _result_copy_trace(
+        tower, "ROUTER_ENTERED", router_payload_utf8_bytes=len(raw),
+        router_payload_sha256=hashlib.sha256(raw).hexdigest(),
+    ):
+        return None, "diagnostic_trace_failed"
     client, clients = observe()
     tower.last_copy_access_context = client.access_context
+    if not _result_copy_trace(
+        tower, "ACCESS_CLIENT_STATE", access_client_ambiguous=bool(client.ambiguous),
+        access_client_tty_present=bool(client.tty),
+    ):
+        return None, "diagnostic_trace_failed"
     destination = ""
     if client.ambiguous or not client.tty:
         choice = _ask_copy_destination(stdscr, allow_terminal=False) if stdscr is not None else ""
@@ -769,16 +835,70 @@ def _route_clipboard(tower, text: str, stdscr=None):
     bridge = load_bridge_client(client.bridge_id) if client.bridge_id else None
     if client.bridge_id and bridge is None:
         return None, t("control.copy_failed")
-    outcome = copy_text(
-        text,
-        destination=route_for_access_client(destination, client),
+    destination = route_for_access_client(destination, client)
+    if not _result_copy_trace(tower, "SELECTED_DESTINATION", destination=destination):
+        return None, "diagnostic_trace_failed"
+
+    def before_clipboard_write(kind: str, tool: str, byte_count: int, digest: str) -> bool:
+        return _result_copy_trace(
+            tower, "CLIPBOARD_WRITE_ATTEMPTED", destination=kind,
+            tool=os.path.basename(tool)[:48], clipboard_payload_utf8_bytes=byte_count,
+            clipboard_payload_sha256=digest,
+        )
+
+    copy_kwargs = dict(
+        destination=destination,
         client=None if client.ambiguous else client.tty,
         ambiguous=client.ambiguous,
         ssh=client.ssh,
         bridge_port=bridge.port if bridge else None,
         bridge_token=bridge.token if bridge else None,
     )
+    if os.environ.get(_COPY_TRACE_ENV):
+        copy_kwargs["diagnostic_callback"] = before_clipboard_write
+    outcome = copy_text(text, **copy_kwargs)
     return outcome, ""
+
+
+def _result_copy_trace(tower, event_name: str, **fields) -> bool:
+    """Append only allowlisted Result-copy metadata when tracing is opted in."""
+
+    path = os.environ.get(_COPY_TRACE_ENV)
+    if not path:
+        return True
+    allowed = {
+        "result_complete", "turn_complete", "body_complete", "result_utf8_bytes", "result_sha256",
+        "provider", "reason_code", "router_payload_utf8_bytes", "router_payload_sha256",
+        "access_client_ambiguous", "access_client_tty_present", "destination", "tool",
+        "clipboard_payload_utf8_bytes", "clipboard_payload_sha256", "outcome", "error_type",
+    }
+    record = {"event": event_name, "time": time.time()}
+    record.update({key: value for key, value in fields.items() if key in allowed})
+    try:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077
+                or info.st_size > 512 * 1024
+            ):
+                raise OSError("unsafe diagnostic trace file")
+            data = (json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")
+            offset = 0
+            while offset < len(data):
+                offset += os.write(fd, data[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return True
+    except Exception as exc:
+        tower._result_copy_trace_failed = True
+        tower.last_result_copy_diagnostic = {
+            "stage": "trace_failed", "outcome": "failed", "reason_code": "DIAGNOSTIC_TRACE_FAILED",
+            "trace_error_type": type(exc).__name__,
+        }
+        return False
 
 
 def _result_copy_notice(outcome, host_label: str = "") -> str:

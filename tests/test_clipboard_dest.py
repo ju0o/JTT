@@ -338,6 +338,38 @@ def test_y_blocks_partial_result_before_any_clipboard_write(monkeypatch):
     assert "text" not in tower.last_result_copy_diagnostic
 
 
+def test_y_blocks_remote_opencode_result_when_clipboard_sanitizer_changes_bytes(monkeypatch):
+    from tmux_agent_tower.ui import control_view
+
+    body = "synthetic \x1b[31mred\x1b[0m result\n"
+    assert control_view.plain_clipboard_text(body).encode("utf-8") != body.encode("utf-8")
+    payload = {
+        "state": "ready", "text": body, "complete": True,
+        "turn_complete": True, "body_complete": True, "source": "remote_opencode",
+    }
+    tower = _Tower()
+    tower.rows[0]["remote"] = True
+    writes = []
+    monkeypatch.setattr(control_view, "get_result", lambda *_a, **_k: (True, "", payload))
+    monkeypatch.setattr(
+        control_view, "observe",
+        lambda: (CopyClient("/dev/pts/1", 1, False, False), (("/dev/pts/1", 1),)),
+    )
+    monkeypatch.setattr(control_view, "load_preference", lambda: LOCAL_HOST)
+    monkeypatch.setattr(
+        control_view, "copy_text",
+        lambda *args, **kwargs: writes.append((args, kwargs)) or CopyOutcome(True, False, "clip.exe"),
+    )
+
+    notice = _copy_result(tower, "%9")
+
+    assert "CLIPBOARD_TEXT_TRANSFORMED" in notice
+    assert writes == []
+    assert tower.last_result_copy_diagnostic["stage"] == "not_entered"
+    assert tower.last_result_copy_diagnostic["outcome"] == "blocked"
+    assert tower.last_result_copy_diagnostic["reason_code"] == "CLIPBOARD_TEXT_TRANSFORMED"
+
+
 def test_y_reports_clipboard_delivery_failure_separately(monkeypatch):
     from tmux_agent_tower.ui import control_view
 
@@ -351,6 +383,93 @@ def test_y_reports_clipboard_delivery_failure_separately(monkeypatch):
     assert notice == "클립보드 전달 실패 [CLIPBOARD_FAILED]. 복사 완료를 확인하지 못했습니다."
     assert tower.last_result_copy_diagnostic["stage"] == "entered"
     assert tower.last_result_copy_diagnostic["reason_code"] == "CLIPBOARD_FAILED"
+
+
+def test_y_opt_in_trace_records_only_copy_metadata(tmp_path, monkeypatch):
+    import hashlib
+    import json
+
+    from tmux_agent_tower.ui import control_view
+
+    body = "합성 한국어\n```py\nprint('safe')\n```\n"
+    payload = {
+        "state": "ready", "text": body, "complete": True,
+        "turn_complete": True, "body_complete": True, "source": "remote_opencode",
+    }
+    tower = _Tower()
+    trace = tmp_path / "copy-trace.jsonl"
+    monkeypatch.setenv("TOWER_RESULT_COPY_TRACE_FILE", str(trace))
+    monkeypatch.setattr(control_view, "get_result", lambda *_a, **_k: (True, "", payload))
+    monkeypatch.setattr(
+        control_view, "observe",
+        lambda: (CopyClient("/dev/pts/1", 1, False, False), (("/dev/pts/1", 1),)),
+    )
+    monkeypatch.setattr(control_view, "load_preference", lambda: LOCAL_HOST)
+
+    def fake_copy(_text, **kwargs):
+        callback = kwargs["diagnostic_callback"]
+        assert callback("local_host", "clip.exe", len(body.encode("utf-8")), hashlib.sha256(body.encode("utf-8")).hexdigest())
+        return CopyOutcome(True, False, "clip.exe")
+
+    monkeypatch.setattr(control_view, "copy_text", fake_copy)
+    assert "복사했습니다" in control_view._copy_result(tower, "%9")
+
+    records = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    names = [record["event"] for record in records]
+    assert names == [
+        "Y_HANDLER_ENTERED", "GET_RESULT_COMPLETE", "ROUTER_ENTERED", "ACCESS_CLIENT_STATE",
+        "SELECTED_DESTINATION", "CLIPBOARD_WRITE_ATTEMPTED", "Y_RETURN_REASON",
+    ]
+    expected_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    result = next(record for record in records if record["event"] == "GET_RESULT_COMPLETE")
+    router = next(record for record in records if record["event"] == "ROUTER_ENTERED")
+    write = next(record for record in records if record["event"] == "CLIPBOARD_WRITE_ATTEMPTED")
+    assert result["result_utf8_bytes"] == len(body.encode("utf-8"))
+    assert result["result_sha256"] == router["router_payload_sha256"] == expected_hash
+    assert write["clipboard_payload_sha256"] == expected_hash
+    assert trace.stat().st_mode & 0o777 == 0o600
+    assert body not in trace.read_text(encoding="utf-8")
+
+
+def test_y_trace_failure_blocks_result_lookup_and_copy(tmp_path, monkeypatch):
+    from tmux_agent_tower.ui import control_view
+
+    tower = _Tower()
+    monkeypatch.setenv("TOWER_RESULT_COPY_TRACE_FILE", str(tmp_path))
+    monkeypatch.setattr(control_view, "get_result", lambda *_a, **_k: pytest.fail("trace failure must stop before lookup"))
+    monkeypatch.setattr(control_view, "copy_text", lambda *_a, **_k: pytest.fail("trace failure must block copy"))
+
+    notice = control_view._copy_result(tower, "%9")
+
+    assert notice == t("control.clipboard_failed")
+    assert tower.last_result_copy_diagnostic["reason_code"] == "DIAGNOSTIC_TRACE_FAILED"
+
+
+def test_y_trace_does_not_record_or_route_a_partial_result(tmp_path, monkeypatch):
+    import json
+
+    from tmux_agent_tower.ui import control_view
+
+    body = "synthetic partial body"
+    tower = _Tower()
+    trace = tmp_path / "partial-trace.jsonl"
+    monkeypatch.setenv("TOWER_RESULT_COPY_TRACE_FILE", str(trace))
+    monkeypatch.setattr(control_view, "get_result", lambda *_a, **_k: (True, "", {
+        "state": "none", "text": body, "complete": False,
+        "turn_complete": True, "body_complete": False, "source": "SOURCE_PARTIAL",
+    }))
+    monkeypatch.setattr(control_view, "_route_clipboard", lambda *_a, **_k: pytest.fail("partial result routed"))
+
+    notice = control_view._copy_result(tower, "%9")
+
+    records = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    result = next(record for record in records if record["event"] == "GET_RESULT_COMPLETE")
+    assert "SOURCE_PARTIAL" in notice
+    assert result["result_complete"] is False
+    assert result["result_utf8_bytes"] == 0
+    assert result["result_sha256"] == ""
+    assert all(record["event"] != "CLIPBOARD_WRITE_ATTEMPTED" for record in records)
+    assert body not in trace.read_text(encoding="utf-8")
 
 
 def test_y_fails_closed_even_with_a_live_multi_client_override(monkeypatch):

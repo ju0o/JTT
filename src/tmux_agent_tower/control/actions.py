@@ -527,6 +527,10 @@ def get_result(
         provider = _RecoveryProvider(lambda target: _recover_remote_result(target.remote_provider_row()))
         candidate = provider.get_latest_complete_result(target)
         return True, "", _candidate_payload(candidate) if candidate else provider.observation
+    if target.transport == "ssh" and (target.agent == "OpenCode" or row.get("result_adapter") == "OpenCode"):
+        if row.get("result_adapter") not in (None, "", "OpenCode"):
+            return True, "", _remote_opencode_failure("AGENT_UNBOUND")
+        return _get_ssh_opencode_result(tower, row, target, pane_key, expected_pane_pid)
     if target.transport == "ssh" and target.agent == "Grok":
         from ..detection.sshdest import ssh_connection_for_pane
 
@@ -736,6 +740,87 @@ def _remote_grok_failure(source: str) -> dict:
     return {
         "state": "none", "text": "", "fingerprint": "", "generated_at": 0.0,
         "complete": False, "turn_complete": False, "body_complete": False, "source": source,
+    }
+
+
+def _remote_opencode_failure(source: str) -> dict:
+    return {
+        "state": "none", "text": "", "fingerprint": "", "generated_at": 0.0,
+        "complete": False, "turn_complete": False, "body_complete": False,
+        "source": source, "reason_code": source,
+    }
+
+
+def _recover_ssh_opencode_result(row: dict) -> dict:
+    """Read one complete export from the explicitly session-bound OpenCode TUI."""
+
+    from ..remote.opencode import fetch_remote_opencode_result
+
+    endpoint = str(row.get("result_provider_endpoint") or "")
+    connection = tuple(row.get("ssh_connection") or ())
+    if (
+        row.get("result_provider_type") != "remote_opencode" or not endpoint
+        or not str(row.get("ssh_client_pid") or "").isdecimal() or len(connection) != 4
+    ):
+        return _remote_opencode_failure("REMOTE_PROVIDER_UNBOUND")
+    requested = {
+        "ssh_client_pid": str(row["ssh_client_pid"]),
+        "client_ip": connection[0], "client_port": connection[1],
+        "server_ip": connection[2], "server_port": connection[3],
+    }
+    result = fetch_remote_opencode_result(endpoint, requested)
+    if not isinstance(result, dict):
+        return _remote_opencode_failure("REMOTE_PROVIDER_UNAVAILABLE")
+    status = str(result.get("status") or "UNKNOWN")
+    if status != "ok":
+        if status not in {
+            "AGENT_SESSION_UNBOUND", "REMOTE_PROVIDER_UNBOUND", "REMOTE_PROVIDER_UNAVAILABLE",
+            "REMOTE_PROVIDER_TIMEOUT", "REMOTE_RESULT_INCOMPLETE", "OUTPUT_RANGE_EXCEEDED",
+        }:
+            status = "UNKNOWN"
+        return _remote_opencode_failure(status)
+    if result.get("ssh_connection") != list(connection):
+        return _remote_opencode_failure("REMOTE_PROVIDER_UNBOUND")
+    session_id = str(result.get("session_id") or "")
+    user_id = str(result.get("user_id") or "")
+    message_id = str(result.get("message_id") or "")
+    remote_session_pid = str(result.get("remote_session_pid") or "")
+    remote_sshd_pid = str(result.get("remote_sshd_pid") or "")
+    opencode_pid = str(result.get("opencode_pid") or "")
+    text = result.get("text")
+    if (
+        not re.fullmatch(r"ses_[A-Za-z0-9_-]{8,128}", session_id)
+        or not user_id.startswith("msg_") or not message_id.startswith("msg_")
+        or not all(value.isdecimal() for value in (remote_session_pid, remote_sshd_pid, opencode_pid))
+        or result.get("turn_complete") is not True or result.get("body_complete") is not True
+        or not isinstance(text, str) or not text
+    ):
+        return _remote_opencode_failure("REMOTE_RESULT_INCOMPLETE")
+    body = text.encode("utf-8", "strict")
+    native_hash = hashlib.sha256(body).hexdigest()
+    if (
+        isinstance(result.get("native_length"), bool)
+        or not isinstance(result.get("native_length"), int)
+        or len(text) != result.get("native_length")
+        or len(body) != result.get("native_utf8_bytes")
+        or native_hash != result.get("native_sha256")
+    ):
+        return _remote_opencode_failure("REMOTE_RESULT_INCOMPLETE")
+    turn_identity = ":".join((
+        str(row["ssh_client_pid"]), *connection, remote_session_pid, remote_sshd_pid,
+        opencode_pid, session_id, user_id, message_id, native_hash,
+    ))
+    now = time.time()
+    return {
+        "state": "ready", "text": text, "fingerprint": native_hash,
+        "generated_at": now, "complete": True, "turn_complete": True, "body_complete": True,
+        "source": "remote_opencode", "turn_identity": turn_identity, "timestamp": now, "confidence": "high",
+        "remote_session_pid": remote_session_pid, "remote_sshd_pid": remote_sshd_pid,
+        "opencode_pid": opencode_pid, "session_id": session_id, "user_id": user_id, "message_id": message_id,
+        "native_length": len(text), "native_utf8_bytes": len(body), "native_sha256": native_hash,
+        "local_ssh_pid": str(row["ssh_client_pid"]), "ssh_connection": connection,
+        "ssh_local_socket": tuple(row.get("ssh_local_socket") or ()),
+        "ssh_connection_mode": str(row.get("ssh_connection_mode") or "direct"),
     }
 
 
@@ -986,6 +1071,71 @@ def send_attention_key(pane_id: str, key: str) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _get_ssh_opencode_result(tower, row: dict, target: ResultTarget, pane_key: str, expected_pane_pid):
+    failure = _remote_opencode_failure("REMOTE_PROVIDER_UNBOUND")
+    pane_id = target.tower_pane_id
+    pane_pid = target.tower_pane_pid
+    session = str(row.get("session") or "")
+    host = target.transport_target
+    interaction = row.get("interaction")
+    if (
+        row.get("status") != "IDLE" or row.get("attention") not in (None, "", "none")
+        or (interaction and (not isinstance(interaction, dict) or interaction.get("type") not in (None, "none")))
+    ):
+        return True, "", _remote_opencode_failure("TURN_NOT_COMPLETE")
+    if (
+        pane_id != pane_key or not _LOCAL_PANE_KEY_RE.fullmatch(pane_id or "")
+        or not pane_pid.isdecimal() or (expected_pane_pid and pane_pid != expected_pane_pid)
+        or not session or not host
+        or not _pane_matches_live_identity(session, pane_id, pane_pid)
+    ):
+        return True, "", failure
+    live = pane_title_and_command(pane_id)
+    if not live or live[1].casefold() not in {"ssh", "ssh.exe"}:
+        return True, "", failure
+    pane_title = live[0]
+
+    from ..detection.sshdest import ssh_connection_for_pane
+
+    connection = ssh_connection_for_pane(pane_pid, host)
+    if connection is None:
+        return True, "", failure
+    target = replace(
+        target, provider_type="remote_opencode", provider_endpoint=host, title=pane_title,
+        ssh_client_pid=connection["ssh_client_pid"],
+        ssh_connection=(
+            connection["client_ip"], connection["client_port"],
+            connection["server_ip"], connection["server_port"],
+        ),
+        ssh_local_socket=tuple(connection.get("local_socket") or ()),
+        ssh_connection_mode=str(connection.get("connection_mode") or "direct"),
+    )
+    provider = _RecoveryProvider(
+        lambda resolved: _recover_ssh_opencode_result(resolved.remote_provider_row())
+    )
+    candidate = provider.get_latest_complete_result(target)
+
+    # The title is a stability check only; session identity comes from explicit --session argv.
+    live_after = pane_title_and_command(pane_id)
+    connection_after = ssh_connection_for_pane(pane_pid, host)
+    if (
+        not _pane_matches_live_identity(session, pane_id, pane_pid)
+        or live_after != live or not connection_after
+        or connection_after.get("ssh_client_pid") != connection["ssh_client_pid"]
+        or tuple(connection_after.get(key) for key in ("client_ip", "client_port", "server_ip", "server_port")) != target.ssh_connection
+        or tuple(connection_after.get("local_socket") or ()) != target.ssh_local_socket
+    ):
+        return True, "", _remote_opencode_failure("REMOTE_PROVIDER_UNBOUND")
+    if candidate is None:
+        return True, "", provider.observation or _remote_opencode_failure("REMOTE_RESULT_INCOMPLETE")
+    payload = _candidate_payload(candidate, provider.observation.get("state") or "ready")
+    payload.update({key: value for key, value in provider.observation.items() if key.startswith("remote_") or key in {
+        "opencode_pid", "session_id", "user_id", "message_id", "native_length", "native_utf8_bytes",
+        "native_sha256", "local_ssh_pid", "ssh_connection", "ssh_local_socket", "ssh_connection_mode",
+    }})
+    return True, "", payload
 
 
 def respond_interaction(tower, pane_key: str, key: str) -> Tuple[bool, str]:

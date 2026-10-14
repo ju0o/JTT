@@ -1,7 +1,10 @@
 """Result copy uses the extracted body and an honest clipboard result."""
 
+import os
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from tmux_agent_tower.adapters.base import ResultCandidate
 from tmux_agent_tower.clipboard import choose_clipboard_tool, copy_text, resolve_terminal_target
@@ -91,6 +94,29 @@ def test_copy_sends_the_body_on_stdin_and_marks_read_only_on_success(monkeypatch
     assert tracker.snapshot("%9").text == BODY
 
 
+def test_copy_diagnostic_failure_blocks_external_clipboard_write(monkeypatch):
+    writes = []
+    attempts = []
+    monkeypatch.setattr("tmux_agent_tower.clipboard.choose_clipboard_tool", lambda *_: "clip.exe")
+    monkeypatch.setattr("tmux_agent_tower.clipboard.shutil.which", lambda _name: "clip.exe")
+
+    def run(argv, data):
+        writes.append((argv, data))
+        return 0
+
+    outcome = copy_text(
+        BODY, destination="local_host", allow_buffer_fallback=False,
+        run=run, which=lambda _name: "clip.exe",
+        diagnostic_callback=lambda *fields: attempts.append(fields) or False,
+    )
+
+    assert len(attempts) == 1
+    assert attempts[0][0:2] == ("local_host", "clip.exe")
+    assert attempts[0][2] == len(BODY.encode("utf-8"))
+    assert writes == []
+    assert outcome.clipboard is False
+
+
 def test_failed_clipboard_uses_the_buffer_and_does_not_mark_read(monkeypatch):
     def run(argv, data):
         if argv[0] == "tmux":
@@ -142,6 +168,10 @@ def test_showing_the_result_marks_it_read_without_copying():
     assert BODY.split("\n", 1)[0] not in notice or True
 
 
+@pytest.mark.skipif(
+    os.environ.get("TOWER_RUN_CLIPBOARD_INTEGRATION") != "1",
+    reason="set TOWER_RUN_CLIPBOARD_INTEGRATION=1 to write and read the real Windows clipboard",
+)
 def test_windows_clipboard_round_trip_keeps_korean_and_a_code_block():
     import hashlib
     import shutil
@@ -149,7 +179,7 @@ def test_windows_clipboard_round_trip_keeps_korean_and_a_code_block():
     from tmux_agent_tower.clipboard import _read_tool_clipboard, normalize_newlines
 
     if shutil.which("clip.exe") is None:
-        return
+        pytest.skip("clip.exe is unavailable")
     sample = "한글 결과\n\n```python\nprint('tower')\n```\n둘째 줄"
     outcome = copy_text(sample)
     assert outcome.clipboard is True
