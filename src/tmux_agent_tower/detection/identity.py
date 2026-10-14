@@ -26,6 +26,7 @@ _BY_BASENAME = {
     "opencode": "OpenCode",
     "grok": "Grok",
     "cursor-agent": "Cursor",
+    "cline": "Cline",
 }
 
 # Strong, unique screen markers. Used only when the process table has

@@ -7,6 +7,8 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from tmux_agent_tower.remote.opencode import _REMOTE_OPENCODE_SCRIPT, fetch_remote_opencode_result
 
 
@@ -406,6 +408,59 @@ def test_tower_uses_boundary_checked_capture_for_bare_opencode_only(monkeypatch)
     assert payload["text"] == body and payload["complete"]
     assert payload["source"] == "ssh_visible_history"
     assert recovered == [("%9", "ssh_visible_history", "900")]
+
+
+@pytest.mark.parametrize(
+    ("captured", "history_size", "expected_text", "expected_complete", "expected_reason"),
+    [
+        (
+            ["┃ synthetic request", "Short complete answer.", "▣ Build · model · 1.0s", "ctrl+p commands"],
+            4, "Short complete answer.", True, "",
+        ),
+        (
+            [*[f"long answer suffix line {index}" for index in range(798)], "▣ Build · model · 1.0s", "ctrl+p commands"],
+            803, "", False, "OUTPUT_RANGE_EXCEEDED",
+        ),
+    ],
+)
+def test_bare_opencode_capture_uses_real_adapter_boundaries(
+    monkeypatch, captured, history_size, expected_text, expected_complete, expected_reason,
+):
+    from tmux_agent_tower.control.actions import get_result
+    from tmux_agent_tower.detection.result import ResultTracker
+
+    tower = _Tower()
+    tower.results = ResultTracker()
+    _bind_local_ssh(monkeypatch)
+    monkeypatch.setattr(
+        "tmux_agent_tower.remote.opencode.fetch_remote_opencode_result",
+        lambda *_: {"status": "AGENT_SESSION_UNBOUND", "session_binding": "implicit_tui"},
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions.find_screen_target",
+        lambda *_: (True, "", "%9"),
+    )
+    monkeypatch.setattr("tmux_agent_tower.control.actions.pane_process_id", lambda _pane: "900")
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions.tmux_capture.pane_history_position",
+        lambda _pane: (history_size, 2000),
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions.tmux_capture.capture_pane",
+        lambda *_a, **_k: captured,
+    )
+
+    ok, reason, payload = get_result(tower, "%9", expected_pane_pid="900")
+
+    assert ok and reason == ""
+    assert payload["text"] == expected_text
+    assert payload["complete"] is expected_complete
+    if expected_complete:
+        assert payload["body_complete"] is True and payload["turn_complete"] is True
+        assert payload["source"] == "ssh_visible_history"
+    else:
+        assert payload["body_complete"] is False
+        assert payload["reason_code"] == expected_reason
 
 
 def test_tower_does_not_capture_when_opencode_binding_is_not_proven(monkeypatch):

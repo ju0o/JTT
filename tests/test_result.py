@@ -538,6 +538,25 @@ def test_grok_and_shell_do_not_invent_a_result():
     assert ShellAdapter().extract_result(ctx("shell-idle.txt")) is None
 
 
+def test_cline_terminal_output_stays_unsupported_without_result_boundaries(monkeypatch):
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _RecoverTower()
+    tower.rows[0].update({"command": "cline", "title": "Cline", "agent": "Cline"})
+    _patch_history(monkeypatch, tower, ["Cline session", "assistant-looking output", "Done"])
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions.pane_title_and_command",
+        lambda _pane: ("Cline", "cline"),
+    )
+    monkeypatch.setattr("tmux_agent_tower.control.actions.tmux_capture.pane_history_position", lambda _pane: None)
+
+    ok, reason, payload = get_result(tower, "%9")
+
+    assert ok and reason == ""
+    assert payload["text"] == "" and payload["complete"] is False
+    assert payload["reason_code"] == "AGENT_UNSUPPORTED"
+
+
 def test_completion_words_in_the_wrong_place_are_not_a_result():
     assert prose_body(["Finished"]) is None
     assert prose_body(["Done"]) == "Done"
