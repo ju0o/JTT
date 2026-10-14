@@ -530,7 +530,10 @@ def get_result(
     if target.transport == "ssh" and (target.agent == "OpenCode" or row.get("result_adapter") == "OpenCode"):
         if row.get("result_adapter") not in (None, "", "OpenCode"):
             return True, "", _remote_opencode_failure("AGENT_UNBOUND")
-        return _get_ssh_opencode_result(tower, row, target, pane_key, expected_pane_pid)
+        native_result = _get_ssh_opencode_result(tower, row, target, pane_key, expected_pane_pid)
+        if native_result[2].get("reason_code") != "SESSION_ID_NOT_EXPOSED":
+            return native_result
+        # Only a verified bare TUI launch reaches capture; its adapter still requires full visible boundaries.
     if target.transport == "ssh" and target.agent == "Grok":
         from ..detection.sshdest import ssh_connection_for_pane
 
@@ -773,6 +776,8 @@ def _recover_ssh_opencode_result(row: dict) -> dict:
         return _remote_opencode_failure("REMOTE_PROVIDER_UNAVAILABLE")
     status = str(result.get("status") or "UNKNOWN")
     if status != "ok":
+        if status == "AGENT_SESSION_UNBOUND" and result.get("session_binding") == "implicit_tui":
+            return _remote_opencode_failure("SESSION_ID_NOT_EXPOSED")
         if status not in {
             "AGENT_SESSION_UNBOUND", "REMOTE_PROVIDER_UNBOUND", "REMOTE_PROVIDER_UNAVAILABLE",
             "REMOTE_PROVIDER_TIMEOUT", "REMOTE_RESULT_INCOMPLETE", "OUTPUT_RANGE_EXCEEDED",

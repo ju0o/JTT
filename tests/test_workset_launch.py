@@ -56,9 +56,17 @@ def isolated_tower(tmp_path, monkeypatch):
     monkeypatch.setattr(tower_module, "HOST_FILE", config_dir / "host")
     monkeypatch.setattr(tower_module, "REMOTE_HOSTS_FILE", config_dir / "remote-hosts.txt")
     session = "workset-" + uuid.uuid4().hex[:8]
+    server_pid = None
     try:
         _tmux("-f", "/dev/null", "new-session", "-d", "-x", "160", "-y", "60", "-s", session, "sleep 600")
         socket_path = _private_tmux_socket(socket_dir)
+        assert socket_path.parent.parent == socket_dir
+        server = subprocess.run(
+            ["tmux", "-S", str(socket_path), "display-message", "-p", "#{pid}"],
+            capture_output=True, text=True, check=False,
+        )
+        assert server.returncode == 0 and server.stdout.strip().isdecimal(), server.stderr
+        server_pid = int(server.stdout.strip())
         base = _tmux("list-panes", "-t", session, "-F", "#{pane_id} #{pane_pid}").split()
         tower = Tower(session, own_pane_id=base[0])
         yield tower, state_dir, base
@@ -68,6 +76,14 @@ def isolated_tower(tmp_path, monkeypatch):
         if sockets:
             socket_path = sockets[0]
             assert stat.S_ISSOCK(socket_path.stat().st_mode), socket_path
+            assert socket_path.parent.parent == socket_dir
+            if server_pid is None:
+                server = subprocess.run(
+                    ["tmux", "-S", str(socket_path), "display-message", "-p", "#{pid}"],
+                    capture_output=True, text=True, check=False,
+                )
+                if server.returncode == 0 and server.stdout.strip().isdecimal():
+                    server_pid = int(server.stdout.strip())
             subprocess.run(
                 ["tmux", "-S", str(socket_path), "kill-server"],
                 capture_output=True, text=True, check=False,
@@ -78,8 +94,16 @@ def isolated_tower(tmp_path, monkeypatch):
                     capture_output=True, text=True, check=False,
                 )
                 if probe.returncode != 0:
-                    assert probe.stderr == f"no server running on {socket_path}\n", probe.stderr
+                    assert server_pid is not None, "could not identify isolated tmux server"
+                    try:
+                        os.kill(server_pid, 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        time.sleep(0.1)
+                        continue
                     socket_path.unlink(missing_ok=True)
+                    assert not socket_path.exists()
                     break
                 time.sleep(0.1)
             else:

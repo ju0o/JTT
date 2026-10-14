@@ -153,7 +153,27 @@ def test_remote_provider_ignores_titles_and_requires_one_explicit_session_argume
     proc, cwd = _remote_fixture(tmp_path / "missing", process_argv=["opencode"])
     payload, _ = _run_remote(proc)
     assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert payload["session_binding"] == "implicit_tui"
     assert not (cwd / ".export-called").exists()
+
+
+def test_remote_provider_marks_only_bare_opencode_for_boundary_checked_capture(tmp_path):
+    proc, _cwd = _remote_fixture(tmp_path / "bare", process_argv=["opencode"])
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert payload["session_binding"] == "implicit_tui"
+
+    proc, _cwd = _remote_fixture(tmp_path / "continue", process_argv=["opencode", "--continue"])
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert "session_binding" not in payload
+
+    proc, _cwd = _remote_fixture(
+        tmp_path / "wrong-executable", process_argv=["opencode"], executable_name="not-opencode",
+    )
+    payload, _ = _run_remote(proc)
+    assert payload["status"] == "REMOTE_PROVIDER_UNAVAILABLE"
+    assert "session_binding" not in payload
 
 
 def test_remote_provider_accepts_explicit_pure_session_and_rejects_extra_or_duplicate_args(tmp_path):
@@ -356,6 +376,58 @@ def test_tower_get_result_uses_bound_ssh_provider_and_rechecks_pane(monkeypatch)
     assert payload["complete"] and payload["turn_complete"] and payload["body_complete"]
     assert payload["source"] == "remote_opencode"
     assert payload["native_sha256"] == hashlib.sha256(body.encode()).hexdigest()
+
+
+def test_tower_uses_boundary_checked_capture_for_bare_opencode_only(monkeypatch):
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _Tower()
+    tower.results = object()
+    _bind_local_ssh(monkeypatch)
+    monkeypatch.setattr(
+        "tmux_agent_tower.remote.opencode.fetch_remote_opencode_result",
+        lambda *_: {"status": "AGENT_SESSION_UNBOUND", "session_binding": "implicit_tui"},
+    )
+    body = "A bounded screen result."
+    recovered = []
+
+    def recover(_tower, pane, _tracker, _identity, *, source, expected_pane_pid):
+        recovered.append((pane, source, expected_pane_pid))
+        return {
+            "state": "ready", "text": body, "fingerprint": hashlib.sha256(body.encode()).hexdigest(),
+            "generated_at": 1.0, "complete": True, "turn_complete": True, "body_complete": True,
+            "source": source, "turn_identity": "turn-1", "timestamp": 1.0, "confidence": "high",
+        }
+
+    monkeypatch.setattr("tmux_agent_tower.control.actions._recover_result", recover)
+    ok, reason, payload = get_result(tower, "%9", expected_pane_pid="900")
+
+    assert ok and reason == ""
+    assert payload["text"] == body and payload["complete"]
+    assert payload["source"] == "ssh_visible_history"
+    assert recovered == [("%9", "ssh_visible_history", "900")]
+
+
+def test_tower_does_not_capture_when_opencode_binding_is_not_proven(monkeypatch):
+    import pytest
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _Tower()
+    _bind_local_ssh(monkeypatch)
+    monkeypatch.setattr(
+        "tmux_agent_tower.remote.opencode.fetch_remote_opencode_result",
+        lambda *_: {"status": "AGENT_SESSION_UNBOUND"},
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions._recover_result",
+        lambda *_a, **_k: pytest.fail("unbound OpenCode must not reach capture"),
+    )
+
+    ok, reason, payload = get_result(tower, "%9", expected_pane_pid="900")
+
+    assert ok and reason == ""
+    assert payload["text"] == "" and not payload["complete"]
+    assert payload["reason_code"] == "AGENT_SESSION_UNBOUND"
 
 
 def test_tower_blocks_changed_socket_and_never_falls_back_to_suffix(monkeypatch):

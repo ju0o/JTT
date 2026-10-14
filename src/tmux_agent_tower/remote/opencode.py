@@ -86,11 +86,16 @@ def process(pid):
     except (OSError, IndexError):
         return None
 
-# shortcut: in-TUI session switches are not exposed; use only in a controlled pane kept on its launch session until OpenCode exposes the active ID.
-def explicit_session_id(pid):
+# shortcut: in-TUI session switches are not exposed; use capture only for a plain TUI launch whose screen proves both result boundaries.
+def process_argv(pid):
     try:
-        argv = [part.decode("utf-8", "strict") for part in open(os.path.join(PROC, pid, "cmdline"), "rb").read().split(b"\0") if part]
+        raw = open(os.path.join(PROC, pid, "cmdline"), "rb").read().split(b"\0")
+        return [part.decode("utf-8", "strict") for part in raw if part]
     except (OSError, UnicodeError):
+        return []
+
+def explicit_session_id(argv):
+    if not argv:
         return None
     args = argv[1:]
     if args.count("--pure") > 1:
@@ -293,8 +298,13 @@ root_proc = processes[root]
 if proc["tty_nr"] == "0" or proc["tty_nr"] != root_proc["tty_nr"] or proc["pgrp"] != proc["tpgid"]:
     emit("AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
-sid = explicit_session_id(pid)
-if not sid:
+argv = process_argv(pid)
+sid = explicit_session_id(argv)
+implicit_tui = (
+    not sid and len(argv) == 1
+    and os.path.basename(argv[0]).lower() in ("opencode", "opencode.exe")
+)
+if not sid and not implicit_tui:
     emit("AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
 try:
@@ -319,6 +329,9 @@ version, state = run_bounded([exe, "--version"], cwd, env, 1024, 2.0)
 if state != "ok" or not version or version.decode("utf-8", "replace").strip().splitlines()[0] != "1.19.0":
     emit("REMOTE_PROVIDER_UNAVAILABLE", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
+if implicit_tui:
+    emit("AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid, session_binding="implicit_tui")
+    raise SystemExit(0)
 export, state = run_bounded([exe, "export", sid], cwd, env, MAX_EXPORT, 8.0)
 binding = {"remote_session_pid": root, "remote_sshd_pid": sshd, "opencode_pid": pid, "ssh_connection": list(expected)}
 if state == "large":
@@ -338,7 +351,7 @@ if status != "ok":
     raise SystemExit(0)
 still_live = process(pid)
 if (
-    not still_live or still_live["starttime"] != proc["starttime"] or explicit_session_id(pid) != sid
+    not still_live or still_live["starttime"] != proc["starttime"] or explicit_session_id(process_argv(pid)) != sid
     or ssh_connection(pid) != expected or still_live["tty_nr"] != root_proc["tty_nr"]
     or still_live["pgrp"] != still_live["tpgid"] or not connection_live(expected)
 ):
