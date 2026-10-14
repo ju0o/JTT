@@ -339,10 +339,17 @@ def test_status_exposes_tmux_location(env):
     assert pane["active"] is True
 
 
-def test_focus_requires_auth_and_only_moves_the_bound_pane(env):
+def test_focus_requires_auth_and_only_moves_the_bound_pane(env, monkeypatch):
     status, body = _post(env["srv"], "/api/panes/%251/focus", {})
     assert status == 401
 
+    from tmux_agent_tower.server import httpapi
+
+    def fake_focus(session, pane_id, _own_pane_id=""):
+        env["calls"].extend((["select-window", "-t", pane_id], ["select-pane", "-t", pane_id]))
+        return session == SESSION and pane_id == "%1", ""
+
+    monkeypatch.setattr(httpapi, "focus_pane", fake_focus)
     before = len(env["calls"])
     status, body = _post(env["srv"], "/api/panes/%251/focus", {}, env["token"])
     assert status == 200
