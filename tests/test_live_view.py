@@ -251,7 +251,7 @@ def test_empty_start_choices_do_not_look_like_a_selected_task(monkeypatch):
     assert "아직 실행 중인 작업이 없습니다." in text
     assert "AI 작업을 한곳에서 보고" in text
     assert "현재 접속 위치를 확인할 수 없습니다" in text
-    assert "Enter 열기" in text
+    assert "Enter 시작" in text
     assert "+ 새 작업" in text
     assert "Ctrl+b" not in text
     assert "작업 이름" not in text
@@ -296,7 +296,7 @@ def test_default_home_draws_user_identity_without_physical_inspector_or_legacy_w
     assert "새 결과" in text
     for internal in ("Pane ID", "Window ID", "Session", "%42", "@4", "A 우선순위", "M 휴대폰", "Ctrl+b w"):
         assert internal not in text
-    for key in ("Enter 열기", "Space 메뉴", "+ 새 작업", "S 저장한 구성", "L 실시간 보기", "/ 찾기·명령", "Y 결과 복사", "Esc 뒤로", "? 도움말"):
+    for key in ("Enter 대화 열기", "Space 메뉴", "+ 새 작업", "S 저장한 구성", "L 실시간 보기", "/ 찾기·명령", "Y 결과 복사", "Esc 뒤로", "? 도움말"):
         assert key in text
 
 

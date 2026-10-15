@@ -72,8 +72,17 @@ def test_tower_default_home_uses_folder_window_task_tree(one_pane):
     tower = tower_module.Tower(SESSION, own_pane_id="")
     tower.load()
     assert tower.view_mode == tower_module.USER_WORK_VIEW
+    assert [row["kind"] for row in tower.visible_rows] == ["other_section"]
+    assert tower.visible_rows[0]["display_name"] == "기타 터미널 · 자동 발견"
+    assert tower.visible_rows[0]["collapsed"] is True
+    assert not any(row.get("kind") == "window" for row in tower.visible_rows)
+
+    # Enter on the discovered-terminal section expands the existing logical
+    # Window and its Pane without switching to the physical tmux inspector.
+    tower_module._open_selected_row(None, tower)
     assert [row["kind"] for row in tower.visible_rows] == ["other_section", "window_asset", "pane"]
     assert tower.visible_rows[1]["display_name"] == "my-project"
+    assert tower.visible_rows[2]["pane_id"] == "%1"
     assert not any(row.get("kind") == "window" for row in tower.visible_rows)
 
 
