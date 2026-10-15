@@ -314,7 +314,14 @@ except OSError:
     emit("REMOTE_PROVIDER_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
 exe_name = os.path.basename(exe)
-if exe_name not in ("opencode", "opencode.exe") or exe_name.lower() != proc["comm"].lower() or exe.endswith(" (deleted)"):
+exe_name_lower = exe_name.lower()
+comm_name = proc["comm"].lower()
+# The supported .exe launcher may report "opencode" as its Linux process comm.
+comm_matches_executable = (
+    exe_name_lower == comm_name
+    or (exe_name_lower == "opencode.exe" and comm_name == "opencode")
+)
+if exe_name_lower not in ("opencode", "opencode.exe") or not comm_matches_executable or exe.endswith(" (deleted)"):
     emit("REMOTE_PROVIDER_UNAVAILABLE", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
 proc_env = env_for(pid, {"HOME", "PATH", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_DATA_DIR", "OPENCODE_DB", "OPENCODE_CONFIG_CONTENT"})

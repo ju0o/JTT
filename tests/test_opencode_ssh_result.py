@@ -212,6 +212,17 @@ def test_remote_provider_accepts_opencode_exe_and_rejects_other_executable_names
     assert not (cwd / ".export-called").exists()
 
 
+def test_remote_provider_accepts_opencode_exe_with_bare_tui_comm_alias(tmp_path):
+    proc, cwd = _remote_fixture(
+        tmp_path, process_argv=["opencode"], executable_name="opencode.exe", comm_name="opencode",
+    )
+    payload, _ = _run_remote(proc)
+
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert payload["session_binding"] == "implicit_tui"
+    assert not (cwd / ".export-called").exists()
+
+
 def test_remote_provider_rejects_opencode_exe_comm_without_matching_executable_or_tty(tmp_path):
     proc, cwd = _remote_fixture(
         tmp_path / "comm-path-mismatch", executable_name="not-opencode.exe", comm_name="opencode.exe",
