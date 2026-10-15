@@ -7,6 +7,24 @@ from tmux_agent_tower.server import httpapi
 from tmux_agent_tower.ui import control_view, tower as tower_module
 
 
+class _RecordingScreen:
+    def __init__(self, height, width):
+        self.height, self.width = height, width
+        self.drawn = {}
+
+    def erase(self):
+        self.drawn.clear()
+
+    def getmaxyx(self):
+        return self.height, self.width
+
+    def addnstr(self, y, x, text, _count, _attr=0):
+        self.drawn[y] = (x, text)
+
+    def noutrefresh(self):
+        pass
+
+
 def test_enter_opens_control_and_does_not_focus(tmp_path, monkeypatch):
     monkeypatch.setattr(tower_module, "STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(tower_module, "CONFIG_DIR", tmp_path / "config")
@@ -192,3 +210,50 @@ def test_live_prompt_and_identity_are_the_shared_actions():
     assert "focus_pane" in inspect.getsource(control_view._go)
     assert "update_identity" in inspect.getsource(tower_module.Tower.edit_selected)
     assert "close_pane" in inspect.getsource(control_view._close)
+
+
+def test_control_footer_wraps_korean_shortcuts_on_narrow_terminal(monkeypatch):
+    from types import SimpleNamespace
+    from tmux_agent_tower.ui.render import display_width
+
+    monkeypatch.setattr(control_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_view, "_live_lines", lambda *_args: [f"synthetic live line {i}" for i in range(20)])
+    screen = _RecordingScreen(20, 45)
+    row = {
+        "key": "asus:%1", "remote": True, "status": "IDLE", "agent": "OpenCode",
+        "role": "builder", "execution_host": "asus", "host": "asus",
+    }
+
+    control_view._draw(screen, SimpleNamespace(config={}), row, "", False)
+
+    action_rows = [screen.drawn[index][1] for index in (18, 19)]
+    assert "Ctrl+Y 결과 복사" in " ".join(action_rows)
+    assert "Ctrl+S 결과 보기" in " ".join(action_rows)
+    assert "Esc 뒤로" in " ".join(action_rows)
+    assert all(display_width(line) <= 42 for line in action_rows)
+    compact_rows = control_view._action_hint_lines(row, 22)
+    assert "Ctrl+Y 복사" in " ".join(compact_rows)
+    assert all(display_width(line) <= 18 for line in compact_rows)
+    remote_hint = screen.drawn[17][1]
+    assert remote_hint.startswith("다른 컴퓨터의 작업은") and remote_hint.endswith("…")
+    assert screen.drawn[16][1] == "synthetic live line 19"
+
+
+def test_control_notice_truncates_by_display_width(monkeypatch):
+    from types import SimpleNamespace
+    from tmux_agent_tower.ui.render import display_width
+
+    monkeypatch.setattr(control_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_view, "_live_lines", lambda *_args: ["synthetic live line"])
+    screen = _RecordingScreen(20, 45)
+    row = {
+        "key": "%1", "remote": True, "status": "IDLE", "agent": "OpenCode",
+        "role": "builder", "execution_host": "asus", "host": "asus",
+    }
+    notice = "클립보드 전달 실패를 확인하고 다시 시도하기 전에 상태를 점검해 주세요"
+
+    control_view._draw(screen, SimpleNamespace(config={}), row, notice, False)
+
+    shown = screen.drawn[19][1]
+    assert shown.endswith("…")
+    assert display_width(shown) <= 42

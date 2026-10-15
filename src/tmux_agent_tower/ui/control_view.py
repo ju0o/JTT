@@ -289,7 +289,8 @@ def _draw(stdscr, tower, row: dict, notice: str, show_result: bool, follow: bool
         live_label_y += 1
 
     live_top = live_label_y + 1
-    footer_y = height - 1
+    action_lines = _action_hint_lines(row, width, show_advanced) if not notice else []
+    footer_y = height - max(1, len(action_lines))
     result_lines: list = []
     if show_result:
         ok, _reason, payload = get_result(tower, row.get("key"))
@@ -301,7 +302,11 @@ def _draw(stdscr, tower, row: dict, notice: str, show_result: bool, follow: bool
     choice_active = interaction.get("type") in ("approval", "choice", "confirm") and interaction.get("options")
     gated = login_required or _unknown_interaction(interaction) or choice_active or interaction.get("type") == "approval" or interaction.get("type") == "confirm"
     composer_rows = 0 if gated or row.get("remote") else 5
-    live_bottom = footer_y - composer_rows - (len(result_lines) + 1 if result_lines else 0)
+    bottom_hint_rows = 1 if not composer_rows and (
+        row.get("remote") or login_required or _unknown_interaction(interaction) or choice_active
+        or (interaction.get("type") == "approval" and row.get("approval_known"))
+    ) else 0
+    live_bottom = footer_y - composer_rows - bottom_hint_rows - (len(result_lines) + 1 if result_lines else 0)
     live_mark = t("control.live_follow") if follow else t("control.live_paused")
     safe_add(stdscr, live_label_y, 2, f'{t("control.live")}  {live_mark}', curses.A_BOLD)
     lines = [_fit_live_line(line, width) for line in _live_lines(tower, row)]
@@ -333,9 +338,9 @@ def _draw(stdscr, tower, row: dict, notice: str, show_result: bool, follow: bool
     elif interaction.get("type") == "approval" and row.get("approval_known"):
         safe_add(stdscr, footer_y - 1, 2, t("control.key_approve"), curses.A_BOLD)
     if notice:
-        safe_add(stdscr, footer_y, 2, notice[: max(0, width - 3)], curses.A_BOLD)
+        safe_add(stdscr, footer_y, 2, notice, curses.A_BOLD)
     else:
-        _draw_actions(stdscr, footer_y, row, show_advanced)
+        _draw_actions(stdscr, footer_y, row, show_advanced, lines=action_lines)
     if composer_rows and composer is not None and not gated:
         _place_composer_cursor(stdscr, footer_y - composer_rows, composer, composer_scroll)
     stdscr.noutrefresh()
@@ -431,18 +436,33 @@ def _fit_live_line(line: str, width: int) -> str:
     return render.truncate_to_width(line, max(4, width - 4))
 
 
-def _draw_actions(stdscr, y: int, row: dict, show_advanced: bool = False) -> None:
+def _draw_actions(stdscr, y: int, row: dict, show_advanced: bool = False, *, lines=None) -> None:
     """Shortcuts remain available while printable keys belong to the composer."""
-    items = ["Ctrl+Y 복사", "Ctrl+S 결과", "Ctrl+E 이름", "Esc 뒤로"]
+    if lines is None:
+        _, width = stdscr.getmaxyx()
+        lines = _action_hint_lines(row, width, show_advanced)
+    for offset, line in enumerate(lines):
+        safe_add(stdscr, y + offset, 2, line, curses.A_BOLD)
+
+
+def _action_hint_lines(row: dict, width: int, show_advanced: bool = False) -> list[str]:
+    compact = width < 28
+    items = (
+        ["Ctrl+Y 복사", "Ctrl+S 결과", "Ctrl+E 이름", "Esc 뒤로"]
+        if compact else
+        ["Ctrl+Y 결과 복사", "Ctrl+S 결과 보기", "Ctrl+E 이름", "Esc 뒤로"]
+    )
     if row.get("pane_id") and not row.get("remote"):
         items.extend(["Ctrl+G 이동", "Ctrl+X 닫기"])
     if row.get("reject_known") and not _unknown_interaction(row.get("interaction") or {}):
         items.append("Ctrl+N 거절")
     if show_advanced:
-        items.extend(["Ctrl+L 현재 화면 복사", "Ctrl+I 간단히"])
+        items.extend(["Ctrl+L 최근 터미널 출력 복사", "Ctrl+I 간단히"])
     else:
         items.append("Ctrl+I 자세히")
-    safe_add(stdscr, y, 2, "   ".join(items), curses.A_BOLD)
+    if compact and show_advanced:
+        items[-2] = "Ctrl+L 출력"
+    return render.wrap_items(items, max(1, width - 4))
 
 
 def _result_label(state: str) -> str:
