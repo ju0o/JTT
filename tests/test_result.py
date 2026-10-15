@@ -497,6 +497,26 @@ def test_opencode_tool_summary_is_not_a_result_but_prose_is():
     result = OpenCodeAdapter().extract_result(PaneContext(title="", command="opencode", lines=tuple(screen)))
     assert result is not None
     assert "promo file" in result.text
+    assert result.complete is False
+    assert result.body_complete is False
+
+
+def test_opencode_first_completed_answer_survives_long_idle_screen():
+    screen = list(lines("opencode-stale-working-idle.txt"))
+    completion = next(i for i, line in enumerate(screen) if line.lstrip().startswith("▣"))
+    screen[completion:completion] = ["┃ synthetic request", "Synthetic complete answer."]
+    screen.extend([""] * 10)
+    context = PaneContext(title="", command="opencode", lines=tuple(screen))
+    adapter = OpenCodeAdapter()
+
+    assert adapter.classify(context).status == "IDLE"
+    assert "ctrl+p commands" not in "\n".join(context.lines[-8:]).lower()
+    result = adapter.extract_result(context)
+    assert result is not None
+    assert result.text == "Synthetic complete answer."
+    assert result.complete is True
+    assert result.turn_complete is True
+    assert result.body_complete is True
 
 
 def test_opencode_working_is_not_a_result():
