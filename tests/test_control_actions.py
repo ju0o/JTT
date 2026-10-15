@@ -98,6 +98,8 @@ def test_selected_pane_diagnostics_refuse_reused_pane_identity(monkeypatch):
     assert control_view.pane_diagnostic_lines(tower, selected) == [control_view.t("diagnostics.stale")]
 
 def test_g_focuses_the_exact_pane_id(monkeypatch):
+    from types import SimpleNamespace
+
     calls = []
 
     def fake(args, capture=True, timeout=3.0):
@@ -108,11 +110,27 @@ def test_g_focuses_the_exact_pane_id(monkeypatch):
 
     monkeypatch.setattr(actions.tmux_capture, "run_tmux", fake)
     monkeypatch.setattr(actions.tmux_capture, "pane_exists", lambda pane_id: pane_id == "%44")
+    monkeypatch.setattr(
+        "tmux_agent_tower.tmux.navigation.subprocess.run",
+        lambda args, **_kwargs: calls.append(args[1:]) or SimpleNamespace(returncode=0),
+    )
     ok, reason = actions.focus_pane("0", "%44", own_pane_id="%6")
     assert ok is True and reason == ""
     assert ["select-window", "-t", "%44"] in calls
     assert ["select-pane", "-t", "%44"] in calls
     assert not any(call and call[0] == "send-keys" for call in calls)
+
+
+def test_g_reports_tmux_selection_failure(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(actions.tmux_capture, "run_tmux", lambda args, **_kwargs: "%44")
+    monkeypatch.setattr(actions.tmux_capture, "pane_exists", lambda _pane_id: True)
+    monkeypatch.setattr(
+        "tmux_agent_tower.tmux.navigation.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
+    )
+    assert actions.focus_pane("0", "%44")[0] is False
 
 
 def test_live_capture_checks_expected_identity_before_and_after_read(monkeypatch):

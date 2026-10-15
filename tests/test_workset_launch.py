@@ -11,8 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from tmux_agent_tower.launcher.spawn import SpawnTarget, spawn_local
-from tmux_agent_tower.launcher.workset_launch import WorksetLaunchError, launch_workset
+from tmux_agent_tower.launcher.spawn import SpawnResult, SpawnTarget, spawn_local
+from tmux_agent_tower.launcher.workset_launch import (
+    WorksetLaunchError, _rollback_message, launch_workset,
+)
 from tmux_agent_tower.state.worksets import WorkMember, WorksetStore, new_workset
 from tmux_agent_tower.ui.tower import Tower
 
@@ -114,6 +116,29 @@ def isolated_tower(tmp_path, monkeypatch):
 
 def _agents():
     return {name: "sleep 600" for name in ("Codex", "Claude", "Cursor", "OpenCode", "Shell")}
+
+
+@pytest.mark.parametrize(("returncode", "cleaned"), [(0, True), (1, False)])
+def test_remote_rollback_report_matches_cleanup_result(monkeypatch, returncode, cleaned):
+    from types import SimpleNamespace
+
+    from tmux_agent_tower.launcher import workset_launch
+
+    target = SpawnTarget("/project", "project", "Shell")
+    result = SpawnResult(target, True, "", window_id="@123")
+    calls = []
+    monkeypatch.setattr(workset_launch.subprocess, "run", lambda *args, **_kwargs:
+                        calls.append(args[0]) or SimpleNamespace(returncode=returncode))
+
+    message = _rollback_message(object(), [([result], "test-asus")], "시작 실패")
+
+    if cleaned:
+        assert "이번 실행을 정리했습니다." in message
+        assert "새 작업이 남아 있을 수 있습니다." not in message
+    else:
+        assert "이번 실행을 정리했습니다." not in message
+        assert "새 작업이 남아 있을 수 있습니다." in message
+    assert calls == [["ssh", "-o", "BatchMode=yes", "test-asus", "tmux kill-window -t @123"]]
 
 
 def test_launch_resolves_new_pane_after_its_process_id_changes(tmp_path, isolated_tower, monkeypatch):

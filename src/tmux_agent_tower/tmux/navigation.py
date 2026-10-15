@@ -8,6 +8,8 @@ windows/panes that already exist -- the same as the user pressing
 
 from __future__ import annotations
 
+import subprocess
+
 from . import capture
 
 
@@ -30,8 +32,17 @@ def focus_local_pane(session: str, pane_id: str) -> bool:
         return False
     if not capture.pane_exists(pane_id):
         return False
-    capture.run_tmux(["select-window", "-t", pane_id], capture=False)
-    capture.run_tmux(["select-pane", "-t", pane_id], capture=False)
+    try:
+        for args in (["select-window", "-t", pane_id], ["select-pane", "-t", pane_id]):
+            result = subprocess.run(
+                ["tmux", *args], stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=3.0, check=False,
+            )
+            if result.returncode != 0:
+                return False
+    except Exception:
+        return False
     return True
 
 

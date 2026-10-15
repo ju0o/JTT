@@ -157,6 +157,8 @@ def test_renamed_window_keeps_its_id():
 
 
 def test_enter_prefers_pane_id_over_window_index(monkeypatch):
+    from types import SimpleNamespace
+
     calls = []
 
     def fake(args, capture=True, timeout=3.0):
@@ -167,6 +169,10 @@ def test_enter_prefers_pane_id_over_window_index(monkeypatch):
 
     monkeypatch.setattr(navigation.capture, "run_tmux", fake)
     monkeypatch.setattr(navigation.capture, "pane_exists", lambda pane_id: pane_id == "%44")
+    monkeypatch.setattr(
+        navigation.subprocess, "run",
+        lambda args, **_kwargs: calls.append(args[1:]) or SimpleNamespace(returncode=0),
+    )
 
     # The row still says window 9. The move must not target 9.
     assert navigation.open_pane("0", "9", "%44") is True
@@ -177,6 +183,8 @@ def test_enter_prefers_pane_id_over_window_index(monkeypatch):
 
 
 def test_moved_pane_still_uses_its_id(monkeypatch):
+    from types import SimpleNamespace
+
     calls = []
 
     def fake(args, capture=True, timeout=3.0):
@@ -187,6 +195,10 @@ def test_moved_pane_still_uses_its_id(monkeypatch):
 
     monkeypatch.setattr(navigation.capture, "run_tmux", fake)
     monkeypatch.setattr(navigation.capture, "pane_exists", lambda pane_id: True)
+    monkeypatch.setattr(
+        navigation.subprocess, "run",
+        lambda args, **_kwargs: calls.append(args[1:]) or SimpleNamespace(returncode=0),
+    )
     assert navigation.focus_local_pane("0", "%33") is True
     assert calls[1] == ["select-window", "-t", "%33"]
     assert calls[2] == ["select-pane", "-t", "%33"]
@@ -200,7 +212,37 @@ def test_stale_pane_does_not_move(monkeypatch):
     assert not any(call[0] in ("select-window", "select-pane", "send-keys") for call in calls)
 
 
+def test_focus_reports_tmux_selection_failure(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(navigation, "_panes_in_session", lambda _session: {"%33"})
+    monkeypatch.setattr(navigation.capture, "pane_exists", lambda _pane_id: True)
+    for failed_command in ("select-window", "select-pane"):
+        calls = []
+
+        def run(args, *, stdin, stdout, stderr, timeout, check):
+            calls.append(args[1])
+            return SimpleNamespace(returncode=1 if args[1] == failed_command else 0)
+
+        monkeypatch.setattr(navigation.subprocess, "run", run)
+        assert navigation.focus_local_pane("0", "%33") is False
+        assert calls == (["select-window"] if failed_command == "select-window" else ["select-window", "select-pane"])
+
+
+def test_focus_handles_tmux_selection_error(monkeypatch):
+    monkeypatch.setattr(navigation, "_panes_in_session", lambda _session: {"%33"})
+    monkeypatch.setattr(navigation.capture, "pane_exists", lambda _pane_id: True)
+
+    def fail(*_args, **_kwargs):
+        raise OSError("tmux unavailable")
+
+    monkeypatch.setattr(navigation.subprocess, "run", fail)
+    assert navigation.focus_local_pane("0", "%33") is False
+
+
 def test_window_enter_goes_to_that_windows_active_pane(monkeypatch):
+    from types import SimpleNamespace
+
     calls = []
 
     def fake(args, capture=True, timeout=3.0):
@@ -213,6 +255,10 @@ def test_window_enter_goes_to_that_windows_active_pane(monkeypatch):
 
     monkeypatch.setattr(navigation.capture, "run_tmux", fake)
     monkeypatch.setattr(navigation.capture, "pane_exists", lambda pane_id: True)
+    monkeypatch.setattr(
+        navigation.subprocess, "run",
+        lambda args, **_kwargs: calls.append(args[1:]) or SimpleNamespace(returncode=0),
+    )
     assert navigation.focus_window("0", "1") is True
     assert ["select-window", "-t", "%52"] in calls
     assert ["select-pane", "-t", "%52"] in calls
