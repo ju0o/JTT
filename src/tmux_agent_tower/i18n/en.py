@@ -499,6 +499,7 @@ STRINGS = {
     "control.result_incomplete": "Could not find the complete latest result",
     "control.result_copy_unavailable": "Result copy blocked [{code}]: the full latest result could not be verified",
     "control.clipboard_failed": "Clipboard delivery failed [CLIPBOARD_FAILED]. Copy was not confirmed.",
+    "control.copy_requires_pane": "The selected item is not a copyable Agent Pane. Select an Agent Pane, then press Y.",
     "diagnostics.title": "Selected task diagnostics",
     "diagnostics.stale": "The selected pane changed or is no longer available.",
     "diagnostics.pane": "Pane {pane} / PID {pid}",

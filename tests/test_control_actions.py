@@ -64,6 +64,90 @@ def test_enter_opens_control_and_does_not_focus(tmp_path, monkeypatch):
     assert moved == []
 
 
+def _run_tower_with_one_key(monkeypatch, tower, key):
+    from tmux_agent_tower.server import service
+
+    keys = iter((key,))
+
+    class Screen:
+        def timeout(self, _milliseconds):
+            pass
+
+    def read(_screen):
+        try:
+            return next(keys)
+        except StopIteration:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(tower_module, "Tower", lambda *_a, **_k: tower)
+    monkeypatch.setattr(tower_module, "draw", lambda *_a, **_k: None)
+    monkeypatch.setattr(tower_module, "_remote_state", lambda: None)
+    monkeypatch.setattr(tower_module, "_apply_background_refresh", lambda *_a: False)
+    monkeypatch.setattr(service, "maybe_autostart", lambda **_k: None)
+    monkeypatch.setattr(tower_module, "read_key", read)
+
+    tower_module._run_loop(Screen(), "isolated-test", "")
+
+
+def test_structure_y_explains_non_pane_without_calling_result_copy(monkeypatch):
+    from types import SimpleNamespace
+    from tmux_agent_tower.ui import widgets
+
+    tower = SimpleNamespace(
+        session="isolated-test", own_pane_id="", visible_rows=[{"kind": "window", "key": "@7"}],
+        rows=[], selected=0, load=lambda: None,
+    )
+    shown = []
+    monkeypatch.setattr(control_view, "_copy_result", lambda *_a, **_k: pytest.fail("non-pane Y must not copy"))
+    monkeypatch.setattr(widgets, "show_message_screen", lambda _s, title, lines: shown.append((title, lines)))
+
+    _run_tower_with_one_key(monkeypatch, tower, "y")
+
+    assert shown == [(tower_module.t("nav.copy_result"), [tower_module.t("control.copy_requires_pane")])]
+
+
+def test_structure_y_shows_copy_diagnostic_and_leaves_it_in_menu_state(monkeypatch):
+    from types import SimpleNamespace
+    from tmux_agent_tower.ui import widgets
+
+    row = {
+        "kind": "pane", "key": "%44", "pane_id": "%44", "pane_pid": "4400",
+        "session": "isolated-test", "result_provider_type": "local_tmux", "result_state": "ready",
+    }
+    tower = SimpleNamespace(
+        session="isolated-test", own_pane_id="", visible_rows=[row], rows=[row], selected=0,
+        load=lambda: None,
+    )
+    copied, shown = [], []
+
+    def copy_result(selected_tower, pane_key, _screen):
+        copied.append(pane_key)
+        selected_tower.last_result_copy_diagnostic = {
+            "pane_key": "%44", "pane_id": "%44", "pane_pid": "4400", "session": "isolated-test",
+            "stage": "not_entered", "outcome": "blocked", "reason_code": "SOURCE_PARTIAL",
+            "turn_complete": True, "body_complete": False, "result_state": "ready",
+        }
+        return "결과 복사 거부 [SOURCE_PARTIAL]"
+
+    monkeypatch.setattr(control_view, "_copy_result", copy_result)
+    monkeypatch.setattr(widgets, "show_message_screen", lambda _s, title, lines: shown.append((title, lines)))
+
+    _run_tower_with_one_key(monkeypatch, tower, "y")
+
+    assert copied == ["%44"]
+    assert shown == [(
+        tower_module.t("detail.result"),
+        [
+            "결과 복사 거부 [SOURCE_PARTIAL]",
+            tower_module.t("diagnostics.clipboard").format(result="not_entered / blocked"),
+            tower_module.t("diagnostics.reason").format(code="SOURCE_PARTIAL"),
+        ],
+    )]
+    diagnostic_lines = control_view.pane_diagnostic_lines(tower, row)
+    assert "not_entered / blocked" in "\n".join(diagnostic_lines)
+    assert "SOURCE_PARTIAL" in "\n".join(diagnostic_lines)
+
+
 def test_selected_pane_diagnostics_show_metadata_without_result_text(monkeypatch):
     from types import SimpleNamespace
 

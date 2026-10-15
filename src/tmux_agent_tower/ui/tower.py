@@ -1903,6 +1903,28 @@ def _open_selected_row(stdscr, tower) -> None:
         run_zero_action(stdscr, tower, row.get("action") or "")
 
 
+def _show_selected_result_copy(stdscr, tower) -> None:
+    row = tower.visible_rows[tower.selected] if tower.visible_rows else None
+    from .widgets import show_message_screen
+
+    if not row or row.get("kind") != "pane" or not row.get("key"):
+        show_message_screen(stdscr, t("nav.copy_result"), [t("control.copy_requires_pane")])
+        return
+
+    from .control_view import _copy_result
+
+    message = _copy_result(tower, row["key"], stdscr)
+    diagnostic = getattr(tower, "last_result_copy_diagnostic", {}) or {}
+    stage = str(diagnostic.get("stage") or "UNKNOWN")
+    outcome = str(diagnostic.get("outcome") or "UNKNOWN")
+    reason_code = str(diagnostic.get("reason_code") or "UNKNOWN")
+    show_message_screen(stdscr, t("detail.result"), [
+        message or t("control.no_result"),
+        t("diagnostics.clipboard").format(result=f"{stage} / {outcome}"),
+        t("diagnostics.reason").format(code=reason_code),
+    ])
+
+
 def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
     from ..server import service
 
@@ -2012,13 +2034,7 @@ def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
             continue
 
         if matches_letter(key, "y"):
-            row = tower.visible_rows[tower.selected] if tower.visible_rows else None
-            if row and row.get("kind") == "pane" and row.get("key"):
-                from .control_view import _copy_result
-                from .widgets import show_message_screen
-
-                message = _copy_result(tower, row["key"], stdscr)
-                show_message_screen(stdscr, t("detail.result"), [message or t("control.no_result")])
+            _show_selected_result_copy(stdscr, tower)
             draw(stdscr, tower, remote_state=remote_state)
             continue
 

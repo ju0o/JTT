@@ -496,6 +496,7 @@ STRINGS = {
     "control.result_incomplete": "최신 결과 전체를 찾지 못했습니다",
     "control.result_copy_unavailable": "결과 복사 거부 [{code}]: 최신 전체 결과를 검증하지 못했습니다",
     "control.clipboard_failed": "클립보드 전달 실패 [CLIPBOARD_FAILED]. 복사 완료를 확인하지 못했습니다.",
+    "control.copy_requires_pane": "선택된 항목은 복사 가능한 Agent Pane이 아닙니다. Agent Pane을 선택한 뒤 Y를 누르세요.",
     "diagnostics.title": "선택한 작업 진단 정보",
     "diagnostics.stale": "선택한 Pane이 바뀌었거나 더 이상 없습니다.",
     "diagnostics.pane": "Pane {pane} / PID {pid}",
