@@ -370,7 +370,10 @@ class Tower:
         self.view_mode = USER_WORK_VIEW      # terminal structure is an explicit secondary view
         self.collapsed: set = set()          # window row keys hidden in the UI only
         self.collapsed_work_groups: set = set()
-        self.collapsed_other = False
+        # Incidental shells discovered from tmux stay out of the way. This is
+        # presentation state for this Tower run; saved folders are untouched.
+        self.collapsed_other = True
+        self.collapsed_agents = False
         self.notice = ""
         self.selected = 0                    # index into visible_rows
         self.last_refresh = 0.0
@@ -997,7 +1000,8 @@ class Tower:
                 self.visible_rows = render.sort_by_attention(matching)
             else:
                 self.visible_rows = folder_tree.build_rows(
-                    self.folders, self.window_assets, work_panes, self.filter_text, self.collapsed_other
+                    self.folders, self.window_assets, work_panes, self.filter_text,
+                    self.collapsed_other, self.collapsed_agents,
                 )
 
         if not self.visible_rows:
@@ -1091,6 +1095,8 @@ class Tower:
     def toggle_folder(self, folder_id: str) -> None:
         if folder_id == "__unfiled__":
             self.collapsed_other = not self.collapsed_other
+        elif folder_id == "__agents__":
+            self.collapsed_agents = not self.collapsed_agents
         else:
             try:
                 self.folders.toggle_folder(folder_id)
@@ -1127,7 +1133,10 @@ class Tower:
             self._apply_filter(row.get("key"))
             return
         if row.get("kind") == "other_section":
-            self.collapsed_other = True
+            if row.get("folder_id") == "__agents__":
+                self.collapsed_agents = True
+            else:
+                self.collapsed_other = True
             self._apply_filter(row.get("key"))
             return
         if row.get("kind") == "work_group":
@@ -1166,7 +1175,10 @@ class Tower:
             self._apply_filter(row.get("key"))
             return
         if row.get("kind") == "other_section":
-            self.collapsed_other = False
+            if row.get("folder_id") == "__agents__":
+                self.collapsed_agents = False
+            else:
+                self.collapsed_other = False
             self._apply_filter(row.get("key"))
             return
         if row.get("kind") == "window_asset":
@@ -1577,9 +1589,40 @@ def _build_selected_summary(tower: Tower, row: Dict) -> List[str]:
     return [str(name), identity_line] + ([" · ".join(details)] if details else [])
 
 
+def _enter_blocked_reason(row: Optional[Dict]) -> str:
+    """Localization key for why a selected row cannot be opened with Enter."""
+
+    if not row:
+        return "enter.no_selection"
+    if row.get("offline") or row.get("placeholder"):
+        return "enter.offline"
+    if row.get("kind") == "work_group_stale" or row.get("stale"):
+        return "enter.stale"
+    if row.get("kind") == "window" and row.get("remote"):
+        return "enter.remote_readonly"
+    if row.get("kind") == "window" and not row.get("window_id"):
+        return "enter.window_missing"
+    return "enter.unavailable"
+
+
+def _selected_enter_hint(row: Optional[Dict]) -> str:
+    intent = enter_intent(row)
+    return {
+        "toggle": t("hint.enter_expand"),
+        "group": t("hint.enter_expand"),
+        "control": t("hint.enter_conversation"),
+        "window": t("hint.enter_window"),
+        "zero": t("hint.enter_start"),
+        "ignore": t("hint.enter_unavailable"),
+    }.get(intent, t("hint.enter_unavailable"))
+
+
 def _home_footer_lines(tower: Tower, width: int) -> List[str]:
+    row = tower.visible_rows[tower.selected] if tower.visible_rows and 0 <= tower.selected < len(tower.visible_rows) else None
+    enter_hint = _selected_enter_hint(row)
     keys = [
-        t("hint.move"), t("hint.open"), t("hint.actions"), t("hint.create"),
+        t("hint.move"), enter_hint, t("hint.actions"), t("hint.create"),
+        t("hint.home_help"),
         t("hint.saved"), t("hint.live"), t("hint.settings"), t("hint.filter"),
         t("hint.result"), t("hint.back"), t("hint.help"),
     ]
@@ -1901,6 +1944,8 @@ def _open_selected_row(stdscr, tower) -> None:
         from .structure_menu import run_zero_action
 
         run_zero_action(stdscr, tower, row.get("action") or "")
+    elif intent == "ignore" and row:
+        tower.notice = t(_enter_blocked_reason(row))
 
 
 def _show_selected_result_copy(stdscr, tower) -> None:
@@ -2050,7 +2095,8 @@ def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
 
             show_message_screen(stdscr, t("help.title"), [
                 t("help.navigation"), t("help.actions"), t("help.saved"),
-                t("help.results"), t("help.start"), t("help.destinations"), t("help.exit"),
+                t("help.results"), t("help.start"), t("help.existing"),
+                t("help.destinations"), t("help.exit"),
             ])
             draw(stdscr, tower, remote_state=remote_state)
             continue

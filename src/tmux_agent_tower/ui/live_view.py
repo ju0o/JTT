@@ -122,7 +122,9 @@ def open_folder_live_view(stdscr, tower, folder: dict) -> None:
     tasks = [row for row in tower.rows if row.get("pane_id") and not row.get("tower_runtime")]
     workspace = tower.folders.workspace(tower.window_assets, tasks)
     if folder.get("kind") == "other_section":
-        windows = workspace["unfiled_windows"]
+        refs = set(folder.get("window_refs") or ())
+        windows = [window for window in workspace["unfiled_windows"]
+                   if not refs or window.get("window_ref") in refs]
     else:
         item = next((value for value in workspace["folders"]
                      if value["folder_id"] == folder.get("folder_id")), None)

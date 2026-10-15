@@ -232,7 +232,10 @@ def open_folder_menu(stdscr, tower, row: dict) -> None:
     folder_id = row.get("folder_id") or ""
     if row.get("kind") == "other_section":
         menu = [("create", t("folder.create")), ("cancel", t("menu.cancel"))]
-        pick = run_list_picker(stdscr, t("folder.other"), menu, footer_hint=t("wizard.hint_list"))
+        pick = run_list_picker(
+            stdscr, row.get("display_name") or t("folder.other"), menu,
+            footer_hint=t("wizard.hint_list"),
+        )
         if pick.selected_key == "create":
             create_folder(stdscr, tower)
         return

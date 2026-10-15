@@ -130,6 +130,9 @@ def test_help_and_saved_work_explain_actions_without_internal_terms(monkeypatch)
     assert "Y 최신 결과 전체 복사" in ko.STRINGS["help.results"]
     assert "G 실제 터미널" in ko.STRINGS["help.results"]
     assert "새 작업" in ko.STRINGS["help.start"]
+    assert "기존 작업" in ko.STRINGS["help.existing"]
+    assert "기존 작업" in ko.STRINGS["hint.home_help"]
+    assert "새 작업" in ko.STRINGS["hint.home_help"]
     assert "복사" in ko.STRINGS["help.destinations"]
 
     captured = {}

@@ -147,17 +147,40 @@ def test_folder_tree_renders_empty_folder_grouped_and_unfiled_windows(tmp_path):
     rows = folder_tree.build_rows(store, assets, tasks)
 
     assert [(row["kind"], row["display_name"]) for row in rows] == [
-        ("folder", "개인 프로젝트"), ("window_asset", "JuBrain"),
-        ("pane", "PM"), ("pane", "구현"),
-        ("folder", "외주"), ("other_section", "기타"),
+        ("other_section", "Agent 작업 · 자동 발견"),
         ("window_asset", "Research"), ("pane", "조사"),
+        ("folder", "개인 프로젝트"), ("window_asset", "JuBrain"),
+        ("pane", "PM"), ("pane", "구현"), ("folder", "외주"),
     ]
-    assert rows[0]["summary_counts"]["working"] == 1
-    assert rows[0]["summary_counts"]["idle"] == 1
-    assert "pane_id" not in json.dumps([rows[0], rows[1], rows[5], rows[6]])
+    assert rows[3]["summary_counts"]["working"] == 1
+    assert rows[3]["summary_counts"]["idle"] == 1
+    assert "pane_id" not in json.dumps([rows[0], rows[1], rows[3], rows[4]])
     assert empty["window_refs"] == []
     by_task = folder_tree.build_rows(store, assets, tasks, "구현")
     assert any(row.get("display_name") == "구현" and row["kind"] == "pane" for row in by_task)
+
+
+def test_unfiled_agent_work_is_prioritized_and_misc_terminals_can_start_collapsed(tmp_path):
+    store = FolderStore(tmp_path / "folders.json")
+    agent_window = _window("OpenCode", window_id="@agent", created="100")
+    shell_window = _window("Shell", window_id="@shell", created="200")
+    tasks = [
+        _task(agent_window, "agent", name="API work", agent="Display label", result_adapter="OpenCode"),
+        _task(shell_window, "shell", name="Command prompt", agent="Custom terminal", result_adapter="Shell"),
+    ]
+    assets = folder_tree.infer_window_assets([agent_window, shell_window], tasks, "host-a")
+
+    rows = folder_tree.build_rows(store, assets, tasks, collapsed_other=True)
+    assert [(row["kind"], row["display_name"]) for row in rows] == [
+        ("other_section", "Agent 작업 · 자동 발견"),
+        ("window_asset", "OpenCode"), ("pane", "API work"),
+        ("other_section", "기타 터미널 · 자동 발견"),
+    ]
+    assert rows[0]["collapsed"] is False
+    assert rows[3]["collapsed"] is True
+
+    expanded = folder_tree.build_rows(store, assets, tasks, collapsed_other=False)
+    assert any(row.get("display_name") == "Command prompt" for row in expanded)
 
 
 def test_folder_tree_search_matches_folder_window_and_tasks_without_other_stale_leaks(tmp_path):

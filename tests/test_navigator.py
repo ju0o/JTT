@@ -301,12 +301,63 @@ def test_project_list_is_the_default_and_attention_does_not_reorder_it(tmp_path,
     assert [row["kind"] for row in tower.visible_rows] == [
         "other_section", "window_asset", "pane", "window_asset", "pane",
     ]
+    assert tower.visible_rows[0]["display_name"] == "Agent 작업 · 자동 발견"
 
     tower.toggle_attention()
     assert [row["kind"] for row in tower.visible_rows] == ["pane", "pane"]
     assert [row["key"] for row in tower.visible_rows] == ["%6", "%7"]
     tower.toggle_attention()
     assert [row["pane_id"] for row in tower.visible_rows if row.get("kind") == "pane"] == ["%6", "%7"]
+
+
+def test_home_prioritizes_agent_work_and_collapses_discovered_shells_by_default(tmp_path, monkeypatch):
+    from tmux_agent_tower.ui import tower as tower_module
+
+    monkeypatch.setattr(tower_module, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(tower_module, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(tower_module, "HOST_FILE", tmp_path / "config" / "host")
+    monkeypatch.setattr(tower_module, "REMOTE_HOSTS_FILE", tmp_path / "config" / "remote-hosts.txt")
+    tower = tower_module.Tower("0")
+    agent = _pane("%agent", "0", "Agent", window_id="@agent", project="Agent task", agent="OpenCode")
+    shell = _pane("%shell", "1", "Shell", window_id="@shell", project="Terminal", agent="Shell")
+    tower.rows = [agent, shell]
+    _apply_user_work_view(tower)
+
+    sections = [row for row in tower.visible_rows if row.get("kind") == "other_section"]
+    assert [row["display_name"] for row in sections] == [
+        "Agent 작업 · 자동 발견", "기타 터미널 · 자동 발견",
+    ]
+    assert sections[0]["collapsed"] is False
+    assert sections[1]["collapsed"] is True
+    assert "%agent" in [row.get("pane_id") for row in tower.visible_rows]
+    assert "%shell" not in [row.get("pane_id") for row in tower.visible_rows]
+
+    tower.selected = tower.visible_rows.index(sections[1])
+    tower.toggle_folder("__unfiled__")
+    assert "%shell" in [row.get("pane_id") for row in tower.visible_rows]
+
+
+def test_enter_reports_why_a_selected_remote_window_cannot_open(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tmux_agent_tower.i18n import t
+    from tmux_agent_tower.ui import tower as tower_module
+
+    row = {"kind": "window", "remote": True, "window_id": "", "key": "remote"}
+    tower = SimpleNamespace(visible_rows=[row], selected=0, notice="")
+    tower_module._open_selected_row(None, tower)
+    assert tower.notice == t("enter.remote_readonly")
+
+
+def test_selected_item_enter_hint_explains_expand_open_and_disabled_actions():
+    from tmux_agent_tower.i18n import ko
+    from tmux_agent_tower.ui.tower import _selected_enter_hint
+
+    assert _selected_enter_hint({"kind": "folder"}) == ko.STRINGS["hint.enter_expand"]
+    assert _selected_enter_hint({"kind": "window_asset"}) == ko.STRINGS["hint.enter_expand"]
+    assert _selected_enter_hint({"kind": "pane", "pane_id": "%1"}) == ko.STRINGS["hint.enter_conversation"]
+    assert _selected_enter_hint({"kind": "window", "window_id": "@1"}) == ko.STRINGS["hint.enter_window"]
+    assert _selected_enter_hint({"kind": "window", "remote": True}) == ko.STRINGS["hint.enter_unavailable"]
 
 
 def test_home_visually_clusters_legacy_ungrouped_tasks_by_project(tmp_path, monkeypatch):
