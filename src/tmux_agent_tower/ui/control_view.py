@@ -696,7 +696,7 @@ def pane_diagnostic_lines(tower, selected_row: dict) -> list[str]:
     if same_binding:
         turn_complete = last.get("turn_complete")
         body_complete = last.get("body_complete")
-        code = str(last.get("reason_code") or "UNKNOWN")
+        code = _copy_diagnostic_reason_code(last)
         if code == "-" and not (turn_complete is True and body_complete is True):
             code = "UNKNOWN"
         clipboard = f'{last.get("stage", "UNKNOWN")} / {last.get("outcome", "UNKNOWN")}'
@@ -725,6 +725,27 @@ def pane_diagnostic_lines(tower, selected_row: dict) -> list[str]:
         t("diagnostics.reason").format(code=code),
         t("diagnostics.clipboard").format(result=clipboard),
     ]
+
+
+def result_copy_status_lines(tower) -> list[str]:
+    """Display only the current copy stage, outcome, and reason code."""
+
+    last = getattr(tower, "last_result_copy_diagnostic", {}) or {}
+    stage = str(last.get("stage") or "UNKNOWN")
+    outcome = str(last.get("outcome") or "UNKNOWN")
+    return [
+        t("diagnostics.clipboard").format(result=f"{stage} / {outcome}"),
+        t("diagnostics.reason").format(code=_copy_diagnostic_reason_code(last)),
+    ]
+
+
+def _copy_diagnostic_reason_code(diagnostic: dict) -> str:
+    reason = diagnostic.get("reason_code")
+    if reason:
+        return str(reason)
+    if diagnostic.get("outcome") in {"readback_verified", "tmux_buffer", "terminal_requested"}:
+        return "NONE"
+    return "UNKNOWN"
 
 
 def _pane_binding(row: dict) -> tuple[str, str, str, str]:

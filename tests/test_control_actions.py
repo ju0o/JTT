@@ -148,6 +148,39 @@ def test_structure_y_shows_copy_diagnostic_and_leaves_it_in_menu_state(monkeypat
     assert "SOURCE_PARTIAL" in "\n".join(diagnostic_lines)
 
 
+def test_structure_y_reports_success_diagnostic_as_none(monkeypatch):
+    from types import SimpleNamespace
+    from tmux_agent_tower.ui import widgets
+
+    row = {
+        "kind": "pane", "key": "%45", "pane_id": "%45", "pane_pid": "4500",
+        "session": "isolated-test", "result_provider_type": "remote_opencode", "result_state": "ready",
+    }
+    tower = SimpleNamespace(
+        session="isolated-test", own_pane_id="", visible_rows=[row], rows=[row], selected=0,
+        load=lambda: None,
+    )
+    shown = []
+
+    def copy_result(selected_tower, _pane_key, _screen):
+        selected_tower.last_result_copy_diagnostic = {
+            "pane_key": "%45", "pane_id": "%45", "pane_pid": "4500", "session": "isolated-test",
+            "stage": "entered", "outcome": "readback_verified", "reason_code": "",
+            "turn_complete": True, "body_complete": True, "result_state": "ready",
+        }
+        return "최신 결과 전체를 복사했습니다"
+
+    monkeypatch.setattr(control_view, "_copy_result", copy_result)
+    monkeypatch.setattr(widgets, "show_message_screen", lambda _s, title, lines: shown.append((title, lines)))
+
+    _run_tower_with_one_key(monkeypatch, tower, "y")
+
+    assert shown[0][1][1:] == control_view.result_copy_status_lines(tower)
+    assert tower_module.t("diagnostics.reason").format(code="NONE") == shown[0][1][2]
+    assert "readback_verified" in "\n".join(control_view.pane_diagnostic_lines(tower, row))
+    assert tower_module.t("diagnostics.reason").format(code="NONE") in control_view.pane_diagnostic_lines(tower, row)
+
+
 def test_selected_pane_diagnostics_show_metadata_without_result_text(monkeypatch):
     from types import SimpleNamespace
 

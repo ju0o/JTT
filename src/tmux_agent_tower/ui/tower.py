@@ -1911,17 +1911,12 @@ def _show_selected_result_copy(stdscr, tower) -> None:
         show_message_screen(stdscr, t("nav.copy_result"), [t("control.copy_requires_pane")])
         return
 
-    from .control_view import _copy_result
+    from .control_view import _copy_result, result_copy_status_lines
 
     message = _copy_result(tower, row["key"], stdscr)
-    diagnostic = getattr(tower, "last_result_copy_diagnostic", {}) or {}
-    stage = str(diagnostic.get("stage") or "UNKNOWN")
-    outcome = str(diagnostic.get("outcome") or "UNKNOWN")
-    reason_code = str(diagnostic.get("reason_code") or "UNKNOWN")
     show_message_screen(stdscr, t("detail.result"), [
         message or t("control.no_result"),
-        t("diagnostics.clipboard").format(result=f"{stage} / {outcome}"),
-        t("diagnostics.reason").format(code=reason_code),
+        *result_copy_status_lines(tower),
     ])
 
 
