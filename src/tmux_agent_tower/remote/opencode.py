@@ -1,8 +1,9 @@
-"""Probe an SSH-bound OpenCode TUI without guessing its active session."""
+"""Read a complete OpenCode result only when the TUI session is process-bound."""
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import ipaddress
 import json
 import shlex
@@ -14,10 +15,13 @@ from .collector import _normalize_ip, _run_ssh
 _MARKER = "__TOWER_OPENCODE_RESULT__"
 _MAX_WIRE_BYTES = 6 * 1024 * 1024
 
-# This runs remotely and returns only process/session-binding status metadata.
-_REMOTE_OPENCODE_SCRIPT = r'''import ipaddress, json, os, re, selectors, subprocess, sys, time
+# Remote helper returns validated binding metadata and a bounded, base64-encoded Result body.
+_REMOTE_OPENCODE_SCRIPT = r'''import base64, hashlib, ipaddress, json, os, re, selectors, stat, subprocess, sys, time
 MARKER = "__TOWER_OPENCODE_RESULT__"
 PROC = sys.argv[5] if len(sys.argv) > 5 else "/proc"
+BINDING_DIR = sys.argv[6] if len(sys.argv) > 6 else "/tmp"
+MAX_EXPORT = 32 * 1024 * 1024
+MAX_BODY = 4 * 1024 * 1024
 
 def emit(status, **fields):
     print(MARKER + json.dumps({"status": status, **fields}, ensure_ascii=True, separators=(",", ":")))
@@ -83,30 +87,6 @@ def process(pid):
         }
     except (OSError, IndexError):
         return None
-
-# A TUI's argv identifies its launch session, not necessarily the session currently selected in the UI.
-def process_argv(pid):
-    try:
-        raw = open(os.path.join(PROC, pid, "cmdline"), "rb").read().split(b"\0")
-        return [part.decode("utf-8", "strict") for part in raw if part]
-    except (OSError, UnicodeError):
-        return []
-
-def explicit_session_id(argv):
-    if not argv:
-        return None
-    args = argv[1:]
-    if args.count("--pure") > 1:
-        return None
-    if args and args[-1] == "--pure":
-        args = args[:-1]
-    if len(args) == 2 and args[0] in ("--session", "-s"):
-        value = args[1]
-    elif len(args) == 1 and args[0].startswith("--session="):
-        value = args[0].split("=", 1)[1]
-    else:
-        return None
-    return value if re.fullmatch(r"ses_[A-Za-z0-9_-]{8,128}", value) else None
 
 def env_for(pid, names):
     try:
@@ -182,6 +162,123 @@ def run_bounded(argv, cwd, env, limit, timeout):
         if child is not None and child.stdout:
             child.stdout.close()
 
+def binding_record(pid, process_info):
+    path = os.path.join(BINDING_DIR, "tower-opencode-session-%s.json" % pid)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            owner = os.stat(os.path.join(PROC, pid)).st_uid
+            if (
+                not stat.S_ISREG(info.st_mode) or info.st_uid != owner
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 4096
+            ):
+                return None
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            return None
+        value = json.loads(raw.decode("utf-8", "strict"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    observed = value.get("observed_at_ms")
+    now_ms = int(time.time() * 1000)
+    if (
+        value.get("schema") != "tower-opencode-tui-binding/v1"
+        or value.get("pid") != int(pid)
+        or value.get("process_starttime") != process_info.get("starttime")
+        or value.get("route_name") not in ("home", "session", "other")
+        or isinstance(value.get("generation"), bool)
+        or not isinstance(value.get("generation"), int) or value["generation"] < 1
+        or isinstance(observed, bool) or not isinstance(observed, int)
+        or observed > now_ms + 500 or now_ms - observed > 2000
+        or not isinstance(value.get("nonce"), str)
+        or not re.fullmatch(r"[0-9a-f]{32}", value["nonce"])
+    ):
+        return None
+    if value["route_name"] == "session":
+        session_id = value.get("session_id")
+        if not isinstance(session_id, str) or not re.fullmatch(r"ses_[A-Za-z0-9_-]{8,128}", session_id):
+            return None
+    elif value.get("session_id") is not None:
+        return None
+    return value
+
+def session_body(exported, session_id, cwd):
+    if not isinstance(exported, dict):
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    info = exported.get("info")
+    messages = exported.get("messages")
+    if not isinstance(info, dict) or info.get("id") != session_id or not isinstance(messages, list):
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    try:
+        if os.path.realpath(info.get("directory", "")) != cwd:
+            return "AGENT_SESSION_UNBOUND", "", {}
+    except (TypeError, OSError):
+        return "AGENT_SESSION_UNBOUND", "", {}
+    revert = info.get("revert")
+    revert_id = revert.get("messageID") if isinstance(revert, dict) else None
+    if revert_id:
+        index = next((i for i, item in enumerate(messages) if isinstance(item, dict) and isinstance(item.get("info"), dict) and item["info"].get("id") == revert_id), None)
+        if index is None:
+            return "REMOTE_RESULT_INCOMPLETE", "", {}
+        messages = messages[:index]
+    last_user_index = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], dict) and isinstance(messages[i].get("info"), dict) and messages[i]["info"].get("role") == "user"), None)
+    if last_user_index is None:
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    user_info = messages[last_user_index]["info"]
+    user_id = user_info.get("id")
+    if user_info.get("sessionID") != session_id or not isinstance(user_id, str) or not user_id.startswith("msg_"):
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    assistant_index = next((i for i in range(len(messages) - 1, last_user_index, -1) if isinstance(messages[i], dict) and isinstance(messages[i].get("info"), dict) and messages[i]["info"].get("role") == "assistant"), None)
+    if assistant_index is None:
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    assistant = messages[assistant_index]
+    message = assistant["info"]
+    if message.get("sessionID") != session_id or message.get("parentID") != user_id:
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    msg_time = message.get("time")
+    completed = msg_time.get("completed") if isinstance(msg_time, dict) else None
+    if isinstance(completed, bool) or not isinstance(completed, (int, float)) or completed < 0:
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    if message.get("error") or message.get("finish") != "stop":
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    parts = assistant.get("parts")
+    if not isinstance(parts, list):
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    text_parts = []
+    for part in parts:
+        if not isinstance(part, dict):
+            return "REMOTE_RESULT_INCOMPLETE", "", {}
+        if part.get("type") == "tool":
+            state = part.get("state")
+            if not isinstance(state, dict) or state.get("status") in ("pending", "running"):
+                return "REMOTE_RESULT_INCOMPLETE", "", {}
+        if part.get("type") == "text":
+            value = part.get("text")
+            if part.get("messageID") != message.get("id") or part.get("sessionID") != session_id or not isinstance(value, str):
+                return "REMOTE_RESULT_INCOMPLETE", "", {}
+            text_parts.append(value)
+    if not text_parts:
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    # Text parts are sequential fragments of one message; inserting separators changes source bytes.
+    body = "".join(text_parts)
+    try:
+        body_bytes = body.encode("utf-8", "strict")
+    except UnicodeError:
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    if not body.strip():
+        return "REMOTE_RESULT_INCOMPLETE", "", {}
+    if len(body_bytes) > MAX_BODY:
+        return "OUTPUT_RANGE_EXCEEDED", "", {}
+    return "ok", body, {
+        "session_id": session_id, "user_id": user_id, "message_id": message.get("id"),
+        "native_length": len(body), "native_utf8_bytes": len(body_bytes),
+        "native_sha256": hashlib.sha256(body_bytes).hexdigest(),
+    }
+
 try:
     expected = (norm_ip(sys.argv[1]), str(int(sys.argv[2])), norm_ip(sys.argv[3]), str(int(sys.argv[4])))
 except (IndexError, ValueError, UnicodeError):
@@ -229,15 +326,6 @@ root_proc = processes[root]
 if proc["tty_nr"] == "0" or proc["tty_nr"] != root_proc["tty_nr"] or proc["pgrp"] != proc["tpgid"]:
     emit("AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
-argv = process_argv(pid)
-sid = explicit_session_id(argv)
-implicit_tui = (
-    not sid and len(argv) == 1
-    and os.path.basename(argv[0]).lower() in ("opencode", "opencode.exe")
-)
-if not sid and not implicit_tui:
-    emit("AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
-    raise SystemExit(0)
 try:
     exe = os.readlink(os.path.join(PROC, pid, "exe"))
     cwd = os.path.realpath(os.readlink(os.path.join(PROC, pid, "cwd")))
@@ -267,10 +355,72 @@ version, state = run_bounded([exe, "--version"], cwd, env, 1024, 2.0)
 if state != "ok" or not version or version.decode("utf-8", "replace").strip().splitlines()[0] != "1.19.0":
     emit("REMOTE_PROVIDER_UNAVAILABLE", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
-# A TUI's argv identifies its launch session, not necessarily the session currently selected in the UI.
+before = binding_record(pid, proc)
+if before is None:
+    emit(
+        "AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd,
+        opencode_pid=pid, session_binding="TUI_BINDING_UNAVAILABLE",
+    )
+    raise SystemExit(0)
+if before["route_name"] != "session":
+    emit(
+        "AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd,
+        opencode_pid=pid, session_binding="NO_ACTIVE_SESSION",
+    )
+    raise SystemExit(0)
+session_id = before["session_id"]
+exported, export_state = run_bounded([exe, "export", session_id], cwd, env, MAX_EXPORT, 8.0)
+if export_state == "timeout":
+    emit("REMOTE_PROVIDER_TIMEOUT", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
+    raise SystemExit(0)
+if export_state == "large":
+    emit("OUTPUT_RANGE_EXCEEDED", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
+    raise SystemExit(0)
+if export_state != "ok" or exported is None:
+    emit("REMOTE_RESULT_INCOMPLETE", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
+    raise SystemExit(0)
+try:
+    export_value = json.loads(exported.decode("utf-8", "strict"))
+except (UnicodeError, ValueError):
+    emit("REMOTE_RESULT_INCOMPLETE", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
+    raise SystemExit(0)
+
+after = binding_record(pid, proc)
+current_proc = process(pid)
+current_root = process(root)
+current_sshd = process(sshd)
+if (
+    after is None or current_proc is None or current_proc["starttime"] != proc["starttime"]
+    or current_root is None or current_root["starttime"] != root_proc["starttime"]
+    or current_sshd is None or current_sshd["starttime"] != processes[sshd]["starttime"]
+    or current_proc["tty_nr"] != root_proc["tty_nr"] or current_proc["pgrp"] != current_proc["tpgid"]
+    or ssh_connection(pid) != expected or not connection_live(expected)
+):
+    emit("REMOTE_PROVIDER_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
+    raise SystemExit(0)
+binding_identity = lambda item: (
+    item.get("pid"), item.get("process_starttime"), item.get("route_name"),
+    item.get("session_id"), item.get("generation"), item.get("nonce"),
+)
+if binding_identity(before) != binding_identity(after):
+    emit(
+        "REMOTE_RESULT_INCOMPLETE", remote_session_pid=root, remote_sshd_pid=sshd,
+        opencode_pid=pid, reason_code="SESSION_BINDING_CHANGED",
+    )
+    raise SystemExit(0)
+result_status, body, result_fields = session_body(export_value, session_id, cwd)
+if result_status != "ok":
+    emit(
+        result_status, remote_session_pid=root, remote_sshd_pid=sshd,
+        opencode_pid=pid, reason_code=result_status,
+    )
+    raise SystemExit(0)
+body_bytes = body.encode("utf-8", "strict")
 emit(
-    "AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd,
-    opencode_pid=pid, session_binding="active_tui_session_unexposed",
+    "ok", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid,
+    ssh_connection=list(expected), session_binding="route.current",
+    turn_complete=True, body_complete=True, body_b64=base64.b64encode(body_bytes).decode("ascii"),
+    **result_fields,
 )
 '''
 
@@ -285,7 +435,7 @@ def fetch_remote_opencode_result(
     connection: Dict[str, str],
     timeout: float = 16.0,
 ) -> Dict | None:
-    """Probe a verified OpenCode TUI; fail closed while its active session is not observable."""
+    """Read a verified TUI result only while its active-session binding stays stable."""
 
     if (
         not host_alias or host_alias.startswith("-") or any(ch.isspace() or not ch.isprintable() for ch in host_alias)
@@ -325,6 +475,14 @@ def fetch_remote_opencode_result(
         body_bytes = base64.b64decode(payload.pop("body_b64"), validate=True)
         body = body_bytes.decode("utf-8", "strict")
     except (KeyError, TypeError, ValueError, UnicodeError):
+        return {"status": "REMOTE_RESULT_INCOMPLETE"}
+    native_length = payload.get("native_length")
+    native_bytes = payload.get("native_utf8_bytes")
+    if (
+        isinstance(native_length, bool) or not isinstance(native_length, int) or native_length != len(body)
+        or isinstance(native_bytes, bool) or not isinstance(native_bytes, int) or native_bytes != len(body_bytes)
+        or payload.get("native_sha256") != hashlib.sha256(body_bytes).hexdigest()
+    ):
         return {"status": "REMOTE_RESULT_INCOMPLETE"}
     payload["text"] = body
     return payload

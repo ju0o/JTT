@@ -777,6 +777,11 @@ def _recover_ssh_opencode_result(row: dict) -> dict:
         return _remote_opencode_failure("REMOTE_PROVIDER_UNAVAILABLE")
     status = str(result.get("status") or "UNKNOWN")
     if status != "ok":
+        if status == "REMOTE_RESULT_INCOMPLETE":
+            reason_code = str(result.get("reason_code") or status)
+            if reason_code not in {"REMOTE_RESULT_INCOMPLETE", "SESSION_BINDING_CHANGED", "OUTPUT_RANGE_EXCEEDED"}:
+                reason_code = "REMOTE_RESULT_INCOMPLETE"
+            return _remote_opencode_failure(reason_code)
         if (
             status == "AGENT_SESSION_UNBOUND"
             and result.get("session_binding") == "active_tui_session_unexposed"
