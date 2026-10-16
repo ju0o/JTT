@@ -632,21 +632,17 @@ def list_row_parts(row: Dict, width: int, badge_text: Callable[[str], str], dura
     if project_name == t("project.no_name"):
         project_name = ""
     project = row.get("display_name") or row.get("task_name") or project_name or t("task.terminal")
-    task_parts = []
     role = badge_text(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
-    user_named = row.get("name_origin") == "user"
-    if not user_named and project_name and project_name.casefold() not in project.casefold():
-        task_parts.append(project_name)
     agent = (row.get("agent") or "").strip()
     if role and role.casefold() not in project.casefold():
         agent = f"{role} · {agent}" if agent else role
-    group = str(row.get("work_group_name") or "").strip()
-    if not user_named and group and group.casefold() not in project.casefold():
-        task_parts.append(group)
     return {
         "guide": guide,
         "project": project,
-        "task": " · ".join(task_parts),
+        # The primary heading is the only task name in the simple list.
+        # Project and work-group metadata remain on the row for filters and
+        # detail/advanced views, but must not compete with a pane title.
+        "task": "",
         "agent": truncate_to_width(agent, 24) if not narrow else "",
         "badge": badge if not narrow else "",
     }
@@ -655,8 +651,8 @@ def list_row_parts(row: Dict, width: int, badge_text: Callable[[str], str], dura
 def row_line_count(row: Dict, narrow: bool) -> int:
     """Physical lines for one pane in the main list.
 
-    Narrow terminals use separate project, task-name, and agent/status lines
-    when a task name differs. Wide terminals add current activity underneath.
+    Narrow terminals reserve a second line for agent/status. Wide terminals
+    add current activity underneath when there is room.
     Pane title, path, and pane id stay in selected details.
     """
 

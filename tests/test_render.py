@@ -197,6 +197,27 @@ def test_user_named_task_has_one_representative_title(display_name, project, gro
     assert f" · {group}" not in " ".join(parts.values())
 
 
+def test_auto_name_from_manual_tmux_pane_title_is_single_representative_title():
+    """A pane title can be human-authored while its origin remains auto."""
+    from tmux_agent_tower.i18n import t
+
+    row = {
+        "kind": "pane", "name_origin": "auto", "display_name": "Projects Briping",
+        "task_name": "Projects Briping", "pane_title": "Projects Briping",
+        "project": "Tmux Agent Tower", "work_group_name": "Tower QA",
+        "agent": "Codex", "status": "UNKNOWN",
+    }
+    parts = render.list_row_parts(row, 120, t)
+
+    assert parts["project"] == "Projects Briping"
+    assert parts["task"] == ""
+    assert parts["agent"] == "Codex"
+    assert "Tmux Agent Tower" not in " ".join(parts.values())
+    assert "Tower QA" not in " ".join(parts.values())
+    # The underlying row still retains advanced/detail metadata unchanged.
+    assert row["project"] == "Tmux Agent Tower"
+
+
 def test_execution_labels_need_agent_process_evidence():
     cases = [
         ({"status": "WORKING", "agent_process_alive": True}, "state.working"),
@@ -255,13 +276,13 @@ def test_filter_no_match_returns_false():
     assert not render.row_matches_filter(row, "nonexistent")
 
 
-def test_task_row_puts_role_before_project_context():
+def test_task_row_keeps_project_context_out_of_representative_title():
     parts = render.list_row_parts(
         {"kind": "pane", "display_name": "API 점검", "project": "SamplePortal", "role": "qa", "agent": "Claude", "status": "IDLE"},
         120, lambda key: {"role.qa": "확인", "state.idle": "대기 중"}[key],
     )
     assert parts["project"] == "API 점검"
-    assert parts["task"] == "SamplePortal"
+    assert parts["task"] == ""
     assert parts["agent"] == "확인 · Claude"
 
 
@@ -374,14 +395,14 @@ def test_row_line_count_narrow_is_project_and_state_only():
     assert render.row_line_count({"title_line": None, "activity_text": "테스트 실행 중"}, narrow=True) == 2
 
 
-def test_narrow_row_uses_one_task_name_then_agent_and_status():
+def test_narrow_row_uses_one_representative_name_then_agent_and_status():
     row = {"project": "SamplePortal", "task_name": "로그인 수정", "activity_text": None}
     assert render.row_line_count(row, narrow=True) == 2
     assert render.list_row_parts(
         {"kind": "pane", **row, "agent": "Codex", "status": "WORKING"},
         58,
         lambda _key: "작업 중",
-    ) == {"guide": "", "project": "로그인 수정", "task": "SamplePortal", "agent": "", "badge": ""}
+    ) == {"guide": "", "project": "로그인 수정", "task": "", "agent": "", "badge": ""}
 
 
 def test_role_appears_concisely_without_replacing_task_or_agent():
@@ -393,7 +414,7 @@ def test_role_appears_concisely_without_replacing_task_or_agent():
     parts = render.list_row_parts(row, 100, lambda key: labels.get(key, key))
 
     assert parts["project"] == "로그인 수정"
-    assert parts["task"] == "SamplePortal"
+    assert parts["task"] == ""
     assert parts["agent"] == "구현 · Codex"
     assert render.row_line_count(row, narrow=True) == 2
 
