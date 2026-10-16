@@ -163,20 +163,54 @@ def prompt_text(
         stdscr.timeout(200)
 
 
-def show_message_screen(stdscr, title: str, lines: Sequence[str], footer: Optional[str] = None) -> None:
-    """Blocking full-screen message; any key dismisses it."""
+def show_message_screen(
+    stdscr,
+    title: str,
+    lines: Sequence[str],
+    footer: Optional[str] = None,
+    *,
+    paginate: bool = False,
+) -> None:
+    """Show a blocking message; optional paging is reserved for long help."""
 
-    footer = footer if footer is not None else t("wizard.press_any_key")
     stdscr.timeout(-1)
     try:
-        stdscr.erase()
-        height, width = stdscr.getmaxyx()
-        safe_add(stdscr, 0, 2, title, curses.A_BOLD)
-        for i, line in enumerate(lines):
-            safe_add(stdscr, 2 + i, 2, line)
-        safe_add(stdscr, height - 1, 2, footer, curses.A_DIM)
-        stdscr.refresh()
-        read_key(stdscr)
+        height, _ = stdscr.getmaxyx()
+        if not paginate:
+            # Keep the established one-screen / any-key dismissal behavior
+            # for ordinary status and confirmation messages.
+            message_footer = footer if footer is not None else t("wizard.press_any_key")
+            stdscr.erase()
+            safe_add(stdscr, 0, 2, title, curses.A_BOLD)
+            for i, line in enumerate(lines):
+                safe_add(stdscr, 2 + i, 2, line)
+            safe_add(stdscr, height - 1, 2, message_footer, curses.A_DIM)
+            stdscr.refresh()
+            read_key(stdscr)
+            return
+
+        page_size = max(1, height - 4)
+        pages = [list(lines[index : index + page_size]) for index in range(0, len(lines), page_size)] or [[]]
+        page = 0
+        while True:
+            stdscr.erase()
+            safe_add(stdscr, 0, 2, title, curses.A_BOLD)
+            for i, line in enumerate(pages[page]):
+                safe_add(stdscr, 2 + i, 2, line)
+            if len(pages) > 1:
+                message_footer = t("help.page_navigation", page=page + 1, pages=len(pages))
+            else:
+                message_footer = footer if footer is not None else t("help.close")
+            safe_add(stdscr, height - 1, 2, message_footer, curses.A_DIM)
+            stdscr.refresh()
+
+            key = read_key(stdscr)
+            if is_escape(key):
+                return
+            if key in (curses.KEY_UP, curses.KEY_PPAGE) and page > 0:
+                page -= 1
+            elif key in (curses.KEY_DOWN, curses.KEY_NPAGE) and page + 1 < len(pages):
+                page += 1
     finally:
         stdscr.timeout(200)
 

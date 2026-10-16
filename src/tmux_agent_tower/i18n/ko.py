@@ -256,6 +256,8 @@ STRINGS = {
     "help.existing": "기존 작업: 목록에서 선택 · S 저장한 구성 다시 열기",
     "help.destinations": "복사 위치는 자동이며, 모호할 때만 선택을 요청합니다.",
     "help.exit": "Ctrl+C 앱 종료",
+    "help.page_navigation": "↑↓/PgUp PgDn 이동 · Esc 닫기 ({page}/{pages})",
+    "help.close": "Esc 닫기",
     "nav.conversation": "대화 열기",
     "nav.show_result": "결과 보기",
     "nav.copy_result": "결과 복사",

@@ -1617,14 +1617,28 @@ def _selected_enter_hint(row: Optional[Dict]) -> str:
     }.get(intent, t("hint.enter_unavailable"))
 
 
+def _help_lines() -> List[str]:
+    return [
+        t("help.navigation"), t("help.actions"), t("help.saved"),
+        t("help.results"), t("help.copy_safety"), t("help.copy_safety_block"),
+        t("help.remote"), t("help.remote_limits"), t("help.manage"),
+        t("help.detail"), t("help.detail_advanced"), t("help.detail_reject"),
+        t("help.troubleshoot"), t("help.advanced"),
+        t("help.start"), t("help.existing"), t("help.destinations"), t("help.exit"),
+    ]
+
+
 def _home_footer_lines(tower: Tower, width: int) -> List[str]:
     row = tower.visible_rows[tower.selected] if tower.visible_rows and 0 <= tower.selected < len(tower.visible_rows) else None
     enter_hint = _selected_enter_hint(row)
-    keys = [
-        t("hint.move"), enter_hint, t("hint.result"), t("hint.actions"),
+    keys = [t("hint.move"), enter_hint]
+    if row and row.get("kind") == "pane":
+        keys.append(t("hint.result"))
+    keys.extend([
+        t("hint.actions"),
         t("hint.user_work_view") if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW else t("hint.create"),
         t("hint.help"),
-    ]
+    ])
     return render.wrap_items(keys, max(1, width - 4))
 
 
@@ -2087,14 +2101,7 @@ def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
         if key == "?":
             from .widgets import show_message_screen
 
-            show_message_screen(stdscr, t("help.title"), [
-                t("help.navigation"), t("help.actions"), t("help.saved"),
-                t("help.results"), t("help.copy_safety"), t("help.copy_safety_block"),
-                t("help.remote"), t("help.remote_limits"), t("help.manage"),
-                t("help.detail"), t("help.detail_advanced"), t("help.detail_reject"),
-                t("help.troubleshoot"), t("help.advanced"),
-                t("help.start"), t("help.existing"), t("help.destinations"), t("help.exit"),
-            ])
+            show_message_screen(stdscr, t("help.title"), _help_lines(), paginate=True)
             draw(stdscr, tower, remote_state=remote_state)
             continue
 

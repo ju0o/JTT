@@ -277,6 +277,26 @@ def test_home_footer_keeps_primary_hints_within_two_lines(width):
         assert hint in rendered
 
 
+@pytest.mark.parametrize("width", [60, 80])
+@pytest.mark.parametrize("kind", ["folder", "work_group"])
+def test_home_footer_hides_copy_for_expandable_rows(width, kind):
+    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.ui.render import display_width
+
+    tower = SimpleNamespace(
+        visible_rows=[{"kind": kind, "key": f"{kind}:selected"}],
+        selected=0,
+        view_mode=tower_module.USER_WORK_VIEW,
+    )
+    lines = tower_module._home_footer_lines(tower, width)
+    rendered = " ".join(lines)
+
+    assert len(lines) <= 2
+    assert all(display_width(line) <= width - 4 for line in lines)
+    assert "Enter 펼치기/접기" in rendered
+    assert "Y 최신 답변 복사" not in rendered
+
+
 def test_default_home_draws_user_identity_without_physical_inspector_or_legacy_wall(monkeypatch):
     from tmux_agent_tower.ui import tower as tower_module
 
@@ -411,6 +431,7 @@ def test_primary_navigation_and_result_keys_route_to_existing_flows(monkeypatch)
 
     tower = FakeTower()
     events = []
+    shown_messages = []
     keys = iter(("s", "l", "c", "?", "y", "g", "n", "w", "\x03"))
     monkeypatch.setattr(tower_module, "Tower", lambda *_a, **_k: tower)
     monkeypatch.setattr(tower_module, "REFRESH_SECONDS", 10**9)
@@ -424,11 +445,15 @@ def test_primary_navigation_and_result_keys_route_to_existing_flows(monkeypatch)
     monkeypatch.setattr(settings_menu, "open_settings", lambda *_a: events.append("settings"))
     monkeypatch.setattr(control_view, "_copy_result", lambda *_a: events.append("copy") or "복사했습니다")
     monkeypatch.setattr(control_view, "_go", lambda *_a: events.append("terminal") or t("control.focused"))
-    monkeypatch.setattr("tmux_agent_tower.ui.widgets.show_message_screen", lambda *_a, **_k: events.append("message"))
+    monkeypatch.setattr(
+        "tmux_agent_tower.ui.widgets.show_message_screen",
+        lambda *args, **kwargs: (events.append("message"), shown_messages.append((args, kwargs))),
+    )
 
     tower_module._run_loop(Screen(), "isolated-test", "")
 
     assert events == ["saved", "live", "settings", "message", "copy", "message", "terminal", "create", "create"]
+    assert shown_messages[0][1] == {"paginate": True}
 
 
 def test_focus_side_by_side_and_grid_draw_selected_order(monkeypatch):

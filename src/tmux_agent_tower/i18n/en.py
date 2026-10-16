@@ -259,6 +259,8 @@ STRINGS = {
     "help.existing": "Existing work: select it in the list · S reopen a saved setup",
     "help.destinations": "Copy is automatic; Tower asks only when the destination is unclear.",
     "help.exit": "Ctrl+C Quit app",
+    "help.page_navigation": "↑↓/PgUp PgDn move · Esc close ({page}/{pages})",
+    "help.close": "Esc close",
     "nav.conversation": "Open conversation",
     "nav.show_result": "View result",
     "nav.copy_result": "Copy result",
