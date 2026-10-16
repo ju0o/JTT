@@ -21,7 +21,8 @@ def test_primary_badge_uses_words_not_enums():
         (_row(attention="input_required", interaction={"type": "choice", "options": [{"key": "1"}]}), "?", "선택 필요"),
         (_row(attention="input_required"), "?", "답변 필요"),
         (_row(result_state="ready"), "✓", "새 결과"),
-        (_row(status="IDLE"), "○", "대기"),
+        (_row(status="IDLE"), "○", "대기 중"),
+        (_row(status="WORKING", offline=True), "×", "연결 안 됨"),
         (_row(status="DEAD"), "×", "종료"),
         (_row(status="UNKNOWN"), "◇", "확인 불가"),
         (_row(attention="error"), "!", "오류"),
@@ -40,7 +41,8 @@ def test_primary_status_wording_is_korean_and_keeps_three_state_families_separat
     assert ko.STRINGS["state.choice"] == "선택 필요"
     assert ko.STRINGS["state.answer"] == "답변 필요"
     assert ko.STRINGS["state.result"] == "새 결과"
-    assert ko.STRINGS["state.idle"] == "대기"
+    assert ko.STRINGS["state.idle"] == "대기 중"
+    assert ko.STRINGS["state.offline"] == "연결 안 됨"
     assert ko.STRINGS["state.dead"] == "종료"
     assert ko.STRINGS["state.unknown"] == "확인 불가"
 
@@ -50,17 +52,21 @@ def test_primary_status_wording_is_korean_and_keeps_three_state_families_separat
         ("✓", "state.result"),
         ("●", "state.working"),
     ]
+    assert render.detail_badges(_row(status="WORKING", offline=True)) == [("×", "state.offline")]
 
 
 def test_primary_korean_menus_hide_tmux_and_transport_terms():
     keys = (
-        "app.title",
+        "app.title", "home.title", "state.offline",
         "hint.move", "hint.open", "hint.enter_expand", "hint.enter_conversation", "hint.enter_window",
         "hint.enter_start", "hint.enter_unavailable", "hint.home_help", "hint.rename", "hint.refresh", "hint.quit",
         "hint.filter", "hint.filter_clear", "hint.navigator", "hint.actions",
         "hint.create", "hint.remote", "hint.attention", "hint.live", "hint.saved",
         "hint.result", "hint.terminal", "hint.back", "hint.help", "hint.settings",
-        "help.title", "help.navigation", "help.actions", "help.saved", "help.results", "help.start", "help.existing", "help.destinations",
+        "help.title", "help.navigation", "help.actions", "help.saved", "help.results", "help.copy_safety",
+        "help.copy_safety_block", "help.remote", "help.remote_limits", "help.manage",
+        "help.detail", "help.detail_advanced", "help.detail_reject", "help.troubleshoot", "help.advanced",
+        "help.start", "help.existing", "help.destinations",
         "nav.conversation", "nav.show_result", "nav.copy_result", "nav.task_settings",
         "nav.copy_screen", "nav.live_view", "nav.settings", "nav.saved", "nav.terminal_structure", "nav.end_task",
         "menu.advanced_names", "menu.project_name", "menu.agent_name", "menu.pane_title",
@@ -79,6 +85,7 @@ def test_primary_korean_menus_hide_tmux_and_transport_terms():
         "struct.close_window_effect", "struct.close_window_yes", "struct.act_prompt", "struct.act_close",
         "control.title", "control.hint", "control.close_title", "control.close_idle", "control.close_working",
         "control.close_waiting", "control.close_yes", "control.tower_protected", "control.approve_unknown",
+        "control.copy_requires_pane", "control.result_copy_unavailable", "control.copy_connection_error",
         "settings.keys", "settings.keys.title", "settings.keys.explain_off", "settings.keys.failed",
         "settings.advanced",
     )
@@ -114,7 +121,7 @@ def test_wide_primary_row_shows_project_agent_and_state_without_internal_ids():
 def test_detail_can_show_more_than_one_badge():
     row = _row(status="IDLE", attention="approval_required", result_state="ready")
     labels = [t(key) for _symbol, key in render.detail_badges(row)]
-    assert labels == ["승인 필요", "새 결과", "대기"]
+    assert labels == ["승인 필요", "새 결과", "대기 중"]
 
 
 def test_watch_header_hides_zero_counts():

@@ -89,7 +89,7 @@ def test_copy_sends_the_body_on_stdin_and_marks_read_only_on_success(monkeypatch
     monkeypatch.setattr("tmux_agent_tower.ui.control_view.load_preference", lambda: "auto")
     monkeypatch.setattr("tmux_agent_tower.ui.control_view.observe", lambda: _local_client())
     notice = _copy_result(tower, "%9")
-    assert notice == "✓ 최신 결과 전체를 복사했습니다"
+    assert notice == "최신 답변을 Windows 클립보드에 복사했습니다."
     assert tracker.snapshot("%9").state == "read"
     assert tracker.snapshot("%9").text == BODY
 
@@ -160,8 +160,14 @@ def test_neither_clipboard_nor_buffer_is_not_success(monkeypatch):
     assert "✓" not in notice
 
 
-def test_showing_the_result_marks_it_read_without_copying():
+def test_showing_the_result_marks_it_read_without_copying(monkeypatch):
+    from tmux_agent_tower.ui import control_view
+
     tower, tracker = _ready_tower()
+    monkeypatch.setattr(control_view, "get_result", lambda *_args, **_kwargs: (True, "", {
+        "state": "ready", "text": BODY, "complete": True,
+        "turn_complete": True, "body_complete": True, "fingerprint": "fp-1",
+    }))
     notice, shown = _show_result(tower, "%9")
     assert shown is True
     assert tracker.snapshot("%9").state == "read"
@@ -523,7 +529,7 @@ def test_copy_notice_names_the_destination_that_actually_worked(monkeypatch):
         "tmux_agent_tower.ui.control_view.copy_text",
         lambda text, **_kwargs: CopyOutcome(True, False, "clip.exe"),
     )
-    assert _copy_result(tower, "%9") == "✓ 최신 결과 전체를 복사했습니다"
+    assert _copy_result(tower, "%9") == "최신 답변을 Windows 클립보드에 복사했습니다."
 
     tower, _tracker = _ready_tower()
     _mock_complete_result(monkeypatch)
@@ -764,8 +770,7 @@ def test_explicit_terminal_without_readback_is_a_request_not_a_copy():
         view.observe = original_observe
         view.load_preference = original_pref
         view.get_result = original_result
-    assert "현재 접속한 터미널" in notice
-    assert "Windows" not in notice
+    assert notice == "클립보드로 전송했습니다. 붙여넣기로 확인해 주세요."
     assert tracker.snapshot("%9").state == "ready"
 
 
@@ -812,8 +817,8 @@ def test_copy_result_passes_the_exact_text_and_one_destination(monkeypatch):
     assert hashlib.sha256(captured["text"].encode()).hexdigest() == hashlib.sha256(BODY.encode()).hexdigest()
     assert captured["kwargs"]["destination"] == "local_host"
     assert captured["kwargs"]["ssh"] is False
-    assert notice == "✓ 최신 결과 전체를 workstation-a에 복사했습니다"
-    assert "Windows" not in notice
+    assert notice == "최신 답변을 Windows 클립보드에 복사했습니다."
+    assert "Windows" in notice
     assert "터미널" not in notice
 
 

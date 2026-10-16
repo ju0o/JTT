@@ -113,6 +113,8 @@ def primary_badge(row: Dict) -> Tuple[str, str]:
     ``card_rank``: approval, input, a new result, an error, then execution.
     """
 
+    if row.get("offline"):
+        return "×", "state.offline"
     attention = row.get("attention") or "none"
     if attention == "approval_required":
         return "!", "state.approval"
@@ -151,6 +153,8 @@ def detail_badges(row: Dict) -> List[Tuple[str, str]]:
     ``primary_badge`` alone so the scan stays one glance.
     """
 
+    if row.get("offline"):
+        return [("×", "state.offline")]
     badges: List[Tuple[str, str]] = []
     attention = row.get("attention") or "none"
     if attention == "approval_required":

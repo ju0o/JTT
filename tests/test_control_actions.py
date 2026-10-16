@@ -127,7 +127,7 @@ def test_structure_y_shows_copy_diagnostic_and_leaves_it_in_menu_state(monkeypat
             "stage": "not_entered", "outcome": "blocked", "reason_code": "SOURCE_PARTIAL",
             "turn_complete": True, "body_complete": False, "result_state": "ready",
         }
-        return "결과 복사 거부 [SOURCE_PARTIAL]"
+        return tower_module.t("control.result_copy_unavailable")
 
     monkeypatch.setattr(control_view, "_copy_result", copy_result)
     monkeypatch.setattr(widgets, "show_message_screen", lambda _s, title, lines: shown.append((title, lines)))
@@ -137,12 +137,9 @@ def test_structure_y_shows_copy_diagnostic_and_leaves_it_in_menu_state(monkeypat
     assert copied == ["%44"]
     assert shown == [(
         tower_module.t("detail.result"),
-        [
-            "결과 복사 거부 [SOURCE_PARTIAL]",
-            tower_module.t("diagnostics.clipboard").format(result="not_entered / blocked"),
-            tower_module.t("diagnostics.reason").format(code="SOURCE_PARTIAL"),
-        ],
+        [tower_module.t("control.result_copy_unavailable")],
     )]
+    assert "SOURCE_PARTIAL" not in "\n".join(shown[0][1])
     diagnostic_lines = control_view.pane_diagnostic_lines(tower, row)
     assert "not_entered / blocked" in "\n".join(diagnostic_lines)
     assert "SOURCE_PARTIAL" in "\n".join(diagnostic_lines)
@@ -168,15 +165,14 @@ def test_structure_y_reports_success_diagnostic_as_none(monkeypatch):
             "stage": "entered", "outcome": "readback_verified", "reason_code": "",
             "turn_complete": True, "body_complete": True, "result_state": "ready",
         }
-        return "최신 결과 전체를 복사했습니다"
+        return tower_module.t("control.copied_complete_windows")
 
     monkeypatch.setattr(control_view, "_copy_result", copy_result)
     monkeypatch.setattr(widgets, "show_message_screen", lambda _s, title, lines: shown.append((title, lines)))
 
     _run_tower_with_one_key(monkeypatch, tower, "y")
 
-    assert shown[0][1][1:] == control_view.result_copy_status_lines(tower)
-    assert tower_module.t("diagnostics.reason").format(code="NONE") == shown[0][1][2]
+    assert shown[0][1] == [tower_module.t("control.copied_complete_windows")]
     assert "readback_verified" in "\n".join(control_view.pane_diagnostic_lines(tower, row))
     assert tower_module.t("diagnostics.reason").format(code="NONE") in control_view.pane_diagnostic_lines(tower, row)
 
@@ -437,16 +433,38 @@ def test_control_footer_wraps_korean_shortcuts_on_narrow_terminal(monkeypatch):
     control_view._draw(screen, SimpleNamespace(config={}), row, "", False)
 
     action_rows = [screen.drawn[index][1] for index in (18, 19)]
-    assert "Ctrl+Y 결과 복사" in " ".join(action_rows)
+    assert "Ctrl+Y 답변 복사" in " ".join(action_rows)
     assert "Ctrl+S 결과 보기" in " ".join(action_rows)
-    assert "Esc 뒤로" in " ".join(action_rows)
+    assert "Esc 목록" in " ".join(action_rows)
     assert all(display_width(line) <= 42 for line in action_rows)
     compact_rows = control_view._action_hint_lines(row, 22)
     assert "Ctrl+Y 복사" in " ".join(compact_rows)
     assert all(display_width(line) <= 18 for line in compact_rows)
     remote_hint = screen.drawn[17][1]
-    assert remote_hint.startswith("다른 컴퓨터의 작업은") and remote_hint.endswith("…")
+    assert remote_hint.startswith("다른 컴퓨터 작업은") and remote_hint.endswith("…")
     assert screen.drawn[16][1] == "synthetic live line 19"
+
+
+def test_detail_prioritizes_task_agent_host_and_state(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(control_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_view, "_live_lines", lambda *_args: ["visible conversation text"])
+    screen = _RecordingScreen(22, 60)
+    row = {
+        "key": "asus:%1", "remote": True, "status": "WORKING", "agent": "OpenCode",
+        "role": "builder", "execution_host": "ASUS", "host": "ASUS",
+        "display_name": "로그인 오류 수정", "activity_text": "파일을 검토하는 중",
+        "pane_id": "%1", "pane_pid": "1234", "session": "session-secret",
+    }
+
+    control_view._draw(screen, SimpleNamespace(config={}), row, "", False)
+
+    assert screen.drawn[0][1] == "로그인 오류 수정"
+    assert "OpenCode" in screen.drawn[1][1] and "실행 위치 ASUS" in screen.drawn[1][1]
+    assert "상태: ● 작업 중" in screen.drawn[2][1]
+    assert "파일을 검토하는 중" in screen.drawn[3][1]
+    assert all(secret not in " ".join(text for _x, text in screen.drawn.values()) for secret in ("1234", "session-secret", "%1"))
 
 
 def test_control_notice_truncates_by_display_width(monkeypatch):

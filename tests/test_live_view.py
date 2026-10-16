@@ -248,6 +248,7 @@ def test_empty_start_choices_do_not_look_like_a_selected_task(monkeypatch):
     tower_module.draw(screen, tower)
 
     text = " ".join(item[2] for item in screen.writes)
+    assert "내 AI 작업" in text
     assert "아직 실행 중인 작업이 없습니다." in text
     assert "AI 작업을 한곳에서 보고" in text
     assert "현재 접속 위치를 확인할 수 없습니다" in text
@@ -255,6 +256,25 @@ def test_empty_start_choices_do_not_look_like_a_selected_task(monkeypatch):
     assert "+ 새 작업" in text
     assert "Ctrl+b" not in text
     assert "작업 이름" not in text
+
+
+@pytest.mark.parametrize("width", [60, 80])
+def test_home_footer_keeps_primary_hints_within_two_lines(width):
+    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.ui.render import display_width
+
+    tower = SimpleNamespace(
+        visible_rows=[{"kind": "pane", "pane_id": "%7", "key": "%7"}],
+        selected=0,
+        view_mode=tower_module.USER_WORK_VIEW,
+    )
+    lines = tower_module._home_footer_lines(tower, width)
+    rendered = " ".join(lines)
+
+    assert len(lines) <= 2
+    assert all(display_width(line) <= width - 4 for line in lines)
+    for hint in ("↑↓ 이동", "Enter 대화 열기", "Y 최신 답변 복사", "Space 메뉴", "+ 새 작업", "? 도움말"):
+        assert hint in rendered
 
 
 def test_default_home_draws_user_identity_without_physical_inspector_or_legacy_wall(monkeypatch):
@@ -296,7 +316,7 @@ def test_default_home_draws_user_identity_without_physical_inspector_or_legacy_w
     assert "새 결과" in text
     for internal in ("Pane ID", "Window ID", "Session", "%42", "@4", "A 우선순위", "M 휴대폰", "Ctrl+b w"):
         assert internal not in text
-    for key in ("Enter 대화 열기", "Space 메뉴", "+ 새 작업", "S 저장한 구성", "L 실시간 보기", "/ 찾기·명령", "Y 결과 복사", "Esc 뒤로", "? 도움말"):
+    for key in ("Enter 대화 열기", "Space 메뉴", "+ 새 작업", "Y 최신 답변 복사", "? 도움말"):
         assert key in text
 
 

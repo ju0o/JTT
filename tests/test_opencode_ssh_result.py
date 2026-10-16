@@ -711,7 +711,8 @@ def test_y_does_not_route_unbound_or_incomplete_opencode_payload(monkeypatch):
     monkeypatch.setattr(control_view, "_route_clipboard", lambda *_: pytest.fail("unsafe payload reached clipboard"))
 
     notice = control_view._copy_result(tower, "%9")
-    assert "AGENT_SESSION_UNBOUND" in notice
+    assert notice == control_view.t("control.opencode_no_active_session")
+    assert tower.last_result_copy_diagnostic["reason_code"] == "AGENT_SESSION_UNBOUND"
 
 
 def test_y_explains_bounded_screen_fallback_when_binding_plugin_is_absent(monkeypatch):
@@ -751,8 +752,8 @@ def test_y_explains_incomplete_screen_fallback_and_binding_failure_in_korean(mon
     }
     monkeypatch.setattr(control_view, "get_result", lambda *_a, **_k: (True, "", incomplete))
     fallback_notice = control_view._copy_result(tower, "%9")
-    assert "화면 기반 대체 경로를 확인했지만 전체 결과를 검증하지 못해" in fallback_notice
-    assert "OUTPUT_RANGE_EXCEEDED" in fallback_notice
+    assert fallback_notice == control_view.t("control.result_copy_unavailable")
+    assert tower.last_result_copy_diagnostic["reason_code"] == "OUTPUT_RANGE_EXCEEDED"
 
     damaged = {
         "state": "none", "text": "", "complete": False, "turn_complete": False,
@@ -760,4 +761,5 @@ def test_y_explains_incomplete_screen_fallback_and_binding_failure_in_korean(mon
     }
     monkeypatch.setattr(control_view, "get_result", lambda *_a, **_k: (True, "", damaged))
     binding_notice = control_view._copy_result(tower, "%9")
-    assert "오래됐거나 손상되어 복사를 차단" in binding_notice
+    assert binding_notice == control_view.t("control.opencode_no_active_session")
+    assert tower.last_result_copy_diagnostic["reason_code"] == "OPENCODE_BINDING_INVALID"

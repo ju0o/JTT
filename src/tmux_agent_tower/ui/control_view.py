@@ -253,24 +253,33 @@ def _draw(stdscr, tower, row: dict, notice: str, show_result: bool, follow: bool
     seconds = row.get("duration_seconds") or 0
     if seconds and tower.config.get("show_status_duration"):
         duration = " · " + render.format_duration(seconds)
-    # Execution is already on the line above. Repeating it here crowded
-    # the control view with the same mark twice.
-    execution = (symbol, key)
-    extra = [badge for badge in render.detail_badges(row) if badge != execution]
-    badges = "   ".join(f"{mark} {t(name)}" for mark, name in extra)
-    safe_add(stdscr, 0, 2, f'{display_name}   {symbol} {t(key)}{duration}', curses.A_BOLD)
+    safe_add(stdscr, 0, 2, _fit_live_line(display_name, width), curses.A_BOLD)
     role = t(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
+    identity_parts = [part for part in (row.get("agent") or t("task.terminal"), role) if part]
     if row.get("work_group_name"):
-        identity = f'{row["work_group_name"]} › ' + " · ".join(part for part in (role, row.get("agent") or "-") if part)
+        identity_parts.insert(0, row["work_group_name"])
+    execution_host = row.get("execution_host") or row.get("host")
+    if execution_host:
+        identity_parts.append(f'{t("detail.execution_host")} {execution_host}')
+    safe_add(stdscr, 1, 2, _fit_live_line(" · ".join(identity_parts), width), curses.A_DIM)
+
+    if row.get("offline"):
+        status_parts = ["× " + t("state.offline")]
     else:
-        identity = " · ".join(part for part in (row.get("agent") or "-", role) if part)
-    safe_add(stdscr, 1, 2, identity)
-    safe_add(stdscr, 2, 2, f'{t("detail.execution_host")}: {row.get("execution_host") or row.get("host") or "-"}', curses.A_DIM)
-    safe_add(stdscr, 3, 2, badges)
-    safe_add(stdscr, 4, 2, f'{t("detail.activity")}: {row.get("activity_text") or "-"}', curses.A_DIM)
+        status_parts = [f"{symbol} {t(key)}{duration}"]
+        status_parts.extend(
+            f"{mark} {t(name)}"
+            for mark, name in render.detail_badges(row)
+            if (mark, name) != (symbol, key)
+        )
+    status_text = f'{t("detail.status")}: ' + " · ".join(status_parts)
+    safe_add(stdscr, 2, 2, _fit_live_line(status_text, width), curses.A_BOLD)
+    y = 3
+    if row.get("activity_text"):
+        safe_add(stdscr, y, 2, _fit_live_line(f'{t("detail.activity")}: {row["activity_text"]}', width), curses.A_DIM)
+        y += 1
     from .tower import location_lines
 
-    y = 5
     if show_advanced:
         safe_add(stdscr, y, 2, t("detail.advanced"), curses.A_BOLD)
         y += 1
@@ -457,20 +466,16 @@ def _draw_actions(stdscr, y: int, row: dict, show_advanced: bool = False, *, lin
 def _action_hint_lines(row: dict, width: int, show_advanced: bool = False) -> list[str]:
     compact = width < 28
     items = (
-        ["Ctrl+Y 복사", "Ctrl+S 결과", "Ctrl+E 이름", "Esc 뒤로"]
+        ["Ctrl+Y 복사", "Ctrl+S 결과", "Esc 목록"]
         if compact else
-        ["Ctrl+Y 결과 복사", "Ctrl+S 결과 보기", "Ctrl+E 이름", "Esc 뒤로"]
+        ["Ctrl+Y 답변 복사", "Ctrl+S 결과 보기", "Esc 목록"]
     )
-    if row.get("pane_id") and not row.get("remote"):
-        items.extend(["Ctrl+G 이동", "Ctrl+X 닫기"])
-    if row.get("reject_known") and not _unknown_interaction(row.get("interaction") or {}):
-        items.append("Ctrl+N 거절")
     if show_advanced:
-        items.extend(["Ctrl+L 최근 터미널 출력 복사", "Ctrl+I 간단히"])
+        if row.get("pane_id") and not row.get("remote"):
+            items.append("Ctrl+L 화면 복사" if compact else "Ctrl+L 최근 화면 복사")
+        items.append("Ctrl+I 간단히")
     else:
         items.append("Ctrl+I 자세히")
-    if compact and show_advanced:
-        items[-2] = "Ctrl+L 출력"
     return render.wrap_items(items, max(1, width - 4))
 
 
@@ -611,7 +616,7 @@ def _copy_result_impl(tower, pane_key: str, stdscr=None) -> str:
     if not row.get("remote") and not pane_pid:
         payload = {"state": row.get("result_state") or "none", "reason_code": "UNKNOWN"}
         _remember_result_copy(tower, row, payload, "not_entered", "blocked", "UNKNOWN")
-        return t("control.result_copy_unavailable").format(code="UNKNOWN")
+        return _result_copy_block_notice("UNKNOWN", payload)
     result = get_result(tower, pane_key) if row.get("remote") else get_result(
         tower, pane_key, expected_pane_pid=pane_pid,
     )
@@ -639,7 +644,7 @@ def _copy_result_impl(tower, pane_key: str, stdscr=None) -> str:
         _remember_result_copy(tower, row, payload, "not_entered", "blocked", code)
         if reason == "not_found":
             return t("nav.stale")
-        return _result_copy_block_notice(code, payload) if reason == "stale" else reason or ""
+        return _result_copy_block_notice(code, payload)
     text = payload.get("text") or ""
     if not payload.get("complete") or not text:
         reason_code = _result_failure_code(row, payload)
@@ -648,7 +653,7 @@ def _copy_result_impl(tower, pane_key: str, stdscr=None) -> str:
     if payload.get("source") == "remote_opencode" and plain_clipboard_text(text).encode("utf-8", "strict") != raw:
         reason_code = "CLIPBOARD_TEXT_TRANSFORMED"
         _remember_result_copy(tower, row, payload, "not_entered", "blocked", reason_code)
-        return t("control.result_copy_unavailable").format(code=reason_code)
+        return _result_copy_block_notice(reason_code, payload)
     outcome, reason = _route_clipboard(tower, text, stdscr)
     if outcome is None:
         if reason == "diagnostic_trace_failed":
@@ -785,8 +790,6 @@ def _result_failure_code(row: dict, payload: dict, reason: str = "") -> str:
 
 
 def _result_copy_block_notice(code: str, payload: dict) -> str:
-    if payload.get("fallback_reason_code") == "OPENCODE_PLUGIN_NOT_INSTALLED":
-        return t("control.opencode_screen_fallback_blocked").format(code=code)
     message_key = {
         "OPENCODE_BINDING_INVALID": "control.opencode_binding_invalid",
         "OPENCODE_NO_ACTIVE_SESSION": "control.opencode_no_active_session",
@@ -794,7 +797,13 @@ def _result_copy_block_notice(code: str, payload: dict) -> str:
     }.get(code)
     if message_key:
         return t(message_key)
-    return t("control.result_copy_unavailable").format(code=code)
+    if code in {
+        "AGENT_SESSION_UNBOUND", "REMOTE_PROVIDER_UNBOUND", "TUI_BINDING_UNAVAILABLE",
+    }:
+        return t("control.opencode_no_active_session")
+    if code in {"REMOTE_PROVIDER_UNAVAILABLE", "REMOTE_PROVIDER_TIMEOUT"}:
+        return t("control.copy_connection_error")
+    return t("control.result_copy_unavailable")
 
 
 def _remember_result_copy(tower, row: dict, payload: dict, stage: str, outcome: str, reason_code: str) -> None:
@@ -967,7 +976,9 @@ def _result_copy_notice(outcome, host_label: str = "") -> str:
     if outcome.tool == "terminal" and outcome.clipboard:
         return t("control.copied_complete_terminal")
     if outcome.terminal_requested:
-        return t("control.sent_complete_terminal")
+        return t("control.copy_sent_unverified")
+    if outcome.clipboard and outcome.tool == "clip.exe":
+        return t("control.copied_complete_windows")
     if outcome.clipboard:
         host = (host_label or "").strip()
         if host:

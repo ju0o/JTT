@@ -136,7 +136,7 @@ def test_default_selected_summary_omits_empty_project_and_role():
             "execution_host": "UNKNOWN",
         },
     )
-    assert lines == ["터미널", "Shell · ○ 대기"]
+    assert lines == ["터미널", "Shell · ○ 대기 중"]
     assert not any("이름 없음" in line or "역할 없음" in line for line in lines)
 
 
@@ -282,6 +282,6 @@ def test_conversation_header_uses_identity_and_keeps_location_friendly(monkeypat
     )
     by_line = dict(seen)
     assert "ExampleProject · 구현" in by_line[0]
-    assert by_line[1] == "Codex · 구현"
-    assert by_line[2] == "실행 위치: workstation-b"
+    assert by_line[1] == "Codex · 구현 · 실행 위치 workstation-b"
+    assert by_line[2] == "상태: ● 작업 중"
     assert not any("Pane" in text or "Window" in text for _line, text in seen)

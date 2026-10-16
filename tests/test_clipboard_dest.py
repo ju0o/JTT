@@ -20,7 +20,7 @@ from tmux_agent_tower.clipboard_dest import (
 )
 from tmux_agent_tower.detection.result import ResultTracker
 from tmux_agent_tower.i18n import t
-from tmux_agent_tower.ui.control_view import _copy_notice, _copy_result, _copy_screen
+from tmux_agent_tower.ui.control_view import _copy_notice, _copy_result, _copy_screen, _result_copy_notice
 import pytest
 from tmux_agent_tower.ui.settings_menu import copy_menu_items
 
@@ -241,6 +241,14 @@ def test_messages_name_one_place_and_hide_the_mechanism():
         assert "Windows" not in notice
 
 
+def test_result_copy_notice_distinguishes_verified_windows_from_terminal_send():
+    verified = _result_copy_notice(CopyOutcome(True, False, "clip.exe"))
+    sent = _result_copy_notice(CopyOutcome(False, False, "terminal", terminal_requested=True))
+
+    assert verified == "최신 답변을 Windows 클립보드에 복사했습니다."
+    assert sent == "클립보드로 전송했습니다. 붙여넣기로 확인해 주세요."
+
+
 def test_copy_test_does_not_claim_a_paste(monkeypatch):
     sent = {}
 
@@ -331,7 +339,7 @@ def test_y_blocks_partial_result_before_any_clipboard_write(monkeypatch):
 
     notice = _copy_result(tower, "%9")
 
-    assert "SOURCE_PARTIAL" in notice
+    assert notice == t("control.result_copy_unavailable")
     assert writes == []
     assert tower.last_result_copy_diagnostic["stage"] == "not_entered"
     assert tower.last_result_copy_diagnostic["outcome"] == "blocked"
@@ -363,7 +371,8 @@ def test_y_blocks_remote_opencode_result_when_clipboard_sanitizer_changes_bytes(
 
     notice = _copy_result(tower, "%9")
 
-    assert "CLIPBOARD_TEXT_TRANSFORMED" in notice
+    assert notice == t("control.result_copy_unavailable")
+    assert tower.last_result_copy_diagnostic["reason_code"] == "CLIPBOARD_TEXT_TRANSFORMED"
     assert writes == []
     assert tower.last_result_copy_diagnostic["stage"] == "not_entered"
     assert tower.last_result_copy_diagnostic["outcome"] == "blocked"
@@ -380,7 +389,8 @@ def test_y_reports_clipboard_delivery_failure_separately(monkeypatch):
 
     notice = _copy_result(tower, "%9")
 
-    assert notice == "클립보드 전달 실패 [CLIPBOARD_FAILED]. 복사 완료를 확인하지 못했습니다."
+    assert notice == t("control.clipboard_failed")
+    assert tower.last_result_copy_diagnostic["reason_code"] == "CLIPBOARD_FAILED"
     assert tower.last_result_copy_diagnostic["stage"] == "entered"
     assert tower.last_result_copy_diagnostic["reason_code"] == "CLIPBOARD_FAILED"
 
@@ -464,7 +474,7 @@ def test_y_trace_does_not_record_or_route_a_partial_result(tmp_path, monkeypatch
 
     records = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
     result = next(record for record in records if record["event"] == "GET_RESULT_COMPLETE")
-    assert "SOURCE_PARTIAL" in notice
+    assert notice == t("control.result_copy_unavailable")
     assert result["result_complete"] is False
     assert result["result_utf8_bytes"] == 0
     assert result["result_sha256"] == ""
@@ -527,7 +537,7 @@ def test_y_prompts_a_safe_destination_when_multiple_clients_are_attached(monkeyp
     notice = _copy_result(tower, "%9", stdscr=screen)
     assert calls == ["local_host"]
     assert prompts == [(screen, False)]
-    assert notice == "✓ 최신 결과 전체를 workstation-a에 복사했습니다"
+    assert notice == t("control.copied_complete_windows")
     assert tower.copy_override == SessionChoice(clients, LOCAL_HOST)
 
 
@@ -606,7 +616,7 @@ def test_remote_result_source_still_routes_to_local_access_clipboard(monkeypatch
 
     assert captured["text"] == payload["text"]
     assert captured["destination"] == LOCAL_HOST
-    assert notice == "✓ 최신 결과 전체를 workstation-a에 복사했습니다"
+    assert notice == t("control.copied_complete_windows")
     assert get_result_calls and get_result_calls[0][1] == {}
 
 
@@ -627,16 +637,25 @@ def test_y_does_not_route_a_partial_tracker_candidate(monkeypatch):
 
     notice = _copy_result(tower, "%9")
 
-    assert notice == "결과 복사 거부 [TURN_NOT_COMPLETE]: 최신 전체 결과를 검증하지 못했습니다"
+    assert notice == t("control.result_copy_unavailable")
     assert routed == []
 
 
-def test_y_displays_provider_failure_reason_without_copying(monkeypatch):
+@pytest.mark.parametrize(
+    ("source", "message_key"),
+    [
+        ("REMOTE_PROVIDER_UNBOUND", "control.opencode_no_active_session"),
+        ("REMOTE_PROVIDER_UNAVAILABLE", "control.copy_connection_error"),
+        ("REMOTE_PROVIDER_TIMEOUT", "control.copy_connection_error"),
+        ("TURN_NOT_COMPLETE", "control.result_copy_unavailable"),
+    ],
+)
+def test_y_displays_friendly_provider_failure_without_copying(monkeypatch, source, message_key):
     routed = []
     tower = _Tower()
     monkeypatch.setattr(
         "tmux_agent_tower.ui.control_view.get_result",
-        lambda *_args, **_kwargs: (True, "", {"complete": False, "text": "", "source": "REMOTE_PROVIDER_UNBOUND"}),
+        lambda *_args, **_kwargs: (True, "", {"complete": False, "text": "", "source": source}),
     )
     monkeypatch.setattr(
         "tmux_agent_tower.ui.control_view._route_clipboard",
@@ -645,8 +664,10 @@ def test_y_displays_provider_failure_reason_without_copying(monkeypatch):
 
     notice = _copy_result(tower, "%9")
 
-    assert notice == "결과 복사 거부 [REMOTE_PROVIDER_UNBOUND]: 최신 전체 결과를 검증하지 못했습니다"
+    assert notice == t(message_key)
+    assert source not in notice
     assert routed == []
+    assert tower.last_result_copy_diagnostic["reason_code"] == source
 
 
 def test_y_fails_closed_when_local_pane_pid_is_missing(monkeypatch):
@@ -660,7 +681,7 @@ def test_y_fails_closed_when_local_pane_pid_is_missing(monkeypatch):
 
     notice = _copy_result(tower, "%9")
 
-    assert "UNKNOWN" in notice
+    assert notice == t("control.result_copy_unavailable")
     assert routed == []
     assert tower.last_result_copy_diagnostic["outcome"] == "blocked"
 

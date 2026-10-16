@@ -4,8 +4,8 @@ from tmux_agent_tower.ui import render
 def _label(status):
     return {
         "WORKING": "작업 중",
-        "WAITING": "대기",
-        "IDLE": "대기",
+        "WAITING": "대기 중",
+        "IDLE": "대기 중",
         "UNKNOWN": "확인 불가",
         "DEAD": "종료됨",
     }[status]
@@ -18,7 +18,7 @@ def test_host_summary_hides_zero_counts():
     counts = {"WORKING": 3, "WAITING": 0, "IDLE": 4, "UNKNOWN": 0, "DEAD": 0}
     summary = render.format_host_summary(counts, _label)
     assert "작업 중 3" in summary
-    assert "대기 4" in summary
+    assert "대기 중 4" in summary
     assert summary.count("대기") == 1
     assert "확인 불가" not in summary
     assert "종료됨" not in summary
@@ -211,7 +211,7 @@ def test_filter_no_match_returns_false():
 def test_task_row_puts_role_before_project_context():
     parts = render.list_row_parts(
         {"kind": "pane", "display_name": "API 점검", "project": "SamplePortal", "role": "qa", "agent": "Claude", "status": "IDLE"},
-        120, lambda key: {"role.qa": "확인", "state.idle": "대기"}[key],
+        120, lambda key: {"role.qa": "확인", "state.idle": "대기 중"}[key],
     )
     assert parts["project"] == "API 점검"
     assert parts["task"] == "SamplePortal"
@@ -265,14 +265,14 @@ def test_display_width_mixed():
 def test_narrow_help_wraps_complete_korean_key_hints():
     hints = [
         "↑↓ 이동", "Enter 열기", "Space 메뉴", "+ 새 작업", "/ 검색",
-        "Y 결과 복사", "G 실제 터미널", "Esc 뒤로", "? 도움말",
+        "Y 최신 답변 복사", "G 실제 터미널", "Esc 뒤로", "? 도움말",
     ]
     lines = render.wrap_items(hints, 45)
 
     assert len(lines) > 1
     assert all(render.display_width(line) <= 45 for line in lines)
     assert "Space 메뉴" in " ".join(lines)
-    assert "Y 결과 복사" in " ".join(lines)
+    assert "Y 최신 답변 복사" in " ".join(lines)
     assert "? 도움말" in " ".join(lines)
     assert all("…" not in line for line in lines)
 

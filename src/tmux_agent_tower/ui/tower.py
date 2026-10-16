@@ -1621,13 +1621,10 @@ def _home_footer_lines(tower: Tower, width: int) -> List[str]:
     row = tower.visible_rows[tower.selected] if tower.visible_rows and 0 <= tower.selected < len(tower.visible_rows) else None
     enter_hint = _selected_enter_hint(row)
     keys = [
-        t("hint.move"), enter_hint, t("hint.actions"), t("hint.create"),
-        t("hint.home_help"),
-        t("hint.saved"), t("hint.live"), t("hint.settings"), t("hint.filter"),
-        t("hint.result"), t("hint.back"), t("hint.help"),
+        t("hint.move"), enter_hint, t("hint.result"), t("hint.actions"),
+        t("hint.user_work_view") if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW else t("hint.create"),
+        t("hint.help"),
     ]
-    if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW:
-        keys.insert(0, t("hint.user_work_view"))
     return render.wrap_items(keys, max(1, width - 4))
 
 
@@ -1684,7 +1681,7 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
 
     # -- row 0: title + per-host mini summaries (right-aligned) ---------
 
-    title = t("app.title")
+    title = t("home.title")
     if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW:
         title = f'{title} · {t("nav.terminal_structure")}'
     safe_add(stdscr, 0, 2, title, curses.A_BOLD)
@@ -1956,13 +1953,10 @@ def _show_selected_result_copy(stdscr, tower) -> None:
         show_message_screen(stdscr, t("nav.copy_result"), [t("control.copy_requires_pane")])
         return
 
-    from .control_view import _copy_result, result_copy_status_lines
+    from .control_view import _copy_result
 
     message = _copy_result(tower, row["key"], stdscr)
-    show_message_screen(stdscr, t("detail.result"), [
-        message or t("control.no_result"),
-        *result_copy_status_lines(tower),
-    ])
+    show_message_screen(stdscr, t("detail.result"), [message or t("control.no_result")])
 
 
 def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
@@ -2095,8 +2089,11 @@ def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
 
             show_message_screen(stdscr, t("help.title"), [
                 t("help.navigation"), t("help.actions"), t("help.saved"),
-                t("help.results"), t("help.start"), t("help.existing"),
-                t("help.destinations"), t("help.exit"),
+                t("help.results"), t("help.copy_safety"), t("help.copy_safety_block"),
+                t("help.remote"), t("help.remote_limits"), t("help.manage"),
+                t("help.detail"), t("help.detail_advanced"), t("help.detail_reject"),
+                t("help.troubleshoot"), t("help.advanced"),
+                t("help.start"), t("help.existing"), t("help.destinations"), t("help.exit"),
             ])
             draw(stdscr, tower, remote_state=remote_state)
             continue
