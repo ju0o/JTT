@@ -58,7 +58,14 @@ class World:
         if cmd == "list-windows":
             return self._result("\n".join(self.windows))
         if cmd == "list-panes" and "-s" in args:
+            if "-t" in args and args[args.index("-t") + 1] != "0":
+                return self._result("", 1)
             panes = [pane for panes in self.windows.values() for pane in panes]
+            if "\x1f" in args[-1]:
+                return self._result("\n".join(
+                    "\x1f".join((pane, self.pids[pane], "0", self.titles.get(pane, "")))
+                    for pane in panes
+                ))
             return self._result("\n".join(panes))
         if cmd == "list-panes":
             window_id = args[args.index("-t") + 1]
