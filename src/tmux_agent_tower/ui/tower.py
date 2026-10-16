@@ -1119,13 +1119,11 @@ class Tower:
             ]
             return
 
-        visual = [{"type": "header", "host": t("list.title")}]
-        clustered = None
+        # The home title is already pinned above the list. Keep saved
+        # folders/groups as flat section rows instead of repeating a
+        # project/tree header above their tasks.
+        visual = []
         for idx, row in enumerate(self.visible_rows):
-            project = row.get("_project_cluster")
-            if project and project != clustered:
-                visual.append({"type": "header", "host": str(project), "level": "project"})
-            clustered = project
             visual.append({"type": "data", "row": row, "row_index": idx})
         self.visual = visual
 
@@ -1870,7 +1868,7 @@ def _home_selected_row(tower: Tower) -> Optional[Dict]:
 
 
 def _home_selection_lines(tower: Tower, width: int) -> List[str]:
-    """Compact selected-item context pinned above the home key hints."""
+    """Compact selected-item context for the wide home side panel."""
 
     row = _home_selected_row(tower)
     if not row:
@@ -1894,23 +1892,11 @@ def _home_selection_lines(tower: Tower, width: int) -> List[str]:
         host = str(row.get("execution_host") or row.get("host") or "").strip()
         if host.casefold() in {"unknown", t("state.unknown").casefold()}:
             host = ""
+        lines.append(render.truncate_to_width(agent_line, available))
         if host:
-            separator = " · "
-            host_prefix = t("home.execution_host", host="").rstrip()
-            fixed_width = render.display_width(separator + host_prefix + " ")
-            agent_budget = max(1, min(
-                render.display_width(agent_line),
-                max(12, (available - fixed_width) // 2),
+            lines.append(render.truncate_to_width(
+                t("home.execution_host", host=host), available
             ))
-            shown_agent = render.truncate_to_width(agent_line, agent_budget)
-            host_budget = max(0, available - render.display_width(shown_agent) - fixed_width)
-            shown_host = render.truncate_to_width(host, host_budget)
-            identity = shown_agent
-            if shown_host:
-                identity += separator + host_prefix + " " + shown_host
-        else:
-            identity = render.truncate_to_width(agent_line, available)
-        lines.append(identity)
 
         _symbol, primary_key = render.primary_badge(row)
         statuses = [t(primary_key)]
@@ -1941,24 +1927,27 @@ def _home_selection_lines(tower: Tower, width: int) -> List[str]:
 def _home_key_lines(tower: Tower, width: int) -> List[str]:
     row = tower.visible_rows[tower.selected] if tower.visible_rows and 0 <= tower.selected < len(tower.visible_rows) else None
     enter_hint = _selected_enter_hint(row)
-    keys = [t("hint.move"), enter_hint]
+    keys = [t("hint.move_compact"), enter_hint]
     if row and row.get("kind") == "pane":
         keys.append(t("hint.result"))
-    keys.extend([
-        t("hint.actions"),
-        t("hint.user_work_view") if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW else t("hint.create"),
-        t("hint.help"),
-    ])
-    return render.wrap_items(keys, max(1, width - 4))
+    if row and row.get("kind") == "zero":
+        keys.append(t("hint.create_compact"))
+    first = "   ".join(keys)
+    view_hint = (
+        t("hint.user_work_view_compact")
+        if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW
+        else t("hint.advanced_compact")
+    )
+    second = "   ".join((
+        t("hint.rename_compact"), t("hint.actions_compact"),
+        t("hint.attention_compact"), view_hint, t("hint.help_compact"),
+    ))
+    available = max(1, width - 4)
+    return [render.truncate_to_width(first, available), render.truncate_to_width(second, available)]
 
 
 def _home_footer_lines(tower: Tower, width: int) -> List[str]:
-    selection = (
-        _home_selection_lines(tower, width)
-        if getattr(tower, "view_mode", USER_WORK_VIEW) == USER_WORK_VIEW
-        else []
-    )
-    return selection + _home_key_lines(tower, width)
+    return _home_key_lines(tower, width)
 
 
 def _location_fields(row: Dict) -> List[Tuple[str, str]]:
@@ -1978,11 +1967,10 @@ def _location_fields(row: Dict) -> List[Tuple[str, str]]:
     return fields
 
 
-def _build_physical_lines(tower: Tower, narrow: bool) -> List[Dict]:
+def _build_physical_lines(tower: Tower, narrow: bool, show_home_context: bool = False) -> List[Dict]:
     """Flattens ``tower.visual`` (header/data items) into one entry per
-    *physical* terminal line, since narrow rows can show project, task name,
-    and agent/status separately -- viewport scrolling paginates over this
-    list, not over ``visual``.
+    *physical* terminal line, since narrow rows show agent/status below the
+    task title -- viewport scrolling paginates over this list, not visual.
     """
 
     physical: List[Dict] = []
@@ -1999,7 +1987,10 @@ def _build_physical_lines(tower: Tower, narrow: bool) -> List[Dict]:
         if (narrow and row.get("kind") in {"folder", "other_section", "window_asset"}
                 and row.get("collapsed")):
             physical.append({"kind": "group_summary", "row": row, "row_index": row_index})
-        elif narrow and row.get("kind") in {"pane", "work_group_stale"}:
+        elif (show_home_context and row_index == tower.selected
+              and row.get("kind") in {"folder", "other_section", "window_asset", "work_group"}):
+            physical.append({"kind": "selected_context", "row": row, "row_index": row_index})
+        elif (narrow or show_home_context) and row.get("kind") in {"pane", "work_group_stale"}:
             physical.append({"kind": "agent_status", "row": row, "row_index": row_index})
         elif not narrow and row.get("activity_text"):
             physical.append({"kind": "activity", "row": row, "row_index": row_index})
@@ -2022,6 +2013,11 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
     from .remote_menu import badge_text
 
     view_mode = getattr(tower, "view_mode", USER_WORK_VIEW)
+    wide_home = view_mode == USER_WORK_VIEW and render.use_home_side_panel(width, height)
+    list_width = render.home_list_width(width) if wide_home else width
+    side_x = list_width + 3
+    side_width = max(0, width - side_x - 2)
+    side_lines = _home_selection_lines(tower, side_width + 4) if wide_home else []
     badge = badge_text(remote_state) if view_mode == TERMINAL_STRUCTURE_VIEW else ""
     badge_x = 2 + render.display_width(title) + 3
     if badge:
@@ -2090,10 +2086,6 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
         safe_add(stdscr, start_y + 1, 2, render.truncate_to_width(t("zero.description"), max(0, width - 4)), curses.A_DIM)
         start_y += 2
     footer_lines = _home_footer_lines(tower, width)
-    selection_line_count = (
-        len(_home_selection_lines(tower, width))
-        if view_mode == USER_WORK_VIEW else 0
-    )
     footer_y = max(0, height - len(footer_lines) - (1 if tower.notice else 0))
 
     # -- selected-item detail, immediately below the work list -----------
@@ -2115,13 +2107,13 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
         if tower.notice:
             safe_add(stdscr, footer_y, 2, render.truncate_to_width(tower.notice, max(0, width - 4)), curses.A_BOLD)
         for index, line in enumerate(footer_lines):
-            attr = curses.A_BOLD if index == 0 and selection_line_count else curses.A_NORMAL
-            safe_add(stdscr, footer_y + index + (1 if tower.notice else 0), 2, line, attr)
+            safe_add(stdscr, footer_y + index + (1 if tower.notice else 0), 2, line, curses.A_NORMAL)
         stdscr.noutrefresh()
         curses.doupdate()
         return
 
-    physical = _build_physical_lines(tower, narrow)
+    show_home_context = view_mode == USER_WORK_VIEW and not wide_home
+    physical = _build_physical_lines(tower, narrow, show_home_context=show_home_context)
 
     selected_phys_index = 0
     for i, p in enumerate(physical):
@@ -2139,6 +2131,8 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
         y = start_y + offset
 
         if p["kind"] == "header":
+            if view_mode == USER_WORK_VIEW and p.get("level") == "host" and p.get("host") == t("list.title"):
+                continue
             if p.get("level") == "window":
                 # A window is a divider above its panes, not a row.
                 label = f'  ┄ {p["host"]} '
@@ -2159,36 +2153,42 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
             base_attr = curses.color_pair(6) | curses.A_BOLD
 
         if is_selected:
-            safe_add(stdscr, y, 0, " " * max(1, width - 1), base_attr)
+            safe_add(stdscr, y, 0, " " * max(1, list_width - 1), base_attr)
 
         if p["kind"] == "primary":
             duration = "" if user_view else _duration_text(tower, row)
-            parts = render.list_row_parts(row, width, t, duration)
+            parts = render.list_row_parts(row, list_width, t, duration)
             if (user_view and row.get("kind") in {"folder", "other_section", "window_asset"}
                     and not row.get("collapsed")):
                 parts["badge"] = ""
-            prefix = ("▶ " if is_selected else "  ") + (parts["guide"] or "") if user_view else (parts["guide"] or " ")
+            if user_view:
+                prefix = "▶ " if is_selected else "  "
+                if row.get("kind") in {"folder", "other_section", "window_asset", "work_group"}:
+                    prefix += ("▸ " if row.get("collapsed") else "▾ ")
+            else:
+                prefix = parts["guide"] or " "
             project_text = parts["project"] if row.get("kind") != "zero" else _project_text(row)
             if parts.get("task") and (narrow or row.get("kind") != "work_group"):
                 project_text = f'{project_text} · {parts["task"]}'
-            state_text = parts["badge"]
-            agent_text = parts["agent"]
+            show_row_identity = not user_view or (wide_home and not is_selected)
+            state_text = parts["badge"] if show_row_identity else ""
+            agent_text = parts["agent"] if show_row_identity else ""
             state_width = render.display_width(state_text)
             prefix_width = render.display_width(prefix)
             state_reserve = state_width + 2 if state_text else 0
             agent_reserve = render.display_width(agent_text) + 2 if agent_text else 0
-            project_budget = max(8, width - prefix_width - state_reserve - agent_reserve - 4)
+            project_budget = max(8, list_width - prefix_width - state_reserve - agent_reserve - 4)
             text = render.truncate_to_width(project_text, project_budget)
 
             safe_add(stdscr, y, 0, prefix, base_attr if is_selected else (
-                curses.A_BOLD if row.get("kind") in {"folder", "other_section", "window_asset"} else 0
+                curses.A_BOLD if row.get("kind") in {"folder", "other_section", "window_asset", "work_group"} else 0
             ))
             safe_add(stdscr, y, prefix_width, text, base_attr)
 
             if agent_text:
                 agent_x = prefix_width + render.display_width(text) + 2
                 safe_add(stdscr, y, agent_x, agent_text, base_attr)
-            state_x = width - state_width - 2
+            state_x = list_width - state_width - 2
             if state_text and state_x > prefix_width + 1:
                 if row.get("kind") in {"window", "folder", "other_section", "window_asset", "work_group"}:
                     status_attr_here = base_attr if is_selected else curses.A_DIM
@@ -2198,24 +2198,48 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
 
         elif p["kind"] == "activity":
             attr = base_attr if is_selected else curses.A_DIM
-            indent = render.display_width(row.get("guide") or "") or 4
+            indent = 2 if user_view else (render.display_width(row.get("guide") or "") or 4)
             safe_add(stdscr, y, indent, row["activity_text"], attr)
 
         elif p["kind"] == "agent_status":
             _symbol, key = render.primary_badge(row)
-            state = f'{_symbol} {t(key)}'
+            primary_status = t(key)
+            statuses = [f'{_symbol} {primary_status}']
+            if user_view and not row.get("offline"):
+                _exec_symbol, execution_key = render.execution_badge_for_row(row)
+                execution = t(execution_key)
+                if execution != primary_status and execution not in statuses:
+                    statuses.append(execution)
+            state = " · ".join(statuses)
             duration = "" if user_view else _duration_text(tower, row)
             if duration:
                 state += " · " + duration
             role = t(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
-            line = render.agent_status_line(row.get("agent") or "-", state, role=role)
-            indent = render.display_width(row.get("guide") or "") + 2
+            host = str(row.get("execution_host") or row.get("host") or "").strip() if user_view else ""
+            if host.casefold() in {"unknown", t("state.unknown").casefold()}:
+                host = ""
+            line = render.agent_status_line(
+                row.get("agent") or "-", state, role=role, host=host,
+                max_width=max(1, list_width - 4),
+            )
+            indent = 2 if user_view else render.display_width(row.get("guide") or "") + 2
             safe_add(stdscr, y, indent, line, base_attr if is_selected else curses.A_DIM)
 
+        elif p["kind"] == "selected_context":
+            context_lines = _home_selection_lines(tower, list_width)
+            if len(context_lines) > 1:
+                safe_add(stdscr, y, 2, context_lines[1], base_attr if is_selected else curses.A_DIM)
+
         elif p["kind"] == "group_summary":
-            indent = render.display_width(row.get("guide") or "") + 2
+            indent = 2 if user_view else render.display_width(row.get("guide") or "") + 2
             summary = row.get("summary_compact") if narrow else row.get("summary")
             safe_add(stdscr, y, indent, summary or t("group.empty"), base_attr if is_selected else curses.A_DIM)
+
+    if wide_home and visible_physical:
+        safe_add(stdscr, start_y, list_width, "│", curses.A_DIM)
+        safe_add(stdscr, start_y, side_x, t("home.summary"), curses.A_BOLD)
+        for index, line in enumerate(side_lines[:max(0, footer_y - start_y - 1)]):
+            safe_add(stdscr, start_y + index + 1, side_x, line, curses.A_DIM)
 
     # -- detail panel ------------------------------------------------------
 
@@ -2229,8 +2253,7 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
     if tower.notice:
         safe_add(stdscr, footer_y, 2, render.truncate_to_width(tower.notice, max(0, width - 4)), curses.A_BOLD)
     for index, line in enumerate(footer_lines):
-        attr = curses.A_BOLD if index == 0 and selection_line_count else curses.A_NORMAL
-        safe_add(stdscr, footer_y + index + (1 if tower.notice else 0), 2, line, attr)
+        safe_add(stdscr, footer_y + index + (1 if tower.notice else 0), 2, line, curses.A_NORMAL)
 
     stdscr.noutrefresh()
     curses.doupdate()

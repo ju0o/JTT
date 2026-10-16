@@ -330,6 +330,20 @@ def test_display_width_mixed():
     assert render.display_width("Pane 이름") == 9
 
 
+@pytest.mark.parametrize(
+    ("width", "height", "expected"),
+    [(60, 18, False), (80, 24, False), (100, 40, False), (109, 40, False),
+     (110, 30, True), (120, 40, True), (120, 24, False)],
+)
+def test_home_side_panel_is_reserved_for_roomy_viewports(width, height, expected):
+    assert render.use_home_side_panel(width, height) is expected
+
+
+def test_home_list_width_preserves_a_useful_left_column():
+    assert render.home_list_width(110) == 66
+    assert render.home_list_width(120) == 72
+
+
 def test_narrow_help_wraps_complete_korean_key_hints():
     hints = [
         "↑↓ 이동", "Enter 열기", "Space 메뉴", "+ 새 작업", "/ 검색",

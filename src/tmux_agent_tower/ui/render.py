@@ -95,6 +95,8 @@ NARROW_WIDTH_THRESHOLD = 70
 # Below this height, the selected-item detail panel is hidden entirely so
 # the pane list itself keeps as much room as possible.
 SHORT_HEIGHT_THRESHOLD = 18
+HOME_SIDE_PANEL_MIN_WIDTH = 110
+HOME_SIDE_PANEL_MIN_HEIGHT = 30
 
 
 def use_narrow_layout(width: int) -> bool:
@@ -103,6 +105,18 @@ def use_narrow_layout(width: int) -> bool:
 
 def should_show_detail_panel(height: int) -> bool:
     return height >= SHORT_HEIGHT_THRESHOLD
+
+
+def use_home_side_panel(width: int, height: int) -> bool:
+    """Use a selected-task side panel only when it cannot crowd the work list."""
+
+    return width >= HOME_SIDE_PANEL_MIN_WIDTH and height >= HOME_SIDE_PANEL_MIN_HEIGHT
+
+
+def home_list_width(width: int) -> int:
+    """Keep the task list dominant while reserving room for a readable summary."""
+
+    return max(1, min(width - 44, (width * 3) // 5))
 
 
 def primary_badge(row: Dict) -> Tuple[str, str]:
@@ -663,14 +677,24 @@ def row_line_count(row: Dict, narrow: bool) -> int:
     return 2
 
 
-def agent_status_line(agent: str, status_label: str, duration_text: str = "", role: str = "") -> str:
-    """Narrow-layout subtitle: Agent, role, and status under the task name."""
+def agent_status_line(
+    agent: str,
+    status_label: str,
+    duration_text: str = "",
+    role: str = "",
+    host: str = "",
+    max_width: Optional[int] = None,
+) -> str:
+    """Secondary row context: Agent/location identity followed by status."""
 
-    identity = " · ".join(part for part in (agent or "-", role) if part)
-    text = f"{identity}  {status_label}"
+    identity = " · ".join(part for part in (agent or "-", role, host) if part)
+    state = status_label
     if duration_text:
-        text += f" · {duration_text}"
-    return text
+        state += f" · {duration_text}"
+    if max_width is not None:
+        identity_budget = max(0, max_width - display_width("  " + state))
+        identity = truncate_to_width(identity, identity_budget)
+    return f"{identity}  {state}" if identity else state
 
 
 def format_detail_panel(fields: Sequence[Tuple[str, str]]) -> List[str]:
