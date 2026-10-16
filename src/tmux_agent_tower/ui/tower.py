@@ -1752,44 +1752,6 @@ def _build_detail_fields(tower: Tower, row: Dict, advanced: bool = False) -> Lis
     return fields
 
 
-def _build_selected_summary(tower: Tower, row: Dict) -> List[str]:
-    """Short, user-facing summary for the default Work view."""
-    if row.get("kind") in {"folder", "other_section"}:
-        return [row.get("display_name") or "", row.get("summary") or t("group.empty")]
-    if row.get("kind") == "window_asset":
-        return [
-            row.get("display_name") or t("folder.terminal"),
-            t("folder.window_tasks").format(n=len(row.get("task_target_ids") or [])),
-            row.get("summary") or t("group.empty"),
-        ]
-    if row.get("kind") == "work_group":
-        return [
-            row.get("display_name") or "",
-            t("group.member_count").format(n=row.get("member_count") or 0),
-            row.get("summary") or t("group.empty"),
-        ]
-
-    project = _project_text(row)
-    name = row.get("display_name") or row.get("task_name") or project or t("task.terminal")
-    role = t(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
-    agent = row.get("agent") or t("task.terminal")
-    identity = [label for label in (role, agent) if label]
-    if role and role.casefold() in str(name).casefold():
-        identity.remove(role)
-    badges = " · ".join(_badge_text(symbol, key) for symbol, key in render.detail_badges(row))
-    duration = _duration_text(tower, row)
-    if duration and row.get("status") == "WORKING":
-        badges = f"{badges} · {duration}"
-    execution_host = row.get("execution_host") or row.get("host") or ""
-    details = []
-    if project:
-        details.append(f'{t("detail.project")} {project}')
-    if execution_host and execution_host.casefold() not in {"unknown", t("state.unknown").casefold()}:
-        details.append(f'{t("detail.execution_host")} {execution_host}')
-    identity_line = " · ".join(identity + ([badges] if badges else []))
-    return [str(name), identity_line] + ([" · ".join(details)] if details else [])
-
-
 def _enter_blocked_reason(row: Optional[Dict]) -> str:
     """Localization key for why a selected row cannot be opened with Enter."""
 
@@ -1807,6 +1769,8 @@ def _enter_blocked_reason(row: Optional[Dict]) -> str:
 
 
 def _selected_enter_hint(row: Optional[Dict]) -> str:
+    if row and row.get("kind") == "pane" and row.get("status") == "UNKNOWN" and not row.get("offline"):
+        return t("hint.enter_check_status")
     intent = enter_intent(row)
     return {
         "toggle": t("hint.enter_expand"),
@@ -1829,7 +1793,80 @@ def _help_lines() -> List[str]:
     ]
 
 
-def _home_footer_lines(tower: Tower, width: int) -> List[str]:
+def _home_selected_row(tower: Tower) -> Optional[Dict]:
+    if not tower.visible_rows or not 0 <= tower.selected < len(tower.visible_rows):
+        return None
+    return tower.visible_rows[tower.selected]
+
+
+def _home_selection_lines(tower: Tower, width: int) -> List[str]:
+    """Compact selected-item context pinned above the home key hints."""
+
+    row = _home_selected_row(tower)
+    if not row:
+        return []
+
+    available = max(0, width - 4)
+    name = (
+        row.get("display_name") or row.get("task_name") or row.get("project")
+        or row.get("folder_name") or t("task.terminal")
+    )
+    lines = [render.truncate_to_width(t("home.selected_task", name=name), available)]
+    kind = row.get("kind")
+
+    if kind in {"pane", "work_group_stale"}:
+        role = t(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
+        agent = str(row.get("agent") or t("task.terminal")).strip()
+        if role and role.casefold() not in str(name).casefold():
+            agent = f"{role} · {agent}"
+
+        agent_line = t("home.agent", agent=agent)
+        host = str(row.get("execution_host") or row.get("host") or "").strip()
+        if host:
+            separator = " · "
+            host_prefix = t("home.execution_host", host="").rstrip()
+            fixed_width = render.display_width(separator + host_prefix + " ")
+            agent_budget = max(1, min(
+                render.display_width(agent_line),
+                max(12, (available - fixed_width) // 2),
+            ))
+            shown_agent = render.truncate_to_width(agent_line, agent_budget)
+            host_budget = max(0, available - render.display_width(shown_agent) - fixed_width)
+            shown_host = render.truncate_to_width(host, host_budget)
+            identity = shown_agent
+            if shown_host:
+                identity += separator + host_prefix + " " + shown_host
+        else:
+            identity = render.truncate_to_width(agent_line, available)
+        lines.append(identity)
+
+        _symbol, primary_key = render.primary_badge(row)
+        statuses = [t(primary_key)]
+        if not row.get("offline"):
+            _symbol, execution_key = render.execution_badge(str(row.get("status") or ""))
+            execution_status = t(execution_key)
+            if execution_status not in statuses:
+                statuses.append(execution_status)
+        lines.append(render.truncate_to_width(
+            t("home.status", status=" · ".join(statuses)), available
+        ))
+    elif kind == "work_group":
+        lines.append(render.truncate_to_width(
+            t("group.member_count").format(n=row.get("member_count") or 0), available
+        ))
+    elif kind == "window_asset":
+        lines.append(render.truncate_to_width(
+            t("home.task_count", count=len(row.get("task_target_ids") or [])), available
+        ))
+    elif kind in {"folder", "other_section"}:
+        lines.append(render.truncate_to_width(
+            t("home.folder_contents", count=len(row.get("window_refs") or [])), available
+        ))
+
+    return lines
+
+
+def _home_key_lines(tower: Tower, width: int) -> List[str]:
     row = tower.visible_rows[tower.selected] if tower.visible_rows and 0 <= tower.selected < len(tower.visible_rows) else None
     enter_hint = _selected_enter_hint(row)
     keys = [t("hint.move"), enter_hint]
@@ -1841,6 +1878,15 @@ def _home_footer_lines(tower: Tower, width: int) -> List[str]:
         t("hint.help"),
     ])
     return render.wrap_items(keys, max(1, width - 4))
+
+
+def _home_footer_lines(tower: Tower, width: int) -> List[str]:
+    selection = (
+        _home_selection_lines(tower, width)
+        if getattr(tower, "view_mode", USER_WORK_VIEW) == USER_WORK_VIEW
+        else []
+    )
+    return selection + _home_key_lines(tower, width)
 
 
 def _location_fields(row: Dict) -> List[Tuple[str, str]]:
@@ -1878,7 +1924,8 @@ def _build_physical_lines(tower: Tower, narrow: bool) -> List[Dict]:
         row_index = item["row_index"]
         physical.append({"kind": "primary", "row": row, "row_index": row_index})
 
-        if narrow and row.get("kind") in {"folder", "other_section", "window_asset"}:
+        if (narrow and row.get("kind") in {"folder", "other_section", "window_asset"}
+                and row.get("collapsed")):
             physical.append({"kind": "group_summary", "row": row, "row_index": row_index})
         elif narrow and row.get("kind") in {"pane", "work_group_stale"}:
             physical.append({"kind": "agent_status", "row": row, "row_index": row_index})
@@ -1894,7 +1941,7 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
     height, width = stdscr.getmaxyx()
     narrow = render.use_narrow_layout(width)
 
-    # -- row 0: title + per-host mini summaries (right-aligned) ---------
+    # -- row 0: title + concise work-state counts (right-aligned) --------
 
     title = t("home.title")
     if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW:
@@ -1908,67 +1955,96 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
     if badge:
         safe_add(stdscr, 0, badge_x, badge, curses.A_DIM)
 
-    host_line = render.format_watch_header(render.watch_counts(tower.visible_rows), t)
-    if host_line and not narrow:
-        min_x = badge_x + render.display_width(badge) + (2 if badge else 0)
-        x = max(min_x, width - render.display_width(host_line) - 2)
-        if x + render.display_width(host_line) < width:
-            safe_add(stdscr, 0, x, host_line, curses.A_BOLD)
+    counts = render.watch_counts(tower.visible_rows)
+    watch_items = [
+        f"{symbol} {t(key)} {counts.get(name, 0)}"
+        for name, symbol, key in render.WATCH_HEADER
+        if counts.get(name, 0) > 0
+    ]
+    watch_text = "   ".join(watch_items)
+    min_watch_x = badge_x + render.display_width(badge) + (2 if badge else 0)
+    watch_x = width - render.display_width(watch_text) - 2
+    watch_lines: List[str] = []
+    if watch_text and watch_x >= min_watch_x:
+        safe_add(stdscr, 0, watch_x, watch_text, curses.A_BOLD)
+    elif watch_items:
+        watch_lines = render.wrap_items(watch_items, max(1, width - 4))
 
     # -- row 1: access and copy context ----------------------------------
     context = getattr(tower, "access_context", None)
     if context:
         preference = load_preference()
+        client = str(context.display_name or "").strip()
         if preference == COPY_AUTO:
             destination = (
                 context.display_name
                 if context.clipboard_capability in {"host", "bridge"}
                 else t("access.unknown_destination")
             )
-            access_line = t("access.copy_auto", client=context.display_name, destination=destination)
+            same_displayed_computer = bool(
+                client and str(destination).strip()
+                and client.casefold() == str(destination).strip().casefold()
+            )
+            access_line = (
+                t("access.copy_auto_same_computer")
+                if same_displayed_computer
+                else t("access.copy_auto", client=context.display_name, destination=destination)
+            )
         else:
             destination = {
                 LOCAL_HOST: context.display_name,
                 CURRENT_TERMINAL: t("access.terminal"),
                 TMUX_BUFFER: t("access.tower_buffer"),
             }.get(preference, t("access.unknown_destination"))
-            access_line = t("access.copy_manual", client=context.display_name, destination=destination)
+            same_displayed_computer = bool(
+                client and str(destination).strip()
+                and client.casefold() == str(destination).strip().casefold()
+            )
+            access_line = (
+                t("access.copy_manual_same_computer")
+                if same_displayed_computer
+                else t("access.copy_manual", client=context.display_name, destination=destination)
+            )
     else:
         access_line = t("access.unknown_context")
     safe_add(stdscr, 1, 2, render.truncate_to_width(access_line, max(0, width - 4)), curses.A_DIM)
     start_y = 2
+    for index, line in enumerate(watch_lines):
+        safe_add(stdscr, start_y + index, 2, line, curses.A_BOLD)
+    start_y += len(watch_lines)
 
     if tower.visible_rows and all(row.get("kind") == "zero" for row in tower.visible_rows):
         safe_add(stdscr, start_y, 2, t("zero.title"), curses.A_BOLD)
         safe_add(stdscr, start_y + 1, 2, render.truncate_to_width(t("zero.description"), max(0, width - 4)), curses.A_DIM)
         start_y += 2
     footer_lines = _home_footer_lines(tower, width)
+    selection_line_count = (
+        len(_home_selection_lines(tower, width))
+        if view_mode == USER_WORK_VIEW else 0
+    )
     footer_y = max(0, height - len(footer_lines) - (1 if tower.notice else 0))
 
     # -- selected-item detail, immediately below the work list -----------
 
     detail_lines: List[str] = []
-    if (render.should_show_detail_panel(height) and tower.visible_rows
+    if (view_mode == TERMINAL_STRUCTURE_VIEW and render.should_show_detail_panel(height) and tower.visible_rows
             and tower.visible_rows[tower.selected].get("kind") != "zero"):
         selected_row = tower.visible_rows[tower.selected]
-        if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW:
-            detail_fields = _build_detail_fields(tower, selected_row, advanced=True)
-        else:
-            detail_fields = []
-        detail_lines = (
-            render.format_detail_panel(detail_fields)
-            if detail_fields
-            else _build_selected_summary(tower, selected_row)
-        )
+        detail_fields = _build_detail_fields(tower, selected_row, advanced=True)
+        detail_lines = render.format_detail_panel(detail_fields) if detail_fields else []
 
     detail_block = (1 + 1 + len(detail_lines)) if detail_lines else 0
     max_rows = max(0, footer_y - start_y - detail_block)
 
     if not tower.visible_rows:
         msg = t("wizard.no_matches") if tower.filter_text else t("empty.no_panes")
-        safe_add(stdscr, start_y, 2, msg)
+        if start_y < footer_y:
+            safe_add(stdscr, start_y, 2, msg)
+        if tower.notice:
+            safe_add(stdscr, footer_y, 2, render.truncate_to_width(tower.notice, max(0, width - 4)), curses.A_BOLD)
         for index, line in enumerate(footer_lines):
-            safe_add(stdscr, footer_y + index, 2, line, curses.A_DIM)
+            attr = curses.A_BOLD if index == 0 and selection_line_count else curses.A_NORMAL
+            safe_add(stdscr, footer_y + index + (1 if tower.notice else 0), 2, line, attr)
         stdscr.noutrefresh()
         curses.doupdate()
         return
@@ -2004,16 +2080,22 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
         is_selected = p["row_index"] == tower.selected
 
         user_view = view_mode == USER_WORK_VIEW
-        base_attr = (curses.A_BOLD if is_selected else 0) if user_view else curses.A_REVERSE
+        base_attr = (
+            (curses.A_REVERSE | curses.A_BOLD) if is_selected else 0
+        ) if user_view else curses.A_REVERSE
         if not user_view and is_selected and curses.has_colors():
             base_attr = curses.color_pair(6) | curses.A_BOLD
 
-        if is_selected and not user_view:
+        if is_selected:
             safe_add(stdscr, y, 0, " " * max(1, width - 1), base_attr)
 
         if p["kind"] == "primary":
-            parts = render.list_row_parts(row, width, t, _duration_text(tower, row))
-            prefix = ("› " if is_selected else "  ") + (parts["guide"] or "") if user_view else (parts["guide"] or " ")
+            duration = "" if user_view else _duration_text(tower, row)
+            parts = render.list_row_parts(row, width, t, duration)
+            if (user_view and row.get("kind") in {"folder", "other_section", "window_asset"}
+                    and not row.get("collapsed")):
+                parts["badge"] = ""
+            prefix = ("▶ " if is_selected else "  ") + (parts["guide"] or "") if user_view else (parts["guide"] or " ")
             project_text = parts["project"] if row.get("kind") != "zero" else _project_text(row)
             if parts.get("task") and (narrow or row.get("kind") != "work_group"):
                 project_text = f'{project_text} · {parts["task"]}'
@@ -2050,7 +2132,7 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
         elif p["kind"] == "agent_status":
             _symbol, key = render.primary_badge(row)
             state = f'{_symbol} {t(key)}'
-            duration = _duration_text(tower, row)
+            duration = "" if user_view else _duration_text(tower, row)
             if duration:
                 state += " · " + duration
             role = t(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
@@ -2075,7 +2157,8 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
     if tower.notice:
         safe_add(stdscr, footer_y, 2, render.truncate_to_width(tower.notice, max(0, width - 4)), curses.A_BOLD)
     for index, line in enumerate(footer_lines):
-        safe_add(stdscr, footer_y + index + (1 if tower.notice else 0), 2, line, curses.A_DIM)
+        attr = curses.A_BOLD if index == 0 and selection_line_count else curses.A_NORMAL
+        safe_add(stdscr, footer_y + index + (1 if tower.notice else 0), 2, line, attr)
 
     stdscr.noutrefresh()
     curses.doupdate()

@@ -147,7 +147,7 @@ def test_folder_tree_renders_empty_folder_grouped_and_unfiled_windows(tmp_path):
     rows = folder_tree.build_rows(store, assets, tasks)
 
     assert [(row["kind"], row["display_name"]) for row in rows] == [
-        ("other_section", "Agent 작업 · 자동 발견"),
+        ("other_section", "자동으로 찾은 작업"),
         ("window_asset", "Research"), ("pane", "조사"),
         ("folder", "개인 프로젝트"), ("window_asset", "JuBrain"),
         ("pane", "PM"), ("pane", "구현"), ("folder", "외주"),
@@ -172,7 +172,7 @@ def test_unfiled_agent_work_is_prioritized_and_misc_terminals_can_start_collapse
 
     rows = folder_tree.build_rows(store, assets, tasks, collapsed_other=True)
     assert [(row["kind"], row["display_name"]) for row in rows] == [
-        ("other_section", "Agent 작업 · 자동 발견"),
+        ("other_section", "자동으로 찾은 작업"),
         ("window_asset", "OpenCode"), ("pane", "API work"),
         ("other_section", "기타 터미널 · 자동 발견"),
     ]

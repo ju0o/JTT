@@ -301,7 +301,7 @@ def test_project_list_is_the_default_and_attention_does_not_reorder_it(tmp_path,
     assert [row["kind"] for row in tower.visible_rows] == [
         "other_section", "window_asset", "pane", "window_asset", "pane",
     ]
-    assert tower.visible_rows[0]["display_name"] == "Agent 작업 · 자동 발견"
+    assert tower.visible_rows[0]["display_name"] == "자동으로 찾은 작업"
 
     tower.toggle_attention()
     assert [row["kind"] for row in tower.visible_rows] == ["pane", "pane"]
@@ -325,7 +325,7 @@ def test_home_prioritizes_agent_work_and_collapses_discovered_shells_by_default(
 
     sections = [row for row in tower.visible_rows if row.get("kind") == "other_section"]
     assert [row["display_name"] for row in sections] == [
-        "Agent 작업 · 자동 발견", "기타 터미널 · 자동 발견",
+        "자동으로 찾은 작업", "기타 터미널 · 자동 발견",
     ]
     assert sections[0]["collapsed"] is False
     assert sections[1]["collapsed"] is True

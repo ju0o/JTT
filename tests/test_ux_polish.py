@@ -24,7 +24,7 @@ def test_primary_badge_uses_words_not_enums():
         (_row(status="IDLE"), "○", "대기 중"),
         (_row(status="WORKING", offline=True), "×", "연결 안 됨"),
         (_row(status="DEAD"), "×", "종료"),
-        (_row(status="UNKNOWN"), "◇", "확인 불가"),
+        (_row(status="UNKNOWN"), "◇", "상태 확인 필요"),
         (_row(attention="error"), "!", "오류"),
     ]
     for row, symbol, word in cases:
@@ -44,7 +44,7 @@ def test_primary_status_wording_is_korean_and_keeps_three_state_families_separat
     assert ko.STRINGS["state.idle"] == "대기 중"
     assert ko.STRINGS["state.offline"] == "연결 안 됨"
     assert ko.STRINGS["state.dead"] == "종료"
-    assert ko.STRINGS["state.unknown"] == "확인 불가"
+    assert ko.STRINGS["state.unknown"] == "상태 확인 필요"
 
     row = _row(status="WORKING", attention="approval_required", result_state="ready")
     assert render.detail_badges(row) == [
