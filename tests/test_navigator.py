@@ -298,9 +298,7 @@ def test_project_list_is_the_default_and_attention_does_not_reorder_it(tmp_path,
     tower.rows = [waiting, idle]
     _apply_user_work_view(tower)
     assert [row["pane_id"] for row in tower.visible_rows if row.get("kind") == "pane"] == ["%6", "%7"]
-    assert [row["kind"] for row in tower.visible_rows] == [
-        "other_section", "window_asset", "pane", "window_asset", "pane",
-    ]
+    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "pane", "pane"]
     assert tower.visible_rows[0]["display_name"] == "자동으로 찾은 작업"
 
     tower.toggle_attention()
@@ -375,11 +373,10 @@ def test_home_visually_clusters_legacy_ungrouped_tasks_by_project(tmp_path, monk
     tower.rows = [first, second]
     _apply_user_work_view(tower)
 
-    assert [row["kind"] for row in tower.visible_rows] == [
-        "other_section", "window_asset", "pane", "window_asset", "pane",
-    ]
-    assert [row["display_name"] for row in tower.visible_rows if row["kind"] == "window_asset"] == [
-        "old-window-a", "old-window-b",
+    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "pane", "pane"]
+    panes = [row for row in tower.visible_rows if row.get("kind") == "pane"]
+    assert [(row["display_name"], row["window_name"]) for row in panes] == [
+        ("PM", "old-window-a"), ("구현", "old-window-b"),
     ]
     assert all(row.get("kind") != "work_group" for row in tower.visible_rows)
 
@@ -422,7 +419,7 @@ def test_remote_only_default_uses_user_work_rows_and_physical_tree_is_explicit(t
 
     assert tower.view_mode == tower_module.USER_WORK_VIEW
     _apply_user_work_view(tower)
-    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "window_asset", "pane"]
+    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "pane"]
 
     tower.toggle_navigator()
     assert tower.view_mode == tower_module.TERMINAL_STRUCTURE_VIEW
@@ -430,7 +427,7 @@ def test_remote_only_default_uses_user_work_rows_and_physical_tree_is_explicit(t
 
     tower.toggle_navigator()
     assert tower.view_mode == tower_module.USER_WORK_VIEW
-    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "window_asset", "pane"]
+    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "pane"]
 
 
 def test_collapse_hides_children_and_search_keeps_the_window(tmp_path, monkeypatch):

@@ -77,12 +77,13 @@ def test_tower_default_home_uses_folder_window_task_tree(one_pane):
     assert tower.visible_rows[0]["collapsed"] is True
     assert not any(row.get("kind") == "window" for row in tower.visible_rows)
 
-    # Enter on the discovered-terminal section expands the existing logical
-    # Window and its Pane without switching to the physical tmux inspector.
+    # Enter on the discovered-terminal section opens its one Pane directly;
+    # the Window identity stays attached for details and advanced view.
     tower_module._open_selected_row(None, tower)
-    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "window_asset", "pane"]
-    assert tower.visible_rows[1]["display_name"] == "my-project"
-    assert tower.visible_rows[2]["pane_id"] == "%1"
+    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "pane"]
+    assert tower.visible_rows[1]["pane_id"] == "%1"
+    assert tower.visible_rows[1]["window_id"] == "@1"
+    assert tower.visible_rows[1]["window_ref"]
     assert not any(row.get("kind") == "window" for row in tower.visible_rows)
 
 
