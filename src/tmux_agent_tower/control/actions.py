@@ -530,9 +530,9 @@ def get_result(
     if target.transport == "ssh" and (target.agent == "OpenCode" or row.get("result_adapter") == "OpenCode"):
         if row.get("result_adapter") not in (None, "", "OpenCode"):
             return True, "", _remote_opencode_failure("AGENT_UNBOUND")
-        native_result = _get_ssh_opencode_result(tower, row, target, pane_key, expected_pane_pid)
-        if native_result[2].get("reason_code") != "SESSION_ID_NOT_EXPOSED":
-            return native_result
+        session_probe = _get_ssh_opencode_result(tower, row, target, pane_key, expected_pane_pid)
+        if session_probe[2].get("reason_code") != "SESSION_ID_NOT_EXPOSED":
+            return session_probe
         # TUI launch arguments do not prove which session is currently selected;
         # its adapter must prove both result boundaries from the visible history.
     if target.transport == "ssh" and target.agent == "Grok":

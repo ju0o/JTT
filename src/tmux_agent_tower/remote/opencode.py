@@ -14,7 +14,7 @@ from .collector import _normalize_ip, _run_ssh
 _MARKER = "__TOWER_OPENCODE_RESULT__"
 _MAX_WIRE_BYTES = 6 * 1024 * 1024
 
-# This runs on the remote host and returns only the selected assistant body.
+# This runs remotely and returns only process/session-binding status metadata.
 _REMOTE_OPENCODE_SCRIPT = r'''import ipaddress, json, os, re, selectors, subprocess, sys, time
 MARKER = "__TOWER_OPENCODE_RESULT__"
 PROC = sys.argv[5] if len(sys.argv) > 5 else "/proc"

@@ -326,7 +326,7 @@ def test_tower_uses_boundary_checked_capture_when_active_opencode_session_is_une
         ),
     ],
 )
-def test_bare_opencode_capture_uses_real_adapter_boundaries(
+def test_opencode_capture_uses_real_adapter_boundaries_when_active_session_is_unexposed(
     monkeypatch, captured, history_size, expected_text, expected_complete, expected_reason,
 ):
     from tmux_agent_tower.control.actions import get_result
