@@ -228,13 +228,22 @@ def test_identity_edit_agent_is_display_only(env):
     assert not any(call[0] == "send-keys" for call in env["calls"])
 
 
-def test_identity_edit_title_pushes_to_the_real_pane(env):
+def test_identity_edit_title_pushes_to_the_real_pane(env, monkeypatch):
+    from tmux_agent_tower.tmux import structure
+
     env["calls"].clear()
+    writes = []
+    original = structure.StructureResult
+    monkeypatch.setattr(
+        structure, "rename_pane",
+        lambda session, pane_id, title, **kwargs: writes.append((session, pane_id, title, kwargs))
+        or original(True, pane_id=pane_id),
+    )
     status, body = _post(env["srv"], _identity_path(), {"title": "New Title"}, env["token"])
     assert status == 200 and body["ok"] is True
-    # Local titles live in tmux itself (same as the TUI's E menu), so the
-    # edit is a select-pane -T on the real pane, never a send-keys.
-    assert ["select-pane", "-t", "%1", "-T", "New Title"] in env["calls"]
+    # The control path verifies session, pane id, and PID before it asks the
+    # structure layer to write the title; it never types into the pane.
+    assert writes == [(SESSION, "%1", "New Title", {"expected_pane_pid": "123"})]
     assert not any(call[0] == "send-keys" for call in env["calls"])
 
 

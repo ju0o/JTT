@@ -9,9 +9,9 @@ from tmux_agent_tower.ui import control_view, render
 from tmux_agent_tower.ui.tower import Tower
 
 
-def _identity(tower, *, project="ExampleProject", command="codex", session="0", pane_pid="123"):
+def _identity(tower, *, project="ExampleProject", command="codex", title="", session="0", pane_pid="123"):
     return tower._identity(
-        "%1", command, "", command, (), project, project, "workstation-b", "(이름 없음)",
+        "%1", command, title, command, (), project, project, "workstation-b", "(이름 없음)",
         session=session, pane_pid=pane_pid,
     )
 
@@ -66,13 +66,20 @@ def test_auto_role_name_tracks_role_and_legacy_name_is_a_user_name(tmp_path):
 
     tower.overrides.set_task_name("%1", "기능 구현", "0", "123")
     tower.overrides.set_role("%1", "qa", "0", "123")
-    identity = _identity(tower, project="Tower", command="claude")
+    identity = _identity(
+        tower, project="Tower", command="claude", title="Agent changed title | AnotherProject",
+    )
     assert identity["display_name"] == "기능 구현"
     assert identity["name_origin"] == "user"
 
     reopened = OverrideStore(tmp_path / "overrides.json")
     assert reopened.get_task_name("%1", "0", "123") == "기능 구현"
     assert reopened.get_task_name_origin("%1", "0", "123") == "user"
+    restarted = Tower.__new__(Tower)
+    restarted.overrides = reopened
+    assert _identity(
+        restarted, project="AnotherProject", command="opencode", title="Agent changed it | Project",
+    )["display_name"] == "기능 구현"
 
 
 def test_tower_runtime_identity_is_detected_without_window_name_matching(tmp_path):

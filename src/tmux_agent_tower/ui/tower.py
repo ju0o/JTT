@@ -46,6 +46,9 @@ from .widgets import is_ctrl_c, is_enter, is_escape, matches_letter, prompt_text
 
 REFRESH_SECONDS = 2.0
 REMOTE_REFRESH_SECONDS = 6.0
+PANE_TITLE_SYNC_INTERVAL_SECONDS = 15.0
+PANE_TITLE_SYNC_CONFLICT_WINDOW_SECONDS = 120.0
+PANE_TITLE_SYNC_MAX_CONFLICTS = 3
 CAPTURE_LINES = 30
 USER_WORK_VIEW = "user_work"
 TERMINAL_STRUCTURE_VIEW = "terminal_structure"
@@ -384,6 +387,8 @@ class Tower:
         self._refresh_ready = None
         self._refresh_snapshot = None
         self.remote_state = None
+        self._last_title_sync_scan = 0.0
+        self._title_sync_last_applied: Dict[Tuple[str, str, str], float] = {}
 
     # -- data ---------------------------------------------------------
 
@@ -1237,7 +1242,7 @@ class Tower:
         return None
 
     def rename_selected(self, stdscr) -> None:
-        """Rename the selected Tower work item without changing tmux names."""
+        """Rename a task in Tower; local tmux title sync is an explicit opt-in."""
 
         if not self.visible_rows:
             return
@@ -1270,27 +1275,223 @@ class Tower:
             self.load()
             return
         if row.get("kind") == "window":
-            pane_id = row.get("rename_pane_id")
-            row = next((pane for pane in self.rows if pane.get("pane_id") == pane_id), {})
+            window = row
+            pane_id = window.get("rename_pane_id")
+            row = next((
+                pane for pane in self.rows
+                if pane.get("pane_id") == pane_id
+                and str(pane.get("session") or "") == str(window.get("session") or "")
+                and bool(pane.get("remote")) == bool(window.get("remote"))
+                and (not window.get("window_id") or pane.get("window_id") == window.get("window_id"))
+            ), {})
         if row.get("offline") or not row.get("pane_id"):
             return
 
         key = row["key"]
         session = str(row.get("session") or "")
         pane_pid = str(row.get("pane_pid") or "")
+        if not key or not session or not pane_pid:
+            self.notice = t("rename.stale")
+            return
         current = row.get("display_name") or row.get("task_name") or row.get("project") or ""
+        suggested = row.get("suggested_name") or current or "-"
+        is_remote = not self._supports_local_pane_title_sync(row)
         name = prompt_text(
             stdscr,
-            t("prompt.rename"),
+            t("rename.prompt"),
             initial=current,
-            context_lines=[f'{t("edit.auto_label")}: {row.get("suggested_name") or current or "-"}'],
+            context_lines=[
+                t("rename.current", name=current or "-"),
+                t("rename.auto", name=suggested),
+                t("rename.default_scope"),
+                t("rename.remote_scope") if is_remote else t("rename.local_scope"),
+            ],
         )
-        if name is not None:
-            if name.strip():
-                self.overrides.set_task_name(key, name.strip(), session, pane_pid)
+        if name is None:
+            return
+
+        cleaned_name = name.strip()
+        sync_state = self.overrides.get_task_title_sync(key, session, pane_pid)
+        if not cleaned_name:
+            if sync_state["enabled"] and not is_remote and not self._restore_managed_pane_title(row, sync_state):
+                self.notice = t("rename.auto_restore_failed")
+                self.load()
+                return
+            self.overrides.clear_field(key, "task_name", session, pane_pid)
+            self.notice = t("rename.auto_restored")
+            self.load()
+            return
+
+        sync_selected = False
+        if not is_remote:
+            pick = run_list_picker(
+                stdscr,
+                t("rename.scope_title"),
+                [("sync", t("rename.sync_option"))],
+                multi=True,
+                checked={"sync"} if sync_state["enabled"] else set(),
+                footer_hint=t("rename.scope_hint"),
+                preamble=[
+                    t("rename.current", name=cleaned_name),
+                    t("rename.auto", name=suggested),
+                    t("rename.default_scope"),
+                ],
+            )
+            if pick.cancelled:
+                return
+            sync_selected = "sync" in pick.selected_keys
+
+        self.overrides.set_task_name(key, cleaned_name, session, pane_pid)
+        if sync_selected:
+            ok, _reason = self._sync_one_pane_title(row, cleaned_name, time.monotonic(), initial=True)
+            if ok:
+                self.notice = t("rename.changed_both")
             else:
-                self.overrides.clear_field(key, "task_name", session, pane_pid)
+                self.overrides.set_task_title_sync(
+                    key, session, pane_pid, enabled=False, blocked=False, conflicts=0,
+                )
+                self.notice = t("rename.display_only")
+        else:
+            self.overrides.set_task_title_sync(
+                key, session, pane_pid, enabled=False, blocked=False, conflicts=0,
+            )
+            self.notice = t("rename.changed_tower")
         self.load()
+
+    def _restore_managed_pane_title(self, row: Dict, sync_state: Dict[str, object]) -> bool:
+        """On explicit auto-reset, restore only a title Tower still owns."""
+
+        if not self._supports_local_pane_title_sync(row) or not sync_state.get("last_title"):
+            return True
+        from ..tmux import structure
+
+        session = str(row.get("session") or "")
+        pane_id = str(row.get("pane_id") or "")
+        pane_pid = str(row.get("pane_pid") or "")
+        live = structure.pane_title_identity(session, pane_id)
+        if not live or live["pane_pid"] != pane_pid:
+            return True
+        if live["pane_title"] != sync_state.get("last_title"):
+            # An Agent or user already changed the title; do not overwrite it.
+            return True
+        result = structure.rename_pane(
+            session,
+            pane_id,
+            str(sync_state.get("original_title") or ""),
+            expected_pane_pid=pane_pid,
+            allow_empty=True,
+        )
+        return result.ok
+
+    def _sync_one_pane_title(
+        self, row: Dict, task_name: str, now: float, *, initial: bool = False,
+    ) -> Tuple[bool, str]:
+        """Set only this local pane's title after a fresh session/id/pid check."""
+
+        if not self._supports_local_pane_title_sync(row):
+            return False, "unsupported"
+        key = str(row.get("key") or "")
+        session = str(row.get("session") or "")
+        pane_id = str(row.get("pane_id") or "")
+        pane_pid = str(row.get("pane_pid") or "").strip()
+        if not key or not session or not pane_pid:
+            return False, "stale"
+
+        from ..tmux import structure
+
+        cleaned_title = structure.clean_name(task_name, limit=80)
+        if not cleaned_title or cleaned_title != task_name:
+            return False, "bad_title"
+        live = structure.pane_title_identity(session, pane_id)
+        if not live or live["pane_pid"] != pane_pid:
+            return False, "stale"
+
+        state = self.overrides.get_task_title_sync(key, session, pane_pid)
+        previous_last = str(state.get("last_title") or "")
+        original_title = (
+            str(state.get("original_title") or "")
+            if previous_last and live["pane_title"] == previous_last
+            else live["pane_title"]
+        )
+        attempt_key = (key, session, pane_pid)
+
+        if live["pane_title"] != cleaned_title and not initial:
+            last_attempt = self._title_sync_last_applied.get(attempt_key)
+            conflict_count = int(state.get("conflicts") or 0)
+            if (last_attempt is not None and now - last_attempt <= PANE_TITLE_SYNC_CONFLICT_WINDOW_SECONDS) or (
+                last_attempt is None and conflict_count > 0
+            ):
+                conflict_count += 1
+                if conflict_count >= PANE_TITLE_SYNC_MAX_CONFLICTS:
+                    self.overrides.set_task_title_sync(
+                        key, session, pane_pid, enabled=False, blocked=True,
+                        conflicts=conflict_count,
+                    )
+                    self._title_sync_last_applied.pop(attempt_key, None)
+                    self.notice = t("rename.title_sync_conflict")
+                    return False, "conflict"
+            else:
+                conflict_count = 0
+        else:
+            conflict_count = 0
+
+        result = structure.rename_pane(
+            session, pane_id, cleaned_title, expected_pane_pid=pane_pid,
+        )
+        if not result.ok:
+            return False, result.detail or "rename_failed"
+        self.overrides.set_task_title_sync(
+            key, session, pane_pid, enabled=True, blocked=False,
+            conflicts=conflict_count, original_title=original_title, last_title=cleaned_title,
+        )
+        if live["pane_title"] != cleaned_title:
+            self._title_sync_last_applied[attempt_key] = now
+        else:
+            self._title_sync_last_applied.pop(attempt_key, None)
+        return True, "changed" if live["pane_title"] != cleaned_title else "unchanged"
+
+    def sync_opted_in_pane_titles(self, now: Optional[float] = None) -> bool:
+        """Rate-limited reconciliation; at most one pane title write per scan."""
+
+        now = time.monotonic() if now is None else now
+        if now - self._last_title_sync_scan < PANE_TITLE_SYNC_INTERVAL_SECONDS:
+            return False
+        self._last_title_sync_scan = now
+        for row in self.rows:
+            if row.get("kind") != "pane" or not self._supports_local_pane_title_sync(row):
+                continue
+            key = str(row.get("key") or "")
+            session = str(row.get("session") or "")
+            pane_pid = str(row.get("pane_pid") or "").strip()
+            if not self.overrides.get_task_title_sync(key, session, pane_pid).get("enabled"):
+                continue
+            task_name = self.overrides.get_task_name(key, session, pane_pid)
+            if self.overrides.get_task_name_origin(key, session, pane_pid) != "user" or not task_name:
+                self.overrides.set_task_title_sync(
+                    key, session, pane_pid, enabled=False, blocked=False, conflicts=0,
+                )
+                continue
+            before_notice = self.notice
+            ok, _reason = self._sync_one_pane_title(row, str(task_name), now)
+            if not ok:
+                if _reason != "conflict":
+                    self.overrides.set_task_title_sync(
+                        key, session, pane_pid, enabled=False, blocked=False, conflicts=0,
+                    )
+                    self.notice = t("rename.display_only")
+                return self.notice != before_notice
+            if _reason != "unchanged":
+                return False
+        return False
+
+    def _supports_local_pane_title_sync(self, row: Dict) -> bool:
+        """Only a locally observed tmux pane may receive physical title writes."""
+
+        if row.get("remote") or row.get("transport") == "ssh" or row.get("offline") or row.get("placeholder"):
+            return False
+        tmux_host = str(row.get("tmux_host") or "").strip().casefold()
+        local_host = str(self.local_host or "").strip().casefold()
+        return not tmux_host or not local_host or tmux_host == local_host
 
     def edit_selected(self, stdscr) -> None:
         """Edit task identity first; keep terminal labels under More."""
@@ -1993,6 +2194,10 @@ def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
             remote_state = tower.remote_state or remote_state
             needs_draw = True
         now = time.monotonic()
+
+        sync_titles = getattr(tower, "sync_opted_in_pane_titles", None)
+        if callable(sync_titles) and sync_titles(now):
+            needs_draw = True
 
         if now - tower.last_refresh >= REFRESH_SECONDS:
             _request_background_refresh(tower)

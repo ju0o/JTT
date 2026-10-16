@@ -104,6 +104,30 @@ def pane_ids(session: str) -> List[str]:
     return [line for line in (result.stdout or "").split("\n") if valid_pane_id(line)]
 
 
+def pane_title_identity(session: str, pane_id: str) -> Optional[dict]:
+    """Read one live pane's session, id, pid, liveness, and title together."""
+
+    if not session or not valid_pane_id(pane_id):
+        return None
+    separator = "\x1f"
+    format_string = separator.join(
+        ("#{session_name}", "#{pane_id}", "#{pane_pid}", "#{pane_dead}", "#{pane_title}")
+    )
+    try:
+        result = _run(["display-message", "-p", "-t", pane_id, format_string])
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    parts = (result.stdout or "").rstrip("\n").split(separator, 4)
+    if len(parts) != 5:
+        return None
+    live_session, live_pane_id, pane_pid, pane_dead, title = parts
+    if live_session != session or live_pane_id != pane_id or pane_dead != "0" or not pane_pid.isdigit():
+        return None
+    return {"session": live_session, "pane_id": live_pane_id, "pane_pid": pane_pid, "pane_title": title}
+
+
 def panes_of_window(window_id: str) -> List[str]:
     if not valid_window_id(window_id):
         return []
@@ -352,18 +376,30 @@ def rename_window(session: str, window_id: str, name: str) -> StructureResult:
     return StructureResult(True, window_id)
 
 
-def rename_pane(session: str, pane_id: str, title: str) -> StructureResult:
+def rename_pane(
+    session: str,
+    pane_id: str,
+    title: str,
+    expected_pane_pid: Optional[str] = None,
+    *,
+    allow_empty: bool = False,
+) -> StructureResult:
     """``select-pane -t <pane_id> -T <title>``.
 
     tmux 3.6's ``-d`` on select-pane disables input, so it is not passed.
     A live check showed ``-T`` alone does not move the client.
     """
 
-    if not valid_pane_id(pane_id) or pane_id not in pane_ids(session):
+    identity = pane_title_identity(session, pane_id)
+    if identity is None:
         return _fail("not_found")
-    cleaned = clean_name(title, limit=80)
-    if not cleaned:
+    if expected_pane_pid and identity["pane_pid"] != str(expected_pane_pid).strip():
+        return _fail("stale")
+    cleaned = "" if allow_empty and title == "" else clean_name(title, limit=80)
+    if not cleaned and not (allow_empty and title == ""):
         return _fail("bad_name")
+    if identity["pane_title"] == cleaned:
+        return StructureResult(True, pane_id=pane_id)
     try:
         result = _run(["select-pane", "-t", pane_id, "-T", cleaned])
     except Exception:

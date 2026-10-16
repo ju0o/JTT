@@ -653,6 +653,8 @@ def test_search_clear_keeps_fold_and_attention_uses_work_list(tmp_path, monkeypa
 
 
 def test_rename_action_on_window_renames_active_tower_work_item(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
     from tmux_agent_tower.ui import tower as tower_module
 
     tower = _fold_tower(tmp_path, monkeypatch)
@@ -666,6 +668,10 @@ def test_rename_action_on_window_renames_active_tower_work_item(tmp_path, monkey
     tower._apply_filter()
     tower.selected = next(i for i, row in enumerate(tower.visible_rows) if row["kind"] == "window")
     monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "new-task")
+    monkeypatch.setattr(
+        tower_module, "run_list_picker",
+        lambda *args, **kwargs: SimpleNamespace(cancelled=False, selected_keys=set()),
+    )
     monkeypatch.setattr(tower, "load", lambda: None)
 
     tower.rename_selected(None)
@@ -678,6 +684,8 @@ def test_rename_action_on_window_renames_active_tower_work_item(tmp_path, monkey
 
 
 def test_rename_action_on_pane_changes_only_tower_work_name(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
     from tmux_agent_tower.ui import tower as tower_module
 
     tower = _fold_tower(tmp_path, monkeypatch)
@@ -688,12 +696,134 @@ def test_rename_action_on_pane_changes_only_tower_work_name(tmp_path, monkeypatc
     _apply_user_work_view(tower)
     tower.selected = next(i for i, row in enumerate(tower.visible_rows) if row.get("kind") == "pane")
     monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "new-name")
+    monkeypatch.setattr(
+        tower_module, "run_list_picker",
+        lambda *args, **kwargs: SimpleNamespace(cancelled=False, selected_keys=set()),
+    )
     monkeypatch.setattr(tower, "load", lambda: None)
 
     tower.rename_selected(None)
 
     assert tower.overrides.get_task_name("%52", "0", "5252") == "new-name"
     assert tower.overrides.get_project("%52", "0", "5252") is None
+
+
+def test_rename_opt_in_syncs_only_the_selected_local_pane(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.tmux import structure
+
+    tower = _fold_tower(tmp_path, monkeypatch)
+    pane = _pane("%53", "0", "terminal", window_id="@5", project="old-name")
+    pane.update(pane_pid="5353", tmux_host=tower.local_host, transport="local")
+    tower.rows = [pane]
+    tower.visible_rows = [pane]
+    monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "new-name")
+    seen = {}
+    monkeypatch.setattr(
+        tower_module, "run_list_picker",
+        lambda *args, **kwargs: seen.update(checked=kwargs["checked"], preamble=kwargs["preamble"])
+        or SimpleNamespace(cancelled=False, selected_keys={"sync"}),
+    )
+    monkeypatch.setattr(
+        structure, "pane_title_identity",
+        lambda session, pane_id: {"session": session, "pane_id": pane_id, "pane_pid": "5353", "pane_title": "Agent title"},
+    )
+    title_writes = []
+    monkeypatch.setattr(
+        structure, "rename_pane",
+        lambda session, pane_id, title, **kwargs: title_writes.append((session, pane_id, title, kwargs))
+        or structure.StructureResult(True, pane_id=pane_id),
+    )
+    monkeypatch.setattr(tower, "load", lambda: None)
+
+    tower.rename_selected(None)
+
+    assert seen["checked"] == set()
+    assert title_writes == [("0", "%53", "new-name", {"expected_pane_pid": "5353"})]
+    assert tower.overrides.get_task_name("%53", "0", "5353") == "new-name"
+    assert tower.overrides.get_task_title_sync("%53", "0", "5353")["enabled"] is True
+    assert tower.notice == "Tower 이름과 tmux 화면 제목을 변경했습니다."
+
+
+def test_remote_ssh_task_never_offers_or_applies_tmux_title_sync(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.tmux import structure
+
+    tower = _fold_tower(tmp_path, monkeypatch)
+    pane = _pane("%54", "0", "ssh", window_id="@5", project="remote-task")
+    pane.update(pane_pid="5454", transport="ssh", execution_host="ASUS", tmux_host=tower.local_host)
+    tower.rows = [pane]
+    tower.visible_rows = [pane]
+    seen = {}
+    monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "ASUS 작업")
+    monkeypatch.setattr(
+        tower_module, "run_list_picker",
+        lambda *args, **kwargs: seen.update(items=kwargs.get("items"))
+        or SimpleNamespace(cancelled=False, selected_keys={"sync"}),
+    )
+    monkeypatch.setattr(
+        structure, "pane_title_identity",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("remote title control attempted")),
+    )
+    monkeypatch.setattr(tower, "load", lambda: None)
+
+    tower.rename_selected(None)
+
+    assert seen == {}
+    assert tower.overrides.get_task_name("%54", "0", "5454") == "ASUS 작업"
+    assert tower.notice == "Tower 작업 이름을 변경했습니다."
+
+
+def test_reset_task_name_returns_to_auto_detection(tmp_path, monkeypatch):
+    from tmux_agent_tower.ui import tower as tower_module
+
+    tower = _fold_tower(tmp_path, monkeypatch)
+    pane = _pane("%55", "0", "terminal", window_id="@5", project="detected-name")
+    pane.update(pane_pid="5555", task_name="custom-name", display_name="custom-name", suggested_name="detected-name")
+    tower.rows = [pane]
+    tower.visible_rows = [pane]
+    tower.overrides.set_task_name("%55", "custom-name", "0", "5555")
+    monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "")
+    monkeypatch.setattr(tower, "load", lambda: None)
+
+    tower.rename_selected(None)
+
+    assert tower.overrides.get_task_name("%55", "0", "5555") is None
+    assert tower.notice == "자동 감지한 작업 이름으로 복원했습니다."
+
+
+def test_reset_does_not_overwrite_an_agent_changed_pane_title(tmp_path, monkeypatch):
+    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.tmux import structure
+
+    tower = _fold_tower(tmp_path, monkeypatch)
+    pane = _pane("%56", "0", "terminal", window_id="@5", project="detected-name")
+    pane.update(pane_pid="5656", task_name="custom-name", display_name="custom-name", suggested_name="detected-name")
+    tower.rows = [pane]
+    tower.visible_rows = [pane]
+    tower.overrides.set_task_name("%56", "custom-name", "0", "5656")
+    tower.overrides.set_task_title_sync(
+        "%56", "0", "5656", enabled=True, original_title="Original", last_title="custom-name",
+    )
+    monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        structure, "pane_title_identity",
+        lambda *args: {"session": "0", "pane_id": "%56", "pane_pid": "5656", "pane_title": "Agent title"},
+    )
+    monkeypatch.setattr(
+        structure, "rename_pane",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Agent title must be preserved")),
+    )
+    monkeypatch.setattr(tower, "load", lambda: None)
+
+    tower.rename_selected(None)
+
+    assert tower.overrides.get_task_name("%56", "0", "5656") is None
+    assert tower.notice == "자동 감지한 작업 이름으로 복원했습니다."
 
 
 def test_edit_menu_uses_task_facing_actions_and_hides_terminal_names(tmp_path, monkeypatch):

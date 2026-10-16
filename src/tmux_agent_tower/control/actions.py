@@ -184,18 +184,11 @@ def apply_identity_edit(tower, pane_key: str, body: dict) -> Tuple[bool, str]:
         return False, "stale"
 
     task_name_edited = "task_name" in body
-    if (
+    preserve_auto_task_name = (
         row.get("name_origin") == "auto"
         and not task_name_edited
         and any(field in body for field in ("project", "agent", "title"))
-    ):
-        tower.overrides.set_task_name(
-            pane_key,
-            row.get("display_name") or row.get("task_name") or "",
-            session,
-            pane_pid,
-            origin="auto",
-        )
+    )
 
     touched = False
     for field in OVERRIDE_FIELDS:
@@ -211,13 +204,30 @@ def apply_identity_edit(tower, pane_key: str, body: dict) -> Tuple[bool, str]:
             return False, f"invalid_{field}"
         if field == "role" and cleaned not in ROLE_IDS:
             return False, "invalid_role"
+        if field == "title" and not row.get("remote") and row.get("transport") != "ssh":
+            from ..tmux import structure
+
+            result = structure.rename_pane(
+                session,
+                str(row.get("pane_id") or ""),
+                cleaned,
+                expected_pane_pid=pane_pid,
+            )
+            if not result.ok:
+                return False, "stale" if result.detail in {"stale", "not_found"} else "title_update_failed"
         getattr(tower.overrides, f"set_{field}")(pane_key, cleaned, session, pane_pid)
         touched = True
-        if field == "title" and not row.get("remote"):
-            tmux_capture.run_tmux(["select-pane", "-t", row["pane_id"], "-T", cleaned], capture=False)
 
     if not touched:
         return False, "bad_request"
+    if preserve_auto_task_name:
+        tower.overrides.set_task_name(
+            pane_key,
+            row.get("display_name") or row.get("task_name") or "",
+            session,
+            pane_pid,
+            origin="auto",
+        )
     if (
         "role" in body
         and row.get("name_origin") == "auto"

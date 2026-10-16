@@ -29,6 +29,28 @@ def test_task_name_is_separate_from_project_identity_and_process_bound(tmp_path)
     assert store.get_task_name("%1", SESSION, "101") is None
 
 
+def test_task_title_sync_is_persisted_only_for_bound_pane_identity(tmp_path):
+    path = tmp_path / "overrides.json"
+    store = OverrideStore(path)
+    store.set_task_name("%1", "User task", SESSION, PID)
+    assert store.set_task_title_sync(
+        "%1", SESSION, PID, enabled=True, conflicts=2,
+        original_title="Agent title", last_title="User task",
+    )
+
+    reopened = OverrideStore(path)
+    assert reopened.get_task_title_sync("%1", SESSION, PID) == {
+        "enabled": True, "blocked": False, "conflicts": 2,
+        "original_title": "Agent title", "last_title": "User task",
+    }
+    assert reopened.get_task_title_sync("%1", SESSION, "101")["enabled"] is False
+    assert reopened.set_task_title_sync("%1", SESSION, "101", enabled=True) is False
+
+    reopened.clear_field("%1", "task_name", SESSION, PID)
+    assert reopened.get_task_name("%1", SESSION, PID) is None
+    assert reopened.get_task_title_sync("%1", SESSION, PID)["last_title"] == ""
+
+
 def test_set_refuses_a_label_with_no_process_id(tmp_path):
     store = OverrideStore(tmp_path / "overrides.json")
     store.set_agent("%1", "Claude", SESSION, "")
