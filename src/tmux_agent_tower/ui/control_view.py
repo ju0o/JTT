@@ -256,12 +256,13 @@ def _draw(stdscr, tower, row: dict, notice: str, show_result: bool, follow: bool
     safe_add(stdscr, 0, 2, _fit_live_line(display_name, width), curses.A_BOLD)
     role = t(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
     identity_parts = [part for part in (row.get("agent") or t("task.terminal"), role) if part]
-    if row.get("work_group_name"):
-        identity_parts.insert(0, row["work_group_name"])
     execution_host = row.get("execution_host") or row.get("host")
     if execution_host:
         identity_parts.append(f'{t("detail.execution_host")} {execution_host}')
-    safe_add(stdscr, 1, 2, _fit_live_line(" · ".join(identity_parts), width), curses.A_DIM)
+    identity = " · ".join(identity_parts)
+    if row.get("work_group_name"):
+        identity = f'{row["work_group_name"]} › {identity}'
+    safe_add(stdscr, 1, 2, _fit_live_line(identity, width), curses.A_DIM)
 
     if row.get("offline"):
         status_parts = ["× " + t("state.offline")]
