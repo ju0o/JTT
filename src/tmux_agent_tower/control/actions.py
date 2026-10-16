@@ -527,14 +527,16 @@ def get_result(
         provider = _RecoveryProvider(lambda target: _recover_remote_result(target.remote_provider_row()))
         candidate = provider.get_latest_complete_result(target)
         return True, "", _candidate_payload(candidate) if candidate else provider.observation
+    screen_fallback_reason = ""
     if target.transport == "ssh" and (target.agent == "OpenCode" or row.get("result_adapter") == "OpenCode"):
         if row.get("result_adapter") not in (None, "", "OpenCode"):
             return True, "", _remote_opencode_failure("AGENT_UNBOUND")
         session_probe = _get_ssh_opencode_result(tower, row, target, pane_key, expected_pane_pid)
-        if session_probe[2].get("reason_code") != "SESSION_ID_NOT_EXPOSED":
+        screen_fallback_reason = str(session_probe[2].get("reason_code") or "")
+        if screen_fallback_reason != "OPENCODE_PLUGIN_NOT_INSTALLED":
             return session_probe
-        # TUI launch arguments do not prove which session is currently selected;
-        # its adapter must prove both result boundaries from the visible history.
+        # Only an explicitly absent binding enables the existing screen adapter;
+        # invalid, stale, or changed bindings stay fail-closed.
     if target.transport == "ssh" and target.agent == "Grok":
         from ..detection.sshdest import ssh_connection_for_pane
 
@@ -590,8 +592,11 @@ def get_result(
     candidate = provider.get_latest_complete_result(target)
     recovered = provider.observation
     if candidate is not None:
-        return True, "", _candidate_payload(candidate, recovered.get("state") or "ready")
-    if row.get("status") != "WORKING" and (
+        payload = _candidate_payload(candidate, recovered.get("state") or "ready")
+        if screen_fallback_reason and payload.get("source") == "ssh_visible_history":
+            payload["fallback_reason_code"] = screen_fallback_reason
+        return True, "", payload
+    if not screen_fallback_reason and row.get("status") != "WORKING" and (
         recovered is None or (not recovered.get("complete") and not recovered.get("working"))
     ):
         remote_target = ResultTarget.from_row(row)
@@ -600,12 +605,15 @@ def get_result(
         )
         remote_candidate = remote_provider.get_latest_complete_result(remote_target)
         if remote_candidate is not None:
-            return True, "", _candidate_payload(remote_candidate, remote_provider.observation.get("state") or "ready")
+            payload = _candidate_payload(remote_candidate, remote_provider.observation.get("state") or "ready")
+            return True, "", payload
     if recovered is None:
         snap = tracker.snapshot(pane_key, identity=identity)
         if row.get("status") == "WORKING" or not snap.complete:
             return True, "", _empty_incomplete(snap)
         return True, "", _payload(snap)
+    if screen_fallback_reason and isinstance(recovered, dict):
+        recovered = {**recovered, "fallback_reason_code": screen_fallback_reason}
     return True, "", recovered
 
 
@@ -782,11 +790,12 @@ def _recover_ssh_opencode_result(row: dict) -> dict:
             if reason_code not in {"REMOTE_RESULT_INCOMPLETE", "SESSION_BINDING_CHANGED", "OUTPUT_RANGE_EXCEEDED"}:
                 reason_code = "REMOTE_RESULT_INCOMPLETE"
             return _remote_opencode_failure(reason_code)
-        if (
-            status == "AGENT_SESSION_UNBOUND"
-            and result.get("session_binding") == "active_tui_session_unexposed"
-        ):
-            return _remote_opencode_failure("SESSION_ID_NOT_EXPOSED")
+        if status == "AGENT_SESSION_UNBOUND" and result.get("session_binding") == "TUI_BINDING_ABSENT":
+            return _remote_opencode_failure("OPENCODE_PLUGIN_NOT_INSTALLED")
+        if status == "AGENT_SESSION_UNBOUND" and result.get("session_binding") == "TUI_BINDING_INVALID":
+            return _remote_opencode_failure("OPENCODE_BINDING_INVALID")
+        if status == "AGENT_SESSION_UNBOUND" and result.get("session_binding") == "NO_ACTIVE_SESSION":
+            return _remote_opencode_failure("OPENCODE_NO_ACTIVE_SESSION")
         if status not in {
             "AGENT_SESSION_UNBOUND", "REMOTE_PROVIDER_UNBOUND", "REMOTE_PROVIDER_UNAVAILABLE",
             "REMOTE_PROVIDER_TIMEOUT", "REMOTE_RESULT_INCOMPLETE", "OUTPUT_RANGE_EXCEEDED",
@@ -1131,7 +1140,7 @@ def _get_ssh_opencode_result(tower, row: dict, target: ResultTarget, pane_key: s
     )
     candidate = provider.get_latest_complete_result(target)
 
-    # The title is a stability check only; session identity comes from explicit --session argv.
+    # The title is a stability check only; session identity comes from the fresh TUI route binding.
     live_after = pane_title_and_command(pane_id)
     connection_after = ssh_connection_for_pane(pane_pid, host)
     if (

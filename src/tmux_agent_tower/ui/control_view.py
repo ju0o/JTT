@@ -639,12 +639,12 @@ def _copy_result_impl(tower, pane_key: str, stdscr=None) -> str:
         _remember_result_copy(tower, row, payload, "not_entered", "blocked", code)
         if reason == "not_found":
             return t("nav.stale")
-        return t("control.result_copy_unavailable").format(code=code) if reason == "stale" else reason or ""
+        return _result_copy_block_notice(code, payload) if reason == "stale" else reason or ""
     text = payload.get("text") or ""
     if not payload.get("complete") or not text:
         reason_code = _result_failure_code(row, payload)
         _remember_result_copy(tower, row, payload, "not_entered", "blocked", reason_code)
-        return t("control.result_copy_unavailable").format(code=reason_code)
+        return _result_copy_block_notice(reason_code, payload)
     if payload.get("source") == "remote_opencode" and plain_clipboard_text(text).encode("utf-8", "strict") != raw:
         reason_code = "CLIPBOARD_TEXT_TRANSFORMED"
         _remember_result_copy(tower, row, payload, "not_entered", "blocked", reason_code)
@@ -672,13 +672,17 @@ def _copy_result_impl(tower, pane_key: str, stdscr=None) -> str:
     )
     _remember_result_copy(
         tower, row, payload, "entered", clipboard_result,
-        "" if clipboard_result != "failed" else "CLIPBOARD_FAILED",
+        str(payload.get("fallback_reason_code") or "")
+        if clipboard_result != "failed" else "CLIPBOARD_FAILED",
     )
     if clipboard_result == "failed":
         return t("control.clipboard_failed")
     access = getattr(tower, "last_copy_access_context", None)
     host = access.display_name if access else getattr(tower, "local_host", "") or ""
-    return _result_copy_notice(outcome, host)
+    notice = _result_copy_notice(outcome, host)
+    if payload.get("fallback_reason_code") == "OPENCODE_PLUGIN_NOT_INSTALLED":
+        notice += " · " + t("control.opencode_screen_fallback")
+    return notice
 
 
 def pane_diagnostic_lines(tower, selected_row: dict) -> list[str]:
@@ -765,7 +769,8 @@ def _result_failure_code(row: dict, payload: dict, reason: str = "") -> str:
         "AGENT_UNSUPPORTED", "AGENT_UNBOUND", "PROVIDER_UNBOUND", "TURN_NOT_COMPLETE", "SOURCE_PARTIAL",
         "OUTPUT_RANGE_EXCEEDED", "CLIPBOARD_FAILED", "UNKNOWN",
         "REMOTE_PROVIDER_UNBOUND", "REMOTE_PROVIDER_UNAVAILABLE", "REMOTE_RESULT_INCOMPLETE",
-        "AGENT_SESSION_UNBOUND", "REMOTE_PROVIDER_TIMEOUT",
+        "AGENT_SESSION_UNBOUND", "REMOTE_PROVIDER_TIMEOUT", "OPENCODE_BINDING_INVALID",
+        "OPENCODE_NO_ACTIVE_SESSION", "SESSION_BINDING_CHANGED",
     }:
         return code
     if reason == "stale":
@@ -777,6 +782,19 @@ def _result_failure_code(row: dict, payload: dict, reason: str = "") -> str:
     if payload.get("body_complete") is False:
         return "SOURCE_PARTIAL"
     return "UNKNOWN"
+
+
+def _result_copy_block_notice(code: str, payload: dict) -> str:
+    if payload.get("fallback_reason_code") == "OPENCODE_PLUGIN_NOT_INSTALLED":
+        return t("control.opencode_screen_fallback_blocked").format(code=code)
+    message_key = {
+        "OPENCODE_BINDING_INVALID": "control.opencode_binding_invalid",
+        "OPENCODE_NO_ACTIVE_SESSION": "control.opencode_no_active_session",
+        "SESSION_BINDING_CHANGED": "control.opencode_session_changed",
+    }.get(code)
+    if message_key:
+        return t(message_key)
+    return t("control.result_copy_unavailable").format(code=code)
 
 
 def _remember_result_copy(tower, row: dict, payload: dict, stage: str, outcome: str, reason_code: str) -> None:
@@ -794,6 +812,7 @@ def _remember_result_copy(tower, row: dict, payload: dict, stage: str, outcome: 
         "turn_complete": payload.get("turn_complete"),
         "body_complete": payload.get("body_complete"),
         "reason_code": reason_code or "-",
+        "fallback_reason_code": str(payload.get("fallback_reason_code") or "-"),
     }
 
 

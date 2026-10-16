@@ -65,7 +65,7 @@ def _proc_process(proc, pid, ppid, comm, cwd, *, executable="/bin/bash", env=Non
     (folder / "cwd").symlink_to(cwd)
 
 
-def _remote_fixture(tmp_path, *, complete=True, duplicate=False, second_opencode=False, background_opencode=False, config_content=None, process_argv=None, executable_name="opencode", comm_name="opencode", finish="stop", binding=True, route_name="session", binding_session=SESSION_ID, generation=1, stale_binding=False, switch_during_export=False, export_session=SESSION_ID, body_parts=None, export_override=None):
+def _remote_fixture(tmp_path, *, complete=True, duplicate=False, second_opencode=False, background_opencode=False, config_content=None, process_argv=None, executable_name="opencode", comm_name="opencode", finish="stop", binding=True, plugin_marker=None, route_name="session", binding_session=SESSION_ID, generation=1, stale_binding=False, switch_during_export=False, export_session=SESSION_ID, body_parts=None, export_override=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     proc = tmp_path / "proc"
     proc.mkdir()
@@ -118,6 +118,7 @@ def _remote_fixture(tmp_path, *, complete=True, duplicate=False, second_opencode
         _proc_process(proc, 201, 101, "opencode", cwd, executable=str(fake_exe), env=opencode_env, argv=["opencode"])
     binding_dir = tmp_path / "binding"
     binding_dir.mkdir()
+    nonce = "0" * 32
     if binding:
         record = {
             "schema": "tower-opencode-tui-binding/v1", "pid": 200,
@@ -126,12 +127,23 @@ def _remote_fixture(tmp_path, *, complete=True, duplicate=False, second_opencode
             "generation": generation, "nonce": "0" * 32,
             "observed_at_ms": int(time.time() * 1000) - (3000 if stale_binding else 0),
         }
+        nonce = record["nonce"]
         binding_path = binding_dir / "tower-opencode-session-200.json"
         binding_path.write_text(json.dumps(record))
         binding_path.chmod(0o600)
         if switch_during_export:
             update = dict(record, generation=generation + 1, session_id=OTHER_SESSION_ID)
             (cwd / ".switch-binding.json").write_text(json.dumps({"path": str(binding_path), "record": update}))
+    if plugin_marker is None:
+        plugin_marker = binding
+    if plugin_marker:
+        marker = {
+            "schema": "tower-opencode-tui-plugin/v1", "pid": 200,
+            "process_starttime": "0", "nonce": nonce,
+        }
+        marker_path = binding_dir / "tower-opencode-session-200.plugin.json"
+        marker_path.write_text(json.dumps(marker))
+        marker_path.chmod(0o600)
     return proc, cwd, binding_dir
 
 
@@ -172,10 +184,10 @@ def test_remote_provider_exports_only_the_verified_current_tui_session(tmp_path,
 @pytest.mark.parametrize(
     ("options", "reason"),
     [
-        ({"binding": False}, "TUI_BINDING_UNAVAILABLE"),
+        ({"binding": False}, "TUI_BINDING_ABSENT"),
         ({"route_name": "home"}, "NO_ACTIVE_SESSION"),
         ({"route_name": "other"}, "NO_ACTIVE_SESSION"),
-        ({"stale_binding": True}, "TUI_BINDING_UNAVAILABLE"),
+        ({"stale_binding": True}, "TUI_BINDING_INVALID"),
     ],
 )
 def test_remote_provider_fails_closed_without_a_fresh_active_route(tmp_path, options, reason):
@@ -203,7 +215,58 @@ def test_remote_provider_rejects_insecure_binding_file(tmp_path):
     (binding_dir / "tower-opencode-session-200.json").chmod(0o644)
     payload, _ = _run_remote(proc, binding_dir)
     assert payload["status"] == "AGENT_SESSION_UNBOUND"
-    assert payload["session_binding"] == "TUI_BINDING_UNAVAILABLE"
+    assert payload["session_binding"] == "TUI_BINDING_INVALID"
+    assert not (cwd / ".export-called").exists()
+
+
+@pytest.mark.parametrize("damage", ["json", "pid"])
+def test_remote_provider_rejects_corrupt_or_wrong_process_binding_without_export(tmp_path, damage):
+    proc, cwd, binding_dir = _remote_fixture(tmp_path)
+    path = binding_dir / "tower-opencode-session-200.json"
+    if damage == "json":
+        path.write_text("{broken", encoding="utf-8")
+    else:
+        record = json.loads(path.read_text())
+        record["pid"] = 201
+        path.write_text(json.dumps(record), encoding="utf-8")
+    path.chmod(0o600)
+
+    payload, _ = _run_remote(proc, binding_dir)
+
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert payload["session_binding"] == "TUI_BINDING_INVALID"
+    assert not (cwd / ".export-called").exists()
+
+
+def test_remote_provider_does_not_treat_missing_binding_as_plugin_absence_when_plugin_is_loaded(tmp_path):
+    proc, cwd, binding_dir = _remote_fixture(tmp_path, binding=False, plugin_marker=True)
+
+    payload, _ = _run_remote(proc, binding_dir)
+
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert payload["session_binding"] == "TUI_BINDING_INVALID"
+    assert not (cwd / ".export-called").exists()
+
+
+@pytest.mark.parametrize("damage", ["json", "nonce", "missing"])
+def test_remote_provider_rejects_binding_without_a_valid_matching_plugin_marker(tmp_path, damage):
+    proc, cwd, binding_dir = _remote_fixture(tmp_path)
+    path = binding_dir / "tower-opencode-session-200.plugin.json"
+    if damage == "json":
+        path.write_text("{broken", encoding="utf-8")
+    elif damage == "nonce":
+        marker = json.loads(path.read_text())
+        marker["nonce"] = "1" * 32
+        path.write_text(json.dumps(marker), encoding="utf-8")
+    else:
+        path.unlink()
+    if path.exists():
+        path.chmod(0o600)
+
+    payload, _ = _run_remote(proc, binding_dir)
+
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert payload["session_binding"] == "TUI_BINDING_INVALID"
     assert not (cwd / ".export-called").exists()
 
 
@@ -435,7 +498,7 @@ def test_tower_preserves_session_switch_reason_and_never_falls_back_to_capture(m
     assert payload["reason_code"] == "SESSION_BINDING_CHANGED"
 
 
-def test_tower_uses_boundary_checked_capture_when_active_opencode_session_is_unexposed(monkeypatch):
+def test_tower_uses_boundary_checked_capture_only_when_opencode_binding_is_absent(monkeypatch):
     from tmux_agent_tower.control.actions import get_result
 
     tower = _Tower()
@@ -445,7 +508,7 @@ def test_tower_uses_boundary_checked_capture_when_active_opencode_session_is_une
         "tmux_agent_tower.remote.opencode.fetch_remote_opencode_result",
         lambda *_: {
             "status": "AGENT_SESSION_UNBOUND",
-            "session_binding": "active_tui_session_unexposed",
+            "session_binding": "TUI_BINDING_ABSENT",
         },
     )
     body = "A bounded screen result."
@@ -465,6 +528,7 @@ def test_tower_uses_boundary_checked_capture_when_active_opencode_session_is_une
     assert ok and reason == ""
     assert payload["text"] == body and payload["complete"]
     assert payload["source"] == "ssh_visible_history"
+    assert payload["fallback_reason_code"] == "OPENCODE_PLUGIN_NOT_INSTALLED"
     assert recovered == [("%9", "ssh_visible_history", "900")]
 
 
@@ -481,7 +545,7 @@ def test_tower_uses_boundary_checked_capture_when_active_opencode_session_is_une
         ),
     ],
 )
-def test_opencode_capture_uses_real_adapter_boundaries_when_active_session_is_unexposed(
+def test_opencode_capture_uses_real_adapter_boundaries_when_binding_plugin_is_absent(
     monkeypatch, captured, history_size, expected_text, expected_complete, expected_reason,
 ):
     from tmux_agent_tower.control.actions import get_result
@@ -494,7 +558,7 @@ def test_opencode_capture_uses_real_adapter_boundaries_when_active_session_is_un
         "tmux_agent_tower.remote.opencode.fetch_remote_opencode_result",
         lambda *_: {
             "status": "AGENT_SESSION_UNBOUND",
-            "session_binding": "active_tui_session_unexposed",
+            "session_binding": "TUI_BINDING_ABSENT",
         },
     )
     monkeypatch.setattr(
@@ -522,9 +586,19 @@ def test_opencode_capture_uses_real_adapter_boundaries_when_active_session_is_un
     else:
         assert payload["body_complete"] is False
         assert payload["reason_code"] == expected_reason
+        assert payload["fallback_reason_code"] == "OPENCODE_PLUGIN_NOT_INSTALLED"
 
 
-def test_tower_does_not_capture_when_opencode_binding_is_not_proven(monkeypatch):
+@pytest.mark.parametrize(
+    ("provider_payload", "expected_reason"),
+    [
+        ({"status": "AGENT_SESSION_UNBOUND"}, "AGENT_SESSION_UNBOUND"),
+        ({"status": "AGENT_SESSION_UNBOUND", "session_binding": "TUI_BINDING_INVALID"}, "OPENCODE_BINDING_INVALID"),
+        ({"status": "AGENT_SESSION_UNBOUND", "session_binding": "NO_ACTIVE_SESSION"}, "OPENCODE_NO_ACTIVE_SESSION"),
+        ({"status": "REMOTE_RESULT_INCOMPLETE", "reason_code": "SESSION_BINDING_CHANGED"}, "SESSION_BINDING_CHANGED"),
+    ],
+)
+def test_tower_does_not_capture_for_invalid_or_changed_opencode_binding(monkeypatch, provider_payload, expected_reason):
     import pytest
     from tmux_agent_tower.control.actions import get_result
 
@@ -532,7 +606,7 @@ def test_tower_does_not_capture_when_opencode_binding_is_not_proven(monkeypatch)
     _bind_local_ssh(monkeypatch)
     monkeypatch.setattr(
         "tmux_agent_tower.remote.opencode.fetch_remote_opencode_result",
-        lambda *_: {"status": "AGENT_SESSION_UNBOUND"},
+        lambda *_: provider_payload,
     )
     monkeypatch.setattr(
         "tmux_agent_tower.control.actions._recover_result",
@@ -543,7 +617,7 @@ def test_tower_does_not_capture_when_opencode_binding_is_not_proven(monkeypatch)
 
     assert ok and reason == ""
     assert payload["text"] == "" and not payload["complete"]
-    assert payload["reason_code"] == "AGENT_SESSION_UNBOUND"
+    assert payload["reason_code"] == expected_reason
 
 
 def test_tower_blocks_changed_socket_and_never_falls_back_to_suffix(monkeypatch):
@@ -618,3 +692,52 @@ def test_y_does_not_route_unbound_or_incomplete_opencode_payload(monkeypatch):
 
     notice = control_view._copy_result(tower, "%9")
     assert "AGENT_SESSION_UNBOUND" in notice
+
+
+def test_y_explains_bounded_screen_fallback_when_binding_plugin_is_absent(monkeypatch):
+    from tmux_agent_tower.clipboard import CopyOutcome
+    from tmux_agent_tower.ui import control_view
+
+    tower = _Tower()
+    row = tower.rows[0]
+    payload = {
+        "state": "ready", "text": "complete bounded result", "complete": True,
+        "turn_complete": True, "body_complete": True, "source": "ssh_visible_history",
+        "fallback_reason_code": "OPENCODE_PLUGIN_NOT_INSTALLED",
+    }
+    monkeypatch.setattr(control_view, "find_row", lambda *_: row)
+    monkeypatch.setattr(control_view, "get_result", lambda *_a, **_k: (True, "", payload))
+    monkeypatch.setattr(control_view, "_route_clipboard", lambda *_: (CopyOutcome(True, False, "clip.exe"), ""))
+
+    notice = control_view._copy_result(tower, "%9")
+
+    assert "연결 플러그인이 없어" in notice
+    assert tower.last_result_copy_diagnostic["reason_code"] == "OPENCODE_PLUGIN_NOT_INSTALLED"
+
+
+def test_y_explains_incomplete_screen_fallback_and_binding_failure_in_korean(monkeypatch):
+    import pytest
+    from tmux_agent_tower.ui import control_view
+
+    tower = _Tower()
+    row = tower.rows[0]
+    monkeypatch.setattr(control_view, "find_row", lambda *_: row)
+    monkeypatch.setattr(control_view, "_route_clipboard", lambda *_: pytest.fail("incomplete result reached copy"))
+
+    incomplete = {
+        "state": "none", "text": "", "complete": False, "turn_complete": False,
+        "body_complete": False, "reason_code": "OUTPUT_RANGE_EXCEEDED",
+        "fallback_reason_code": "OPENCODE_PLUGIN_NOT_INSTALLED",
+    }
+    monkeypatch.setattr(control_view, "get_result", lambda *_a, **_k: (True, "", incomplete))
+    fallback_notice = control_view._copy_result(tower, "%9")
+    assert "화면 기반 대체 경로를 확인했지만 전체 결과를 검증하지 못해" in fallback_notice
+    assert "OUTPUT_RANGE_EXCEEDED" in fallback_notice
+
+    damaged = {
+        "state": "none", "text": "", "complete": False, "turn_complete": False,
+        "body_complete": False, "reason_code": "OPENCODE_BINDING_INVALID",
+    }
+    monkeypatch.setattr(control_view, "get_result", lambda *_a, **_k: (True, "", damaged))
+    binding_notice = control_view._copy_result(tower, "%9")
+    assert "오래됐거나 손상되어 복사를 차단" in binding_notice

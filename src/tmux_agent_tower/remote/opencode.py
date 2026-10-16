@@ -162,11 +162,52 @@ def run_bounded(argv, cwd, env, limit, timeout):
         if child is not None and child.stdout:
             child.stdout.close()
 
+def plugin_marker_record(pid, process_info):
+    path = os.path.join(BINDING_DIR, "tower-opencode-session-%s.plugin.json" % pid)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None, "absent"
+    except OSError:
+        return None, "invalid"
+    try:
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            owner = os.stat(os.path.join(PROC, pid)).st_uid
+            if (
+                not stat.S_ISREG(info.st_mode) or info.st_uid != owner
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 1024
+            ):
+                return None, "invalid"
+            raw = stream.read(1025)
+        if len(raw) > 1024:
+            return None, "invalid"
+        value = json.loads(raw.decode("utf-8", "strict"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None, "invalid"
+    if (
+        not isinstance(value, dict)
+        or value.get("schema") != "tower-opencode-tui-plugin/v1"
+        or value.get("pid") != int(pid)
+        or value.get("process_starttime") != process_info.get("starttime")
+        or not isinstance(value.get("nonce"), str)
+        or not re.fullmatch(r"[0-9a-f]{32}", value["nonce"])
+    ):
+        return None, "invalid"
+    return value, "ok"
+
 def binding_record(pid, process_info):
     path = os.path.join(BINDING_DIR, "tower-opencode-session-%s.json" % pid)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
+    except FileNotFoundError:
+        _marker, marker_state = plugin_marker_record(pid, process_info)
+        return (None, "absent") if marker_state == "absent" else (None, "invalid")
+    except OSError:
+        return None, "invalid"
+    try:
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             owner = os.stat(os.path.join(PROC, pid)).st_uid
@@ -174,15 +215,15 @@ def binding_record(pid, process_info):
                 not stat.S_ISREG(info.st_mode) or info.st_uid != owner
                 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 4096
             ):
-                return None
+                return None, "invalid"
             raw = stream.read(4097)
         if len(raw) > 4096:
-            return None
+            return None, "invalid"
         value = json.loads(raw.decode("utf-8", "strict"))
     except (OSError, UnicodeError, ValueError, TypeError):
-        return None
+        return None, "invalid"
     if not isinstance(value, dict):
-        return None
+        return None, "invalid"
     observed = value.get("observed_at_ms")
     now_ms = int(time.time() * 1000)
     if (
@@ -197,14 +238,17 @@ def binding_record(pid, process_info):
         or not isinstance(value.get("nonce"), str)
         or not re.fullmatch(r"[0-9a-f]{32}", value["nonce"])
     ):
-        return None
+        return None, "invalid"
     if value["route_name"] == "session":
         session_id = value.get("session_id")
         if not isinstance(session_id, str) or not re.fullmatch(r"ses_[A-Za-z0-9_-]{8,128}", session_id):
-            return None
+            return None, "invalid"
     elif value.get("session_id") is not None:
-        return None
-    return value
+        return None, "invalid"
+    marker, marker_state = plugin_marker_record(pid, process_info)
+    if marker_state != "ok" or marker.get("nonce") != value.get("nonce"):
+        return None, "invalid"
+    return value, "ok"
 
 def session_body(exported, session_id, cwd):
     if not isinstance(exported, dict):
@@ -355,11 +399,12 @@ version, state = run_bounded([exe, "--version"], cwd, env, 1024, 2.0)
 if state != "ok" or not version or version.decode("utf-8", "replace").strip().splitlines()[0] != "1.19.0":
     emit("REMOTE_PROVIDER_UNAVAILABLE", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
-before = binding_record(pid, proc)
+before, binding_state = binding_record(pid, proc)
 if before is None:
     emit(
         "AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd,
-        opencode_pid=pid, session_binding="TUI_BINDING_UNAVAILABLE",
+        opencode_pid=pid,
+        session_binding="TUI_BINDING_ABSENT" if binding_state == "absent" else "TUI_BINDING_INVALID",
     )
     raise SystemExit(0)
 if before["route_name"] != "session":
@@ -385,12 +430,12 @@ except (UnicodeError, ValueError):
     emit("REMOTE_RESULT_INCOMPLETE", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
 
-after = binding_record(pid, proc)
+after, after_binding_state = binding_record(pid, proc)
 current_proc = process(pid)
 current_root = process(root)
 current_sshd = process(sshd)
 if (
-    after is None or current_proc is None or current_proc["starttime"] != proc["starttime"]
+    after is None or after_binding_state != "ok" or current_proc is None or current_proc["starttime"] != proc["starttime"]
     or current_root is None or current_root["starttime"] != root_proc["starttime"]
     or current_sshd is None or current_sshd["starttime"] != processes[sshd]["starttime"]
     or current_proc["tty_nr"] != root_proc["tty_nr"] or current_proc["pgrp"] != current_proc["tpgid"]

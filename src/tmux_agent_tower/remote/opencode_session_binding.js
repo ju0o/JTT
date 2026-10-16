@@ -3,6 +3,7 @@ import { closeSync, fstatSync, openSync, readFileSync, renameSync, unlinkSync, w
 import { createEffect } from "solid-js"
 
 const SCHEMA = "tower-opencode-tui-binding/v1"
+const MARKER_SCHEMA = "tower-opencode-tui-plugin/v1"
 const INTERVAL_MS = 500
 
 function processStarttime() {
@@ -16,6 +17,30 @@ function sessionRoute(route) {
     return { routeName: "session", sessionID: route.params.sessionID }
   }
   return { routeName: route?.name === "home" ? "home" : "other", sessionID: null }
+}
+
+function writeAtomic(path, value) {
+  const tempPath = `${path}.${randomBytes(8).toString("hex")}.tmp`
+  let fd
+  try {
+    fd = openSync(tempPath, "wx", 0o600)
+    writeFileSync(fd, JSON.stringify(value), { encoding: "utf8" })
+    if ((fstatSync(fd).mode & 0o777) !== 0o600) throw new Error("unsafe binding permissions")
+    closeSync(fd)
+    fd = undefined
+    renameSync(tempPath, path)
+    return true
+  } catch {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd)
+      } catch {}
+    }
+    try {
+      unlinkSync(tempPath)
+    } catch {}
+    return false
+  }
 }
 
 function publishBinding(api, state) {
@@ -36,24 +61,7 @@ function publishBinding(api, state) {
     nonce: state.nonce,
     observed_at_ms: Date.now(),
   })
-  const tempPath = `${state.path}.${randomBytes(8).toString("hex")}.tmp`
-  let fd
-  try {
-    fd = openSync(tempPath, "wx", 0o600)
-    writeFileSync(fd, record, { encoding: "utf8" })
-    if ((fstatSync(fd).mode & 0o777) !== 0o600) throw new Error("unsafe binding permissions")
-    closeSync(fd)
-    fd = undefined
-    renameSync(tempPath, state.path)
-  } catch {
-    if (fd !== undefined) {
-      try {
-        closeSync(fd)
-      } catch {}
-    }
-    try {
-      unlinkSync(tempPath)
-    } catch {}
+  if (!writeAtomic(state.path, JSON.parse(record))) {
     try {
       unlinkSync(state.path)
     } catch {}
@@ -74,11 +82,18 @@ export default {
 
     const state = {
       path: `/tmp/tower-opencode-session-${process.pid}.json`,
+      markerPath: `/tmp/tower-opencode-session-${process.pid}.plugin.json`,
       processStarttime: starttime,
       generation: 0,
       key: undefined,
       nonce: randomBytes(16).toString("hex"),
     }
+    if (!writeAtomic(state.markerPath, {
+      schema: MARKER_SCHEMA,
+      pid: process.pid,
+      process_starttime: state.processStarttime,
+      nonce: state.nonce,
+    })) return
     const monitor = () => {
       createEffect(() => publishBinding(api, state))
       return null
@@ -90,10 +105,12 @@ export default {
     })
     api.lifecycle.onDispose(() => {
       clearInterval(interval)
-      try {
-        const current = JSON.parse(readFileSync(state.path, "utf8"))
-        if (current?.nonce === state.nonce) unlinkSync(state.path)
-      } catch {}
+      for (const path of [state.path, state.markerPath]) {
+        try {
+          const current = JSON.parse(readFileSync(path, "utf8"))
+          if (current?.nonce === state.nonce) unlinkSync(path)
+        } catch {}
+      }
     })
   },
 }
