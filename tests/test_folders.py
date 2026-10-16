@@ -4,6 +4,7 @@ import pytest
 
 from tmux_agent_tower.state.folders import FolderStore, window_ref
 from tmux_agent_tower.ui import folder_tree, render
+from tmux_agent_tower.control.actions import enter_intent
 from tmux_agent_tower.tmux import discovery
 
 
@@ -131,6 +132,19 @@ def test_workspace_projection_keeps_stale_windows_and_aggregates_states(tmp_path
     assert "window_id" not in json.dumps(workspace)
 
 
+def test_confirmed_agent_exit_is_not_counted_as_working_in_folder_summary(tmp_path):
+    store = FolderStore(tmp_path / "folders.json")
+    window = _window("Agent run")
+    task = _task(
+        window, "agent", name="빌드", status="WORKING", agent_process_ended=True,
+    )
+
+    workspace = store.workspace([window], [task])
+
+    assert workspace["unfiled_windows"][0]["summary_counts"]["working"] == 0
+    assert workspace["unfiled_windows"][0]["summary_counts"]["unavailable"] == 1
+
+
 def test_folder_tree_renders_empty_folder_grouped_and_unfiled_windows(tmp_path):
     store = FolderStore(tmp_path / "folders.json")
     main = _window("JuBrain")
@@ -181,6 +195,43 @@ def test_unfiled_agent_work_is_prioritized_and_misc_terminals_can_start_collapse
 
     expanded = folder_tree.build_rows(store, assets, tasks, collapsed_other=False)
     assert any(row.get("display_name") == "Command prompt" for row in expanded)
+
+
+def test_default_work_tree_flattens_one_pane_window_but_keeps_targets_and_multi_pane_window(tmp_path):
+    store = FolderStore(tmp_path / "folders.json")
+    one = _window("Projects Briping", window_id="@one", created="100")
+    many = _window("Agent team", window_id="@many", created="200")
+    tasks = [
+        _task(one, "exact-target-one", name="사용자 지정 작업", pane_id="%41"),
+        _task(many, "exact-target-two", name="구현", pane_id="%42"),
+        _task(many, "exact-target-three", name="검토", pane_id="%43"),
+    ]
+    assets = folder_tree.infer_window_assets([one, many], tasks, "host-a")
+
+    rows = folder_tree.build_rows(
+        store, assets, tasks, flatten_single_pane_windows=True,
+    )
+
+    single = next(row for row in rows if row.get("target_id") == "exact-target-one")
+    assert single["kind"] == "pane"
+    assert single["key"] == "exact-target-one"
+    assert single["pane_id"] == "%41"
+    assert single["tree_window_ref"] == one["window_ref"]
+    assert enter_intent(single) == "control"
+    assert sum(row.get("kind") == "window_asset" for row in rows) == 1
+    multi_window = next(row for row in rows if row.get("window_ref") == many["window_ref"] and row.get("kind") == "window_asset")
+    assert enter_intent(multi_window) == "toggle"
+    assert {row["pane_id"] for row in rows if row.get("kind") == "pane"} == {"%41", "%42", "%43"}
+
+    store.update_window(one["window_ref"], collapsed=True)
+    collapsed_rows = folder_tree.build_rows(
+        store, assets, tasks, flatten_single_pane_windows=True,
+    )
+    collapsed_single = next(row for row in collapsed_rows if row.get("window_ref") == one["window_ref"])
+    assert collapsed_single["kind"] == "window_asset"
+    assert collapsed_single["collapsed"] is True
+    assert enter_intent(collapsed_single) == "toggle"
+    assert "%41" not in {row.get("pane_id") for row in collapsed_rows}
 
 
 def test_folder_tree_search_matches_folder_window_and_tasks_without_other_stale_leaks(tmp_path):

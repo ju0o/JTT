@@ -414,6 +414,35 @@ def test_home_selection_and_footer_stay_visible_in_fake_viewports(monkeypatch, h
 
 
 @pytest.mark.parametrize("height,width", [(18, 60), (24, 80), (40, 100), (40, 120)])
+def test_user_title_is_single_list_heading_across_fake_viewports(monkeypatch, height, width):
+    from tmux_agent_tower.ui import tower as tower_module
+
+    row = _row(
+        "%41", display_name="Projects Briping", task_name="Projects Briping",
+        name_origin="user", project="Tmux Agent Tower", work_group_name="RC handoff",
+        status="IDLE", agent_process_alive=True, target_id="target-41",
+    )
+    tower = SimpleNamespace(
+        visible_rows=[row], selected=0,
+        visual=[{"type": "header", "host": "내 AI 작업"}, {"type": "data", "row": row, "row_index": 0}],
+        access_context=None, filter_text="", notice="", config={"show_status_duration": False},
+        view_mode=tower_module.USER_WORK_VIEW,
+    )
+    screen = Screen(height=height, width=width)
+    monkeypatch.setattr(tower_module.curses, "has_colors", lambda: False)
+    monkeypatch.setattr(tower_module.curses, "doupdate", lambda: None)
+
+    tower_module.draw(screen, tower)
+
+    selected_y = next(item[0] for item in screen.writes if item[2] == "▶ ")
+    selected_line = " ".join(item[2] for item in screen.writes if item[0] == selected_y)
+    assert "Projects Briping" in selected_line
+    assert "Tmux Agent Tower" not in selected_line
+    assert "RC handoff" not in selected_line
+    assert row["key"] == "%41" and row["target_id"] == "target-41"
+
+
+@pytest.mark.parametrize("height,width", [(18, 60), (24, 80), (40, 100), (40, 120)])
 def test_expanded_folder_hides_duplicate_counts_and_copy_hint(monkeypatch, height, width):
     from tmux_agent_tower.ui import tower as tower_module
 

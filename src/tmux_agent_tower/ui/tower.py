@@ -58,6 +58,31 @@ def _target_id(host: str, session_id: str, pane_id: str, pane_pid: str) -> str:
     identity = "\0".join((host or "", session_id or "", pane_id or "", pane_pid or ""))
     return hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()
 
+
+def _confirmed_agent_exit(
+    previous: Dict,
+    *,
+    pane_dead: bool,
+    via_ssh: bool,
+    process_alive: bool,
+    detected_agent: bool,
+    auto_source: str,
+) -> bool:
+    """Keep an Agent exit visible only across the same local Pane identity.
+
+    This is a presentation hint, not a Result completion signal. It requires
+    a previously process-confirmed Agent and a current local shell process;
+    SSH panes and uncertain screen-only identity stay unverified.
+    """
+
+    if pane_dead or via_ssh or process_alive or detected_agent or auto_source != "process":
+        return False
+    if previous.get("agent_process_ended"):
+        return True
+    if str(previous.get("auto_agent") or "").casefold() in {"", "shell", "unknown", "터미널"}:
+        return False
+    return bool(previous.get("agent_process_alive"))
+
 STATE_DIR = Path.home() / ".cache" / "tmux-agent-tower"
 CONFIG_DIR = Path.home() / ".config" / "tmux-agent-tower"
 HOST_FILE = CONFIG_DIR / "host"
@@ -399,7 +424,14 @@ class Tower:
         """
 
         activity_text = None
-        if self.config["show_activity"] and not dead:
+        # Activity summaries can remain in scrollback after a turn ends.
+        # Require both the status engine and the adapter's current-widget
+        # classifier to say WORKING; a screen-change hold or old
+        # "Working/Edited/Explored" text alone is not enough.
+        if (
+            self.config["show_activity"] and not dead and status == "WORKING"
+            and adapter.classify(ctx).status == "WORKING"
+        ):
             activity = adapter.extract_activity(ctx)
             # Low-confidence guesses are computed (testable at the adapter
             # level) but never shown -- a plausible-sounding wrong answer
@@ -526,6 +558,10 @@ class Tower:
         panes = discovery.list_panes(self.session, self.own_pane_id, CAPTURE_LINES)
         out = []
         no_name = t("project.no_name")
+        previous_agents = {
+            (str(row.get("session") or ""), str(row.get("pane_id") or ""), str(row.get("pane_pid") or "")): row
+            for row in self.rows if row.get("pane_id") and not row.get("remote")
+        }
 
         for pane in panes:
             adapter = resolve_adapter(
@@ -596,6 +632,19 @@ class Tower:
                 pane["pane_id"], pane["dead"], adapter, ctx,
                 runtime_identity=pane.get("pane_pid") or None,
             )
+            detected_agent = str(auto_name or "").strip().casefold() not in {
+                "", "shell", "unknown", "터미널",
+            }
+            agent_process_alive = bool(
+                not pane["dead"] and auto_source == "process" and detected_agent
+            )
+            previous_agent = previous_agents.get((str(session_name), str(key), str(pane_pid)), {})
+            agent_process_ended = _confirmed_agent_exit(
+                previous_agent,
+                pane_dead=bool(pane["dead"]), via_ssh=via_ssh,
+                process_alive=agent_process_alive, detected_agent=detected_agent,
+                auto_source=auto_source,
+            )
             project = identity["project"]
             agent = identity["agent"]
             auto_project = identity["auto_project"]
@@ -642,6 +691,9 @@ class Tower:
                     "project_source": identity["project_source"],
                     "auto_project_source": identity["auto_project_source"],
                     "agent": agent,
+                    "agent_process_alive": agent_process_alive,
+                    "agent_process_ended": agent_process_ended,
+                    "agent_status_unverified": bool(detected_agent and not agent_process_alive),
                     "auto_agent": identity["auto_agent"],
                     "auto_detected_agent": auto_name,
                     "result_adapter": adapter.name,
@@ -759,6 +811,14 @@ class Tower:
                     session=pane.get("session") or "",
                     pane_pid=pane.get("pane_pid") or "",
                 )
+                detected_agent = str(identity.get("auto_agent") or "").strip().casefold() not in {
+                    "", "shell", "unknown", "터미널",
+                }
+                agent_process_alive = bool(
+                    not pane["dead"]
+                    and identity.get("auto_agent_source") == "process"
+                    and detected_agent
+                )
                 project = identity["project"]
                 agent = identity["agent"]
                 auto_project = identity["auto_project"]
@@ -797,6 +857,8 @@ class Tower:
                         "project_source": identity["project_source"],
                         "auto_project_source": identity["auto_project_source"],
                         "agent": agent,
+                        "agent_process_alive": agent_process_alive,
+                        "agent_status_unverified": bool(detected_agent and not agent_process_alive),
                         "auto_agent": identity["auto_agent"],
                         "auto_detected_agent": identity["auto_agent"],
                         "result_adapter": adapter.name,
@@ -1007,6 +1069,7 @@ class Tower:
                 self.visible_rows = folder_tree.build_rows(
                     self.folders, self.window_assets, work_panes, self.filter_text,
                     self.collapsed_other, self.collapsed_agents,
+                    flatten_single_pane_windows=True,
                 )
 
         if not self.visible_rows:
@@ -1151,6 +1214,13 @@ class Tower:
         if row.get("kind") == "window_asset":
             try:
                 self.folders.update_window(row["window_ref"], collapsed=True)
+            except (KeyError, OSError, ValueError):
+                self.notice = t("folder.save_failed")
+            self._apply_filter(row.get("key"))
+            return
+        if row.get("kind") == "pane" and row.get("tree_window_ref"):
+            try:
+                self.folders.update_window(row["tree_window_ref"], collapsed=True)
             except (KeyError, OSError, ValueError):
                 self.notice = t("folder.save_failed")
             self._apply_filter(row.get("key"))
@@ -1696,7 +1766,7 @@ def _build_detail_fields(tower: Tower, row: Dict, advanced: bool = False) -> Lis
             (t("group.members"), str(row.get("member_count") or 0)),
             (t("detail.status"), row.get("summary") or t("group.empty")),
         ]
-    symbol, key = render.execution_badge(row.get("status") or "")
+    symbol, key = render.execution_badge_for_row(row)
     status_text = _badge_text(symbol, key)
     duration = _duration_text(tower, row)
     if duration:
@@ -1845,7 +1915,7 @@ def _home_selection_lines(tower: Tower, width: int) -> List[str]:
         _symbol, primary_key = render.primary_badge(row)
         statuses = [t(primary_key)]
         if not row.get("offline"):
-            _symbol, execution_key = render.execution_badge(str(row.get("status") or ""))
+            _symbol, execution_key = render.execution_badge_for_row(row)
             execution_status = t(execution_key)
             if execution_status not in statuses:
                 statuses.append(execution_status)

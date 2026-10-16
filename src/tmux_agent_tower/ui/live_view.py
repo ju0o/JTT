@@ -9,7 +9,7 @@ from ..control.actions import get_pane_screen
 from ..i18n import t
 from ..state.worksets import LAYOUTS
 from .perf_trace import draw as trace_draw
-from .render import display_width, truncate_to_width, use_narrow_layout
+from .render import display_width, execution_badge_for_row, truncate_to_width, use_narrow_layout
 from .widgets import is_escape, read_key, run_list_picker, safe_add
 
 REFRESH_SECONDS = 0.7
@@ -402,10 +402,7 @@ def _apply_refresh(tower) -> bool:
 
 
 def _execution(row: dict):
-    status = row.get("status")
-    labels = {"WORKING": ("●", "status.WORKING"), "WAITING": ("!", "status.WAITING"),
-              "IDLE": ("○", "status.IDLE"), "DEAD": ("×", "status.DEAD")}
-    mark, key = labels.get(status, ("?", "status.UNKNOWN"))
+    mark, key = execution_badge_for_row(row)
     return mark, t(key)
 
 

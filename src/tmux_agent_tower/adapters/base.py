@@ -235,10 +235,9 @@ class Activity:
     """A best-effort, one-line description of what an agent looks like
     it's doing right now, extracted purely from terminal output patterns
     -- never from an LLM call (see docs/STATUS_ENGINE.md's "Task
-    Awareness" section). ``confidence`` is informational only today
-    ("high"/"medium"/"low"); the UI currently shows any non-None activity
-    the same way, but keeping it lets a future version hide low-confidence
-    guesses instead of showing a plausible-sounding wrong answer.
+    Awareness" section). ``confidence`` is informational ("high"/"medium"/"low");
+    the UI shows activity only alongside an independently confirmed WORKING
+    status so stale output is not presented as current work.
 
     Never persisted to disk: an activity string is a fragment of the
     pane's own terminal output, which can contain private project

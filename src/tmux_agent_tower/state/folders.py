@@ -252,7 +252,7 @@ class FolderStore:
             task_list.append({key: task.get(key) for key in (
                 "target_id", "key", "display_name", "task_name", "project", "agent", "role",
                 "status", "attention", "result_state", "execution_host", "work_group_id",
-                "work_group_name", "window_ref",
+                "work_group_name", "window_ref", "agent_process_ended",
                 "remote",
             )})
         for source in windows:

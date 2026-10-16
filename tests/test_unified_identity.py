@@ -82,6 +82,33 @@ def test_auto_role_name_tracks_role_and_legacy_name_is_a_user_name(tmp_path):
     )["display_name"] == "기능 구현"
 
 
+def test_agent_exit_label_requires_same_local_pane_and_confirmed_agent_to_shell_transition():
+    from tmux_agent_tower.ui.tower import _confirmed_agent_exit
+
+    previous = {"auto_agent": "Codex", "agent_process_alive": True}
+    assert _confirmed_agent_exit(
+        previous, pane_dead=False, via_ssh=False, process_alive=False,
+        detected_agent=False, auto_source="process",
+    )
+    assert _confirmed_agent_exit(
+        {"auto_agent": "Shell", "agent_process_ended": True},
+        pane_dead=False, via_ssh=False, process_alive=False,
+        detected_agent=False, auto_source="process",
+    )
+    assert not _confirmed_agent_exit(
+        previous, pane_dead=False, via_ssh=True, process_alive=False,
+        detected_agent=False, auto_source="process",
+    )
+    assert not _confirmed_agent_exit(
+        previous, pane_dead=False, via_ssh=False, process_alive=True,
+        detected_agent=True, auto_source="process",
+    )
+    assert not _confirmed_agent_exit(
+        previous, pane_dead=False, via_ssh=False, process_alive=False,
+        detected_agent=False, auto_source="ui",
+    )
+
+
 def test_tower_runtime_identity_is_detected_without_window_name_matching(tmp_path):
     tower = Tower.__new__(Tower)
     tower.overrides = OverrideStore(tmp_path / "overrides.json")

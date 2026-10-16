@@ -15,6 +15,8 @@ STRINGS = {
     "state.answer": "답변 필요",
     "state.result": "새 결과",
     "state.idle": "대기 중",
+    "state.input_waiting": "입력 대기",
+    "state.running_unknown": "실행 중 · 상태 미확인",
     "state.offline": "연결 안 됨",
     "state.dead": "종료",
     "state.unknown": "상태 확인 필요",

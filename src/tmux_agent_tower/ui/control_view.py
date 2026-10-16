@@ -248,7 +248,7 @@ def _draw(stdscr, tower, row: dict, notice: str, show_result: bool, follow: bool
     height, width = stdscr.getmaxyx()
     display_name = row.get("display_name") or row.get("task_name") or row.get("project") or t("task.unnamed")
 
-    symbol, key = render.execution_badge(row.get("status") or "")
+    symbol, key = render.execution_badge_for_row(row)
     duration = ""
     seconds = row.get("duration_seconds") or 0
     if seconds and tower.config.get("show_status_duration"):

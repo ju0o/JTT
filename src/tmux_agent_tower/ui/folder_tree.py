@@ -53,7 +53,8 @@ def visible_windows(windows: Iterable[dict], rows: Iterable[dict], own_window_id
 
 def build_rows(store: FolderStore, windows: Iterable[dict], tasks: Iterable[dict],
                filter_text: str = "", collapsed_other: bool = False,
-               collapsed_agents: bool = False) -> List[dict]:
+               collapsed_agents: bool = False,
+               flatten_single_pane_windows: bool = False) -> List[dict]:
     windows = list(windows)
     tasks = [row for row in tasks if row.get("pane_id")]
     workspace = store.workspace(windows, tasks)
@@ -89,6 +90,17 @@ def build_rows(store: FolderStore, windows: Iterable[dict], tasks: Iterable[dict
             "folder_id": window.get("folder_id"), "guide": guide,
             "remote": bool(source.get("remote")), "host": source.get("host") or "",
         }
+        if flatten_single_pane_windows and len(members) == 1 and not row["collapsed"]:
+            # The default work list needs the task, not a second selectable
+            # heading for its one-pane window. Keep the window reference on
+            # the pane so collapsing still targets only this saved window.
+            task = dict(members[0])
+            task["kind"] = "pane"
+            task["window_ref"] = window["window_ref"]
+            task["guide"] = guide
+            task["tree_window_ref"] = window["window_ref"]
+            out.append(task)
+            return True
         out.append(row)
         if row["collapsed"] and not query:
             return True

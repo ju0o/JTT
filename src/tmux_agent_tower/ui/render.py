@@ -129,13 +129,39 @@ def primary_badge(row: Dict) -> Tuple[str, str]:
         return "✓", "state.result"
     if attention == "error":
         return "!", "state.error"
-    return _execution_badge(row.get("status") or "")
+    return execution_badge_for_row(row)
 
 
-def execution_badge(status: str) -> Tuple[str, str]:
+def execution_badge(
+    status: str,
+    *,
+    agent_process_alive: bool = False,
+    agent_process_ended: bool = False,
+    agent_status_unverified: bool = False,
+) -> Tuple[str, str]:
     """Execution only, for the detail line next to attention and result."""
 
+    if agent_process_ended:
+        return "×", "state.dead"
+    if status in {"IDLE", "WAITING"}:
+        if agent_process_alive:
+            return "○", "state.input_waiting"
+        if agent_status_unverified:
+            return "◇", "state.unknown"
+    if status == "UNKNOWN" and agent_process_alive:
+        return "◇", "state.running_unknown"
     return _execution_badge(status)
+
+
+def execution_badge_for_row(row: Dict) -> Tuple[str, str]:
+    """Render execution status without treating a live pane as a live Agent."""
+
+    return execution_badge(
+        str(row.get("status") or ""),
+        agent_process_alive=bool(row.get("agent_process_alive")),
+        agent_process_ended=bool(row.get("agent_process_ended")),
+        agent_status_unverified=bool(row.get("agent_status_unverified")),
+    )
 
 
 def _execution_badge(status: str) -> Tuple[str, str]:
@@ -171,7 +197,7 @@ def detail_badges(row: Dict) -> List[Tuple[str, str]]:
         badges.append(("✓", "state.result"))
     if attention == "error":
         badges.append(("!", "state.error"))
-    badges.append(_execution_badge(row.get("status") or ""))
+    badges.append(execution_badge_for_row(row))
     return badges
 
 
@@ -195,7 +221,7 @@ def watch_counts(rows: Sequence[Dict]) -> Dict[str, int]:
             counts[category] += 1
         elif row.get("result_state") == "ready":
             counts["result"] += 1
-        elif row.get("status") == "WORKING":
+        elif row.get("status") == "WORKING" and not row.get("agent_process_ended"):
             counts["working"] += 1
     return counts
 
@@ -608,13 +634,14 @@ def list_row_parts(row: Dict, width: int, badge_text: Callable[[str], str], dura
     project = row.get("display_name") or row.get("task_name") or project_name or t("task.terminal")
     task_parts = []
     role = badge_text(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
-    if project_name and project_name.casefold() not in project.casefold():
+    user_named = row.get("name_origin") == "user"
+    if not user_named and project_name and project_name.casefold() not in project.casefold():
         task_parts.append(project_name)
     agent = (row.get("agent") or "").strip()
     if role and role.casefold() not in project.casefold():
         agent = f"{role} · {agent}" if agent else role
     group = str(row.get("work_group_name") or "").strip()
-    if group and group.casefold() not in project.casefold():
+    if not user_named and group and group.casefold() not in project.casefold():
         task_parts.append(group)
     return {
         "guide": guide,

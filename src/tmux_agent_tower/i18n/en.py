@@ -18,6 +18,8 @@ STRINGS = {
     "state.answer": "Answer needed",
     "state.result": "New result",
     "state.idle": "Waiting",
+    "state.input_waiting": "Waiting for input",
+    "state.running_unknown": "Running · status unknown",
     "state.offline": "Disconnected",
     "state.dead": "Closed",
     "state.unknown": "Check status",

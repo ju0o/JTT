@@ -1,3 +1,5 @@
+import pytest
+
 from tmux_agent_tower.ui import render
 
 
@@ -169,6 +171,51 @@ def test_default_row_keeps_task_agent_role_together_and_hides_empty_labels():
     assert parts["agent"] == "구현 · Codex"
     assert "(이름 없음)" not in " ".join(parts.values())
     assert "역할 없음" not in " ".join(parts.values())
+
+
+@pytest.mark.parametrize(
+    "display_name,project,group",
+    [
+        ("Projects Briping", "Tmux Agent Tower", "릴리스 점검"),
+        ("TmuxTower", "TmuxTower PM", "TmuxTower"),
+    ],
+)
+def test_user_named_task_has_one_representative_title(display_name, project, group):
+    from tmux_agent_tower.i18n import t
+
+    row = {
+        "kind": "pane", "name_origin": "user", "display_name": display_name,
+        "task_name": display_name, "project": project, "work_group_name": group,
+        "agent": "OpenCode", "role": None, "status": "UNKNOWN",
+    }
+    parts = render.list_row_parts(row, 120, t)
+
+    assert parts["project"] == display_name
+    assert parts["task"] == ""
+    assert parts["agent"] == "OpenCode"
+    assert project not in " ".join(parts.values())
+    assert f" · {group}" not in " ".join(parts.values())
+
+
+def test_execution_labels_need_agent_process_evidence():
+    cases = [
+        ({"status": "WORKING", "agent_process_alive": True}, "state.working"),
+        ({"status": "IDLE", "agent_process_alive": True}, "state.input_waiting"),
+        ({"status": "UNKNOWN", "agent_process_alive": True}, "state.running_unknown"),
+        ({"status": "WORKING", "agent_process_ended": True}, "state.dead"),
+        ({"status": "IDLE", "agent_status_unverified": True}, "state.unknown"),
+        ({"status": "DEAD", "agent_status_unverified": True}, "state.dead"),
+    ]
+    for row, expected_key in cases:
+        _symbol, key = render.execution_badge_for_row(row)
+        assert key == expected_key
+
+
+def test_remote_agent_without_process_evidence_is_not_guessed_waiting():
+    _symbol, key = render.execution_badge_for_row({
+        "status": "IDLE", "remote": True, "agent_status_unverified": True,
+    })
+    assert key == "state.unknown"
 
 
 # -- row_matches_filter ----------------------------------------------
