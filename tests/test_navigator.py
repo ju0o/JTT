@@ -485,7 +485,7 @@ def test_collapse_hides_children_and_search_keeps_the_window(tmp_path, monkeypat
     )
     assert narrow["agent"] == ""
     assert narrow["project"] == "로그인 수정"
-    assert narrow["task"] == "쥬포탈"
+    assert narrow["task"] == ""
     assert "3m" not in narrow["badge"]
     assert render.agent_status_line("Cursor", "● 작업 중") == "Cursor  ● 작업 중"
     assert "%2" not in "".join(narrow.values())
@@ -493,7 +493,7 @@ def test_collapse_hides_children_and_search_keeps_the_window(tmp_path, monkeypat
     assert "%2" not in "".join(wide.values())
     assert wide["agent"] == "Cursor"
     assert wide["project"] == "로그인 수정"
-    assert wide["task"] == "쥬포탈"
+    assert wide["task"] == ""
     assert "3m" in wide["badge"]
     assert render.display_width("쥬포탈") == 6
     assert render.display_width("├─ ") == render.display_width("└─ ")
