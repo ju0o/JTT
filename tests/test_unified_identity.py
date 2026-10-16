@@ -132,19 +132,20 @@ def test_default_task_details_hide_tmux_names_and_ids():
     assert labels == ["작업 이름", "프로젝트", "에이전트", "역할", "상태", "확인할 일", "결과", "실행 위치"]
 
 
-def test_default_selected_summary_omits_empty_project_and_role():
+def test_default_home_summary_omits_empty_project_role_and_unknown_host():
     from tmux_agent_tower.ui import tower as tower_module
 
-    lines = tower_module._build_selected_summary(
-        SimpleNamespace(config={"show_status_duration": False}),
-        {
-            "display_name": "터미널", "project": "(이름 없음)", "agent": "Shell",
-            "role": None, "status": "IDLE", "attention": "none", "result_state": "none",
-            "execution_host": "UNKNOWN",
-        },
+    row = {
+        "kind": "pane", "display_name": "터미널", "project": "(이름 없음)",
+        "agent": "Shell", "role": None, "status": "IDLE", "attention": "none",
+        "result_state": "none", "execution_host": "UNKNOWN",
+    }
+    lines = tower_module._home_selection_lines(
+        SimpleNamespace(visible_rows=[row], selected=0), 80
     )
-    assert lines == ["터미널", "Shell · ○ 대기 중"]
+    assert lines == ["선택한 작업: 터미널", "에이전트: Shell", "상태: 대기 중"]
     assert not any("이름 없음" in line or "역할 없음" in line for line in lines)
+    assert not any("실행 위치 UNKNOWN" in line for line in lines)
 
 
 def test_project_rebind_changes_path_and_preserves_result_provider(tmp_path):

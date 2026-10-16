@@ -1822,6 +1822,8 @@ def _home_selection_lines(tower: Tower, width: int) -> List[str]:
 
         agent_line = t("home.agent", agent=agent)
         host = str(row.get("execution_host") or row.get("host") or "").strip()
+        if host.casefold() in {"unknown", t("state.unknown").casefold()}:
+            host = ""
         if host:
             separator = " · "
             host_prefix = t("home.execution_host", host="").rstrip()
