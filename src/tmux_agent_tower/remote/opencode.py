@@ -22,6 +22,7 @@ PROC = sys.argv[5] if len(sys.argv) > 5 else "/proc"
 BINDING_DIR = sys.argv[6] if len(sys.argv) > 6 else "/tmp"
 MAX_EXPORT = 32 * 1024 * 1024
 MAX_BODY = 4 * 1024 * 1024
+SUPPORTED_OPENCODE_VERSIONS = {"1.19.0", "1.19.1"}
 
 def emit(status, **fields):
     print(MARKER + json.dumps({"status": status, **fields}, ensure_ascii=True, separators=(",", ":")))
@@ -396,7 +397,7 @@ for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOM
     if key in proc_env:
         env[key] = proc_env[key]
 version, state = run_bounded([exe, "--version"], cwd, env, 1024, 2.0)
-if state != "ok" or not version or version.decode("utf-8", "replace").strip().splitlines()[0] != "1.19.0":
+if state != "ok" or not version or version.decode("utf-8", "replace").strip().splitlines()[0] not in SUPPORTED_OPENCODE_VERSIONS:
     emit("REMOTE_PROVIDER_UNAVAILABLE", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
 before, binding_state = binding_record(pid, proc)

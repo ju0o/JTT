@@ -4,6 +4,7 @@ import { createEffect } from "solid-js"
 
 const SCHEMA = "tower-opencode-tui-binding/v1"
 const MARKER_SCHEMA = "tower-opencode-tui-plugin/v1"
+const SUPPORTED_OPENCODE_VERSIONS = new Set(["1.19.0", "1.19.1"])
 const INTERVAL_MS = 500
 
 function processStarttime() {
@@ -70,7 +71,7 @@ function publishBinding(api, state) {
 
 export default {
   tui: async (api) => {
-    if (process.platform !== "linux" || api.app.version !== "1.19.0") return
+    if (process.platform !== "linux" || !SUPPORTED_OPENCODE_VERSIONS.has(api.app.version)) return
 
     let starttime
     try {

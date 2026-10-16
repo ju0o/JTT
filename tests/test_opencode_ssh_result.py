@@ -65,7 +65,7 @@ def _proc_process(proc, pid, ppid, comm, cwd, *, executable="/bin/bash", env=Non
     (folder / "cwd").symlink_to(cwd)
 
 
-def _remote_fixture(tmp_path, *, complete=True, duplicate=False, second_opencode=False, background_opencode=False, config_content=None, process_argv=None, executable_name="opencode", comm_name="opencode", finish="stop", binding=True, plugin_marker=None, route_name="session", binding_session=SESSION_ID, generation=1, stale_binding=False, switch_during_export=False, export_session=SESSION_ID, body_parts=None, export_override=None):
+def _remote_fixture(tmp_path, *, opencode_version="1.19.0", complete=True, duplicate=False, second_opencode=False, background_opencode=False, config_content=None, process_argv=None, executable_name="opencode", comm_name="opencode", finish="stop", binding=True, plugin_marker=None, route_name="session", binding_session=SESSION_ID, generation=1, stale_binding=False, switch_during_export=False, export_session=SESSION_ID, body_parts=None, export_override=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     proc = tmp_path / "proc"
     proc.mkdir()
@@ -81,7 +81,7 @@ def _remote_fixture(tmp_path, *, complete=True, duplicate=False, second_opencode
     fake_exe.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, pathlib, sys\n"
-        "if sys.argv[1:] == ['--version']:\n print('1.19.0')\n"
+        f"if sys.argv[1:] == ['--version']:\n print({opencode_version!r})\n"
         "elif sys.argv[1:3] == ['session', 'list']:\n pathlib.Path('.session-list-called').write_text('yes'); sys.exit(4)\n"
         "elif len(sys.argv) == 3 and sys.argv[1] == 'export':\n"
         " pathlib.Path('.export-called').write_text(sys.argv[2])\n"
@@ -179,6 +179,26 @@ def test_remote_provider_exports_only_the_verified_current_tui_session(tmp_path,
     assert (cwd / ".export-called").read_text() == SESSION_ID
     assert "한글 결과" not in wire
     assert not (cwd / ".session-list-called").exists()
+
+
+def test_remote_provider_supports_opencode_1_19_1(tmp_path):
+    proc, cwd, binding_dir = _remote_fixture(tmp_path, opencode_version="1.19.1")
+    payload, _ = _run_remote(proc, binding_dir)
+
+    assert payload["status"] == "ok"
+    assert payload["session_binding"] == "route.current"
+    assert (cwd / ".export-called").read_text() == SESSION_ID
+
+
+@pytest.mark.parametrize("opencode_version", ["1.18.27", "1.19.2", "1.19.1-preview", "1.20.0"])
+def test_remote_provider_rejects_unsupported_opencode_versions(tmp_path, opencode_version):
+    proc, cwd, binding_dir = _remote_fixture(tmp_path, opencode_version=opencode_version)
+    payload, wire = _run_remote(proc, binding_dir)
+
+    assert payload["status"] == "REMOTE_PROVIDER_UNAVAILABLE"
+    assert "body_b64" not in payload
+    assert "한글 결과" not in wire
+    assert not (cwd / ".export-called").exists()
 
 
 @pytest.mark.parametrize(

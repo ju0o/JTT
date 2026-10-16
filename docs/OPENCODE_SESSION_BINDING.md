@@ -1,13 +1,14 @@
-# OpenCode 1.19.0 TUI session binding
+# OpenCode 1.19.0 / 1.19.1 TUI session binding
 
 This optional plugin lets Tower read the session currently selected in the
-OpenCode TUI. It is supported only by the Linux OpenCode 1.19.0 runtime. Tower
-does not install or enable it automatically.
+OpenCode TUI. It is supported only by the Linux OpenCode 1.19.0 and 1.19.1
+runtimes. Other versions are rejected; Tower does not install or enable it
+automatically.
 
 ## Loader and dependency contract
 
-The v1.19.0 TUI host creates the legacy TUI plugin host, resolves configured
-TUI plugin origins, loads them with `kind: "tui"`, and runs the module's
+Both supported TUI hosts create the legacy TUI plugin host, resolve configured
+TUI plugin origins, load them with `kind: "tui"`, and run the module's
 `tui(api)` initializer. Its public TUI API exposes `api.route.current`; the
 binding plugin reads that route rather than inferring a session from a command
 line argument or a session list.
@@ -25,10 +26,10 @@ existing TUI `plugin` array, for example:
 }
 ```
 
-The plugin imports `createEffect` from `solid-js`. OpenCode v1.19.0 pins
-`solid-js` to `1.9.10`; the dependency must be available from the active
-OpenCode config directory. If that directory already has `package.json`, merge
-the dependency without replacing its existing fields:
+The plugin imports `createEffect` from `solid-js`. OpenCode v1.19.0 and v1.19.1
+both pin `solid-js` to `1.9.10`; the dependency must be available from the
+active OpenCode config directory. If that directory already has `package.json`,
+merge the dependency without replacing its existing fields:
 
 ```json
 {
@@ -39,7 +40,7 @@ the dependency without replacing its existing fields:
 ```
 
 This snippet shows the dependency to merge, not a replacement manifest. Keep
-any existing dependencies. The v1.19.0 TUI configuration host prepares local
+any existing dependencies. The supported TUI configuration host prepares local
 plugin dependencies during startup; OpenCode's plugin documentation describes
 the local `package.json` / Bun dependency workflow. Let the OpenCode host do
 that preparation rather than installing packages into a different runtime.
@@ -63,8 +64,8 @@ was changed for this PR.
 5. Merge the pinned `solid-js: 1.9.10` dependency into the config directory's
    existing `package.json`, or create a minimal manifest only if none exists.
    Preserve any existing lockfile. Review the diff before restarting OpenCode.
-6. After separate approval, restart OpenCode so v1.19.0's TUI loader can load
-   the configured module and prepare dependencies. Confirm a fresh binding
+6. After separate approval, restart OpenCode so the supported TUI loader can
+   load the configured module and prepare dependencies. Confirm a fresh binding
    using Tower's metadata-only diagnostics; do not log Result text.
 
 The plugin publishes an owner-only activation marker and a short-lived binding
@@ -93,10 +94,11 @@ to require its completion-boundary and truncation checks.
 No user configuration, plugin, package manifest, or OpenCode process was
 modified as part of this PR.
 
-## Upstream v1.19.0 references
+## Upstream references
 
 - [TUI plugin runtime](https://github.com/anomalyco/opencode/blob/v1.19.0/packages/opencode/src/plugin/tui/runtime.ts): external origins load with `kind: "tui"` and initialize the module's `tui` export.
 - [TUI plugin API](https://github.com/anomalyco/opencode/blob/v1.19.0/packages/plugin/src/tui.ts): `TuiPluginModule` shape and `api.route.current` contract.
 - [TUI config loader](https://github.com/anomalyco/opencode/blob/v1.19.0/packages/opencode/src/config/tui.ts): global/project `tui.json` and `tui.jsonc` sources, plugin origins, and startup dependency preparation.
 - [v1.19.0 package catalog](https://github.com/anomalyco/opencode/blob/v1.19.0/package.json): `solid-js` is pinned to `1.9.10`.
 - [Official plugin dependency guide](https://github.com/anomalyco/opencode/blob/v1.19.0/packages/web/src/content/docs/plugins.mdx): local external dependencies are declared in the config-directory `package.json` and prepared at startup.
+- [v1.19.1 TUI plugin API](https://github.com/anomalyco/opencode/blob/v1.19.1/packages/plugin/src/tui.ts), [TUI config loader](https://github.com/anomalyco/opencode/blob/v1.19.1/packages/opencode/src/config/tui.ts), [TUI plugin runtime](https://github.com/anomalyco/opencode/blob/v1.19.1/packages/opencode/src/plugin/tui/runtime.ts), and [package catalog](https://github.com/anomalyco/opencode/blob/v1.19.1/package.json): PM source comparison found the binding-relevant source blobs unchanged from v1.19.0, including the `solid-js` 1.9.10 pin.
