@@ -109,25 +109,28 @@ def pane_title_identity(session: str, pane_id: str) -> Optional[dict]:
 
     if not session or not valid_pane_id(pane_id):
         return None
-    separator = "\x1f"
+    if pane_id not in pane_ids(session):
+        return None
+    separator = "\t"
     format_string = separator.join(
         ("#{pane_id}", "#{pane_pid}", "#{pane_dead}", "#{pane_title}")
     )
     try:
-        result = _run(["list-panes", "-s", "-t", session, "-F", format_string])
+        result = _run(["display-message", "-p", "-t", pane_id, format_string])
     except Exception:
         return None
     if result.returncode != 0:
         return None
-    for line in (result.stdout or "").splitlines():
-        parts = line.split(separator, 3)
-        if len(parts) != 4 or parts[0] != pane_id:
-            continue
-        live_pane_id, pane_pid, pane_dead, title = parts
-        if pane_dead != "0" or not pane_pid.isdigit():
-            return None
-        return {"session": session, "pane_id": live_pane_id, "pane_pid": pane_pid, "pane_title": title}
-    return None
+    output = (result.stdout or "").removesuffix("\n")
+    parts = output.split(separator, 3)
+    if len(parts) != 4:
+        return None
+    live_pane_id, pane_pid, pane_dead, title = parts
+    if live_pane_id != pane_id or pane_dead != "0" or not pane_pid.isdigit():
+        return None
+    if pane_id not in pane_ids(session):
+        return None
+    return {"session": session, "pane_id": live_pane_id, "pane_pid": pane_pid, "pane_title": title}
 
 
 def panes_of_window(window_id: str) -> List[str]:

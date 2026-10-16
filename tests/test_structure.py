@@ -61,9 +61,9 @@ class World:
             if "-t" in args and args[args.index("-t") + 1] != "0":
                 return self._result("", 1)
             panes = [pane for panes in self.windows.values() for pane in panes]
-            if "\x1f" in args[-1]:
+            if "\t" in args[-1]:
                 return self._result("\n".join(
-                    "\x1f".join((pane, self.pids[pane], "0", self.titles.get(pane, "")))
+                    "\t".join((pane, self.pids[pane], "0", self.titles.get(pane, "")))
                     for pane in panes
                 ))
             return self._result("\n".join(panes))
@@ -75,8 +75,8 @@ class World:
             if target.startswith("%"):
                 for wid, panes in self.windows.items():
                     if target in panes:
-                        if "#{session_name}" in args[-1]:
-                            return self._result("\x1f".join(("0", target, self.pids[target], "0", self.titles.get(target, ""))))
+                        if "\t" in args[-1]:
+                            return self._result("\t".join((target, self.pids[target], "0", self.titles.get(target, ""))))
                         return self._result(wid)
                 return self._result("", 1)
             if target.startswith("@"):
