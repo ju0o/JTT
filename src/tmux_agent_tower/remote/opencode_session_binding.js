@@ -70,6 +70,7 @@ function publishBinding(api, state) {
 }
 
 export default {
+  id: "tower-opencode-session-binding",
   tui: async (api) => {
     if (process.platform !== "linux" || !SUPPORTED_OPENCODE_VERSIONS.has(api.app.version)) return
 
