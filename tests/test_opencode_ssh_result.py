@@ -118,157 +118,71 @@ def _run_remote(proc):
     return json.loads(record), completed.stdout
 
 
-def test_remote_provider_exports_only_the_explicit_launch_session_and_latest_assistant(tmp_path):
-    proc, _cwd = _remote_fixture(tmp_path)
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["opencode"],
+        ["opencode", "--session", SESSION_ID],
+        ["opencode", "--session=" + SESSION_ID],
+        ["opencode", "-s", SESSION_ID, "--pure"],
+    ],
+)
+def test_remote_provider_fails_closed_when_active_tui_session_is_not_exposed(tmp_path, argv):
+    proc, cwd = _remote_fixture(tmp_path, process_argv=argv, duplicate=True)
     payload, wire = _run_remote(proc)
-    expected = "한글 결과\n```python\nprint('full')\n```\n다음 문단\n"
 
-    assert payload["status"] == "ok"
-    assert payload["session_id"] == SESSION_ID
-    assert payload["user_id"] == USER_ID and payload["message_id"] == ASSISTANT_ID
-    assert payload["turn_complete"] and payload["body_complete"]
-    assert base64.b64decode(payload["body_b64"]).decode() == expected
-    assert payload["native_utf8_bytes"] == len(expected.encode())
-    assert payload["native_sha256"] == hashlib.sha256(expected.encode()).hexdigest()
-    assert "OLD TURN MUST NOT COPY" not in wire and "TOOL OUTPUT MUST NOT COPY" not in wire
-
-
-def test_export_inherits_the_exact_isolated_database_and_cache_from_bound_tui(tmp_path):
-    proc, cwd = _remote_fixture(tmp_path)
-    payload, _ = _run_remote(proc)
-    env = json.loads((cwd / ".export-env.json").read_text())
-
-    assert payload["status"] == "ok"
-    assert env == {
-        "OPENCODE_DB": str(tmp_path / "isolated-opencode" / "opencode.db"),
-        "XDG_CACHE_HOME": str(tmp_path / "isolated-opencode" / "cache"),
-    }
-
-
-def test_remote_provider_ignores_titles_and_requires_one_explicit_session_argument(tmp_path):
-    proc, cwd = _remote_fixture(tmp_path, duplicate=True)
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "ok"
-    assert (cwd / ".export-called").read_text() == SESSION_ID
+    assert payload["status"] == "AGENT_SESSION_UNBOUND"
+    assert payload["session_binding"] == "active_tui_session_unexposed"
+    assert "body_b64" not in payload and "한글 결과" not in wire
+    assert not (cwd / ".export-called").exists()
     assert not (cwd / ".session-list-called").exists()
 
-    proc, cwd = _remote_fixture(tmp_path / "missing", process_argv=["opencode"])
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "AGENT_SESSION_UNBOUND"
-    assert payload["session_binding"] == "implicit_tui"
-    assert not (cwd / ".export-called").exists()
 
-
-def test_remote_provider_marks_only_bare_opencode_for_boundary_checked_capture(tmp_path):
-    proc, _cwd = _remote_fixture(tmp_path / "bare", process_argv=["opencode"])
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "AGENT_SESSION_UNBOUND"
-    assert payload["session_binding"] == "implicit_tui"
-
-    proc, _cwd = _remote_fixture(tmp_path / "continue", process_argv=["opencode", "--continue"])
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "AGENT_SESSION_UNBOUND"
-    assert "session_binding" not in payload
-
-    proc, _cwd = _remote_fixture(
-        tmp_path / "wrong-executable", process_argv=["opencode"], executable_name="not-opencode",
-    )
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "REMOTE_PROVIDER_UNAVAILABLE"
-    assert "session_binding" not in payload
-
-
-def test_remote_provider_accepts_explicit_pure_session_and_rejects_extra_or_duplicate_args(tmp_path):
-    proc, cwd = _remote_fixture(tmp_path / "pure", process_argv=["opencode", "--session", SESSION_ID, "--pure"])
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "ok"
-    assert (cwd / ".export-called").read_text() == SESSION_ID
-
+def test_remote_provider_does_not_guess_sessions_for_ambiguous_tui_arguments(tmp_path):
     for name, argv in (
-        ("unknown", ["opencode", "--session", SESSION_ID, "--pure", "--unexpected"]),
-        ("duplicate-session", ["opencode", "--session", SESSION_ID, "--pure", "--session", SESSION_ID]),
-        ("duplicate-pure", ["opencode", "--session", SESSION_ID, "--pure", "--pure"]),
+        ("continue", ["opencode", "--continue"]),
+        ("unexpected", ["opencode", "--session", SESSION_ID, "--unexpected"]),
+        ("duplicate", ["opencode", "--session", SESSION_ID, "--session", SESSION_ID]),
     ):
         proc, cwd = _remote_fixture(tmp_path / name, process_argv=argv)
         payload, _ = _run_remote(proc)
         assert payload["status"] == "AGENT_SESSION_UNBOUND"
+        assert "session_binding" not in payload
         assert not (cwd / ".export-called").exists()
 
-    proc, cwd = _remote_fixture(tmp_path / "duplicate-arg", process_argv=["opencode", "--session", SESSION_ID, "--session", SESSION_ID])
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "AGENT_SESSION_UNBOUND"
-    assert not (cwd / ".export-called").exists()
 
-
-def test_remote_provider_accepts_opencode_exe_and_rejects_other_executable_names(tmp_path):
-    proc, cwd = _remote_fixture(tmp_path / "exe-suffix", executable_name="opencode.exe", comm_name="opencode.exe")
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "ok"
-    assert (cwd / ".export-called").read_text() == SESSION_ID
-
-    proc, cwd = _remote_fixture(tmp_path / "wrong-name", executable_name="not-opencode")
+def test_remote_provider_preserves_executable_and_connection_checks(tmp_path):
+    proc, cwd = _remote_fixture(
+        tmp_path / "wrong-executable", process_argv=["opencode"], executable_name="not-opencode",
+    )
     payload, _ = _run_remote(proc)
     assert payload["status"] == "REMOTE_PROVIDER_UNAVAILABLE"
-    assert not (cwd / ".export-called").exists()
+    assert "session_binding" not in payload and not (cwd / ".export-called").exists()
+
+    proc, cwd = _remote_fixture(tmp_path / "wrong-socket")
+    wrong_args = ["198.51.100.24", CLIENT[1], CLIENT[2], CLIENT[3], str(proc)]
+    completed = subprocess.run(
+        [sys.executable, "-c", _REMOTE_OPENCODE_SCRIPT, *wrong_args], capture_output=True, text=True,
+    )
+    record = next(
+        line.removeprefix("__TOWER_OPENCODE_RESULT__") for line in completed.stdout.splitlines()
+        if line.startswith("__TOWER_OPENCODE_RESULT__")
+    )
+    assert json.loads(record)["status"] == "REMOTE_PROVIDER_UNBOUND"
+
+    proc, _cwd = _remote_fixture(tmp_path / "multiple", second_opencode=True)
+    assert _run_remote(proc)[0]["status"] == "REMOTE_PROVIDER_UNBOUND"
 
 
-def test_remote_provider_accepts_opencode_exe_with_bare_tui_comm_alias(tmp_path):
+def test_remote_provider_recognizes_opencode_exe_comm_alias_but_still_fails_closed(tmp_path):
     proc, cwd = _remote_fixture(
         tmp_path, process_argv=["opencode"], executable_name="opencode.exe", comm_name="opencode",
     )
     payload, _ = _run_remote(proc)
 
     assert payload["status"] == "AGENT_SESSION_UNBOUND"
-    assert payload["session_binding"] == "implicit_tui"
+    assert payload["session_binding"] == "active_tui_session_unexposed"
     assert not (cwd / ".export-called").exists()
-
-
-def test_remote_provider_rejects_opencode_exe_comm_without_matching_executable_or_tty(tmp_path):
-    proc, cwd = _remote_fixture(
-        tmp_path / "comm-path-mismatch", executable_name="not-opencode.exe", comm_name="opencode.exe",
-    )
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "REMOTE_PROVIDER_UNAVAILABLE"
-    assert not (cwd / ".export-called").exists()
-
-    proc, cwd = _remote_fixture(
-        tmp_path / "comm-wrong", executable_name="opencode.exe", comm_name="other-agent.exe",
-    )
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "REMOTE_PROVIDER_UNBOUND"
-    assert not (cwd / ".export-called").exists()
-
-    proc, cwd = _remote_fixture(
-        tmp_path / "exe-background", executable_name="opencode.exe", comm_name="opencode.exe",
-        background_opencode=True,
-    )
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "AGENT_SESSION_UNBOUND"
-    assert not (cwd / ".export-called").exists()
-
-
-def test_remote_provider_rejects_length_finished_assistant_as_incomplete(tmp_path):
-    proc, _cwd = _remote_fixture(tmp_path, finish="length")
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "REMOTE_RESULT_INCOMPLETE"
-    assert "body_b64" not in payload
-
-
-def test_remote_provider_rejects_incomplete_turn_wrong_socket_and_multiple_processes(tmp_path):
-    proc, _cwd = _remote_fixture(tmp_path / "incomplete", complete=False)
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "REMOTE_RESULT_INCOMPLETE"
-    assert "body_b64" not in payload
-
-    proc, _cwd = _remote_fixture(tmp_path / "wrong-socket")
-    wrong_args = ["198.51.100.24", CLIENT[1], CLIENT[2], CLIENT[3], str(proc)]
-    completed = subprocess.run([sys.executable, "-c", _REMOTE_OPENCODE_SCRIPT, *wrong_args], capture_output=True, text=True)
-    record = next(line.removeprefix("__TOWER_OPENCODE_RESULT__") for line in completed.stdout.splitlines() if line.startswith("__TOWER_OPENCODE_RESULT__"))
-    assert json.loads(record)["status"] == "REMOTE_PROVIDER_UNBOUND"
-
-    proc, _cwd = _remote_fixture(tmp_path / "multiple", second_opencode=True)
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "REMOTE_PROVIDER_UNBOUND"
 
 
 def test_remote_provider_rejects_background_process_and_does_not_return_config_content(tmp_path):
@@ -281,31 +195,6 @@ def test_remote_provider_rejects_background_process_and_does_not_return_config_c
     payload, wire = _run_remote(proc)
     assert payload["status"] == "REMOTE_PROVIDER_UNAVAILABLE"
     assert secret not in wire
-
-
-def test_remote_provider_rechecks_opencode_pid_after_export(tmp_path):
-    proc, cwd = _remote_fixture(tmp_path)
-    (cwd / ".kill-opencode-stat").write_text(str(proc / "200" / "stat"))
-    payload, _ = _run_remote(proc)
-    assert payload["status"] == "AGENT_SESSION_UNBOUND"
-
-
-def test_remote_provider_preserves_long_multiline_korean_markdown(tmp_path):
-    proc, cwd = _remote_fixture(tmp_path)
-    exported_path = cwd / ".export.json"
-    exported = json.loads(exported_path.read_text())
-    assistant_parts = exported["messages"][-1]["parts"]
-    long_text = "\n".join(f"{index:02d}행 한글 **Result** — `item_{index}`" for index in range(100))
-    assistant_parts[0]["text"] = long_text
-    exported_path.write_text(json.dumps(exported, ensure_ascii=False))
-
-    payload, _ = _run_remote(proc)
-    expected = long_text + "\n다음 문단\n"
-    assert payload["status"] == "ok"
-    body = base64.b64decode(payload["body_b64"]).decode("utf-8")
-    assert body == expected and len(body.splitlines()) >= 100
-    assert payload["native_utf8_bytes"] == len(expected.encode("utf-8"))
-    assert payload["native_sha256"] == hashlib.sha256(expected.encode("utf-8")).hexdigest()
 
 
 def test_fetch_decodes_bounded_wire_payload_and_keeps_exact_utf8(monkeypatch):
@@ -391,7 +280,7 @@ def test_tower_get_result_uses_bound_ssh_provider_and_rechecks_pane(monkeypatch)
     assert payload["native_sha256"] == hashlib.sha256(body.encode()).hexdigest()
 
 
-def test_tower_uses_boundary_checked_capture_for_bare_opencode_only(monkeypatch):
+def test_tower_uses_boundary_checked_capture_when_active_opencode_session_is_unexposed(monkeypatch):
     from tmux_agent_tower.control.actions import get_result
 
     tower = _Tower()
@@ -399,7 +288,10 @@ def test_tower_uses_boundary_checked_capture_for_bare_opencode_only(monkeypatch)
     _bind_local_ssh(monkeypatch)
     monkeypatch.setattr(
         "tmux_agent_tower.remote.opencode.fetch_remote_opencode_result",
-        lambda *_: {"status": "AGENT_SESSION_UNBOUND", "session_binding": "implicit_tui"},
+        lambda *_: {
+            "status": "AGENT_SESSION_UNBOUND",
+            "session_binding": "active_tui_session_unexposed",
+        },
     )
     body = "A bounded screen result."
     recovered = []
@@ -445,7 +337,10 @@ def test_bare_opencode_capture_uses_real_adapter_boundaries(
     _bind_local_ssh(monkeypatch)
     monkeypatch.setattr(
         "tmux_agent_tower.remote.opencode.fetch_remote_opencode_result",
-        lambda *_: {"status": "AGENT_SESSION_UNBOUND", "session_binding": "implicit_tui"},
+        lambda *_: {
+            "status": "AGENT_SESSION_UNBOUND",
+            "session_binding": "active_tui_session_unexposed",
+        },
     )
     monkeypatch.setattr(
         "tmux_agent_tower.control.actions.find_screen_target",

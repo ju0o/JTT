@@ -1,4 +1,4 @@
-"""Read the current, complete OpenCode TUI result bound to one SSH pane."""
+"""Probe an SSH-bound OpenCode TUI without guessing its active session."""
 
 from __future__ import annotations
 
@@ -15,11 +15,9 @@ _MARKER = "__TOWER_OPENCODE_RESULT__"
 _MAX_WIRE_BYTES = 6 * 1024 * 1024
 
 # This runs on the remote host and returns only the selected assistant body.
-_REMOTE_OPENCODE_SCRIPT = r'''import base64, hashlib, ipaddress, json, os, re, selectors, subprocess, sys, time
+_REMOTE_OPENCODE_SCRIPT = r'''import ipaddress, json, os, re, selectors, subprocess, sys, time
 MARKER = "__TOWER_OPENCODE_RESULT__"
 PROC = sys.argv[5] if len(sys.argv) > 5 else "/proc"
-MAX_EXPORT = 32 * 1024 * 1024
-MAX_BODY = 4 * 1024 * 1024
 
 def emit(status, **fields):
     print(MARKER + json.dumps({"status": status, **fields}, ensure_ascii=True, separators=(",", ":")))
@@ -86,7 +84,7 @@ def process(pid):
     except (OSError, IndexError):
         return None
 
-# shortcut: in-TUI session switches are not exposed; use capture only for a plain TUI launch whose screen proves both result boundaries.
+# A TUI's argv identifies its launch session, not necessarily the session currently selected in the UI.
 def process_argv(pid):
     try:
         raw = open(os.path.join(PROC, pid, "cmdline"), "rb").read().split(b"\0")
@@ -184,73 +182,6 @@ def run_bounded(argv, cwd, env, limit, timeout):
         if child is not None and child.stdout:
             child.stdout.close()
 
-def session_body(exported, session_id, cwd):
-    if not isinstance(exported, dict):
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    info = exported.get("info")
-    messages = exported.get("messages")
-    if not isinstance(info, dict) or info.get("id") != session_id or not isinstance(messages, list):
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    try:
-        if os.path.realpath(info.get("directory", "")) != cwd:
-            return "AGENT_SESSION_UNBOUND", "", {}
-    except (TypeError, OSError):
-        return "AGENT_SESSION_UNBOUND", "", {}
-    revert = info.get("revert")
-    revert_id = revert.get("messageID") if isinstance(revert, dict) else None
-    if revert_id:
-        index = next((i for i, item in enumerate(messages) if isinstance(item, dict) and isinstance(item.get("info"), dict) and item["info"].get("id") == revert_id), None)
-        if index is not None:
-            messages = messages[:index]
-    last_user_index = next((i for i in range(len(messages) - 1, -1, -1) if isinstance(messages[i], dict) and isinstance(messages[i].get("info"), dict) and messages[i]["info"].get("role") == "user"), None)
-    if last_user_index is None:
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    user_info = messages[last_user_index]["info"]
-    user_id = user_info.get("id")
-    if user_info.get("sessionID") != session_id or not isinstance(user_id, str):
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    assistant_index = next((i for i in range(len(messages) - 1, last_user_index, -1) if isinstance(messages[i], dict) and isinstance(messages[i].get("info"), dict) and messages[i]["info"].get("role") == "assistant"), None)
-    if assistant_index is None:
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    assistant = messages[assistant_index]
-    message = assistant["info"]
-    if message.get("sessionID") != session_id or message.get("parentID") != user_id:
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    msg_time = message.get("time")
-    completed = msg_time.get("completed") if isinstance(msg_time, dict) else None
-    if isinstance(completed, bool) or not isinstance(completed, (int, float)) or completed < 0:
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    if message.get("error") or message.get("finish") != "stop":
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    parts = assistant.get("parts")
-    if not isinstance(parts, list):
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    text_parts = []
-    for part in parts:
-        if not isinstance(part, dict):
-            return "REMOTE_RESULT_INCOMPLETE", "", {}
-        if part.get("type") == "tool":
-            state = part.get("state")
-            if not isinstance(state, dict) or state.get("status") in ("pending", "running"):
-                return "REMOTE_RESULT_INCOMPLETE", "", {}
-        if part.get("type") == "text":
-            value = part.get("text")
-            if part.get("messageID") != message.get("id") or part.get("sessionID") != session_id or not isinstance(value, str):
-                return "REMOTE_RESULT_INCOMPLETE", "", {}
-            text_parts.append(value)
-    if not text_parts:
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    body = "\n".join(text_parts)
-    try:
-        body_bytes = body.encode("utf-8", "strict")
-    except UnicodeError:
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    if not body.strip():
-        return "REMOTE_RESULT_INCOMPLETE", "", {}
-    if len(body_bytes) > MAX_BODY:
-        return "OUTPUT_RANGE_EXCEEDED", "", {}
-    return "ok", body, {"session_id": session_id, "user_id": user_id, "message_id": message.get("id"), "native_length": len(body), "native_utf8_bytes": len(body_bytes), "native_sha256": hashlib.sha256(body_bytes).hexdigest()}
-
 try:
     expected = (norm_ip(sys.argv[1]), str(int(sys.argv[2])), norm_ip(sys.argv[3]), str(int(sys.argv[4])))
 except (IndexError, ValueError, UnicodeError):
@@ -336,36 +267,11 @@ version, state = run_bounded([exe, "--version"], cwd, env, 1024, 2.0)
 if state != "ok" or not version or version.decode("utf-8", "replace").strip().splitlines()[0] != "1.19.0":
     emit("REMOTE_PROVIDER_UNAVAILABLE", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid)
     raise SystemExit(0)
-if implicit_tui:
-    emit("AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd, opencode_pid=pid, session_binding="implicit_tui")
-    raise SystemExit(0)
-export, state = run_bounded([exe, "export", sid], cwd, env, MAX_EXPORT, 8.0)
-binding = {"remote_session_pid": root, "remote_sshd_pid": sshd, "opencode_pid": pid, "ssh_connection": list(expected)}
-if state == "large":
-    emit("OUTPUT_RANGE_EXCEEDED", **binding)
-    raise SystemExit(0)
-if state != "ok":
-    emit("REMOTE_PROVIDER_UNAVAILABLE", **binding)
-    raise SystemExit(0)
-try:
-    exported = json.loads(export.decode("utf-8", "strict"))
-except (UnicodeError, ValueError):
-    emit("REMOTE_RESULT_INCOMPLETE", **binding)
-    raise SystemExit(0)
-status, body, evidence = session_body(exported, sid, cwd)
-if status != "ok":
-    emit(status, **binding)
-    raise SystemExit(0)
-still_live = process(pid)
-if (
-    not still_live or still_live["starttime"] != proc["starttime"] or explicit_session_id(process_argv(pid)) != sid
-    or ssh_connection(pid) != expected or still_live["tty_nr"] != root_proc["tty_nr"]
-    or still_live["pgrp"] != still_live["tpgid"] or not connection_live(expected)
-):
-    emit("AGENT_SESSION_UNBOUND", **binding)
-    raise SystemExit(0)
-body_bytes = body.encode("utf-8", "strict")
-emit("ok", **binding, **evidence, turn_complete=True, body_complete=True, body_b64=base64.b64encode(body_bytes).decode("ascii"))
+# A TUI's argv identifies its launch session, not necessarily the session currently selected in the UI.
+emit(
+    "AGENT_SESSION_UNBOUND", remote_session_pid=root, remote_sshd_pid=sshd,
+    opencode_pid=pid, session_binding="active_tui_session_unexposed",
+)
 '''
 
 _REMOTE_STATUSES = {
@@ -379,7 +285,7 @@ def fetch_remote_opencode_result(
     connection: Dict[str, str],
     timeout: float = 16.0,
 ) -> Dict | None:
-    """Export only the session ID explicitly passed to the bound TUI process."""
+    """Probe a verified OpenCode TUI; fail closed while its active session is not observable."""
 
     if (
         not host_alias or host_alias.startswith("-") or any(ch.isspace() or not ch.isprintable() for ch in host_alias)
