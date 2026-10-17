@@ -332,10 +332,8 @@ def _heading_attr() -> int:
         return curses.A_BOLD
 
 
-def _draw_navigation(stdscr, region, rows, selected_key, selected_identity,
-                     cursor_key=None, collapsed=()) -> None:
+def _draw_navigation(stdscr, region, lines) -> None:
     x, y, width, height = region
-    lines = navigation_lines(rows, selected_key, selected_identity, collapsed, cursor_key)
     selected_line = next((index for index, line in enumerate(lines) if line.get("cursor")), 0)
     capacity = max(0, height)
     top = max(0, selected_line - capacity + 1)
@@ -394,8 +392,14 @@ def grid_columns(panel_width: int, panel_height: int, screen_width: int, item_co
 def _find_nav_line(rows, selected_key, selected_identity, cursor_key, collapsed=(),
                    projects=(), window_assets=(), hidden_refs=()):
     return next((line for line in navigation_lines(
-        rows, selected_key, selected_identity, collapsed, cursor_key,
-        projects, window_assets, hidden_refs,
+        rows=rows,
+        selected_key=selected_key,
+        selected_identity=selected_identity,
+        collapsed=collapsed,
+        cursor_key=cursor_key,
+        projects=projects,
+        window_assets=window_assets,
+        hidden_refs=hidden_refs,
     ) if line.get("node_key") == cursor_key), None)
 
 
@@ -484,7 +488,7 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
 
     _draw_navigation(
         stdscr, (regions[0][0], regions[0][1] + 1, regions[0][2], max(0, regions[0][3] - 1)),
-        display_rows, selected_key, selected_identity, cursor_key, collapsed,
+        nav_lines,
     )
     if current:
         grid_rows = _scope_grid_rows(selected, panes, groups, nav_line)
@@ -830,10 +834,15 @@ def open_control_room(stdscr, tower) -> None:
             hidden_refs = _hidden_project_refs(tower)
             window_assets = getattr(tower, "window_assets", ()) or ()
             nav_items = navigation_lines(
-                current_panes if is_current or str(selected.get("window_ref") or "") in hidden_refs
-                else current_panes + [selected],
-                selected_key, selected_identity, collapsed,
-                projects, window_assets, hidden_refs,
+                rows=(current_panes if is_current or str(selected.get("window_ref") or "") in hidden_refs
+                      else current_panes + [selected]),
+                selected_key=selected_key,
+                selected_identity=selected_identity,
+                collapsed=collapsed,
+                cursor_key=cursor_key,
+                projects=projects,
+                window_assets=window_assets,
+                hidden_refs=hidden_refs,
             )
             nav_line = next((line for line in nav_items if line.get("node_key") == cursor_key), None)
             cursor_kind = nav_line.get("kind", "pane") if nav_line else "pane"
@@ -841,12 +850,7 @@ def open_control_room(stdscr, tower) -> None:
             if key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT):
                 if active_panel == 0:
                     if key in (curses.KEY_UP, curses.KEY_DOWN):
-                        visible_items = navigation_lines(
-                            current_panes if is_current or str(selected.get("window_ref") or "") in hidden_refs
-                            else current_panes + [selected],
-                            selected_key, selected_identity, collapsed,
-                            projects, window_assets, hidden_refs,
-                        )
+                        visible_items = nav_items
                         index = next((i for i, line in enumerate(visible_items)
                                       if line.get("node_key") == cursor_key), None)
                         if index is None:

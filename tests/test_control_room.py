@@ -198,6 +198,47 @@ def test_project_selection_scopes_center_grid_and_right_live_to_same_snapshot(mo
     assert drawn == ["asus-target", "main-target", "main-target"]
 
 
+def test_final_draw_uses_project_navigation_model_and_hides_empty_project_section(monkeypatch):
+    from tmux_agent_tower.i18n import t
+
+    visible_ref, hidden_ref, stale_ref = "a" * 64, "b" * 64, "c" * 64
+    visible = _pane("%1", target="visible", window_ref=visible_ref)
+    base_tower = SimpleNamespace(
+        rows=[visible], window_assets=[],
+        projects=SimpleNamespace(all=lambda: [], hidden_refs=lambda: set()),
+    )
+    screen = Screen(40, 120)
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(live_view, "_draw_tile", lambda *_args: None)
+
+    control_room.draw(screen, base_tower, visible["key"], control_room.pane_identity(visible), visible)
+    assert t("control_room.projects_root") not in [text for _y, _x, text, _attr in screen.writes]
+
+    project = {
+        "project_id": "saved-project", "display_name": "실제 저장 프로젝트",
+        "window_refs": [hidden_ref, visible_ref, stale_ref], "order": 0, "collapsed": False,
+    }
+    tower = SimpleNamespace(
+        rows=[visible],
+        window_assets=[
+            {"window_ref": visible_ref, "display_name": "현재 창", "tmux_host": "mainpc"},
+            {"window_ref": hidden_ref, "display_name": "숨긴 창", "tmux_host": "asus"},
+        ],
+        projects=SimpleNamespace(all=lambda: [project], hidden_refs=lambda: {hidden_ref}),
+    )
+    cursor = ("tower_project_window", "saved-project", stale_ref)
+
+    control_room.draw(
+        screen, tower, visible["key"], control_room.pane_identity(visible), visible,
+        cursor_key=cursor,
+    )
+
+    drawn_text = "\n".join(text for _y, _x, text, _attr in screen.writes)
+    assert "실제 저장 프로젝트" in drawn_text
+    assert "숨긴 창" in drawn_text
+    assert t("project_manage.disconnected") in drawn_text
+
+
 @pytest.mark.parametrize("height,width", [(18, 60), (24, 80), (40, 120)])
 def test_project_tree_and_live_panels_fit_required_viewports(monkeypatch, height, width):
     ref = "8" * 64
@@ -241,6 +282,118 @@ def test_project_window_visibility_excludes_project_panes_but_keeps_management_a
     assert [key for key, _ in control_room.action_menu_items(
         visible, project_management=True,
     )][-3:] == ["projects", "details", "settings"]
+
+
+def test_project_creation_and_keyboard_navigation_keep_grid_and_focus_on_exact_remote_pane(
+    monkeypatch, tmp_path,
+):
+    from tmux_agent_tower.state.projects import ProjectStore
+    from tmux_agent_tower.ui import projects as project_ui
+
+    main_ref, asus_ref = "3" * 64, "4" * 64
+    main = _pane("%1", target="main-target", window_ref=main_ref,
+                 tmux_host="mainpc", execution_host="mainpc", live_lines=["MAIN_ONLY"])
+    asus = _pane("%1", target="asus-target", window_ref=asus_ref,
+                 tmux_host="asus", execution_host="asus", remote=True,
+                 transport="remote_tmux", transport_target="asus", live_lines=["ASUS_ONLY"])
+    store = ProjectStore(tmp_path / "projects.json")
+    tower = SimpleNamespace(
+        rows=[main, asus], visible_rows=[main, asus], selected=0,
+        window_assets=[
+            {"window_ref": main_ref, "display_name": "Main", "tmux_host": "mainpc"},
+            {"window_ref": asus_ref, "display_name": "ASUS", "tmux_host": "asus"},
+        ],
+        projects=store, work_groups=SimpleNamespace(all=lambda: []),
+        start_background_refresh=lambda: False, _apply_filter=lambda: None,
+    )
+    screen = Screen(40, 120, [" "])
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(
+        control_room, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="projects"),
+    )
+    monkeypatch.setattr(
+        project_ui, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="create"),
+    )
+    monkeypatch.setattr(project_ui, "prompt_text", lambda *_args, **_kwargs: "Cross-host project")
+    selected_tiles = []
+
+    def add_remote_window(stdscr, current_tower, project_id):
+        store.add_windows(project_id, [asus_ref])
+        nav = control_room.navigation_lines(
+            [main, asus], main["key"], control_room.pane_identity(main),
+            projects=store.all(), window_assets=tower.window_assets,
+            hidden_refs=store.hidden_refs(),
+        )
+        current_cursor = next(i for i, line in enumerate(nav)
+                              if line["kind"] == "pane" and line.get("row") is main
+                              and not line.get("project_id"))
+        target_cursor = next(i for i, line in enumerate(nav)
+                             if line["kind"] == "pane" and line.get("row") is main
+                             and line.get("project_id") == project_id)
+        screen.keys = iter([curses.KEY_DOWN] * (target_cursor - current_cursor)
+                           + ["\t", curses.KEY_DOWN, "q"])
+
+    monkeypatch.setattr(project_ui, "open_project_editor", add_remote_window)
+    monkeypatch.setattr(
+        live_view, "_draw_tile",
+        lambda _screen, _tower, row, _index, _y, x, *_args: selected_tiles.append(
+            (row["target_id"], x)
+        ),
+    )
+
+    control_room.open_control_room(screen, tower)
+
+    assert store.all()[0]["display_name"] == "Cross-host project"
+    assert store.all()[0]["window_refs"] == [main_ref, asus_ref]
+    center_x = control_room.panel_regions(120, 40)[1][0]
+    right_x = control_room.panel_regions(120, 40)[2][0]
+    assert [target for target, _x in selected_tiles[-3:]] == [
+        "main-target", "asus-target", "asus-target",
+    ]
+    assert all(center_x <= x < right_x for _target, x in selected_tiles[-3:-1])
+    assert selected_tiles[-1][1] == right_x
+    drawn_text = "\n".join(text for _y, _x, text, _attr in screen.writes)
+    assert "Cross-host project" in drawn_text
+
+
+def test_hidden_and_disconnected_project_windows_accept_arrow_enter_and_space(monkeypatch):
+    from tmux_agent_tower.ui import projects as project_ui
+
+    hidden_ref, visible_ref, stale_ref = "5" * 64, "6" * 64, "7" * 64
+    visible = _pane("%2", target="visible", window_ref=visible_ref)
+    hidden = _pane("%1", target="hidden", window_ref=hidden_ref)
+    project = {
+        "project_id": "hidden-project", "display_name": "Hidden project",
+        "window_refs": [hidden_ref, stale_ref, visible_ref], "order": 0, "collapsed": False,
+    }
+    tower = SimpleNamespace(
+        rows=[visible, hidden], visible_rows=[visible], selected=0,
+        window_assets=[
+            {"window_ref": hidden_ref, "display_name": "숨긴 창", "tmux_host": "asus"},
+            {"window_ref": visible_ref, "display_name": "현재 창", "tmux_host": "mainpc"},
+        ],
+        projects=SimpleNamespace(all=lambda: [project], hidden_refs=lambda: {hidden_ref}),
+        work_groups=SimpleNamespace(all=lambda: []),
+        start_background_refresh=lambda: False,
+    )
+    # From the physical pane, three Down presses land on the project's hidden
+    # Window. Enter toggles its view-local expansion; Space opens its editor.
+    screen = Screen(40, 120, [curses.KEY_DOWN, curses.KEY_DOWN, curses.KEY_DOWN, "\n", " ", "q"])
+    opened = []
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(live_view, "_draw_tile", lambda *_args: None)
+    monkeypatch.setattr(
+        project_ui, "open_project_editor",
+        lambda _screen, _tower, project_id: opened.append(project_id),
+    )
+
+    control_room.open_control_room(screen, tower)
+
+    assert opened == ["hidden-project"]
 
 
 def test_space_on_project_opens_its_editor_and_delete_can_be_cancelled(monkeypatch, tmp_path):
