@@ -7,6 +7,7 @@ tile rendering to the established LIVE view renderer.
 
 from __future__ import annotations
 
+import copy
 import curses
 import math
 import time
@@ -15,6 +16,7 @@ from ..i18n import t
 from . import live_view, render
 from .perf_trace import draw as trace_draw
 from .widgets import is_enter, is_escape, read_key, run_list_picker, safe_add, show_message_screen
+from .widgets import prompt_text
 
 MAX_GRID_PANES = 4
 _IDENTITY_FIELDS = (
@@ -56,6 +58,116 @@ def _project_values(tower) -> list[dict]:
 def _hidden_project_refs(tower) -> set[str]:
     store = _project_store(tower)
     return store.hidden_refs() if store is not None else set()
+
+
+def _screen_store(tower):
+    return getattr(tower, "control_screens", None)
+
+
+def _reference_identity(reference: dict) -> tuple:
+    identity = reference["identity"]
+    return tuple(str(identity[field] or "") for field in _IDENTITY_FIELDS) + (bool(identity["remote"]),)
+
+
+def _same_reference(row: dict, reference: dict) -> bool:
+    if pane_identity(row) != _reference_identity(reference):
+        return False
+    saved_window = str(reference.get("window_ref") or "")
+    return not saved_window or str(row.get("window_ref") or "") == saved_window
+
+
+def _stale_reference_row(reference: dict, index: int) -> dict:
+    identity = reference["identity"]
+    return {
+        **identity,
+        "kind": "pane",
+        "key": f"saved-screen-stale:{index}",
+        "window_ref": reference.get("window_ref") or "",
+        "display_name": reference.get("display_name") or t("control_room.screens_disconnected"),
+        "live_lines": [],
+        "_live_stale": True,
+    }
+
+
+def _resolve_saved_rows(references, panes) -> list[dict]:
+    rows = []
+    for index, reference in enumerate(references or ()):
+        match = next((row for row in pane_rows(panes) if _same_reference(row, reference)), None)
+        rows.append(match if match is not None else _stale_reference_row(reference, index))
+    return rows
+
+
+def _saved_view_selection(view: dict, rows: list[dict]) -> dict:
+    reference = view.get("selected")
+    if reference:
+        match = next((row for row in rows if _same_reference(row, reference)), None)
+        if match is not None:
+            return match
+    return rows[0]
+
+
+def _layout_capacity(layout: str) -> int:
+    return 1 if layout == "focus" else 2 if layout == "split-2" else MAX_GRID_PANES
+
+
+def _default_layout(rows) -> str:
+    count = min(MAX_GRID_PANES, len(rows or ()))
+    return "focus" if count <= 1 else "split-2" if count == 2 else "grid-4"
+
+
+def _layout_rows(rows, selected, layout: str) -> list[dict]:
+    candidates = list(rows or ())
+    if not candidates and selected:
+        candidates = [selected]
+    capacity = _layout_capacity(layout)
+    if selected and not any(pane_identity(row) == pane_identity(selected) for row in candidates):
+        candidates.insert(0, selected)
+    candidates = candidates[:capacity]
+    if selected and not any(pane_identity(row) == pane_identity(selected) for row in candidates):
+        candidates[-1:] = [selected]
+    return candidates
+
+
+def _context_for(row: dict | None, nav_line: dict | None, tower) -> dict:
+    project_id = str((nav_line or {}).get("project_id") or "")
+    window_ref = str((nav_line or {}).get("window_ref") or (row or {}).get("window_ref") or "")
+    if not project_id and window_ref:
+        memberships = getattr(_project_store(tower), "memberships", lambda: {})()
+        project_id = str(memberships.get(window_ref) or "")
+    return {"project_id": project_id or None, "window_ref": window_ref or None}
+
+
+def _cursor_for_view(tower, panes, selected, context) -> tuple:
+    identity = pane_identity(selected)
+    lines = navigation_lines(
+        panes, str(selected.get("key") or ""), identity,
+        projects=_project_values(tower),
+        window_assets=getattr(tower, "window_assets", ()) or (),
+        hidden_refs=_hidden_project_refs(tower),
+    )
+    matching = [line for line in lines if line.get("kind") == "pane"
+                and pane_identity(line.get("row") or {}) == identity]
+    project_id = str((context or {}).get("project_id") or "")
+    preferred = next((line for line in matching if line.get("project_id") == project_id), None) if project_id else None
+    line = preferred or next((item for item in matching if not item.get("project_id")), None) or (matching[0] if matching else None)
+    return line.get("node_key") if line else _initial_cursor(panes, selected, None, ())
+
+
+def _saved_screen_state(view: dict, tower, panes) -> dict:
+    rows = _resolve_saved_rows(view["panes"], panes)
+    selected = _saved_view_selection(view, rows)
+    context = copy.deepcopy(view["context"])
+    return {
+        "view_rows": rows,
+        "selected_row": dict(selected),
+        "selected_key": str(selected.get("key") or ""),
+        "selected_identity": pane_identity(selected),
+        "original": dict(selected),
+        "cursor_key": _cursor_for_view(tower, panes + [row for row in rows if row.get("_live_stale")], selected, context),
+        "layout": view["layout"],
+        "layout_pinned": True,
+        "context": context,
+    }
 
 
 def _visible_panes(tower) -> list[dict]:
@@ -353,22 +465,48 @@ def _draw_navigation(stdscr, region, lines) -> None:
         safe_add(stdscr, y + offset, x, render.truncate_to_width(text, max(0, width)), attr)
 
 
-def _draw_grid(stdscr, tower, region, rows, selected_identity, screen_width, scroll: int = 0) -> None:
+def _layout_rectangles(region, layout: str) -> list[tuple[int, int, int, int]]:
     x, y, width, height = region
-    rows = list(rows[:MAX_GRID_PANES])
+    if layout == "focus":
+        return [(x, y, width, height)]
+    if layout == "split-2":
+        left = width // 2
+        return [(x, y, left, height), (x + left, y, width - left, height)]
+    if layout == "main-plus-side":
+        main_width = max(1, width * 3 // 5)
+        side_width = max(0, width - main_width)
+        heights = [height // 3, height // 3, height - 2 * (height // 3)]
+        result = [(x, y, main_width, height)]
+        current_y = y
+        for slot_height in heights:
+            result.append((x + main_width, current_y, side_width, slot_height))
+            current_y += slot_height
+        return result
+    half_width, half_height = width // 2, height // 2
+    return [
+        (x, y, half_width, half_height),
+        (x + half_width, y, width - half_width, half_height),
+        (x, y + half_height, half_width, height - half_height),
+        (x + half_width, y + half_height, width - half_width, height - half_height),
+    ]
+
+
+def _draw_grid(stdscr, tower, region, rows, selected_identity, screen_width,
+               scroll: int = 0, layout: str = "grid-4") -> None:
+    x, y, width, height = region
+    rows = _layout_rows(rows, next((row for row in rows if pane_identity(row) == selected_identity), None), layout)
     if not rows:
         safe_add(stdscr, y, x, t("live.unavailable"), curses.A_DIM)
         return
-    cols = grid_columns(width, height, screen_width, len(rows))
-    row_count = (len(rows) + cols - 1) // cols
-    cell_width = width // cols
-    cell_height = max(0, height // row_count)
-    for index, row in enumerate(rows):
-        cell_y = y + (index // cols) * cell_height
-        cell_x = x + (index % cols) * cell_width
-        current_width = width - (index % cols) * cell_width if index % cols == cols - 1 else cell_width
-        if index % cols:
-            safe_add(stdscr, cell_y, cell_x, "│", curses.A_DIM)
+    rectangles = _layout_rectangles(region, layout)
+    for index, rect in enumerate(rectangles):
+        cell_x, cell_y, current_width, cell_height = rect
+        if index >= len(rows):
+            if current_width > 2 and cell_height > 0:
+                safe_add(stdscr, cell_y + cell_height // 2, cell_x + 1,
+                         t("control_room.screens_slot"), curses.A_DIM)
+            continue
+        row = rows[index]
         safe_row = _render_row(row)
         focused = pane_identity(row) == selected_identity
         live_view._draw_tile(
@@ -451,7 +589,8 @@ def _footer_lines(width, active_panel, cursor_kind):
 @trace_draw("control_room")
 def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
          original: dict, groups=(), *, active_panel: int = 0, cursor_key=None,
-         collapsed=(), focus_scroll: int = 0) -> bool:
+         collapsed=(), focus_scroll: int = 0, layout: str = "grid-4",
+         grid_rows_override: list[dict] | None = None) -> bool:
     """Draw a read-only room and return whether the selection is still current."""
 
     stdscr.erase()
@@ -490,19 +629,38 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
         stdscr, (regions[0][0], regions[0][1] + 1, regions[0][2], max(0, regions[0][3] - 1)),
         nav_lines,
     )
-    if current:
+    if grid_rows_override is not None:
+        grid_rows = _resolve_saved_rows(
+            [
+                {"identity": {field: row.get(field) for field in (
+                    "target_id", "tmux_host", "session", "session_id", "window_id", "pane_id",
+                    "pane_pid", "transport", "transport_target", "remote",
+                )}, "window_ref": row.get("window_ref") or "", "display_name": row.get("display_name") or "Pane"}
+                for row in grid_rows_override
+            ], panes,
+        )
+    elif current:
         grid_rows = _scope_grid_rows(selected, panes, groups, nav_line)
     else:
         grid_rows = [selected]
+    grid_total_count = len(grid_rows)
+    grid_rows = _layout_rows(grid_rows, selected, layout)
+    if len(grid_rows) < grid_total_count:
+        grid_heading = t("control_room.panel_grid_count").format(
+            shown=len(grid_rows), total=grid_total_count,
+        )
+        safe_add(stdscr, regions[1][1], regions[1][0],
+                 render.truncate_to_width(grid_heading, max(0, regions[1][2])),
+                 curses.A_REVERSE | curses.A_BOLD if active_panel == 1 else _heading_attr())
     _draw_grid(
         stdscr, tower,
         (regions[1][0], regions[1][1] + 1, regions[1][2], max(0, regions[1][3] - 1)),
-        grid_rows, selected_identity if current else None, width,
+        grid_rows, selected_identity, width, layout=layout,
     )
     _draw_grid(
         stdscr, tower,
         (regions[2][0], regions[2][1] + 1, regions[2][2], max(0, regions[2][3] - 1)),
-        [selected], selected_identity if current else None, width, focus_scroll,
+        [selected], selected_identity if current else None, width, focus_scroll, "focus",
     )
 
     footer_lines = _footer_lines(width, active_panel, cursor_kind)
@@ -577,7 +735,7 @@ def action_menu_items(row: dict | None, *, cursor_kind: str = "pane", has_group:
                       project_management: bool = False) -> list[tuple[str, str]]:
     """Visible routes to established features; no new Agent-control actions."""
 
-    items: list[tuple[str, str]] = []
+    items: list[tuple[str, str]] = [("screens", t("control_room.menu_screens"))]
     if has_group and live_routes_safe:
         items.append(("group_live", t("control_room.menu_group_live")))
     if has_folder and live_routes_safe:
@@ -595,6 +753,178 @@ def action_menu_items(row: dict | None, *, cursor_kind: str = "pane", has_group:
         ("settings", t("control_room.menu_settings")),
     ])
     return items
+
+
+def _screen_confirm(stdscr, title: str, message: str) -> bool:
+    pick = run_list_picker(
+        stdscr, title,
+        [("cancel", t("menu.cancel")), ("confirm", t("project_manage.confirm_yes"))],
+        footer_hint=t("wizard.hint_list"), preamble=[message],
+    )
+    return not pick.cancelled and pick.selected_key == "confirm"
+
+
+def _screen_picker(stdscr, title: str, records: list[dict], *, key_field: str,
+                   label_field: str, empty_key: str = "control_room.screens_empty"):
+    if not records:
+        show_message_screen(stdscr, title, [t(empty_key)])
+        return None
+    pick = run_list_picker(
+        stdscr, title,
+        [(str(item[key_field]), str(item[label_field])) for item in records],
+        footer_hint=t("wizard.hint_list"),
+    )
+    if pick.cancelled:
+        return None
+    return next((item for item in records if str(item[key_field]) == str(pick.selected_key)), None)
+
+
+def _screen_context_view_rows(state: dict, tower, panes, groups, nav_line) -> None:
+    selected = state.get("selected_row")
+    state["view_rows"] = _scope_grid_rows(selected, panes, groups, nav_line) if selected else []
+    state["context"] = _context_for(selected, nav_line, tower)
+
+
+def _open_screen_menu(stdscr, tower, state: dict, current_panes, groups, nav_line) -> None:
+    store = _screen_store(tower)
+    if store is None:
+        show_message_screen(stdscr, t("control_room.screens_title"), [t("control_room.screens_save_failed")])
+        return
+    try:
+        screens = store.screens()
+        templates = store.templates()
+        last_view = store.last_view()
+        if store.corrupt:
+            raise ValueError("saved view is unreadable")
+    except (OSError, ValueError):
+        show_message_screen(stdscr, t("control_room.screens_title"), [t("control_room.screens_save_failed")])
+        return
+    items = [
+        ("resume", t("control_room.screens_resume")),
+        ("open", t("control_room.screens_open")),
+        ("save", t("control_room.screens_save")),
+        ("layout", t("control_room.screens_layout")),
+        ("template_save", t("control_room.screens_template_save")),
+        ("template_apply", t("control_room.screens_template_apply")),
+        ("manage", t("control_room.screens_manage")),
+        ("cancel", t("menu.cancel")),
+    ]
+    pick = run_list_picker(stdscr, t("control_room.screens_title"), items,
+                           footer_hint=t("wizard.hint_list"))
+    if pick.cancelled or not pick.selected_key or pick.selected_key == "cancel":
+        return
+    choice = str(pick.selected_key)
+    if choice in {"resume", "open"}:
+        if choice == "resume":
+            if last_view is None:
+                show_message_screen(stdscr, t("control_room.screens_title"), [t("control_room.screens_resume_missing")])
+                return
+            view = last_view
+        else:
+            selected_screen = _screen_picker(
+                stdscr, t("control_room.screens_open"), screens,
+                key_field="screen_id", label_field="name",
+            )
+            if selected_screen is None:
+                return
+            view = selected_screen
+        state.update(_saved_screen_state(view, tower, current_panes))
+        return
+    if choice == "save":
+        name = prompt_text(stdscr, t("control_room.screens_name_prompt"))
+        if not name:
+            return
+        existing = next((item for item in screens if item["name"].casefold() == name.strip().casefold()), None)
+        if existing and not _screen_confirm(
+            stdscr, t("control_room.screens_save"),
+            t("control_room.screens_overwrite_confirm"),
+        ):
+            return
+        rows = _layout_rows(state.get("view_rows", ()), state.get("selected_row"), state["layout"])
+        try:
+            saved = store.save_screen(
+                name, rows, state.get("selected_row"), state["layout"], state.get("context"),
+                screen_id=existing["screen_id"] if existing else None,
+            )
+            show_message_screen(
+                stdscr, t("control_room.screens_title"),
+                [t("control_room.screens_saved").format(name=saved["name"])],
+            )
+        except (OSError, ValueError):
+            show_message_screen(stdscr, t("control_room.screens_title"), [t("control_room.screens_save_failed")])
+        return
+    if choice == "layout":
+        pick = run_list_picker(
+            stdscr, t("control_room.screens_layout"),
+            [(layout, t(f"layout.{layout}")) for layout in ("focus", "split-2", "grid-4", "main-plus-side")],
+            footer_hint=t("wizard.hint_list"),
+        )
+        if not pick.cancelled and pick.selected_key:
+            _screen_context_view_rows(state, tower, current_panes, groups, nav_line)
+            state["layout"] = str(pick.selected_key)
+            state["layout_pinned"] = True
+        return
+    if choice == "template_save":
+        name = prompt_text(stdscr, t("control_room.screens_template_name_prompt"))
+        if not name:
+            return
+        existing = next((item for item in templates if item["name"].casefold() == name.strip().casefold()), None)
+        if existing and not _screen_confirm(stdscr, t("control_room.screens_template_save"),
+                                            t("control_room.screens_template_overwrite_confirm")):
+            return
+        try:
+            saved = store.save_template(name, state["layout"],
+                                        template_id=existing["template_id"] if existing else None)
+            show_message_screen(
+                stdscr, t("control_room.screens_title"),
+                [t("control_room.screens_template_saved").format(name=saved["name"])],
+            )
+        except (OSError, ValueError):
+            show_message_screen(stdscr, t("control_room.screens_title"), [t("control_room.screens_save_failed")])
+        return
+    if choice == "template_apply":
+        template = _screen_picker(
+            stdscr, t("control_room.screens_template_apply"), templates,
+            key_field="template_id", label_field="name",
+            empty_key="control_room.screens_template_empty",
+        )
+        if template:
+            _screen_context_view_rows(state, tower, current_panes, groups, nav_line)
+            state["layout"] = template["layout"]
+            state["layout_pinned"] = True
+        return
+    if choice == "manage":
+        screen = _screen_picker(
+            stdscr, t("control_room.screens_manage"), screens,
+            key_field="screen_id", label_field="name",
+        )
+        if screen is None:
+            return
+        action = run_list_picker(
+            stdscr, screen["name"],
+            [("rename", t("control_room.screens_rename")),
+             ("delete", t("control_room.screens_delete")), ("cancel", t("menu.cancel"))],
+            footer_hint=t("wizard.hint_list"),
+        )
+        if action.cancelled or action.selected_key == "cancel":
+            return
+        if action.selected_key == "rename":
+            name = prompt_text(stdscr, t("control_room.screens_name_prompt"), initial=screen["name"])
+            if not name or name == screen["name"]:
+                return
+            try:
+                store.rename_screen(screen["screen_id"], name)
+                show_message_screen(stdscr, t("control_room.screens_title"), [t("control_room.screens_renamed")])
+            except (OSError, ValueError):
+                show_message_screen(stdscr, t("control_room.screens_title"), [t("control_room.screens_save_failed")])
+        elif action.selected_key == "delete" and _screen_confirm(
+            stdscr, t("control_room.screens_title"), t("control_room.screens_delete_confirm"),
+        ):
+            try:
+                store.delete_screen(screen["screen_id"])
+                show_message_screen(stdscr, t("control_room.screens_title"), [t("control_room.screens_deleted")])
+            except (OSError, ValueError):
+                show_message_screen(stdscr, t("control_room.screens_title"), [t("control_room.screens_save_failed")])
 
 
 def _run_action(stdscr, tower, action: str, row: dict | None, groups=(),
@@ -653,39 +983,57 @@ def _run_action(stdscr, tower, action: str, row: dict | None, groups=(),
         open_project_picker(stdscr, tower, row)
 
 
-def _open_action_menu(stdscr, tower, row, groups, selected_home, cursor_kind, nav_line=None):
-    if cursor_kind == "tower_project":
-        from .projects import open_project_editor
-
-        open_project_editor(stdscr, tower, str((nav_line or {}).get("project_id") or ""))
-        return
-    if cursor_kind in {"project_window", "project_window_hidden", "project_window_disconnected"}:
-        from .projects import open_project_editor
-
-        open_project_editor(stdscr, tower, str((nav_line or {}).get("project_id") or ""))
-        return
-    if cursor_kind == "tower_projects_root":
-        from .projects import open_project_picker
-
-        open_project_picker(stdscr, tower)
-        return
-    group_id = str((row or {}).get("work_group_id") or "")
-    has_group = bool(
-        cursor_kind in {"pane", "project"} and group_id
-        and any(str(group.get("group_id") or "") == group_id for group in groups or ())
-    )
-    has_folder = bool(selected_home and selected_home.get("kind") in {"folder", "other_section"})
-    items = action_menu_items(
-        row, cursor_kind=cursor_kind, has_group=has_group, has_folder=has_folder,
-        copy_safe=_copy_key_is_unambiguous(getattr(tower, "rows", ()), row),
-        live_routes_safe=_pane_keys_unique(getattr(tower, "rows", ())),
-        project_management=_project_store(tower) is not None,
-    )
+def _open_action_menu(stdscr, tower, row, groups, selected_home, cursor_kind, nav_line=None,
+                      screen_state: dict | None = None):
+    if cursor_kind in {"tower_project", "project_window", "project_window_hidden",
+                       "project_window_disconnected"}:
+        items = [
+            ("screens", t("control_room.menu_screens")),
+            ("edit_project", t("control_room.menu_edit_project")),
+            ("cancel", t("menu.cancel")),
+        ]
+    elif cursor_kind == "tower_projects_root":
+        items = [
+            ("screens", t("control_room.menu_screens")),
+            ("projects", t("control_room.menu_projects")),
+            ("cancel", t("menu.cancel")),
+        ]
+    else:
+        group_id = str((row or {}).get("work_group_id") or "")
+        has_group = bool(
+            cursor_kind in {"pane", "project"} and group_id
+            and any(str(group.get("group_id") or "") == group_id for group in groups or ())
+        )
+        has_folder = bool(selected_home and selected_home.get("kind") in {"folder", "other_section"})
+        items = action_menu_items(
+            row, cursor_kind=cursor_kind, has_group=has_group, has_folder=has_folder,
+            copy_safe=_copy_key_is_unambiguous(getattr(tower, "rows", ()), row),
+            live_routes_safe=_pane_keys_unique(getattr(tower, "rows", ())),
+            project_management=_project_store(tower) is not None,
+        )
     pick = run_list_picker(
         stdscr, t("control_room.menu_title"), items,
         footer_hint=t("wizard.hint_list"),
     )
     if not pick.cancelled and pick.selected_key:
+        if pick.selected_key == "screens":
+            current_panes = _visible_panes(tower)
+            if screen_state is not None:
+                _open_screen_menu(stdscr, tower, screen_state, current_panes, groups, nav_line)
+            return
+        if pick.selected_key == "edit_project":
+            from .projects import open_project_editor
+
+            open_project_editor(stdscr, tower, str((nav_line or {}).get("project_id") or ""))
+            return
+        if cursor_kind == "tower_projects_root":
+            if pick.selected_key == "projects":
+                from .projects import open_project_picker
+
+                open_project_picker(stdscr, tower)
+            return
+        if cursor_kind in {"tower_project", "project_window", "project_window_hidden", "project_window_disconnected"}:
+            return
         _run_action(
             stdscr, tower, str(pick.selected_key), row, groups, selected_home,
             copy_allowed=cursor_kind == "pane",
@@ -748,7 +1096,12 @@ def open_control_room(stdscr, tower) -> None:
     """Open the read-only room; panel keys are consumed here, never sent to an Agent."""
 
     panes = _visible_panes(tower)
-    if not panes:
+    screen_store = _screen_store(tower)
+    try:
+        last_view = screen_store.last_view() if screen_store is not None else None
+    except (OSError, ValueError):
+        last_view = None
+    if not panes and last_view is None:
         if _project_values(tower):
             from .projects import open_project_picker
 
@@ -759,12 +1112,36 @@ def open_control_room(stdscr, tower) -> None:
     visible = getattr(tower, "visible_rows", ())
     selected_home = visible[tower.selected] if visible and 0 <= tower.selected < len(visible) else None
     groups = getattr(getattr(tower, "work_groups", None), "all", lambda: [])()
-    selected = initial_pane(panes, selected_home, groups) or panes[0]
-    selected_key = str(selected.get("key") or "")
-    selected_identity = pane_identity(selected)
+    selected = initial_pane(panes, selected_home, groups) if panes else None
+    selected = selected or (panes[0] if panes else None)
+    if last_view is not None:
+        restored = _saved_screen_state(last_view, tower, panes)
+        selected = restored["selected_row"]
+        selected_key = restored["selected_key"]
+        selected_identity = restored["selected_identity"]
+        original = restored["original"]
+        cursor_key = restored["cursor_key"]
+        layout = restored["layout"]
+        layout_pinned = restored["layout_pinned"]
+        view_rows = restored["view_rows"]
+        view_context = restored["context"]
+    else:
+        if selected is None:
+            return
+        selected_key = str(selected.get("key") or "")
+        selected_identity = pane_identity(selected)
+        cursor_key = _initial_cursor(panes, selected, selected_home, groups)
+        original = dict(selected)
+        initial_line = _find_nav_line(
+            panes, selected_key, selected_identity, cursor_key,
+            projects=_project_values(tower), window_assets=getattr(tower, "window_assets", ()) or (),
+            hidden_refs=_hidden_project_refs(tower),
+        )
+        view_rows = _scope_grid_rows(selected, panes, groups, initial_line)
+        view_context = _context_for(selected, initial_line, tower)
+        layout = _default_layout(view_rows)
+        layout_pinned = False
     home_scope_identity = selected_identity
-    original = dict(selected)
-    cursor_key = _initial_cursor(panes, selected, selected_home, groups)
     collapsed: set[tuple] = set()
     active_panel = 0
     focus_scroll = 0
@@ -795,10 +1172,22 @@ def open_control_room(stdscr, tower) -> None:
                 visible_output_lines = max(0, right_region_height - 3)
                 output_length = len(selected_snapshot.get("live_lines") or ()) if selected_current else 0
                 focus_scroll = min(focus_scroll, max(0, output_length - visible_output_lines))
+                view_rows = _resolve_saved_rows(
+                    [{
+                        "identity": {field: row.get(field) for field in (
+                            "target_id", "tmux_host", "session", "session_id", "window_id", "pane_id",
+                            "pane_pid", "transport", "transport_target", "remote",
+                        )},
+                        "window_ref": row.get("window_ref") or "",
+                        "display_name": row.get("display_name") or "Pane",
+                    } for row in view_rows],
+                    _visible_panes(tower),
+                )
                 current = draw(
                     stdscr, tower, selected_key, selected_identity, original, groups,
                     active_panel=active_panel, cursor_key=cursor_key,
                     collapsed=collapsed, focus_scroll=focus_scroll,
+                    layout=layout, grid_rows_override=view_rows,
                 )
                 current_cursor = _find_nav_line(
                     _visible_panes(tower), selected_key, selected_identity,
@@ -863,6 +1252,10 @@ def open_control_room(stdscr, tower) -> None:
                                 selected_key, selected_identity, original, cursor_key = _set_selection(
                                     row, cursor_key=target.get("node_key"),
                                 )
+                                view_rows = _scope_grid_rows(row, current_panes, groups, target)
+                                view_context = _context_for(row, target, tower)
+                                if not layout_pinned:
+                                    layout = _default_layout(view_rows)
                                 focus_scroll = 0
                             else:
                                 cursor_key = target.get("node_key")
@@ -881,13 +1274,17 @@ def open_control_room(stdscr, tower) -> None:
                             if row:
                                 selected_key, selected_identity, original = _set_selection(row)[:3]
                                 cursor_key = parent
+                                view_rows = _scope_grid_rows(row, current_panes, groups, parent_line)
+                                view_context = _context_for(row, parent_line, tower)
+                                if not layout_pinned:
+                                    layout = _default_layout(view_rows)
                                 focus_scroll = 0
                             else:
                                 cursor_key = parent
                     elif key == curses.KEY_RIGHT and cursor_kind == "pane":
                         active_panel = 1
-                elif active_panel == 1 and is_current:
-                    grid_rows = _scope_grid_rows(selected, current_panes, groups, nav_line)
+                elif active_panel == 1:
+                    grid_rows = list(view_rows or _scope_grid_rows(selected, current_panes, groups, nav_line))
                     grid_rows = [row for row in grid_rows if pane_identity(row) is not None]
                     index = next((i for i, row in enumerate(grid_rows)
                                   if pane_identity(row) == selected_identity), None)
@@ -937,11 +1334,34 @@ def open_control_room(stdscr, tower) -> None:
                 continue
 
             if key == " ":
+                room_state = {
+                    "layout": layout,
+                    "layout_pinned": layout_pinned,
+                    "view_rows": list(view_rows),
+                    "selected_row": dict(selected),
+                    "selected_key": selected_key,
+                    "selected_identity": selected_identity,
+                    "original": dict(original),
+                    "cursor_key": cursor_key,
+                    "context": copy.deepcopy(view_context),
+                }
                 if not is_current:
-                    show_message_screen(stdscr, t("control_room.title"), [t("live.changed_output")])
+                    _open_screen_menu(stdscr, tower, room_state, current_panes, groups, nav_line)
                 else:
                     menu_home = selected_home if pane_identity(selected) == home_scope_identity else None
-                    _open_action_menu(stdscr, tower, selected, groups, menu_home, cursor_kind, nav_line)
+                    _open_action_menu(
+                        stdscr, tower, selected, groups, menu_home, cursor_kind, nav_line,
+                        screen_state=room_state,
+                    )
+                layout = room_state["layout"]
+                layout_pinned = room_state["layout_pinned"]
+                view_rows = room_state["view_rows"]
+                view_context = room_state["context"]
+                selected_key = room_state["selected_key"]
+                selected_identity = room_state["selected_identity"]
+                original = room_state["original"]
+                cursor_key = room_state["cursor_key"]
+                focus_scroll = 0
                 needs_draw = True
                 continue
 
@@ -960,3 +1380,13 @@ def open_control_room(stdscr, tower) -> None:
                 needs_draw = True
     finally:
         stdscr.timeout(200)
+        try:
+            store = _screen_store(tower)
+            if store is not None:
+                selected_for_save, _ = _resolve_selection(
+                    _visible_panes(tower), selected_key, selected_identity, original,
+                )
+                rows_for_save = _layout_rows(view_rows, selected_for_save, layout)
+                store.save_last_view(rows_for_save, selected_for_save, layout, view_context)
+        except (OSError, ValueError):
+            tower.notice = t("control_room.screens_save_failed")

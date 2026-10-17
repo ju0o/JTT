@@ -390,6 +390,10 @@ def test_hidden_and_disconnected_project_windows_accept_arrow_enter_and_space(mo
         project_ui, "open_project_editor",
         lambda _screen, _tower, project_id: opened.append(project_id),
     )
+    monkeypatch.setattr(
+        control_room, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="edit_project"),
+    )
 
     control_room.open_control_room(screen, tower)
 
@@ -404,7 +408,15 @@ def test_space_on_project_opens_its_editor_and_delete_can_be_cancelled(monkeypat
     project = store.create("Keep me")
     tower = SimpleNamespace(projects=store, window_assets=[], folders=SimpleNamespace(window=lambda _ref: {}))
     opened = []
+    offered = []
     monkeypatch.setattr(project_ui, "open_project_editor", lambda _s, _t, project_id: opened.append(project_id))
+    monkeypatch.setattr(
+        control_room, "run_list_picker",
+        lambda _s, _title, items, **_kwargs: (
+            offered.extend(key for key, _label in items)
+            or SimpleNamespace(cancelled=False, selected_key="edit_project")
+        ),
+    )
 
     control_room._open_action_menu(
         None, tower, None, [], None, "tower_project",
@@ -412,6 +424,7 @@ def test_space_on_project_opens_its_editor_and_delete_can_be_cancelled(monkeypat
     )
 
     assert opened == [project["project_id"]]
+    assert "screens" in offered and "edit_project" in offered
 
     monkeypatch.setattr(
         project_ui, "run_list_picker",
@@ -737,7 +750,7 @@ def test_space_menu_reopens_existing_saved_group_window_layout_and_settings_rout
     tower = SimpleNamespace(rows=[row], work_groups=SimpleNamespace(all=lambda: [group]))
     items = control_room.action_menu_items(row, has_group=True)
     assert [key for key, _label in items] == [
-        "group_live", "window_live", "layout_live", "copy", "details", "settings",
+        "screens", "group_live", "window_live", "layout_live", "copy", "details", "settings",
     ]
 
     routed = []

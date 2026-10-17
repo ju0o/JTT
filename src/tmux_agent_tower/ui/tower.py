@@ -33,6 +33,7 @@ from ..state.bindings import ProjectBindingStore
 from ..state.folders import FolderStore, window_ref
 from ..state.overrides import ROLE_IDS, OverrideStore
 from ..state.projects import ProjectStore
+from ..state.control_screens import ControlScreenStore
 from ..state.work_groups import WorkGroupStore
 from ..detection.project import git_project_name
 from ..state.visits import VisitStore
@@ -375,6 +376,7 @@ class Tower:
         self.work_groups = WorkGroupStore(STATE_DIR / "work-groups.json")
         self.folders = FolderStore(STATE_DIR / "folders.json")
         self.projects = ProjectStore(STATE_DIR / "projects.json")
+        self.control_screens = ControlScreenStore(STATE_DIR / "control-screens.json")
         self.window_assets: List[Dict] = []
         # The TUI owns one engine for its lifetime. Remote passes the
         # server's engine in so hysteresis survives across HTTP polls.
