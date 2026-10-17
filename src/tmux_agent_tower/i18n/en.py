@@ -561,6 +561,7 @@ STRINGS = {
     "control.result_incomplete": "Could not find the complete latest result",
     "control.result_copy_unavailable": "The full answer could not be verified, so nothing was copied.",
     "control.copy_connection_error": "The task connection could not be verified. Check the connection status.",
+    "control.copy_pane_changed": "The selected task has changed.",
     "control.opencode_binding_invalid": "The conversation could not be verified. Open that conversation in OpenCode.",
     "control.opencode_no_active_session": "The conversation could not be verified. Open that conversation in OpenCode.",
     "control.opencode_session_changed": "The OpenCode conversation changed while reading the result, so copying was blocked. Check the completed result in the current conversation.",

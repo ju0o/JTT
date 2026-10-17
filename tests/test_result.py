@@ -5,6 +5,7 @@ from pathlib import Path
 import pty
 import socket
 import sqlite3
+import stat
 import termios
 
 import pytest
@@ -921,6 +922,98 @@ def test_shared_tracker_serializes_concurrent_read_and_poll_without_body_bytes(t
     assert b"Private concurrent body" not in persisted
     assert b"Private answer" not in persisted
     assert b"PRIVATE PROMPT" not in persisted
+
+
+def test_new_result_state_database_and_journal_are_private(tmp_path):
+    state_path = tmp_path / "state" / "nested" / "result-state.sqlite3"
+    identity = _shared_identity()
+    tracker = ResultTracker(state_path)
+    result = ResultCandidate("Private fixture answer", "private-fingerprint")
+
+    assert tracker.observe("%9", "IDLE", result, identity).state == "ready"
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(state_path.parent.parent.stat().st_mode) == 0o700
+
+    connection = tracker._connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE result_state SET state = 'read' WHERE pane_identity = ?",
+            (json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False),),
+        )
+        journal = Path(f"{state_path}-journal")
+        assert journal.is_file()
+        assert stat.S_IMODE(journal.stat().st_mode) == 0o600
+    finally:
+        connection.rollback()
+        connection.close()
+
+    assert ResultTracker(state_path).snapshot("%9", identity).state == "ready"
+
+
+def test_existing_result_database_data_and_mode_are_preserved(tmp_path):
+    state_path = tmp_path / "result-state.sqlite3"
+    identity = _shared_identity()
+    identity_key = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            "CREATE TABLE result_state (schema_version INTEGER NOT NULL, "
+            "pane_identity TEXT PRIMARY KEY NOT NULL, state TEXT NOT NULL, "
+            "fingerprint TEXT NOT NULL, generated_at REAL NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO result_state VALUES (?, ?, ?, ?, ?)",
+            (1, identity_key, "ready", "existing-fingerprint", 123.0),
+        )
+    state_path.chmod(0o644)
+    before = state_path.read_bytes()
+
+    snapshot = ResultTracker(state_path).snapshot("%9", identity)
+
+    assert snapshot.state == "ready"
+    assert snapshot.fingerprint == "existing-fingerprint"
+    assert snapshot.text == ""
+    assert state_path.read_bytes() == before
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("link_type", ["symlink", "hardlink"])
+def test_result_state_refuses_external_database_links_without_writing_target(tmp_path, link_type):
+    external = tmp_path / "external.sqlite3"
+    with sqlite3.connect(external) as connection:
+        connection.execute("CREATE TABLE external_data (value TEXT)")
+        connection.execute("INSERT INTO external_data VALUES ('preserve-me')")
+    external.chmod(0o600)
+    before = external.read_bytes()
+    state_path = tmp_path / "state" / "result-state.sqlite3"
+    state_path.parent.mkdir(mode=0o700)
+    if link_type == "symlink":
+        state_path.symlink_to(external)
+    else:
+        os.link(external, state_path)
+
+    with pytest.raises(OSError, match="unsafe Result state database"):
+        ResultTracker(state_path)._connect()
+
+    assert external.read_bytes() == before
+    if link_type == "symlink":
+        assert state_path.is_symlink()
+    else:
+        assert state_path.stat().st_nlink == 2
+
+
+def test_result_state_refuses_a_group_or_world_writable_database_directory(tmp_path):
+    state_dir = tmp_path / "unsafe-state"
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o777)
+    state_path = state_dir / "result-state.sqlite3"
+
+    with pytest.raises(OSError, match="writable by other users"):
+        ResultTracker(state_path)._connect()
+
+    assert not state_path.exists()
+    state_dir.chmod(0o700)
 
 
 def test_status_payload_exposes_state_but_not_result_text():

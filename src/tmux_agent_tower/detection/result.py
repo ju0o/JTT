@@ -147,10 +147,107 @@ class ResultTracker:
             return None
         return stored[:2]
 
+    @staticmethod
+    def _ensure_state_parent(path: Path) -> Path:
+        """Create a private state directory and reject unsafe path components."""
+
+        absolute = Path(os.path.abspath(path))
+        missing = []
+        current = absolute
+        while True:
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                missing.append(current)
+                if current.parent == current:
+                    raise OSError("state directory has no existing ancestor")
+                current = current.parent
+                continue
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise OSError("unsafe state directory")
+            break
+
+        euid = os.geteuid() if hasattr(os, "geteuid") else None
+        for directory in reversed(missing):
+            os.mkdir(directory, 0o700)
+            info = directory.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                or (euid is not None and info.st_uid != euid)
+                or stat.S_IMODE(info.st_mode) & 0o077
+            ):
+                raise OSError("unsafe created state directory")
+
+        resolved = absolute.resolve(strict=True)
+        if resolved != absolute:
+            raise OSError("state directory traverses a symlink")
+        # Walk existing ancestors as well: a writable, non-sticky ancestor
+        # could replace the database directory after it has been checked.
+        current = absolute
+        while True:
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise OSError("unsafe state directory")
+            mode = stat.S_IMODE(info.st_mode)
+            if mode & 0o022 and not mode & stat.S_ISVTX:
+                raise OSError("state directory is writable by other users")
+            if current == absolute and euid is not None and info.st_uid != euid:
+                raise OSError("state directory is not owned by the current user")
+            if current.parent == current:
+                break
+            current = current.parent
+        return absolute
+
+    @staticmethod
+    def _prepare_state_file(path: Path) -> tuple[Path, tuple[int, int]]:
+        """Create only a missing DB as 0600; never follow or replace a file."""
+
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        created = False
+        try:
+            fd = os.open(path, flags, 0o600)
+            created = True
+        except FileExistsError:
+            fd = -1
+
+        if created:
+            try:
+                os.fchmod(fd, 0o600)
+                info = os.fstat(fd)
+            finally:
+                os.close(fd)
+        else:
+            info = path.lstat()
+
+        euid = os.geteuid() if hasattr(os, "geteuid") else None
+        if (
+            stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or (euid is not None and info.st_uid != euid)
+        ):
+            raise OSError("unsafe Result state database")
+        return path, (info.st_dev, info.st_ino)
+
     def _connect(self) -> sqlite3.Connection:
         assert self.state_path is not None
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(str(self.state_path), timeout=30.0, isolation_level=None)
+        path = self._ensure_state_parent(self.state_path.parent) / self.state_path.name
+        path, identity = self._prepare_state_file(path)
+        # mode=rw prevents SQLite from silently recreating a DB that vanishes
+        # between the no-follow file check and sqlite3.connect().
+        connection = sqlite3.connect(
+            path.as_uri() + "?mode=rw", uri=True, timeout=30.0, isolation_level=None,
+        )
+        try:
+            current = path.lstat()
+            if (
+                stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != identity
+            ):
+                raise OSError("Result state database changed while opening")
+        except Exception:
+            connection.close()
+            raise
         connection.execute("PRAGMA busy_timeout = 30000")
         connection.execute(
             "CREATE TABLE IF NOT EXISTS result_state ("

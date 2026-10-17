@@ -770,17 +770,17 @@ def _truth(value) -> str:
 
 
 def _result_failure_code(row: dict, payload: dict, reason: str = "") -> str:
+    if reason == "stale":
+        return "PANE_IDENTITY_CHANGED"
     code = str(payload.get("reason_code") or payload.get("source") or "")
     if code in {
         "AGENT_UNSUPPORTED", "AGENT_UNBOUND", "PROVIDER_UNBOUND", "TURN_NOT_COMPLETE", "SOURCE_PARTIAL",
         "OUTPUT_RANGE_EXCEEDED", "CLIPBOARD_FAILED", "UNKNOWN",
         "REMOTE_PROVIDER_UNBOUND", "REMOTE_PROVIDER_UNAVAILABLE", "REMOTE_RESULT_INCOMPLETE",
         "AGENT_SESSION_UNBOUND", "REMOTE_PROVIDER_TIMEOUT", "OPENCODE_BINDING_INVALID",
-        "OPENCODE_NO_ACTIVE_SESSION", "SESSION_BINDING_CHANGED",
+        "OPENCODE_NO_ACTIVE_SESSION", "SESSION_BINDING_CHANGED", "PANE_IDENTITY_CHANGED",
     }:
         return code
-    if reason == "stale":
-        return "UNKNOWN"
     if row.get("result_adapter") == "Shell":
         return "AGENT_UNSUPPORTED"
     if payload.get("turn_complete") is False:
@@ -795,6 +795,7 @@ def _result_copy_block_notice(code: str, payload: dict) -> str:
         "OPENCODE_BINDING_INVALID": "control.opencode_binding_invalid",
         "OPENCODE_NO_ACTIVE_SESSION": "control.opencode_no_active_session",
         "SESSION_BINDING_CHANGED": "control.opencode_session_changed",
+        "PANE_IDENTITY_CHANGED": "control.copy_pane_changed",
     }.get(code)
     if message_key:
         return t(message_key)

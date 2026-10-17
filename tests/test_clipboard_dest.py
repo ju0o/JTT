@@ -395,6 +395,26 @@ def test_y_reports_clipboard_delivery_failure_separately(monkeypatch):
     assert tower.last_result_copy_diagnostic["reason_code"] == "CLIPBOARD_FAILED"
 
 
+def test_y_explains_a_changed_pane_identity_without_routing(monkeypatch):
+    from tmux_agent_tower.ui import control_view
+
+    tower = _Tower()
+    routed = []
+    monkeypatch.setattr(
+        control_view, "get_result",
+        lambda *_args, **_kwargs: (False, "stale", {"reason_code": "UNKNOWN"}),
+    )
+    monkeypatch.setattr(
+        control_view, "_route_clipboard", lambda *_args, **_kwargs: routed.append(True),
+    )
+
+    notice = _copy_result(tower, "%9")
+
+    assert notice == t("control.copy_pane_changed")
+    assert tower.last_result_copy_diagnostic["reason_code"] == "PANE_IDENTITY_CHANGED"
+    assert routed == []
+
+
 def test_y_opt_in_trace_records_only_copy_metadata(tmp_path, monkeypatch):
     import hashlib
     import json

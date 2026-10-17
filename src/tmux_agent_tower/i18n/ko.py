@@ -558,6 +558,7 @@ STRINGS = {
     "control.result_incomplete": "최신 결과 전체를 찾지 못했습니다",
     "control.result_copy_unavailable": "답변 전체를 확인할 수 없어 복사하지 않았습니다.",
     "control.copy_connection_error": "작업 연결을 확인할 수 없습니다. 연결 상태를 확인해 주세요.",
+    "control.copy_pane_changed": "선택한 작업이 변경되었습니다.",
     "control.opencode_binding_invalid": "복사할 대화를 확인할 수 없습니다. OpenCode에서 해당 대화를 열어 주세요.",
     "control.opencode_no_active_session": "복사할 대화를 확인할 수 없습니다. OpenCode에서 해당 대화를 열어 주세요.",
     "control.opencode_session_changed": "복사할 대화를 확인할 수 없습니다. OpenCode에서 해당 대화를 열어 주세요.",
