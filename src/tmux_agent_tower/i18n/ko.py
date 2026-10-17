@@ -912,6 +912,8 @@ STRINGS = {
     "control_room.screens_open": "저장한 화면 열기",
     "control_room.screens_save": "현재 화면 저장",
     "control_room.screens_layout": "화면 배치 변경",
+    "control_room.screens_help_screen": "화면은 작업 구성과 선택 상태를 함께 기억합니다.",
+    "control_room.screens_help_layout": "배치는 분할 모양만 저장해 다른 작업에도 쓸 수 있습니다.",
     "control_room.screens_template_save": "현재 배치를 템플릿으로 저장",
     "control_room.screens_template_apply": "저장한 배치 적용",
     "control_room.screens_manage": "저장한 화면 이름 변경·삭제",

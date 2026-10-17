@@ -220,6 +220,23 @@ def test_explicit_confirmation_cancel_does_not_validate_or_select(monkeypatch):
     assert result is None
 
 
+def test_handoff_confirmation_defaults_to_cancel_on_wide_dialog(monkeypatch):
+    row = _row()
+    tower = _tower(row)
+    screen = Screen(44, 160, ["\n"])
+    monkeypatch.setattr(
+        control_room.control_actions,
+        "handoff_focus_target",
+        lambda *_args: pytest.fail("Enter on the default Cancel choice must not hand off"),
+    )
+
+    assert control_room._request_agent_handoff(screen, tower, row) is None
+    frame = "\n".join(text for _y, _x, text, _attr in screen.writes)
+    assert "+" in frame
+    assert "취소" in frame
+    assert "조작 화면으로 이동" in frame
+
+
 def test_limited_peer_menu_explains_unavailable_without_confirmation(monkeypatch):
     remote = _row(remote=True, tmux_host="asus", execution_host="asus",
                   transport="remote_tmux", transport_target="asus")

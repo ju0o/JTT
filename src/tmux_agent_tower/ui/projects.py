@@ -245,13 +245,16 @@ def create_project(stdscr, tower, row: dict | None = None) -> None:
         _error(stdscr, exc)
 
 
-def open_project_picker(stdscr, tower, row: dict | None = None) -> None:
+def open_project_picker(stdscr, tower, row: dict | None = None, *, centered: bool = False) -> None:
     store = _store(tower)
     if store is None:
         return
     items = [("create", t("project_manage.create"))]
     items.extend((item["project_id"], item["display_name"]) for item in store.all())
-    pick = run_list_picker(stdscr, t("project_manage.title"), items, footer_hint=t("wizard.hint_list"))
+    pick = run_list_picker(
+        stdscr, t("project_manage.title"), items,
+        footer_hint=t("wizard.hint_list"), centered=centered,
+    )
     if pick.cancelled or not pick.selected_key:
         return
     if pick.selected_key == "create":

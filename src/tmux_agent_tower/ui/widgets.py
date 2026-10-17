@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from ..i18n import t
 from .perf_trace import event
-from .render import truncate_to_width
+from .render import display_width, truncate_to_width
 
 
 def read_key(stdscr):
@@ -102,6 +102,41 @@ def safe_add(stdscr, y, x, text, attr=0):
         stdscr.addnstr(y, x, clipped, len(clipped), attr)
     except curses.error:
         pass
+
+
+def _wrap_picker_preamble(lines: Sequence[str], max_width: int) -> List[str]:
+    """Wrap picker context text by terminal columns without dropping content."""
+
+    wrapped: List[str] = []
+    for raw_line in lines:
+        words = str(raw_line).split()
+        if not words:
+            wrapped.append("")
+            continue
+        current = ""
+        for word in words:
+            if display_width(word) > max_width:
+                if current:
+                    wrapped.append(current)
+                    current = ""
+                chunk = ""
+                for char in word:
+                    if chunk and display_width(chunk + char) > max_width:
+                        wrapped.append(chunk)
+                        chunk = char
+                    else:
+                        chunk += char
+                current = chunk
+                continue
+            candidate = f"{current} {word}" if current else word
+            if current and display_width(candidate) > max_width:
+                wrapped.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            wrapped.append(current)
+    return wrapped
 
 
 @dataclass
@@ -226,6 +261,7 @@ def run_list_picker(
     extra_keys: Optional[Dict[str, str]] = None,
     footer_hint: str = "",
     preamble: Optional[Sequence[str]] = None,
+    centered: bool = False,
 ) -> PickResult:
     """Generic single/multi-select list picker with optional live search.
 
@@ -233,7 +269,9 @@ def run_list_picker(
     a case-insensitive substring match against ``label``. ``extra_keys``
     maps a single lowercase character to a tag string; pressing it
     immediately returns a ``PickResult`` with that tag in ``.extra`` (used
-    for e.g. "B" = manual path entry, handled by the caller).
+    for e.g. "B" = manual path entry, handled by the caller). ``centered``
+    opts Control Room menus into a compact dialog on roomy terminals; smaller
+    terminals retain the established full-width list presentation.
     """
 
     extra_keys = extra_keys or {}
@@ -256,30 +294,79 @@ def run_list_picker(
             visible = [(k, label) for k, label in items if query in label.lower()] if query else list(items)
             selected_index = max(0, min(selected_index, len(visible) - 1)) if visible else 0
 
-            stdscr.erase()
             height, width = stdscr.getmaxyx()
-            safe_add(stdscr, 0, 2, title, curses.A_BOLD)
+            stdscr.erase()
 
-            row_y = 2
-            for line in preamble or []:
-                safe_add(stdscr, row_y, 2, line)
-                row_y += 1
-            if preamble:
-                row_y += 1
-            if searchable:
-                cursor = "_" if editing_search else ""
-                safe_add(stdscr, row_y, 2, f'{t("wizard.search_label")} {search}{cursor}', curses.A_DIM)
-                row_y += 2
+            use_dialog = centered and width >= 110 and height >= 32
+            if use_dialog:
+                labels_width = max(
+                    [display_width(str(title)), display_width(footer_hint)]
+                    + [display_width(str(label)) for _item_key, label in items]
+                    + [display_width(str(line)) for line in (preamble or [])]
+                )
+                dialog_width = min(width - 8, max(56, min(104, labels_width + 8)))
+                left = (width - dialog_width) // 2
+                content_width = dialog_width - 4
+                wrapped_preamble = _wrap_picker_preamble(preamble or (), content_width)
+                list_top_offset = 3 + len(wrapped_preamble) + (1 if wrapped_preamble else 0)
+                if searchable:
+                    list_top_offset += 2
+                dialog_height = min(
+                    height - 4,
+                    max(10, list_top_offset + len(visible) + 3),
+                )
+                top_edge = (height - dialog_height) // 2
+                bottom_edge = top_edge + dialog_height - 1
+                safe_add(stdscr, top_edge, left, "+" + "-" * (dialog_width - 2) + "+", curses.A_DIM)
+                for border_y in range(top_edge + 1, bottom_edge):
+                    safe_add(stdscr, border_y, left, "|" + " " * (dialog_width - 2) + "|", curses.A_DIM)
+                safe_add(stdscr, bottom_edge, left, "+" + "-" * (dialog_width - 2) + "+", curses.A_DIM)
 
-            list_top = row_y
-            max_rows = max(1, height - list_top - 3)
+                safe_add(stdscr, top_edge + 1, left + 2, truncate_to_width(title, content_width), curses.A_BOLD)
+                row_y = top_edge + 3
+                for line in wrapped_preamble:
+                    safe_add(stdscr, row_y, left + 2, line, curses.A_DIM)
+                    row_y += 1
+                if wrapped_preamble:
+                    row_y += 1
+                if searchable:
+                    cursor = "_" if editing_search else ""
+                    search_line = f'{t("wizard.search_label")} {search}{cursor}'
+                    safe_add(stdscr, row_y, left + 2, truncate_to_width(search_line, content_width), curses.A_DIM)
+                    row_y += 2
+
+                list_top = row_y
+                footer_y = bottom_edge - 1
+                max_rows = max(1, footer_y - list_top - 1)
+                hint = truncate_to_width(footer_hint, content_width)
+                safe_add(stdscr, footer_y, left + 2, hint, curses.A_DIM)
+            else:
+                safe_add(stdscr, 0, 2, title, curses.A_BOLD)
+
+                row_y = 2
+                for line in preamble or []:
+                    safe_add(stdscr, row_y, 2, line)
+                    row_y += 1
+                if preamble:
+                    row_y += 1
+                if searchable:
+                    cursor = "_" if editing_search else ""
+                    safe_add(stdscr, row_y, 2, f'{t("wizard.search_label")} {search}{cursor}', curses.A_DIM)
+                    row_y += 2
+
+                list_top = row_y
+                max_rows = max(1, height - list_top - 3)
 
             top = 0
             if selected_index >= max_rows:
                 top = selected_index - max_rows + 1
 
             if not visible:
-                safe_add(stdscr, list_top, 2, t("wizard.no_matches"), curses.A_DIM)
+                if use_dialog:
+                    safe_add(stdscr, list_top, left + 2,
+                             truncate_to_width(t("wizard.no_matches"), content_width), curses.A_DIM)
+                else:
+                    safe_add(stdscr, list_top, 2, t("wizard.no_matches"), curses.A_DIM)
 
             for offset, (key, label) in enumerate(visible[top : top + max_rows]):
                 real_index = top + offset
@@ -292,10 +379,17 @@ def run_list_picker(
                     prefix = "[x] " if key in checked_keys else "[ ] "
 
                 marker = "> " if is_selected else "  "
-                safe_add(stdscr, y, 0, f"{marker}{prefix}{label}", base_attr)
+                row_text = f"{marker}{prefix}{label}"
+                if use_dialog:
+                    clipped = truncate_to_width(row_text, dialog_width - 2)
+                    row_text = clipped + " " * max(0, dialog_width - 2 - display_width(clipped))
+                    safe_add(stdscr, y, left + 1, row_text, base_attr)
+                else:
+                    safe_add(stdscr, y, 0, row_text, base_attr)
 
-            hint_y = height - 2
-            safe_add(stdscr, hint_y, 2, footer_hint, curses.A_DIM)
+            if not use_dialog:
+                hint_y = height - 2
+                safe_add(stdscr, hint_y, 2, footer_hint, curses.A_DIM)
 
             stdscr.refresh()
             if first_draw:

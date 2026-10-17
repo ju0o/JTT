@@ -917,6 +917,8 @@ STRINGS = {
     "control_room.screens_open": "Open a saved screen",
     "control_room.screens_save": "Save the current screen",
     "control_room.screens_layout": "Change screen layout",
+    "control_room.screens_help_screen": "A screen saves its Panes and selection together.",
+    "control_room.screens_help_layout": "A layout saves only the split arrangement for reuse.",
     "control_room.screens_template_save": "Save this layout as a template",
     "control_room.screens_template_apply": "Apply a saved layout",
     "control_room.screens_manage": "Rename or delete a saved screen",

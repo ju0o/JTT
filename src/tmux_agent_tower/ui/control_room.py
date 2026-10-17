@@ -830,6 +830,7 @@ def _request_agent_handoff(stdscr, tower, row: dict):
         ],
         footer_hint=t("wizard.hint_list"),
         preamble=_handoff_confirmation_lines(row),
+        centered=True,
     )
     if pick.cancelled or pick.selected_key != "confirm":
         return None
@@ -856,7 +857,7 @@ def _screen_confirm(stdscr, title: str, message: str) -> bool:
     pick = run_list_picker(
         stdscr, title,
         [("cancel", t("menu.cancel")), ("confirm", t("project_manage.confirm_yes"))],
-        footer_hint=t("wizard.hint_list"), preamble=[message],
+        footer_hint=t("wizard.hint_list"), preamble=[message], centered=True,
     )
     return not pick.cancelled and pick.selected_key == "confirm"
 
@@ -870,6 +871,7 @@ def _screen_picker(stdscr, title: str, records: list[dict], *, key_field: str,
         stdscr, title,
         [(str(item[key_field]), str(item[label_field])) for item in records],
         footer_hint=t("wizard.hint_list"),
+        centered=True,
     )
     if pick.cancelled:
         return None
@@ -907,7 +909,10 @@ def _open_screen_menu(stdscr, tower, state: dict, current_panes, groups, nav_lin
         ("cancel", t("menu.cancel")),
     ]
     pick = run_list_picker(stdscr, t("control_room.screens_title"), items,
-                           footer_hint=t("wizard.hint_list"))
+                           footer_hint=t("wizard.hint_list"),
+                           preamble=[t("control_room.screens_help_screen"),
+                                     t("control_room.screens_help_layout")],
+                           centered=True)
     if pick.cancelled or not pick.selected_key or pick.selected_key == "cancel":
         return
     choice = str(pick.selected_key)
@@ -955,6 +960,7 @@ def _open_screen_menu(stdscr, tower, state: dict, current_panes, groups, nav_lin
             stdscr, t("control_room.screens_layout"),
             [(layout, t(f"layout.{layout}")) for layout in ("focus", "split-2", "grid-4", "main-plus-side")],
             footer_hint=t("wizard.hint_list"),
+            centered=True,
         )
         if not pick.cancelled and pick.selected_key:
             _screen_context_view_rows(state, tower, current_panes, groups, nav_line)
@@ -1002,6 +1008,7 @@ def _open_screen_menu(stdscr, tower, state: dict, current_panes, groups, nav_lin
             [("rename", t("control_room.screens_rename")),
              ("delete", t("control_room.screens_delete")), ("cancel", t("menu.cancel"))],
             footer_hint=t("wizard.hint_list"),
+            centered=True,
         )
         if action.cancelled or action.selected_key == "cancel":
             return
@@ -1077,7 +1084,7 @@ def _run_action(stdscr, tower, action: str, row: dict | None, groups=(),
     elif action == "projects":
         from .projects import open_project_picker
 
-        open_project_picker(stdscr, tower, row)
+        open_project_picker(stdscr, tower, row, centered=True)
 
 
 def _open_action_menu(stdscr, tower, row, groups, selected_home, cursor_kind, nav_line=None,
@@ -1112,6 +1119,7 @@ def _open_action_menu(stdscr, tower, row, groups, selected_home, cursor_kind, na
     pick = run_list_picker(
         stdscr, t("control_room.menu_title"), items,
         footer_hint=t("wizard.hint_list"),
+        centered=True,
     )
     if not pick.cancelled and pick.selected_key:
         if pick.selected_key == "screens":
@@ -1128,7 +1136,7 @@ def _open_action_menu(stdscr, tower, row, groups, selected_home, cursor_kind, na
             if pick.selected_key == "projects":
                 from .projects import open_project_picker
 
-                open_project_picker(stdscr, tower)
+                open_project_picker(stdscr, tower, centered=True)
             return
         if cursor_kind in {"tower_project", "project_window", "project_window_hidden", "project_window_disconnected"}:
             return
