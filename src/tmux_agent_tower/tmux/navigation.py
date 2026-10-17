@@ -116,6 +116,37 @@ def focus_local_pane(session: str, pane_id: str) -> bool:
     return True
 
 
+def _select_pane_target_step(command: str, pane_id: str) -> bool | None:
+    """Run one focus-only tmux command; ``None`` means execution is uncertain."""
+
+    if not pane_id or not pane_id.startswith("%") or not pane_id[1:].isdecimal():
+        return False
+    try:
+        result = subprocess.run(
+            ["tmux", command, "-t", pane_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3.0,
+            check=False,
+        )
+    except Exception:
+        return None
+    return result.returncode == 0
+
+
+def select_window_for_pane(pane_id: str) -> bool | None:
+    """Select the existing Window containing one previously verified Pane."""
+
+    return _select_pane_target_step("select-window", pane_id)
+
+
+def select_pane_for_pane(pane_id: str) -> bool | None:
+    """Select one previously verified existing Pane; never sends input."""
+
+    return _select_pane_target_step("select-pane", pane_id)
+
+
 def active_pane_in_window(session: str, window_index: str) -> str:
     """The live active pane id of ``session:window_index``, or ``""``.
 

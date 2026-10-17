@@ -52,6 +52,15 @@ class FocusTargetStatus(str, Enum):
     UNVERIFIED = "UNVERIFIED"
 
 
+class FocusHandoffStatus(str, Enum):
+    """Outcome of a confirmed local tmux focus handoff."""
+
+    FOCUSED = "FOCUSED"
+    REFUSED = "REFUSED"
+    FAILED = "FAILED"
+    PARTIAL = "PARTIAL"
+
+
 @dataclass(frozen=True)
 class FocusTargetValidation:
     """Read-only eligibility result; never a token that authorizes later focus."""
@@ -63,6 +72,15 @@ class FocusTargetValidation:
     @property
     def allowed(self) -> bool:
         return self.status is FocusTargetStatus.ALLOWED
+
+
+@dataclass(frozen=True)
+class FocusHandoffResult:
+    """A focus operation outcome, including the last identity check and step."""
+
+    status: FocusHandoffStatus
+    validation: FocusTargetValidation
+    stage: str = ""
 
 
 _FOCUS_IDENTITY_FIELDS = (
@@ -207,6 +225,41 @@ def validate_focus_target(tower, row: dict) -> FocusTargetValidation:
         pane_id,
         expected_identity,
     )
+
+
+def handoff_focus_target(tower, row: dict) -> FocusHandoffResult:
+    """Revalidate and focus one explicitly confirmed local Pane.
+
+    No arbitrary key or prompt is forwarded. The operation revalidates before
+    selecting the Window, again before selecting the Pane, and after the last
+    selection. tmux cannot atomically compare identity and select, so a race
+    remains; any intermediate mismatch stops the sequence without attempting
+    an automatic rollback or another target.
+    """
+
+    validation = validate_focus_target(tower, row)
+    if not validation.allowed:
+        return FocusHandoffResult(FocusHandoffStatus.REFUSED, validation, "before_focus")
+
+    window_step = tmux_navigation.select_window_for_pane(validation.pane_id)
+    if window_step is False:
+        return FocusHandoffResult(FocusHandoffStatus.FAILED, validation, "select_window")
+    if window_step is None:
+        return FocusHandoffResult(FocusHandoffStatus.PARTIAL, validation, "select_window_uncertain")
+
+    validation = validate_focus_target(tower, row)
+    if not validation.allowed:
+        return FocusHandoffResult(FocusHandoffStatus.PARTIAL, validation, "after_select_window")
+
+    pane_step = tmux_navigation.select_pane_for_pane(validation.pane_id)
+    if pane_step is not True:
+        return FocusHandoffResult(FocusHandoffStatus.PARTIAL, validation, "select_pane")
+
+    validation = validate_focus_target(tower, row)
+    if not validation.allowed:
+        return FocusHandoffResult(FocusHandoffStatus.PARTIAL, validation, "after_select_pane")
+
+    return FocusHandoffResult(FocusHandoffStatus.FOCUSED, validation, "complete")
 
 _ANSI_RE = re.compile(
     r"\x1b\[[0-?]*[ -/]*[@-~]"

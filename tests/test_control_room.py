@@ -57,6 +57,9 @@ class Screen:
     def noutrefresh(self):
         pass
 
+    def refresh(self):
+        pass
+
     def timeout(self, value):
         self.timeouts.append(value)
 
@@ -281,7 +284,7 @@ def test_project_window_visibility_excludes_project_panes_but_keeps_management_a
     assert not any(line.get("row") is hidden for line in lines)
     assert [key for key, _ in control_room.action_menu_items(
         visible, project_management=True,
-    )][-3:] == ["projects", "details", "settings"]
+    )][-4:] == ["projects", "details", "settings", "agent_handoff"]
 
 
 def test_project_creation_and_keyboard_navigation_keep_grid_and_focus_on_exact_remote_pane(
@@ -751,6 +754,7 @@ def test_space_menu_reopens_existing_saved_group_window_layout_and_settings_rout
     items = control_room.action_menu_items(row, has_group=True)
     assert [key for key, _label in items] == [
         "screens", "group_live", "window_live", "layout_live", "copy", "details", "settings",
+        "agent_handoff",
     ]
 
     routed = []
@@ -825,6 +829,8 @@ def test_menu_result_copy_reuses_existing_handler_and_remote_menu_has_no_input_a
     assert calls == ["%3"]
     assert "layout_live" not in remote_keys
     assert "window_live" not in remote_keys
+    assert "agent_handoff" not in remote_keys
+    assert "agent_handoff_unavailable" in remote_keys
     assert "send_prompt" not in remote_keys
     assert "terminal_input" not in remote_keys
 

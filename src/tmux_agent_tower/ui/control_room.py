@@ -1,8 +1,9 @@
-"""Read-only, three-panel view over Tower's existing pane snapshot.
+"""Three-panel view over Tower's existing pane snapshot.
 
-This screen never captures a pane during drawing. It renders only the
-``live_lines`` already carried by the Tower refresh snapshot and delegates
-tile rendering to the established LIVE view renderer.
+The room observes only the ``live_lines`` already carried by the Tower
+refresh snapshot and delegates tile rendering to the established LIVE view
+renderer. A separate, explicit confirmation may hand focus to one verified
+local tmux Pane; this module never relays Agent keystrokes.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import curses
 import math
 import time
 
+from ..control import actions as control_actions
 from ..i18n import t
 from . import live_view, render
 from .perf_trace import draw as trace_draw
@@ -741,8 +743,9 @@ def _copy_key_is_unambiguous(rows, row: dict | None) -> bool:
 def action_menu_items(row: dict | None, *, cursor_kind: str = "pane", has_group: bool = False,
                       has_folder: bool = False, copy_safe: bool = True,
                       live_routes_safe: bool = True,
-                      project_management: bool = False) -> list[tuple[str, str]]:
-    """Visible routes to established features; no new Agent-control actions."""
+                      project_management: bool = False,
+                      direct_control_available: bool | None = None) -> list[tuple[str, str]]:
+    """Existing routes plus an explicitly confirmed local tmux handoff."""
 
     items: list[tuple[str, str]] = [("screens", t("control_room.menu_screens"))]
     if has_group and live_routes_safe:
@@ -761,7 +764,92 @@ def action_menu_items(row: dict | None, *, cursor_kind: str = "pane", has_group:
         ("details", t("control_room.menu_details")),
         ("settings", t("control_room.menu_settings")),
     ])
+    if row and cursor_kind == "pane":
+        if direct_control_available is None:
+            direct_control_available = (
+                not row.get("remote")
+                and row.get("transport") in {"local", "ssh"}
+            )
+        if direct_control_available:
+            items.append(("agent_handoff", t("control_room.menu_agent_handoff")))
+        else:
+            items.append(("agent_handoff_unavailable", t("control_room.handoff_unavailable")))
     return items
+
+
+def _focus_handoff_menu_available(tower, row: dict | None) -> bool:
+    """Cheap row-only menu gate; authoritative checks happen after confirmation."""
+
+    if not isinstance(row, dict) or row.get("kind") != "pane" or row.get("remote"):
+        return False
+    pane_id = str(row.get("pane_id") or "")
+    if not pane_id.startswith("%") or not pane_id[1:].isdecimal() or row.get("key") != pane_id:
+        return False
+    if pane_id == str(getattr(tower, "own_pane_id", "") or "") or row.get("tower_runtime"):
+        return False
+    host = str(row.get("tmux_host") or "").strip()
+    local_host = str(getattr(tower, "local_host", "") or "").strip()
+    if not host or not local_host or host.casefold() != local_host.casefold():
+        return False
+    session_id = str(row.get("session_id") or "")
+    window_id = str(row.get("window_id") or "")
+    pane_pid = str(row.get("pane_pid") or "")
+    if (
+        not row.get("target_id") or not row.get("session")
+        or not session_id.startswith("$") or not window_id.startswith("@")
+        or not pane_pid.isdecimal()
+    ):
+        return False
+    transport = row.get("transport")
+    target = str(row.get("transport_target") or "").strip()
+    return (transport == "local" and not target) or (transport == "ssh" and bool(target))
+
+
+def _handoff_confirmation_lines(row: dict) -> list[str]:
+    task = str(row.get("display_name") or row.get("task_name") or t("task.terminal"))
+    agent = str(row.get("agent") or t("state.unknown"))
+    computer = _host_label(row)
+    window = str(row.get("window_name") or row.get("window_index") or t("state.unknown"))
+    return [
+        t("control_room.read_only"),
+        t("control_room.handoff_target").format(
+            task=task, agent=agent, computer=computer, window=window,
+        ),
+        t("control_room.handoff_confirm_prompt"),
+        t("control_room.handoff_return_hint"),
+    ]
+
+
+def _request_agent_handoff(stdscr, tower, row: dict):
+    pick = run_list_picker(
+        stdscr,
+        t("control_room.handoff_title"),
+        [
+            ("cancel", t("menu.cancel")),
+            ("confirm", t("control_room.handoff_confirm")),
+        ],
+        footer_hint=t("wizard.hint_list"),
+        preamble=_handoff_confirmation_lines(row),
+    )
+    if pick.cancelled or pick.selected_key != "confirm":
+        return None
+
+    result = control_actions.handoff_focus_target(tower, row)
+    if result.status is control_actions.FocusHandoffStatus.FOCUSED:
+        return result.status
+    if result.status is control_actions.FocusHandoffStatus.PARTIAL:
+        message = t("control_room.handoff_partial")
+    elif result.status is control_actions.FocusHandoffStatus.FAILED:
+        message = t("control_room.handoff_failed")
+    elif result.validation.status in {
+        control_actions.FocusTargetStatus.REMOTE_UNSUPPORTED,
+        control_actions.FocusTargetStatus.SELF_TARGET,
+    }:
+        message = t("control_room.handoff_unavailable")
+    else:
+        message = t("control_room.handoff_rejected")
+    show_message_screen(stdscr, t("control_room.handoff_title"), [message])
+    return result.status
 
 
 def _screen_confirm(stdscr, title: str, message: str) -> bool:
@@ -1019,6 +1107,7 @@ def _open_action_menu(stdscr, tower, row, groups, selected_home, cursor_kind, na
             copy_safe=_copy_key_is_unambiguous(getattr(tower, "rows", ()), row),
             live_routes_safe=_pane_keys_unique(getattr(tower, "rows", ())),
             project_management=_project_store(tower) is not None,
+            direct_control_available=_focus_handoff_menu_available(tower, row),
         )
     pick = run_list_picker(
         stdscr, t("control_room.menu_title"), items,
@@ -1043,6 +1132,14 @@ def _open_action_menu(stdscr, tower, row, groups, selected_home, cursor_kind, na
             return
         if cursor_kind in {"tower_project", "project_window", "project_window_hidden", "project_window_disconnected"}:
             return
+        if pick.selected_key == "agent_handoff_unavailable":
+            show_message_screen(
+                stdscr, t("control_room.handoff_title"),
+                [t("control_room.handoff_unavailable")],
+            )
+            return
+        if pick.selected_key == "agent_handoff":
+            return _request_agent_handoff(stdscr, tower, row)
         _run_action(
             stdscr, tower, str(pick.selected_key), row, groups, selected_home,
             copy_allowed=cursor_kind == "pane",

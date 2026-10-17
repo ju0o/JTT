@@ -279,6 +279,28 @@ Ctrl+Y copies Result, Ctrl+S shows it, Ctrl+E edits names, Ctrl+G focuses the
 pane, Ctrl+N rejects only a measured rejection, Ctrl+X closes where allowed,
 and Esc returns to the list.
 
+## Confirmed Agent focus handoff
+
+Control Room remains an observation screen until the user chooses `Agent
+direct control` and confirms the named task, Agent, computer, and Window. Tower
+does not relay arbitrary keys: after the handoff, the selected local tmux Pane
+and tmux handle keyboard input. A MainPC SSH Client Pane can be eligible only
+when its live process-tree destination matches the observed SSH target; an
+ASUS `remote_tmux` peer is not a local handoff target.
+
+The handoff rechecks the Tower target ID, Host, Session name and ID, Window ID,
+Pane ID/PID, transport, and SSH target against a fresh read-only tmux/process
+snapshot immediately before focusing. Because focusing uses separate
+`select-window` and `select-pane` commands, tmux cannot make identity check and
+selection atomic. The checks reduce but do not eliminate the race. Identity
+change or uncertain command completion stops the sequence; if the Window was
+already selected, Tower reports a partial handoff and does not attempt an
+automatic rollback or another target. Tower itself is not terminated. Return
+is manual through the user's existing tmux navigation; Tower promises no
+fixed prefix or one-key return. Its existing snapshot refresh continues, and
+a disappeared/reused Pane is shown as stale rather than inheriting old LIVE
+output.
+
 `send_prompt` sends one initial Enter. Only Cursor can receive one more,
 after a fresh capture shows the prompt head as the first nonblank text
 below the current `Add a follow-up` composer. A prompt echo above that
