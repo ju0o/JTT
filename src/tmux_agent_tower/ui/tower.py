@@ -2489,30 +2489,9 @@ def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
             continue
 
         if matches_letter(key, "l"):
-            row = tower.visible_rows[tower.selected] if tower.visible_rows else None
-            if row and row.get("kind") in {"folder", "other_section"}:
-                from .live_view import open_folder_live_view
+            from .control_room import open_control_room
 
-                open_folder_live_view(stdscr, tower, row)
-            elif row and row.get("kind") == "work_group":
-                from .live_view import open_group_live_view
-
-                store = getattr(tower, "work_groups", None)
-                group = next((item for item in store.all()
-                              if item.get("group_id") == row.get("group_id")), row) if store else row
-                open_group_live_view(stdscr, tower, group)
-            elif row and row.get("kind") == "window_asset":
-                from .live_view import open_window_live_view
-
-                open_window_live_view(stdscr, tower, row.get("window_ref") or "")
-            elif row and row.get("kind") == "pane" and row.get("key"):
-                from .live_view import open_live_view
-
-                open_live_view(stdscr, tower, row["key"])
-            else:
-                from .live_view import open_live_view
-
-                open_live_view(stdscr, tower)
+            open_control_room(stdscr, tower)
             _request_background_refresh(tower)
             draw(stdscr, tower, remote_state=remote_state)
             continue

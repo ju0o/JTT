@@ -556,9 +556,9 @@ def test_expanded_folder_hides_duplicate_counts_and_copy_hint(monkeypatch, heigh
     assert "Y 최신 답변 복사" not in text
 
 
-def test_tower_v_opens_navigator_and_l_opens_live_view(monkeypatch):
+def test_tower_v_opens_navigator_and_l_opens_quiet_control_room(monkeypatch):
     from tmux_agent_tower.server import service
-    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.ui import control_room, tower as tower_module
 
     class FakeTower:
         session = "isolated-test"
@@ -586,20 +586,20 @@ def test_tower_v_opens_navigator_and_l_opens_live_view(monkeypatch):
     monkeypatch.setattr(tower_module, "draw", lambda _screen, current, **_kwargs: events.append(("draw", current.navigator_mode)))
     monkeypatch.setattr(tower_module, "_remote_state", lambda: "stopped")
     monkeypatch.setattr(service, "maybe_autostart", lambda **_kwargs: None)
-    monkeypatch.setattr(live_view, "open_live_view", lambda _screen, current, selected_key=None: events.append(("live", current.navigator_mode, selected_key)))
+    monkeypatch.setattr(control_room, "open_control_room", lambda _screen, current: events.append(("control_room", current.navigator_mode)))
 
     tower_module._run_loop(screen, "isolated-test", "")
 
     assert events[0] == ("draw", False)
     assert ("draw", True) in events
-    assert ("live", True, "%7") in events
+    assert ("control_room", True) in events
     assert tower.navigator_mode is True
     assert tower.loaded == 2
 
 
-def test_live_on_selected_group_opens_group_view(monkeypatch):
+def test_control_room_entry_is_independent_of_selected_group_type(monkeypatch):
     from tmux_agent_tower.server import service
-    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.ui import control_room, tower as tower_module
 
     group = {"kind": "work_group", "group_id": "g1", "display_name": "ExampleProject"}
 
@@ -621,16 +621,16 @@ def test_live_on_selected_group_opens_group_view(monkeypatch):
     monkeypatch.setattr(tower_module, "draw", lambda *_a, **_k: None)
     monkeypatch.setattr(tower_module, "_remote_state", lambda: "stopped")
     monkeypatch.setattr(service, "maybe_autostart", lambda **_k: None)
-    monkeypatch.setattr(live_view, "open_group_live_view", lambda _s, _t, row: opened.append(row))
+    monkeypatch.setattr(control_room, "open_control_room", lambda _s, current: opened.append(current))
 
     tower_module._run_loop(Screen(), "isolated-test", "")
 
-    assert opened == [group]
+    assert opened == [tower]
 
 
 def test_primary_navigation_and_result_keys_route_to_existing_flows(monkeypatch):
     from tmux_agent_tower.server import service
-    from tmux_agent_tower.ui import control_view, settings_menu, structure_menu, tower as tower_module, worksets
+    from tmux_agent_tower.ui import control_room, control_view, settings_menu, structure_menu, tower as tower_module, worksets
     from tmux_agent_tower.ui.widgets import show_message_screen
 
     pane = _row("%7")
@@ -657,7 +657,7 @@ def test_primary_navigation_and_result_keys_route_to_existing_flows(monkeypatch)
     monkeypatch.setattr(service, "maybe_autostart", lambda **_k: None)
     monkeypatch.setattr(worksets, "open_saved_collection", lambda *_a: events.append("saved"))
     monkeypatch.setattr(structure_menu, "open_create_hub", lambda *_a: events.append("create"))
-    monkeypatch.setattr(live_view, "open_live_view", lambda *_a: events.append("live"))
+    monkeypatch.setattr(control_room, "open_control_room", lambda *_a: events.append("live"))
     monkeypatch.setattr(settings_menu, "open_settings", lambda *_a: events.append("settings"))
     monkeypatch.setattr(control_view, "_copy_result", lambda *_a: events.append("copy") or "복사했습니다")
     monkeypatch.setattr(control_view, "_go", lambda *_a: events.append("terminal") or t("control.focused"))
