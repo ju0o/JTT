@@ -182,6 +182,8 @@ def test_partial_saved_screen_reconnect_keeps_unmatched_pane_disconnected(tmp_pa
 def test_last_view_reconnect_updates_center_and_right_after_exact_pane_returns(
     monkeypatch, tmp_path, height, width,
 ):
+    from tmux_agent_tower.ui import control_view
+
     pane = _pane("%4", host="mainpc", session="work", window="@7", pid="704",
                  target="mainpc:work:@7:%4", window_ref="saved-window",
                  live_lines=["CURRENT_PANE_OUTPUT"])
@@ -209,6 +211,10 @@ def test_last_view_reconnect_updates_center_and_right_after_exact_pane_returns(
     monkeypatch.setattr(live_view, "_start_refresh", lambda _tower: False)
     monkeypatch.setattr(live_view, "_apply_refresh", apply_refresh)
     monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_room, "show_message_screen", lambda *_args: None)
+    copied = []
+    monkeypatch.setattr(control_view, "_copy_result",
+                        lambda _tower, key, _screen: copied.append(key) or "copied")
     draw_calls = []
     draw_grid = control_room._draw_grid
     regions = control_room.panel_regions(width, height)
@@ -228,7 +234,7 @@ def test_last_view_reconnect_updates_center_and_right_after_exact_pane_returns(
     agent_starts = []
     tower.start_agent = lambda *args, **kwargs: agent_starts.append((args, kwargs))
 
-    control_room.open_control_room(Screen(height, width, [-1, "q"]), tower)
+    control_room.open_control_room(Screen(height, width, [-1, "y", "q"]), tower)
 
     assert len(draw_calls) >= 4
     first_frame, restored_frame = draw_calls[:2], draw_calls[-2:]
@@ -244,6 +250,7 @@ def test_last_view_reconnect_updates_center_and_right_after_exact_pane_returns(
     assert control_room.pane_identity(center[0]) == control_room.pane_identity(right[0])
     assert center[0]["live_lines"] == right[0]["live_lines"] == ["CURRENT_PANE_OUTPUT"]
     assert agent_starts == []
+    assert copied == [pane["key"]]
     persisted = (tmp_path / "control-screens.json").read_text(encoding="utf-8")
     assert "CURRENT_PANE_OUTPUT" not in persisted
     assert "MUST_NOT_BE_RESTORED" not in persisted
