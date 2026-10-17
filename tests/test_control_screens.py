@@ -161,6 +161,24 @@ def test_stale_selection_rebinds_only_exact_identity_and_window_reference(tmp_pa
         assert selected["live_lines"] == []
         assert selected["_live_stale"] is True
 
+    saved_without_window_ref = _pane(
+        "%6", pid="666", target="no-window-reference", window_ref="",
+    )
+    store.save_last_view([saved_without_window_ref], saved_without_window_ref, "focus")
+    reference_without_window_ref = store.last_view()["panes"]
+    stale_without_window_ref = control_room._resolve_saved_rows(reference_without_window_ref, [])[0]
+    appeared_in_different_window = dict(saved_without_window_ref, window_ref="new-window")
+    resolved = control_room._resolve_saved_rows(
+        reference_without_window_ref, [appeared_in_different_window],
+    )[0]
+    assert resolved["_live_stale"] is True
+    selected, current = control_room._resolve_selection(
+        [appeared_in_different_window], stale_without_window_ref["key"],
+        control_room.pane_identity(stale_without_window_ref), stale_without_window_ref,
+    )
+    assert current is False
+    assert selected["live_lines"] == []
+
 
 def test_partial_saved_screen_reconnect_keeps_unmatched_pane_disconnected(tmp_path):
     first = _pane("%1", target="target-1", pid="101", window_ref="window-one")

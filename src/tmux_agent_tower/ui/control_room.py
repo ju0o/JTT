@@ -74,7 +74,7 @@ def _same_reference(row: dict, reference: dict) -> bool:
     if pane_identity(row) != _reference_identity(reference):
         return False
     saved_window = str(reference.get("window_ref") or "")
-    return not saved_window or str(row.get("window_ref") or "") == saved_window
+    return str(row.get("window_ref") or "") == saved_window
 
 
 def _stale_reference_row(reference: dict, index: int) -> dict:
@@ -396,7 +396,7 @@ def _resolve_selection(rows, key: str, identity: tuple | None, original: dict) -
         current = next((
             row for row in pane_rows(rows)
             if pane_identity(row) == identity
-            and (not saved_window_ref or str(row.get("window_ref") or "") == saved_window_ref)
+            and str(row.get("window_ref") or "") == saved_window_ref
         ), None)
     if identity is None or current is None:
         return {**original, "_live_stale": True, "live_lines": []}, False
