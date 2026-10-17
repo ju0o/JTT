@@ -30,10 +30,10 @@ from pathlib import Path
 from typing import Optional
 
 from ..i18n import t
+from ..paths import CONFIG_DIR
 from ..tmux import capture as tmux_capture
 from . import httpapi, netutil, tailscale
 
-CONFIG_DIR = Path.home() / ".config" / "tmux-agent-tower"
 DEFAULT_PORT = 4312
 _START_TIMEOUT_SECONDS = 20.0
 _STATUS_CACHE_SECONDS = 2.0

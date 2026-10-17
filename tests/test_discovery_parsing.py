@@ -132,3 +132,58 @@ def test_tmux_34_octal_separator_is_parsed(monkeypatch):
     assert len(rows) == 1
     assert rows[0]["pane_id"] == "%9"
     assert rows[0]["pane_pid"] == "555"
+
+
+def test_isolated_discovery_lists_panes_server_wide_without_losing_session_identity(monkeypatch):
+    fs = discovery.FIELD_SEP
+    output = "\n".join(
+        [
+            fs.join(["main", "@9", "0", "Work", "0", "%9", "Main", "bash", "/work", "555", "0", "1"]),
+            fs.join(["sidecar", "@10", "0", "Tower UX", "0", "%10", "Tower", "python", "/work", "556", "0", "1"]),
+        ]
+    )
+    calls = []
+
+    def run_tmux(args):
+        calls.append(args)
+        return output
+
+    monkeypatch.setattr(discovery.capture, "run_tmux", run_tmux)
+    monkeypatch.setattr(discovery.process_detection, "cmdline_by_pid", lambda: {})
+    monkeypatch.setattr(discovery.process_detection, "ppid_by_pid", lambda: {})
+    monkeypatch.setattr(discovery.capture, "capture_pane", lambda pane_id, lines=30: [pane_id])
+    monkeypatch.setattr(discovery, "discover_project", lambda path: "project")
+    monkeypatch.setattr(discovery, "git_project_name", lambda path: None)
+
+    rows = discovery.list_panes("sidecar", exclude_pane_id="%10", all_sessions=True)
+
+    assert calls == [["list-panes", "-a", "-F", discovery._PANE_FORMAT]]
+    assert [(row["session"], row["pane_id"]) for row in rows] == [("main", "%9")]
+
+
+def test_isolated_discovery_lists_windows_server_wide_and_default_remains_scoped(monkeypatch):
+    fs = discovery.FIELD_SEP
+    output = "\n".join(
+        [
+            fs.join(["main", "$1", "@9", "0", "Work", "100"]),
+            fs.join(["sidecar", "$2", "@10", "0", "Tower UX", "200"]),
+        ]
+    )
+    calls = []
+    def run_tmux(args):
+        calls.append(args)
+        if "-t" in args:
+            return fs.join(["sidecar", "$2", "@10", "0", "Tower UX", "200"])
+        return output
+
+    monkeypatch.setattr(discovery.capture, "run_tmux", run_tmux)
+
+    all_windows = discovery.list_windows("sidecar", all_sessions=True)
+    scoped_windows = discovery.list_windows("sidecar")
+
+    assert calls == [
+        ["list-windows", "-a", "-F", discovery._WINDOW_FORMAT],
+        ["list-windows", "-t", "sidecar", "-F", discovery._WINDOW_FORMAT],
+    ]
+    assert [item["session"] for item in all_windows] == ["main", "sidecar"]
+    assert [item["session"] for item in scoped_windows] == ["sidecar"]

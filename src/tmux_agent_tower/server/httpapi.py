@@ -37,6 +37,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
 from .. import __version__
+from ..paths import CONFIG_DIR
 from ..control.actions import (
     MAX_IDENTITY_CHARS,
     MAX_PROMPT_CHARS,
@@ -764,9 +765,7 @@ class _Server(ThreadingHTTPServer):
 
 
 def default_token_path():
-    from pathlib import Path
-
-    return Path.home() / ".config" / "tmux-agent-tower" / "remote-tokens.json"
+    return CONFIG_DIR / "remote-tokens.json"
 
 
 def create_server(

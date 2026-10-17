@@ -27,6 +27,12 @@ from ..detection.result import ResultTracker, pane_result_identity, shared_resul
 from ..detection.status import StatusEngine, STATUS_DEAD
 from ..i18n import t
 from ..launcher.config import AGENT_LAUNCH_ORDER, load_config
+from ..paths import (
+    APP_HOME_ISOLATED,
+    CONFIG_DIR as APP_CONFIG_DIR,
+    STATE_DIR as APP_STATE_DIR,
+    configured_path,
+)
 from .. import notify
 from ..remote.collector import fetch_remote, HOST_STATUS_ONLINE
 from ..state.bindings import ProjectBindingStore
@@ -85,10 +91,12 @@ def _confirmed_agent_exit(
         return False
     return bool(previous.get("agent_process_alive"))
 
-STATE_DIR = Path.home() / ".cache" / "tmux-agent-tower"
-CONFIG_DIR = Path.home() / ".config" / "tmux-agent-tower"
-HOST_FILE = CONFIG_DIR / "host"
-REMOTE_HOSTS_FILE = CONFIG_DIR / "remote-hosts.txt"
+STATE_DIR = APP_STATE_DIR
+CONFIG_DIR = APP_CONFIG_DIR
+HOST_FILE = configured_path("TMUX_AGENT_TOWER_HOST_FILE", CONFIG_DIR / "host")
+REMOTE_HOSTS_FILE = configured_path(
+    "TMUX_AGENT_TOWER_REMOTE_HOSTS_FILE", CONFIG_DIR / "remote-hosts.txt",
+)
 
 STATUS_SYMBOL = render.STATUS_SYMBOL
 STATUS_ORDER = render.STATUS_ORDER
@@ -365,6 +373,7 @@ class Tower:
     def __init__(self, session: str, own_pane_id: str = "", status_engine: Optional[StatusEngine] = None, results: Optional[ResultTracker] = None):
         self.session = session
         self.own_pane_id = own_pane_id
+        self.discover_all_sessions = APP_HOME_ISOLATED
         self.local_host = local_host_label()
         self.access_context = None
         self.remote_hosts = load_remote_hosts()
@@ -559,7 +568,10 @@ class Tower:
         return openssh_hostname(token)
 
     def _local_rows(self) -> List[Dict]:
-        panes = discovery.list_panes(self.session, self.own_pane_id, CAPTURE_LINES)
+        panes = discovery.list_panes(
+            self.session, self.own_pane_id, CAPTURE_LINES,
+            all_sessions=self.discover_all_sessions,
+        )
         out = []
         no_name = t("project.no_name")
         previous_agents = {
@@ -918,7 +930,7 @@ class Tower:
 
         now = time.monotonic()
         self.access_context = observe_access_client()[0].access_context
-        windows = discovery.list_windows(self.session)
+        windows = discovery.list_windows(self.session, all_sessions=self.discover_all_sessions)
         own_window_id = discovery.window_for_pane(self.own_pane_id)
         for window in windows:
             window["tmux_host"] = self.local_host
@@ -1573,6 +1585,8 @@ class Tower:
     def _supports_local_pane_title_sync(self, row: Dict) -> bool:
         """Only a locally observed tmux pane may receive physical title writes."""
 
+        if APP_HOME_ISOLATED:
+            return False
         if row.get("remote") or row.get("transport") == "ssh" or row.get("offline") or row.get("placeholder"):
             return False
         tmux_host = str(row.get("tmux_host") or "").strip().casefold()

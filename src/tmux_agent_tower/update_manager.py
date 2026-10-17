@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from .paths import APP_HOME_ISOLATED, DATA_DIR
+
 REPOSITORY = "ju0o/tmux-agent-tower"
 API_ROOT = f"https://api.github.com/repos/{REPOSITORY}"
 _TAG_RE = re.compile(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc(0|[1-9][0-9]*))?$")
@@ -562,6 +564,8 @@ def _register_launcher(release_dir: Path, launcher: Path, release: Release) -> N
 
 
 def data_root() -> Path:
+    if APP_HOME_ISOLATED:
+        return DATA_DIR
     xdg = os.environ.get("XDG_DATA_HOME", "")
     base = Path(xdg).expanduser() if xdg and Path(xdg).expanduser().is_absolute() else Path.home() / ".local" / "share"
     return base / "tmux-agent-tower"

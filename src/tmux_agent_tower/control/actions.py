@@ -24,6 +24,7 @@ from ..state.overrides import FIELDS as OVERRIDE_FIELDS, ROLE_IDS
 from ..detection.result import pane_result_identity
 from ..detection.providers import ResultProvider, ResultTarget, normalize_candidate
 from ..detection.sshdest import find_ssh_client, host_from_destination
+from ..paths import APP_HOME_ISOLATED
 from ..tmux import capture as tmux_capture
 from ..tmux import navigation as tmux_navigation
 from ..tmux.navigation import focus_local_pane
@@ -430,6 +431,8 @@ def apply_identity_edit(tower, pane_key: str, body: dict) -> Tuple[bool, str]:
             return False, f"invalid_{field}"
         if field == "role" and cleaned not in ROLE_IDS:
             return False, "invalid_role"
+        if field == "title" and APP_HOME_ISOLATED and not row.get("remote") and row.get("transport") != "ssh":
+            return False, "title_sync_unavailable"
         if field == "title" and not row.get("remote") and row.get("transport") != "ssh":
             from ..tmux import structure
 

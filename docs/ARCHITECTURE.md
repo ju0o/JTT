@@ -301,6 +301,28 @@ fixed prefix or one-key return. Its existing snapshot refresh continues, and
 a disappeared/reused Pane is shown as stale rather than inheriting old LIVE
 output.
 
+## Isolated local UX sidecars
+
+For an explicitly isolated local UI run, `TMUX_AGENT_TOWER_HOME` redirects
+Tower-owned config, cache, saved projects/screens, result metadata, remote
+service metadata, and update data beneath a separate absolute directory. The
+process `HOME` is not changed, so OpenSSH continues to use the existing user's
+SSH profile and authentication-agent socket. Optional
+`TMUX_AGENT_TOWER_REMOTE_HOSTS_FILE` and `TMUX_AGENT_TOWER_HOST_FILE` point to
+existing read-only Tower host profiles; Tower only reads these files.
+
+This does not isolate tmux session options. Tower registration is
+session-scoped and last-write-wins, so a sidecar must run in its own tmux
+session on the existing tmux server; using the same session can replace the
+active Tower registration. Isolated mode refuses Tower's tmux key-binding
+install/restore actions and physical Pane-title synchronization. For useful
+read-only discovery from that separate session, isolated mode lists panes and
+windows server-wide (`tmux list-panes -a` / `list-windows -a`) while excluding
+only its own Pane; normal Tower runs remain scoped to their own session. Keep
+its config absent/defaulted so Remote autostart stays off. This mode alone
+does not authorize creating that session, launching the TUI, connecting to
+remote hosts, or handing focus to an Agent.
+
 `send_prompt` sends one initial Enter. Only Cursor can receive one more,
 after a fresh capture shows the prompt head as the first nonblank text
 below the current `Add a follow-up` composer. A prompt echo above that

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .access_context import AccessContext, context_from_dict
+from .paths import LOCAL_STATE_DIR
 
 HOST = "127.0.0.1"
 MAX_BYTES = 48 * 1024
@@ -38,7 +39,7 @@ class BridgeRegistration:
 
 
 def bridge_state_dir() -> Path:
-    return Path.home() / ".local" / "state" / "tmux-agent-tower" / "clipboard-bridges"
+    return LOCAL_STATE_DIR / "clipboard-bridges"
 
 
 def register_bridge_client(instance_id: str, registration: dict) -> None:

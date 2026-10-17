@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from tmux_agent_tower.i18n import t
 from tmux_agent_tower.server import httpapi, webui
+from tmux_agent_tower.control import actions as actions_module
 from tmux_agent_tower.control.actions import apply_identity_edit
 from tmux_agent_tower.state.bindings import ProjectBindingStore
 from tmux_agent_tower.state.overrides import OverrideStore
@@ -265,6 +266,32 @@ def test_agent_edit_preserves_auto_name_and_role_edit_recomputes_it(tmp_path):
     assert apply_identity_edit(tower, "%1", {"role": "builder"}) == (True, "")
     assert overrides.get_task_name("%1", "0", "123") == "ExampleProject · 구현"
     assert overrides.get_task_name_origin("%1", "0", "123") == "auto"
+
+
+def test_isolated_identity_edit_refuses_physical_pane_title_write(tmp_path, monkeypatch):
+    overrides = OverrideStore(tmp_path / "overrides.json")
+
+    class FakeTower:
+        def __init__(self):
+            self.overrides = overrides
+            self.rows = [{
+                "key": "%1", "session": "0", "pane_id": "%1", "pane_pid": "123",
+                "remote": False, "transport": "local",
+            }]
+
+        def load(self):
+            return None
+
+    monkeypatch.setattr(actions_module, "APP_HOME_ISOLATED", True)
+    monkeypatch.setattr(
+        "tmux_agent_tower.tmux.structure.rename_pane",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not rename a user Pane")),
+    )
+
+    assert apply_identity_edit(FakeTower(), "%1", {"title": "sidecar title"}) == (
+        False, "title_sync_unavailable",
+    )
+    assert overrides.get_title("%1", "0", "123") is None
 
 
 def test_status_and_phone_use_the_same_task_identity():

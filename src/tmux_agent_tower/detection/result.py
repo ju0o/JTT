@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, Mapping, Optional
 
 from ..adapters.base import ResultCandidate
+from ..paths import STATE_DIR
 
 RESULT_NONE = "none"
 RESULT_READY = "ready"
@@ -40,7 +41,7 @@ _IDENTITY_FIELDS = (
 def shared_result_state_path() -> Path:
     """The same local metadata file for the TUI and Phone Remote."""
 
-    return Path.home() / ".cache" / "tmux-agent-tower" / "result-state.sqlite3"
+    return STATE_DIR / "result-state.sqlite3"
 
 
 def pane_result_identity(row: Mapping[str, object]) -> Optional[dict]:
