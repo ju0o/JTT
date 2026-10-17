@@ -135,6 +135,120 @@ def test_restored_screen_never_rebinds_on_host_pid_or_window_mismatch(tmp_path):
     assert all("OLD_PANE_OUTPUT_MUST_STAY_HIDDEN" not in text for _y, _x, text, _attr in screen.writes)
 
 
+def test_stale_selection_rebinds_only_exact_identity_and_window_reference(tmp_path):
+    saved = _pane("%4", host="mainpc", pid="444", target="saved-target", window_ref="saved-window")
+    store = ControlScreenStore(tmp_path / "control-screens.json")
+    store.save_last_view([saved], saved, "focus")
+    stale = control_room._resolve_saved_rows(store.last_view()["panes"], [])[0]
+    exact = dict(saved, live_lines=["CURRENT_OUTPUT"])
+
+    selected, current = control_room._resolve_selection(
+        [exact], stale["key"], control_room.pane_identity(stale), stale,
+    )
+    assert current is True
+    assert selected is exact
+
+    replacements = [
+        _pane("%4", host="asus", pid="444", target="saved-target", window_ref="saved-window"),
+        _pane("%4", host="mainpc", pid="445", target="saved-target", window_ref="saved-window"),
+        _pane("%4", host="mainpc", pid="444", target="saved-target", window_ref="another-window"),
+    ]
+    for replacement in replacements:
+        selected, current = control_room._resolve_selection(
+            [replacement], stale["key"], control_room.pane_identity(stale), stale,
+        )
+        assert current is False
+        assert selected["live_lines"] == []
+        assert selected["_live_stale"] is True
+
+
+def test_partial_saved_screen_reconnect_keeps_unmatched_pane_disconnected(tmp_path):
+    first = _pane("%1", target="target-1", pid="101", window_ref="window-one")
+    second = _pane("%2", target="target-2", pid="202", window_ref="window-two")
+    store = ControlScreenStore(tmp_path / "control-screens.json")
+    store.save_last_view([first, second], first, "split-2")
+    replacement = _pane("%2", target="target-2", pid="999", window_ref="window-two",
+                         live_lines=["UNRELATED_OUTPUT"])
+
+    rows = control_room._resolve_saved_rows(store.last_view()["panes"], [first, replacement])
+
+    assert rows[0] is first
+    assert rows[1]["key"].startswith("saved-screen-stale:")
+    assert rows[1]["live_lines"] == []
+    assert rows[1]["_live_stale"] is True
+
+
+@pytest.mark.parametrize("height,width", [(24, 80), (40, 120)])
+def test_last_view_reconnect_updates_center_and_right_after_exact_pane_returns(
+    monkeypatch, tmp_path, height, width,
+):
+    pane = _pane("%4", host="mainpc", session="work", window="@7", pid="704",
+                 target="mainpc:work:@7:%4", window_ref="saved-window",
+                 live_lines=["CURRENT_PANE_OUTPUT"])
+    missing = _pane("%5", host="mainpc", session="work", window="@7", pid="705",
+                    target="mainpc:work:@7:%5", window_ref="saved-window",
+                    live_lines=["MUST_NOT_BE_RESTORED"])
+    store = ControlScreenStore(tmp_path / "control-screens.json")
+    store.save_last_view([pane, missing], pane, "split-2", {"window_ref": "saved-window"})
+    tower = SimpleNamespace(
+        rows=[], visible_rows=[], selected=0, projects=None, window_assets=[],
+        work_groups=SimpleNamespace(all=lambda: []), control_screens=store,
+        start_background_refresh=lambda: None,
+    )
+    refresh_count = 0
+
+    def apply_refresh(current_tower):
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == 2:
+            current_tower.rows = [pane]
+            current_tower.visible_rows = [pane]
+            return True
+        return False
+
+    monkeypatch.setattr(live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(live_view, "_apply_refresh", apply_refresh)
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    draw_calls = []
+    draw_grid = control_room._draw_grid
+    regions = control_room.panel_regions(width, height)
+
+    def capture_grid(screen, current_tower, region, rows, selected_identity, current_width,
+                     *args, **kwargs):
+        panel = next(
+            (index for index, expected in enumerate(regions)
+             if region[0] == expected[0] and region[1] == expected[1] + 1),
+            None,
+        )
+        draw_calls.append((panel, [dict(row) for row in rows], selected_identity))
+        return draw_grid(screen, current_tower, region, rows, selected_identity, current_width,
+                         *args, **kwargs)
+
+    monkeypatch.setattr(control_room, "_draw_grid", capture_grid)
+    agent_starts = []
+    tower.start_agent = lambda *args, **kwargs: agent_starts.append((args, kwargs))
+
+    control_room.open_control_room(Screen(height, width, [-1, "q"]), tower)
+
+    assert len(draw_calls) >= 4
+    first_frame, restored_frame = draw_calls[:2], draw_calls[-2:]
+    assert first_frame[0][1][0]["_live_stale"] is True
+    assert first_frame[0][1][0]["live_lines"] == []
+    center = next(rows for panel, rows, _identity in restored_frame if panel == 1)
+    right = next(rows for panel, rows, _identity in restored_frame if panel == 2)
+    assert len(center) == 2 and len(right) == 1
+    assert center[0]["key"] == pane["key"]
+    assert center[1]["key"].startswith("saved-screen-stale:")
+    assert center[1]["live_lines"] == []
+    assert right[0]["key"] == pane["key"]
+    assert control_room.pane_identity(center[0]) == control_room.pane_identity(right[0])
+    assert center[0]["live_lines"] == right[0]["live_lines"] == ["CURRENT_PANE_OUTPUT"]
+    assert agent_starts == []
+    persisted = (tmp_path / "control-screens.json").read_text(encoding="utf-8")
+    assert "CURRENT_PANE_OUTPUT" not in persisted
+    assert "MUST_NOT_BE_RESTORED" not in persisted
+
+
 def test_duplicate_pane_ids_across_hosts_restore_only_matching_host(tmp_path):
     main = _pane("%2", host="mainpc", target="main-2", pid="222", window_ref="window-main")
     asus = _pane("%2", host="asus", target="asus-2", pid="222", window_ref="window-asus",

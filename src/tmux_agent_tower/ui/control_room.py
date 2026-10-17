@@ -19,6 +19,7 @@ from .widgets import is_enter, is_escape, read_key, run_list_picker, safe_add, s
 from .widgets import prompt_text
 
 MAX_GRID_PANES = 4
+_SAVED_SCREEN_STALE_PREFIX = "saved-screen-stale:"
 _IDENTITY_FIELDS = (
     "target_id", "tmux_host", "session", "session_id", "window_id", "pane_id",
     "pane_pid", "transport", "transport_target",
@@ -81,7 +82,7 @@ def _stale_reference_row(reference: dict, index: int) -> dict:
     return {
         **identity,
         "kind": "pane",
-        "key": f"saved-screen-stale:{index}",
+        "key": f"{_SAVED_SCREEN_STALE_PREFIX}{index}",
         "window_ref": reference.get("window_ref") or "",
         "display_name": reference.get("display_name") or t("control_room.screens_disconnected"),
         "live_lines": [],
@@ -389,6 +390,14 @@ def related_panes(selected: dict, rows, groups=(), limit: int = MAX_GRID_PANES) 
 def _resolve_selection(rows, key: str, identity: tuple | None, original: dict) -> tuple[dict, bool]:
     matching_keys = [row for row in pane_rows(rows) if row.get("key") == key]
     current = next((row for row in matching_keys if pane_identity(row) == identity), None)
+    if (current is None and str(key).startswith(_SAVED_SCREEN_STALE_PREFIX)
+            and identity is not None and pane_identity(original) == identity):
+        saved_window_ref = str(original.get("window_ref") or "")
+        current = next((
+            row for row in pane_rows(rows)
+            if pane_identity(row) == identity
+            and (not saved_window_ref or str(row.get("window_ref") or "") == saved_window_ref)
+        ), None)
     if identity is None or current is None:
         return {**original, "_live_stale": True, "live_lines": []}, False
     return current, True
@@ -1168,6 +1177,12 @@ def open_control_room(stdscr, tower) -> None:
                 selected_snapshot, selected_current = _resolve_selection(
                     _visible_panes(tower), selected_key, selected_identity, original,
                 )
+                if selected_current and selected_key.startswith(_SAVED_SCREEN_STALE_PREFIX):
+                    # Rebind only the internal placeholder to the exact Pane
+                    # identity that returned. Future copy/selection actions use
+                    # the real current key, never the saved-screen placeholder.
+                    selected_key = str(selected_snapshot.get("key") or "")
+                    original = dict(selected_snapshot)
                 right_region_height = max(0, panel_regions(screen_width, screen_height)[2][3] - 1)
                 visible_output_lines = max(0, right_region_height - 3)
                 output_length = len(selected_snapshot.get("live_lines") or ()) if selected_current else 0
