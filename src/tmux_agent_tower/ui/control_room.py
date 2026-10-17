@@ -14,7 +14,7 @@ import time
 from ..i18n import t
 from . import live_view, render
 from .perf_trace import draw as trace_draw
-from .widgets import is_escape, read_key, safe_add, show_message_screen
+from .widgets import is_enter, is_escape, read_key, run_list_picker, safe_add, show_message_screen
 
 MAX_GRID_PANES = 4
 _IDENTITY_FIELDS = (
@@ -52,17 +52,61 @@ def _host_label(row: dict) -> str:
     return execution or tmux_host or t("state.unknown")
 
 
-def navigation_lines(rows, selected_key: str, selected_identity: tuple | None) -> list[dict]:
-    """Flat drawing model for Host → Session → Window → project → Pane."""
+def _navigation_path(row: dict) -> tuple[tuple, tuple, tuple, tuple | None, tuple]:
+    host = _host_label(row)
+    host_key = (
+        "host", host, str(row.get("tmux_host") or ""), str(row.get("transport") or ""),
+        str(row.get("transport_target") or ""),
+    )
+    session = str(row.get("session") or t("state.unknown"))
+    session_id = str(row.get("session_id") or session)
+    window_id = str(row.get("window_id") or row.get("window_index") or "")
+    session_key = ("session", host_key, session_id, session)
+    window_key = ("window", host_key, session_id, window_id, bool(row.get("remote")))
+    group_name = str(row.get("work_group_name") or row.get("project") or "").strip()
+    group_key = ("project", window_key, str(row.get("work_group_id") or group_name)) if group_name else None
+    pane_key = ("pane", pane_identity(row) or (str(row.get("target_id") or row.get("key") or ""),))
+    return host_key, session_key, window_key, group_key, pane_key
+
+
+def navigation_lines(rows, selected_key: str, selected_identity: tuple | None,
+                     collapsed=(), cursor_key: tuple | None = None) -> list[dict]:
+    """Flat keyboard tree model for Host → Session → Window → project → Pane.
+
+    Collapse state and cursor are view-local. Every non-leaf carries the exact
+    current rows in its scope; no saved Folder/Work Group state is changed.
+    """
+
+    rows = list(rows or ())
+    paths = {id(row): _navigation_path(row) for row in rows}
+    collapsed = set(collapsed or ())
+    members = {}
+    for row in rows:
+        for key in paths[id(row)]:
+            if key is not None:
+                members.setdefault(key, []).append(row)
 
     result: list[dict] = []
     previous = None
+
+    def add(kind, key, parents, text, row=None):
+        if any(parent in collapsed for parent in parents):
+            return
+        item = {
+            "kind": kind, "text": text, "node_key": key, "parent_keys": parents,
+            "member_rows": list(members.get(key, ())), "cursor": key == cursor_key,
+            "collapsed": key in collapsed,
+        }
+        if row is not None:
+            item.update({
+                "key": row.get("key"), "identity": pane_identity(row), "row": row,
+                "selected": row.get("key") == selected_key and pane_identity(row) == selected_identity,
+                "member_rows": [row],
+            })
+        result.append(item)
+
     for row in rows:
-        window_key = (
-            str(row.get("tmux_host") or ""), str(row.get("session_id") or row.get("session") or ""),
-            str(row.get("window_id") or row.get("window_index") or ""), bool(row.get("remote")),
-        )
-        group_name = str(row.get("work_group_name") or row.get("project") or "").strip()
+        host_key, session_key, window_key, group_key, pane_key = paths[id(row)]
         host = _host_label(row)
         session = str(row.get("session") or t("state.unknown"))
         window_index = row.get("window_index")
@@ -70,25 +114,23 @@ def navigation_lines(rows, selected_key: str, selected_identity: tuple | None) -
         window = f"{window_index}: {window_name}" if window_index is not None and window_name else (
             window_name or str(window_index) if window_index is not None else t("state.unknown")
         )
-
-        if previous is None or previous[0] != host:
-            result.append({"kind": "host", "text": host})
-        if previous is None or previous[1] != (host, session):
-            result.append({"kind": "session", "text": t("control_room.session").format(session=session)})
+        if previous is None or previous[0] != host_key:
+            add("host", host_key, (), host)
+        if previous is None or previous[1] != session_key:
+            add("session", session_key, (host_key,), t("control_room.session").format(session=session))
         if previous is None or previous[2] != window_key:
-            result.append({"kind": "window", "text": t("control_room.window").format(window=window)})
-        if group_name and (previous is None or previous[3] != (window_key, group_name)):
-            result.append({"kind": "project", "text": t("control_room.project").format(project=group_name)})
+            add("window", window_key, (host_key, session_key), t("control_room.window").format(window=window))
+        if group_key and (previous is None or previous[3] != group_key):
+            group_name = str(row.get("work_group_name") or row.get("project") or "").strip()
+            add("project", group_key, (host_key, session_key, window_key),
+                t("control_room.project").format(project=group_name))
 
         name = str(row.get("display_name") or row.get("task_name") or row.get("project") or t("task.terminal"))
         agent = str(row.get("agent") or "").strip()
         text = f"{name} · {agent}" if agent else name
-        result.append({
-            "kind": "pane", "text": text, "key": row.get("key"),
-            "identity": pane_identity(row), "row": row,
-            "selected": row.get("key") == selected_key and pane_identity(row) == selected_identity,
-        })
-        previous = (host, (host, session), window_key, (window_key, group_name) if group_name else None)
+        parents = (host_key, session_key, window_key) + ((group_key,) if group_key else ())
+        add("pane", pane_key, parents, text, row)
+        previous = (host_key, session_key, window_key, group_key)
     return result
 
 
@@ -115,15 +157,21 @@ def related_panes(selected: dict, rows, groups=(), limit: int = MAX_GRID_PANES) 
                 })
     else:
         selected_window = (
+            str(selected.get("execution_host") or selected.get("host") or ""),
             str(selected.get("tmux_host") or ""),
             str(selected.get("session_id") or selected.get("session") or ""),
             str(selected.get("window_id") or selected.get("window_index") or ""),
+            str(selected.get("transport") or ""),
+            str(selected.get("transport_target") or ""),
             bool(selected.get("remote")),
         )
         candidates = [row for row in pane_rows(rows) if (
+            str(row.get("execution_host") or row.get("host") or ""),
             str(row.get("tmux_host") or ""),
             str(row.get("session_id") or row.get("session") or ""),
             str(row.get("window_id") or row.get("window_index") or ""),
+            str(row.get("transport") or ""),
+            str(row.get("transport_target") or ""),
             bool(row.get("remote")),
         ) == selected_window]
 
@@ -137,8 +185,9 @@ def related_panes(selected: dict, rows, groups=(), limit: int = MAX_GRID_PANES) 
 
 
 def _resolve_selection(rows, key: str, identity: tuple | None, original: dict) -> tuple[dict, bool]:
-    current = next((row for row in pane_rows(rows) if row.get("key") == key), None)
-    if identity is None or current is None or pane_identity(current) != identity:
+    matching_keys = [row for row in pane_rows(rows) if row.get("key") == key]
+    current = next((row for row in matching_keys if pane_identity(row) == identity), None)
+    if identity is None or current is None:
         return {**original, "_live_stale": True, "live_lines": []}, False
     return current, True
 
@@ -157,7 +206,7 @@ def panel_regions(width: int, height: int) -> tuple[tuple[int, int, int, int], .
     """Three columns when roomy, three stacked panels when space is tight."""
 
     top = 2
-    total_height = max(0, height - top - 1)  # reserve the final row for the quiet footer
+    total_height = max(0, height - top - 2)  # reserve two rows for contextual keyboard help
     if width >= 110 and height >= 22:
         usable = max(0, width - 4)  # side margins and two one-cell gutters
         left = max(22, usable * 24 // 100)
@@ -193,25 +242,29 @@ def _heading_attr() -> int:
         return curses.A_BOLD
 
 
-def _draw_navigation(stdscr, region, rows, selected_key, selected_identity) -> None:
+def _draw_navigation(stdscr, region, rows, selected_key, selected_identity,
+                     cursor_key=None, collapsed=()) -> None:
     x, y, width, height = region
-    lines = navigation_lines(rows, selected_key, selected_identity)
-    pane_lines = [index for index, line in enumerate(lines) if line["kind"] == "pane"]
-    selected_line = next((index for index in pane_lines if lines[index].get("selected")), pane_lines[0] if pane_lines else 0)
+    lines = navigation_lines(rows, selected_key, selected_identity, collapsed, cursor_key)
+    selected_line = next((index for index, line in enumerate(lines) if line.get("cursor")), 0)
     capacity = max(0, height)
     top = max(0, selected_line - capacity + 1)
     visible = lines[top:top + capacity]
     for offset, line in enumerate(visible):
         kind = line["kind"]
-        prefix = "▶ " if kind == "pane" and line.get("selected") else "  " if kind == "pane" else ""
-        attr = (curses.A_REVERSE | curses.A_BOLD) if kind == "pane" and line.get("selected") else (
+        pane_cursor = kind == "pane" and line.get("cursor")
+        prefix = "▶ " if pane_cursor else (
+            "▾ " if kind != "pane" and not line.get("collapsed") else "▸ "
+        )
+        active = line.get("cursor")
+        attr = (curses.A_REVERSE | curses.A_BOLD) if active else (
             _heading_attr() if kind in {"host", "project"} else curses.A_DIM
         )
         text = prefix + str(line.get("text") or "")
         safe_add(stdscr, y + offset, x, render.truncate_to_width(text, max(0, width)), attr)
 
 
-def _draw_grid(stdscr, tower, region, rows, selected_identity, screen_width) -> None:
+def _draw_grid(stdscr, tower, region, rows, selected_identity, screen_width, scroll: int = 0) -> None:
     x, y, width, height = region
     rows = list(rows[:MAX_GRID_PANES])
     if not rows:
@@ -231,7 +284,7 @@ def _draw_grid(stdscr, tower, region, rows, selected_identity, screen_width) -> 
         focused = pane_identity(row) == selected_identity
         live_view._draw_tile(
             stdscr, tower, safe_row, index, cell_y, cell_x, cell_height,
-            current_width, focused,
+            current_width, focused, scroll if focused else 0,
         )
 
 
@@ -247,9 +300,47 @@ def grid_columns(panel_width: int, panel_height: int, screen_width: int, item_co
     return min(maximum, max(1, preferred, needed))
 
 
+def _find_nav_line(rows, selected_key, selected_identity, cursor_key, collapsed=()):
+    return next((line for line in navigation_lines(
+        rows, selected_key, selected_identity, collapsed, cursor_key,
+    ) if line.get("node_key") == cursor_key), None)
+
+
+def _scope_grid_rows(selected, panes, groups, nav_line=None):
+    if nav_line and nav_line.get("kind") != "pane":
+        scoped = [row for row in nav_line.get("member_rows", ())
+                  if any(pane_identity(row) == pane_identity(current) for current in panes)]
+        group_id = str(selected.get("work_group_id") or "")
+        group = next((item for item in groups or () if group_id and str(item.get("group_id") or "") == group_id), None)
+        if group and nav_line.get("kind") == "project":
+            return related_panes(selected, panes, groups)
+        if scoped:
+            selected_identity = pane_identity(selected)
+            if not any(pane_identity(row) == selected_identity for row in scoped):
+                scoped.insert(0, selected)
+            return scoped[:MAX_GRID_PANES]
+    return related_panes(selected, panes, groups)
+
+
+def _footer_lines(width, active_panel, cursor_kind):
+    movement = t("control_room.footer_navigation")
+    if cursor_kind != "pane":
+        actions = t("control_room.footer_group")
+    elif active_panel == 2:
+        actions = t("control_room.footer_focus")
+    else:
+        actions = t("control_room.footer")
+    available = max(0, width - 4)
+    return (
+        render.truncate_to_width(movement, available),
+        render.truncate_to_width(actions, available),
+    )
+
+
 @trace_draw("control_room")
 def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
-         original: dict, groups=()) -> bool:
+         original: dict, groups=(), *, active_panel: int = 0, cursor_key=None,
+         collapsed=(), focus_scroll: int = 0) -> bool:
     """Draw a read-only room and return whether the selection is still current."""
 
     stdscr.erase()
@@ -265,18 +356,24 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
     display_rows = list(panes)
     if not current:
         display_rows.append(selected)
+    nav_lines = navigation_lines(display_rows, selected_key, selected_identity, collapsed, cursor_key)
+    nav_line = next((line for line in nav_lines if line.get("node_key") == cursor_key), None)
+    if nav_line is None and cursor_key is None:
+        nav_line = next((line for line in nav_lines if line.get("kind") == "pane" and line.get("selected")), None)
+    cursor_kind = nav_line.get("kind", "pane") if nav_line else "pane"
     regions = panel_regions(width, height)
     headings = (t("control_room.panel_location"), t("control_room.panel_grid"), t("control_room.panel_focus"))
-    for region, heading in zip(regions, headings):
+    for index, (region, heading) in enumerate(zip(regions, headings)):
         x, y, region_width, region_height = region
-        safe_add(stdscr, y, x, render.truncate_to_width(heading, max(0, region_width)), _heading_attr())
+        heading_attr = curses.A_REVERSE | curses.A_BOLD if index == active_panel else _heading_attr()
+        safe_add(stdscr, y, x, render.truncate_to_width(heading, max(0, region_width)), heading_attr)
 
     _draw_navigation(
         stdscr, (regions[0][0], regions[0][1] + 1, regions[0][2], max(0, regions[0][3] - 1)),
-        display_rows, selected_key, selected_identity,
+        display_rows, selected_key, selected_identity, cursor_key, collapsed,
     )
     if current:
-        grid_rows = related_panes(selected, panes, groups)
+        grid_rows = _scope_grid_rows(selected, panes, groups, nav_line)
     else:
         grid_rows = [selected]
     _draw_grid(
@@ -287,11 +384,12 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
     _draw_grid(
         stdscr, tower,
         (regions[2][0], regions[2][1] + 1, regions[2][2], max(0, regions[2][3] - 1)),
-        [selected], selected_identity if current else None, width,
+        [selected], selected_identity if current else None, width, focus_scroll,
     )
 
-    footer = t("control_room.footer")
-    safe_add(stdscr, max(0, height - 1), 2, render.truncate_to_width(footer, max(0, width - 4)), curses.A_DIM)
+    footer_lines = _footer_lines(width, active_panel, cursor_kind)
+    safe_add(stdscr, max(0, height - 2), 2, footer_lines[0], curses.A_DIM)
+    safe_add(stdscr, max(0, height - 1), 2, footer_lines[1], curses.A_DIM)
     stdscr.noutrefresh()
     curses.doupdate()
     return current
@@ -302,6 +400,164 @@ def _sync_home_selection(tower, key: str, identity: tuple | None) -> None:
         if row.get("key") == key and pane_identity(row) == identity:
             tower.selected = index
             return
+
+
+def _row_for_nav_line(line, panes, groups=()) -> dict | None:
+    if not line:
+        return None
+    members = line.get("member_rows") or ()
+    current = [row for row in members if any(pane_identity(row) == pane_identity(item) for item in panes)]
+    if line.get("kind") == "pane":
+        return current[0] if current else None
+    if line.get("kind") == "project":
+        group_id = next((str(row.get("work_group_id") or "") for row in current if row.get("work_group_id")), "")
+        if group_id and any(str(group.get("group_id") or "") == group_id for group in groups or ()):
+            return initial_pane(panes, {"kind": "work_group", "group_id": group_id}, groups)
+    return current[0] if current else None
+
+
+def _initial_cursor(panes, selected, selected_home, groups):
+    if selected_home and selected_home.get("kind") == "work_group":
+        group_id = str(selected_home.get("group_id") or "")
+        for line in navigation_lines(panes, selected.get("key", ""), pane_identity(selected)):
+            if line.get("kind") == "project" and any(
+                str(row.get("work_group_id") or "") == group_id for row in line.get("member_rows", ())
+            ):
+                return line.get("node_key")
+    identity = pane_identity(selected)
+    return ("pane", identity or (str(selected.get("target_id") or selected.get("key") or ""),))
+
+
+def pane_detail_lines(row: dict) -> list[str]:
+    """Identity-only detail; never includes the captured terminal body."""
+
+    return [
+        f'{t("control_room.detail_name")}: {row.get("display_name") or row.get("task_name") or t("task.terminal")}',
+        f'{t("control_room.detail_agent")}: {row.get("agent") or t("state.unknown")}',
+        f'{t("control_room.detail_host")}: {_host_label(row)}',
+        f'{t("control_room.detail_session")}: {row.get("session") or t("state.unknown")}',
+        f'{t("control_room.detail_window")}: {row.get("window_name") or row.get("window_index") or t("state.unknown")}',
+        f'{t("control_room.detail_pane")}: {row.get("pane_id") or t("state.unknown")} · PID {row.get("pane_pid") or t("state.unknown")}',
+    ]
+
+
+def _copy_key_is_unambiguous(rows, row: dict | None) -> bool:
+    if not row or not row.get("key"):
+        return False
+    matching = [
+        item for item in pane_rows(rows)
+        if str(item.get("key") or "") == str(row.get("key") or "")
+    ]
+    return len(matching) == 1 and pane_identity(matching[0]) is not None
+
+
+def action_menu_items(row: dict | None, *, cursor_kind: str = "pane", has_group: bool = False,
+                      has_folder: bool = False, copy_safe: bool = True,
+                      live_routes_safe: bool = True) -> list[tuple[str, str]]:
+    """Visible routes to established features; no new Agent-control actions."""
+
+    items: list[tuple[str, str]] = []
+    if has_group and live_routes_safe:
+        items.append(("group_live", t("control_room.menu_group_live")))
+    if has_folder and live_routes_safe:
+        items.append(("folder_live", t("control_room.menu_folder_live")))
+    if row and row.get("window_ref") and not row.get("remote") and live_routes_safe:
+        items.append(("window_live", t("control_room.menu_window_live")))
+    if row and not row.get("remote") and live_routes_safe:
+        items.append(("layout_live", t("control_room.menu_layout_live")))
+    if row and cursor_kind == "pane" and copy_safe:
+        items.append(("copy", t("control_room.menu_copy")))
+    items.extend([
+        ("details", t("control_room.menu_details")),
+        ("settings", t("control_room.menu_settings")),
+    ])
+    return items
+
+
+def _run_action(stdscr, tower, action: str, row: dict | None, groups=(),
+                selected_home=None, *, copy_allowed=True) -> None:
+    if action == "copy":
+        if not copy_allowed or not row:
+            show_message_screen(stdscr, t("detail.result"), [t("control_room.copy_select_pane")])
+            return
+        if not _copy_key_is_unambiguous(getattr(tower, "rows", ()), row):
+            show_message_screen(stdscr, t("detail.result"), [t("control_room.copy_ambiguous")])
+            return
+        _selected, current = _resolve_selection(
+            getattr(tower, "rows", ()), str(row.get("key") or ""), pane_identity(row), row,
+        )
+        if not current:
+            message = t("live.changed_output")
+        else:
+            from .control_view import _copy_result
+
+            message = _copy_result(tower, str(row.get("key") or ""), stdscr)
+        show_message_screen(stdscr, t("detail.result"), [message or t("control.no_result")])
+    elif action == "group_live" and row:
+        if not _pane_keys_unique(getattr(tower, "rows", ())):
+            show_message_screen(stdscr, t("control_room.title"), [t("control_room.live_ambiguous")])
+            return
+        group_id = str(row.get("work_group_id") or "")
+        group = next((item for item in groups or () if str(item.get("group_id") or "") == group_id), None)
+        if group:
+            live_view.open_group_live_view(stdscr, tower, group)
+        else:
+            show_message_screen(stdscr, t("live.title"), [t("live.empty")])
+    elif action == "folder_live" and selected_home:
+        if not _pane_keys_unique(getattr(tower, "rows", ())):
+            show_message_screen(stdscr, t("control_room.title"), [t("control_room.live_ambiguous")])
+            return
+        live_view.open_folder_live_view(stdscr, tower, selected_home)
+    elif action == "window_live" and row and row.get("window_ref"):
+        if not _pane_keys_unique(getattr(tower, "rows", ())):
+            show_message_screen(stdscr, t("control_room.title"), [t("control_room.live_ambiguous")])
+            return
+        live_view.open_window_live_view(stdscr, tower, str(row["window_ref"]))
+    elif action == "layout_live":
+        if not _pane_keys_unique(getattr(tower, "rows", ())):
+            show_message_screen(stdscr, t("control_room.title"), [t("control_room.live_ambiguous")])
+            return
+        live_view.open_live_view(stdscr, tower)
+    elif action == "details" and row:
+        show_message_screen(stdscr, t("control_room.detail_title"), pane_detail_lines(row))
+    elif action == "settings":
+        from .settings_menu import open_settings
+
+        open_settings(stdscr, tower)
+
+
+def _open_action_menu(stdscr, tower, row, groups, selected_home, cursor_kind):
+    group_id = str((row or {}).get("work_group_id") or "")
+    has_group = bool(
+        cursor_kind in {"pane", "project"} and group_id
+        and any(str(group.get("group_id") or "") == group_id for group in groups or ())
+    )
+    has_folder = bool(selected_home and selected_home.get("kind") in {"folder", "other_section"})
+    items = action_menu_items(
+        row, cursor_kind=cursor_kind, has_group=has_group, has_folder=has_folder,
+        copy_safe=_copy_key_is_unambiguous(getattr(tower, "rows", ()), row),
+        live_routes_safe=_pane_keys_unique(getattr(tower, "rows", ())),
+    )
+    pick = run_list_picker(
+        stdscr, t("control_room.menu_title"), items,
+        footer_hint=t("wizard.hint_list"),
+    )
+    if not pick.cancelled and pick.selected_key:
+        _run_action(
+            stdscr, tower, str(pick.selected_key), row, groups, selected_home,
+            copy_allowed=cursor_kind == "pane",
+        )
+
+
+def _pane_keys_unique(rows) -> bool:
+    keys = [str(row.get("key") or "") for row in pane_rows(rows)]
+    return bool(keys) and len(keys) == len(set(keys))
+
+
+def _set_selection(row, *, cursor_key=None):
+    identity = pane_identity(row)
+    key = str(row.get("key") or "")
+    return key, identity, dict(row), cursor_key or ("pane", identity or (str(row.get("target_id") or key),))
 
 
 def initial_pane(panes, selected_home: dict | None, groups=()) -> dict | None:
@@ -346,7 +602,7 @@ def initial_pane(panes, selected_home: dict | None, groups=()) -> dict | None:
 
 
 def open_control_room(stdscr, tower) -> None:
-    """Open the quiet room from the existing LIVE entry; no Agent input is sent."""
+    """Open the read-only room; panel keys are consumed here, never sent to an Agent."""
 
     panes = pane_rows(getattr(tower, "rows", ()))
     if not panes:
@@ -358,7 +614,12 @@ def open_control_room(stdscr, tower) -> None:
     selected = initial_pane(panes, selected_home, groups) or panes[0]
     selected_key = str(selected.get("key") or "")
     selected_identity = pane_identity(selected)
+    home_scope_identity = selected_identity
     original = dict(selected)
+    cursor_key = _initial_cursor(panes, selected, selected_home, groups)
+    collapsed: set[tuple] = set()
+    active_panel = 0
+    focus_scroll = 0
 
     keypad = getattr(stdscr, "keypad", None)
     if keypad:
@@ -378,8 +639,25 @@ def open_control_room(stdscr, tower) -> None:
                 live_view._start_refresh(tower)
                 last_refresh = now
             if needs_draw:
-                current = draw(stdscr, tower, selected_key, selected_identity, original, groups)
-                if current:
+                screen_height, screen_width = stdscr.getmaxyx()
+                selected_snapshot, selected_current = _resolve_selection(
+                    getattr(tower, "rows", ()), selected_key, selected_identity, original,
+                )
+                right_region_height = max(0, panel_regions(screen_width, screen_height)[2][3] - 1)
+                visible_output_lines = max(0, right_region_height - 3)
+                output_length = len(selected_snapshot.get("live_lines") or ()) if selected_current else 0
+                focus_scroll = min(focus_scroll, max(0, output_length - visible_output_lines))
+                current = draw(
+                    stdscr, tower, selected_key, selected_identity, original, groups,
+                    active_panel=active_panel, cursor_key=cursor_key,
+                    collapsed=collapsed, focus_scroll=focus_scroll,
+                )
+                current_cursor = _find_nav_line(
+                    pane_rows(getattr(tower, "rows", ())), selected_key, selected_identity,
+                    cursor_key, collapsed,
+                )
+                cursor_kind = current_cursor.get("kind", "pane") if current_cursor else "pane"
+                if current and cursor_kind == "pane":
                     _sync_home_selection(tower, selected_key, selected_identity)
                 needs_draw = False
             key = read_key(stdscr)
@@ -390,29 +668,111 @@ def open_control_room(stdscr, tower) -> None:
                 continue
             if is_escape(key) or key in ("q", "Q"):
                 return
-            if key in (curses.KEY_UP, curses.KEY_DOWN):
-                current_panes = pane_rows(getattr(tower, "rows", ()))
-                if not current_panes:
-                    needs_draw = True
-                    continue
-                index = next((i for i, row in enumerate(current_panes)
-                              if row.get("key") == selected_key and pane_identity(row) == selected_identity), None)
-                if index is None:
-                    index = -1 if key == curses.KEY_DOWN else 0
-                index = (index + (1 if key == curses.KEY_DOWN else -1)) % len(current_panes)
-                selected = current_panes[index]
-                selected_key = str(selected.get("key") or "")
-                selected_identity = pane_identity(selected)
-                original = dict(selected)
-                _sync_home_selection(tower, selected_key, selected_identity)
+            if key == "\t":
+                active_panel = (active_panel + 1) % 3
                 needs_draw = True
                 continue
+            if key == getattr(curses, "KEY_BTAB", object()):
+                active_panel = (active_panel - 1) % 3
+                needs_draw = True
+                continue
+
+            current_panes = pane_rows(getattr(tower, "rows", ()))
+            selected, is_current = _resolve_selection(
+                getattr(tower, "rows", ()), selected_key, selected_identity, original,
+            )
+            nav_items = navigation_lines(
+                current_panes if is_current else current_panes + [selected],
+                selected_key, selected_identity, collapsed,
+            )
+            nav_line = next((line for line in nav_items if line.get("node_key") == cursor_key), None)
+            cursor_kind = nav_line.get("kind", "pane") if nav_line else "pane"
+
+            if key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_LEFT, curses.KEY_RIGHT):
+                if active_panel == 0:
+                    if key in (curses.KEY_UP, curses.KEY_DOWN):
+                        visible_items = navigation_lines(
+                            current_panes if is_current else current_panes + [selected],
+                            selected_key, selected_identity, collapsed,
+                        )
+                        index = next((i for i, line in enumerate(visible_items)
+                                      if line.get("node_key") == cursor_key), None)
+                        if index is None:
+                            index = -1 if key == curses.KEY_DOWN else 0
+                        step = 1 if key == curses.KEY_DOWN else -1
+                        if visible_items:
+                            target = visible_items[(index + step) % len(visible_items)]
+                            row = _row_for_nav_line(target, current_panes, groups)
+                            if row:
+                                selected_key, selected_identity, original, cursor_key = _set_selection(
+                                    row, cursor_key=target.get("node_key"),
+                                )
+                                focus_scroll = 0
+                    elif nav_line and nav_line.get("kind") != "pane":
+                        node_key = nav_line.get("node_key")
+                        if key == curses.KEY_RIGHT:
+                            collapsed.discard(node_key)
+                        else:
+                            collapsed.add(node_key)
+                    elif key == curses.KEY_LEFT and nav_line:
+                        parent = next((parent for parent in reversed(nav_line.get("parent_keys", ()))
+                                       if any(line.get("node_key") == parent for line in nav_items)), None)
+                        if parent is not None:
+                            parent_line = next(line for line in nav_items if line.get("node_key") == parent)
+                            row = _row_for_nav_line(parent_line, current_panes, groups)
+                            if row:
+                                selected_key, selected_identity, original = _set_selection(row)[:3]
+                                cursor_key = parent
+                                focus_scroll = 0
+                    elif key == curses.KEY_RIGHT and cursor_kind == "pane":
+                        active_panel = 1
+                elif active_panel == 1 and is_current:
+                    grid_rows = _scope_grid_rows(selected, current_panes, groups, nav_line)
+                    grid_rows = [row for row in grid_rows if pane_identity(row) is not None]
+                    index = next((i for i, row in enumerate(grid_rows)
+                                  if pane_identity(row) == selected_identity), None)
+                    if grid_rows:
+                        if index is None:
+                            index = 0
+                        step = -1 if key in (curses.KEY_UP, curses.KEY_LEFT) else 1
+                        row = grid_rows[(index + step) % len(grid_rows)]
+                        selected_key, selected_identity, original, cursor_key = _set_selection(row)
+                        focus_scroll = 0
+                elif active_panel == 2 and key in (curses.KEY_UP, curses.KEY_DOWN):
+                    focus_scroll = max(0, focus_scroll + (1 if key == curses.KEY_UP else -1))
+                needs_draw = True
+                continue
+
+            if is_enter(key):
+                if active_panel == 0 and nav_line and cursor_kind != "pane":
+                    node_key = nav_line.get("node_key")
+                    if node_key in collapsed:
+                        collapsed.discard(node_key)
+                    else:
+                        collapsed.add(node_key)
+                elif is_current:
+                    show_message_screen(stdscr, t("control_room.detail_title"), pane_detail_lines(selected))
+                else:
+                    show_message_screen(stdscr, t("control_room.detail_title"), [t("live.changed_output")])
+                needs_draw = True
+                continue
+
+            if key == " ":
+                if not is_current:
+                    show_message_screen(stdscr, t("control_room.title"), [t("live.changed_output")])
+                else:
+                    menu_home = selected_home if pane_identity(selected) == home_scope_identity else None
+                    _open_action_menu(stdscr, tower, selected, groups, menu_home, cursor_kind)
+                needs_draw = True
+                continue
+
             if key in ("y", "Y"):
-                selected, current = _resolve_selection(
-                    getattr(tower, "rows", ()), selected_key, selected_identity, original,
-                )
-                if not current:
+                if cursor_kind != "pane":
+                    message = t("control_room.copy_select_pane")
+                elif not is_current:
                     message = t("live.changed_output")
+                elif not _copy_key_is_unambiguous(getattr(tower, "rows", ()), selected):
+                    message = t("control_room.copy_ambiguous")
                 else:
                     from .control_view import _copy_result
 

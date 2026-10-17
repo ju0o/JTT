@@ -98,8 +98,42 @@ input action is invoked by this screen.
   that scope as the initial selection when the same identity is available.
   Up/Down selects a Pane; `Y` delegates to the existing Result Copy handler;
   Escape returns to Home. No Agent input is sent.
-- WBS-04-2 and later: focus switching between panel regions, project editing,
-  saved control-room layouts, and direct input are outside this change.
+- WBS-04-2: Tab/Shift+Tab move focus between the three panels; arrows navigate
+  the current panel; Enter opens identity details or expands/collapses a tree
+  node; Space opens a one-level menu to the existing LIVE layouts, Result Copy,
+  Pane details, and settings. The left-tree collapse state is process-local and
+  is not written to the Folder or Work Group stores. Work Group and Window LIVE
+  entries delegate to the existing layout implementations. Result Copy still
+  delegates to the existing _copy_result handler; ambiguous duplicate Pane
+  keys are refused before that handler so another host cannot be selected by
+  key alone. Direct Agent input and saved control-room layouts remain outside
+  this WBS.
+- WBS-04-3 and later: project editing, saved control-room layouts, and direct
+  input remain outside this stage.
+
+## WBS-04-2 keyboard and feature-access contract
+
+- The active panel title is reverse-highlighted, and the selected Pane card
+  remains the source for the right-hand read-only LIVE panel.
+- Tab and curses KEY_BTAB cycle panel focus. KEY_BTAB is used only when the
+  terminal/curses layer reports it distinctly.
+- Left-tree Up/Down selects Pane and parent nodes; Left/Right and Enter
+  collapse or expand parent nodes. This state is in memory only.
+- Center-panel arrows select a current Pane by the full Pane identity. The
+  right panel follows that identity. Right-panel Up/Down scrolls only the
+  already-captured live_lines snapshot.
+- Space exposes established routes: saved Work Group LIVE, selected Window
+  LIVE, the existing LIVE layout chooser, the existing Result Copy handler,
+  metadata-only Pane details, and Tower settings. Remote peers are not offered
+  unsupported Pane/Window LIVE routes from this menu. No Agent-input action is
+  added to this menu.
+- A Pane key appearing more than once in the current snapshot is not passed to the
+  existing key-only Result Copy interface or legacy key-only LIVE surfaces.
+  Ambiguous copy/LIVE routes are refused rather than guessing which host owns
+  that key. Existing PID and binding checks remain unchanged.
+- Fake-screen tests cover 60×18, 80×24, 100×40, and 120×40 plus panel focus,
+  selection identity, duplicate Pane keys, and the legacy LIVE menu routes.
+  They do not establish real-user terminal behavior.
 
 Verification is limited to repository tests with fake curses screens. It is
 not a test against a user's real tmux panes, Windows Clipboard, or ASUS TUI.
