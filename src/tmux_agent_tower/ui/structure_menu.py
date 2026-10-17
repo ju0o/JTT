@@ -87,6 +87,10 @@ def run_zero_action(stdscr, tower, action: str) -> None:
         create_work_group(stdscr, tower)
     elif action == "folder":
         create_folder(stdscr, tower)
+    elif action == "projects":
+        from .projects import open_project_picker
+
+        open_project_picker(stdscr, tower)
 
 
 def open_create_hub(stdscr, tower) -> None:
@@ -231,25 +235,36 @@ def create_folder(stdscr, tower) -> None:
 def open_folder_menu(stdscr, tower, row: dict) -> None:
     folder_id = row.get("folder_id") or ""
     if row.get("kind") == "other_section":
-        menu = [("create", t("folder.create")), ("cancel", t("menu.cancel"))]
+        menu = [("create", t("folder.create"))]
+        if getattr(tower, "projects", None) is not None:
+            menu.append(("projects", t("control_room.menu_projects")))
+        menu.append(("cancel", t("menu.cancel")))
         pick = run_list_picker(
             stdscr, row.get("display_name") or t("folder.other"), menu,
             footer_hint=t("wizard.hint_list"),
         )
         if pick.selected_key == "create":
             create_folder(stdscr, tower)
+        elif pick.selected_key == "projects":
+            run_zero_action(stdscr, tower, "projects")
         return
-    pick = run_list_picker(stdscr, row.get("display_name") or t("folder.title"), [
+    menu = [
         ("rename", t("folder.rename")),
         ("new_window", t("folder.add_window")),
         ("move_in", t("folder.move_window_in")),
         ("order", t("folder.reorder")),
         ("delete", t("folder.delete")),
-        ("cancel", t("menu.cancel")),
-    ], footer_hint=t("wizard.hint_list"))
+    ]
+    if getattr(tower, "projects", None) is not None:
+        menu.append(("projects", t("control_room.menu_projects")))
+    menu.append(("cancel", t("menu.cancel")))
+    pick = run_list_picker(stdscr, row.get("display_name") or t("folder.title"), menu,
+                           footer_hint=t("wizard.hint_list"))
     if pick.cancelled or pick.selected_key in (None, "cancel"):
         return
-    if pick.selected_key == "rename":
+    if pick.selected_key == "projects":
+        run_zero_action(stdscr, tower, "projects")
+    elif pick.selected_key == "rename":
         name = prompt_text(stdscr, t("folder.rename_prompt"), initial=row.get("display_name") or "")
         if name:
             tower.folders.rename(folder_id, name)

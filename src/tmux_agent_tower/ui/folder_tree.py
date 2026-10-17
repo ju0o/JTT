@@ -54,14 +54,25 @@ def visible_windows(windows: Iterable[dict], rows: Iterable[dict], own_window_id
 def build_rows(store: FolderStore, windows: Iterable[dict], tasks: Iterable[dict],
                filter_text: str = "", collapsed_other: bool = False,
                collapsed_agents: bool = False,
-               flatten_single_pane_windows: bool = False) -> List[dict]:
+               flatten_single_pane_windows: bool = False,
+               hidden_window_refs: Iterable[str] = ()) -> List[dict]:
     windows = list(windows)
+    hidden_window_refs = set(hidden_window_refs or ())
     tasks = [row for row in tasks if row.get("pane_id")]
     workspace = store.workspace(windows, tasks)
+    workspace["unfiled_windows"] = [
+        window for window in workspace["unfiled_windows"]
+        if window["window_ref"] not in hidden_window_refs
+    ]
+    for folder in workspace["folders"]:
+        folder["windows"] = [window for window in folder["windows"]
+                             if window["window_ref"] not in hidden_window_refs]
+        folder["summary_counts"] = aggregate_window_list(folder["windows"])
     source_by_ref = {str(row.get("window_ref") or window_ref(row)): row for row in windows}
     task_by_ref = {
         str(row.get("target_id") or row.get("key")): row for row in tasks
-        if row.get("target_id") or row.get("key")
+        if (row.get("target_id") or row.get("key"))
+        and str(row.get("window_ref") or "") not in hidden_window_refs
     }
     query = filter_text.casefold().strip()
     out: List[dict] = []

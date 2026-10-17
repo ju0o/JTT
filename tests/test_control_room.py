@@ -115,6 +115,179 @@ def test_related_grid_does_not_mix_matching_pane_ids_from_another_tmux_host():
     )) == "ASUS (SSH 창 · MainPC)"
 
 
+def test_project_tree_groups_exact_cross_host_window_refs_and_keeps_duplicate_pane_ids_distinct():
+    main_ref, asus_ref = "a" * 64, "b" * 64
+    main = _pane("%1", target="main-target", window_ref=main_ref,
+                 tmux_host="mainpc", execution_host="mainpc", window_id="@1")
+    asus = _pane("%1", target="asus-target", window_ref=asus_ref,
+                 tmux_host="asus", execution_host="asus", window_id="@1", remote=True,
+                 transport="remote_tmux", transport_target="asus")
+    project = {
+        "project_id": "project-1", "display_name": "통합 프로젝트",
+        "window_refs": [asus_ref, main_ref], "order": 0, "collapsed": False,
+    }
+    assets = [
+        {"window_ref": main_ref, "display_name": "Main", "tmux_host": "mainpc", "execution_host": "mainpc"},
+        {"window_ref": asus_ref, "display_name": "Remote", "tmux_host": "asus", "execution_host": "asus"},
+    ]
+
+    lines = control_room.navigation_lines(
+        [main, asus], "%1", control_room.pane_identity(main),
+        projects=[project], window_assets=assets,
+    )
+    project_line = next(line for line in lines if line["kind"] == "tower_project")
+    window_lines = [line for line in lines if line["kind"] == "project_window"]
+    pane_lines = [line for line in lines if line["kind"] == "pane" and line.get("project_id")]
+
+    assert project_line["member_rows"] == [asus, main]
+    assert [line["window_ref"] for line in window_lines] == [asus_ref, main_ref]
+    assert len(pane_lines) == 2
+    assert pane_lines[0]["node_key"] != pane_lines[1]["node_key"]
+    assert control_room._row_for_nav_line(pane_lines[0], [main, asus]) is asus
+    assert control_room._scope_grid_rows(asus, [main, asus], [], project_line) == [asus, main]
+
+
+def test_hidden_and_disconnected_project_windows_remain_manageable_without_rebinding():
+    old_ref, new_ref = "c" * 64, "d" * 64
+    replacement = _pane("%1", target="replacement", window_ref=new_ref,
+                        tmux_host="mainpc", execution_host="mainpc", window_id="@1")
+    project = {
+        "project_id": "project-2", "display_name": "Stale project",
+        "window_refs": [old_ref], "order": 0, "collapsed": False,
+    }
+    hidden_lines = control_room.navigation_lines(
+        [replacement], "%1", control_room.pane_identity(replacement),
+        projects=[project], window_assets=[{"window_ref": new_ref, "display_name": "New"}],
+    )
+
+    stale = next(line for line in hidden_lines if line["kind"] == "project_window_disconnected")
+    assert stale["window_ref"] == old_ref
+    assert stale["member_rows"] == []
+    assert not any(line.get("row") is replacement and line.get("project_id") for line in hidden_lines)
+
+
+def test_project_selection_scopes_center_grid_and_right_live_to_same_snapshot(monkeypatch):
+    main_ref, asus_ref = "e" * 64, "f" * 64
+    main = _pane("%1", target="main-target", window_ref=main_ref,
+                 tmux_host="mainpc", execution_host="mainpc", live_lines=["MAIN_ONLY"])
+    asus = _pane("%1", target="asus-target", window_ref=asus_ref,
+                 tmux_host="asus", execution_host="asus", remote=True,
+                 transport="remote_tmux", transport_target="asus", live_lines=["ASUS_ONLY"])
+    project = {
+        "project_id": "project-3", "display_name": "Cross host",
+        "window_refs": [asus_ref, main_ref], "order": 0, "collapsed": False,
+    }
+    tower = SimpleNamespace(
+        rows=[main, asus], window_assets=[],
+        projects=SimpleNamespace(all=lambda: [project], hidden_refs=lambda: set()),
+    )
+    screen = Screen(40, 120)
+    drawn = []
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(
+        live_view, "_draw_tile",
+        lambda _screen, _tower, row, *_args: drawn.append(row["target_id"]),
+    )
+
+    result = control_room.draw(
+        screen, tower, main["key"], control_room.pane_identity(main), main,
+        cursor_key=("tower_project", "project-3"),
+    )
+
+    assert result is True
+    assert drawn == ["asus-target", "main-target", "main-target"]
+
+
+@pytest.mark.parametrize("height,width", [(18, 60), (24, 80), (40, 120)])
+def test_project_tree_and_live_panels_fit_required_viewports(monkeypatch, height, width):
+    ref = "8" * 64
+    pane = _pane("%8", window_ref=ref, display_name="한글과 English 이름을 유지하는 작업",
+                 live_lines=["READ_ONLY_SNAPSHOT"])
+    project = {"project_id": "project-viewport", "display_name": "장기 프로젝트",
+               "window_refs": [ref], "order": 0, "collapsed": False}
+    asset = {"window_ref": ref, "display_name": "개발 화면", "tmux_host": "mainpc",
+             "execution_host": "mainpc"}
+    tower = SimpleNamespace(
+        rows=[pane], window_assets=[asset],
+        projects=SimpleNamespace(all=lambda: [project], hidden_refs=lambda: set()),
+    )
+    screen = Screen(height, width)
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(live_view, "_draw_tile", lambda *_args: None)
+
+    assert control_room.draw(
+        screen, tower, pane["key"], control_room.pane_identity(pane), pane,
+        cursor_key=("tower_project", "project-viewport"),
+    ) is True
+    assert all(0 <= y < height and 0 <= x < width for y, x, _text, _attr in screen.writes)
+    assert all(x + _visible_width(text) <= width for _y, x, text, _attr in screen.writes)
+
+
+def test_project_window_visibility_excludes_project_panes_but_keeps_management_action():
+    hidden_ref, visible_ref = "1" * 64, "2" * 64
+    hidden = _pane("%1", target="hidden", window_ref=hidden_ref)
+    visible = _pane("%2", target="visible", window_ref=visible_ref)
+    project = {
+        "project_id": "project-4", "display_name": "Hidden work",
+        "window_refs": [hidden_ref, visible_ref], "order": 0, "collapsed": False,
+    }
+    lines = control_room.navigation_lines(
+        [visible], "%2", control_room.pane_identity(visible),
+        projects=[project], hidden_refs={hidden_ref},
+    )
+
+    assert any(line["kind"] == "project_window_hidden" and line["window_ref"] == hidden_ref for line in lines)
+    assert not any(line.get("row") is hidden for line in lines)
+    assert [key for key, _ in control_room.action_menu_items(
+        visible, project_management=True,
+    )][-3:] == ["projects", "details", "settings"]
+
+
+def test_space_on_project_opens_its_editor_and_delete_can_be_cancelled(monkeypatch, tmp_path):
+    from tmux_agent_tower.state.projects import ProjectStore
+    from tmux_agent_tower.ui import projects as project_ui
+
+    store = ProjectStore(tmp_path / "projects.json")
+    project = store.create("Keep me")
+    tower = SimpleNamespace(projects=store, window_assets=[], folders=SimpleNamespace(window=lambda _ref: {}))
+    opened = []
+    monkeypatch.setattr(project_ui, "open_project_editor", lambda _s, _t, project_id: opened.append(project_id))
+
+    control_room._open_action_menu(
+        None, tower, None, [], None, "tower_project",
+        {"kind": "tower_project", "project_id": project["project_id"]},
+    )
+
+    assert opened == [project["project_id"]]
+
+    monkeypatch.setattr(
+        project_ui, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="delete"),
+    )
+    monkeypatch.setattr(project_ui, "_confirm", lambda *_args: False)
+    project_ui.open_project_editor(None, tower, project["project_id"])
+    assert store.all()[0]["project_id"] == project["project_id"]
+
+
+def test_project_creation_from_selected_pane_stores_only_logical_window_ref(monkeypatch, tmp_path):
+    from tmux_agent_tower.state.projects import ProjectStore
+    from tmux_agent_tower.ui import projects as project_ui
+
+    ref = "9" * 64
+    source = {"window_ref": ref, "window_id": "@9", "pane_id": "%9", "pane_pid": "900"}
+    physical_before = dict(source)
+    store = ProjectStore(tmp_path / "projects.json")
+    tower = SimpleNamespace(projects=store, folders=SimpleNamespace(window=lambda _ref: {}),
+                            _apply_filter=lambda: None)
+    monkeypatch.setattr(project_ui, "prompt_text", lambda *_args, **_kwargs: "Release")
+    monkeypatch.setattr(project_ui, "open_project_editor", lambda *_args: None)
+
+    project_ui.create_project(None, tower, source)
+
+    assert store.all()[0]["window_refs"] == [ref]
+    assert source == physical_before
+
+
 def test_opening_from_work_group_keeps_selected_project_member_as_focus():
     first = _pane("%1", target="first")
     member = _pane("%2", target="member", work_group_id="g1")

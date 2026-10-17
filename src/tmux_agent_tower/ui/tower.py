@@ -32,6 +32,7 @@ from ..remote.collector import fetch_remote, HOST_STATUS_ONLINE
 from ..state.bindings import ProjectBindingStore
 from ..state.folders import FolderStore, window_ref
 from ..state.overrides import ROLE_IDS, OverrideStore
+from ..state.projects import ProjectStore
 from ..state.work_groups import WorkGroupStore
 from ..detection.project import git_project_name
 from ..state.visits import VisitStore
@@ -335,7 +336,7 @@ def navigator_rows(panes: List[Dict], collapsed: Optional[set] = None) -> List[D
     return out
 
 
-def zero_state_rows() -> List[Dict]:
+def zero_state_rows(*, include_projects: bool = False) -> List[Dict]:
     """What to show when Tower has no working pane yet."""
 
     title = t("zero.title")
@@ -343,7 +344,7 @@ def zero_state_rows() -> List[Dict]:
         ("task", t("zero.task")),
         ("saved", t("zero.saved")),
         ("template", t("zero.template")),
-    )
+    ) + ((("projects", t("project_manage.title")),) if include_projects else ())
     return [
         {
             "kind": "zero",
@@ -373,6 +374,7 @@ class Tower:
         self.bindings = ProjectBindingStore(STATE_DIR / "project-bindings.json")
         self.work_groups = WorkGroupStore(STATE_DIR / "work-groups.json")
         self.folders = FolderStore(STATE_DIR / "folders.json")
+        self.projects = ProjectStore(STATE_DIR / "projects.json")
         self.window_assets: List[Dict] = []
         # The TUI owns one engine for its lifetime. Remote passes the
         # server's engine in so hysteresis survives across HTTP polls.
@@ -945,6 +947,10 @@ class Tower:
         task_rows = [row for row in self.rows if row.get("pane_id") and not row.get("tower_runtime")]
         live_windows = folder_tree.visible_windows(live_windows.values(), self.rows, own_window_id)
         self.window_assets = folder_tree.infer_window_assets(live_windows, task_rows, self.local_host)
+        for asset in self.window_assets:
+            saved_name = self.folders.window(str(asset.get("window_ref") or "")).get("display_name")
+            if saved_name:
+                asset["display_name"] = saved_name
         groups = self.work_groups.all()
         group_by_target = {target: group for group in groups for target in group["member_target_ids"]}
         for row in self.rows:
@@ -979,6 +985,7 @@ class Tower:
         snapshot = copy.copy(self)
         for name in ("status_engine", "notifier", "visits", "overrides", "bindings", "work_groups", "folders", "_host_registry"):
             setattr(snapshot, name, copy.deepcopy(getattr(self, name)))
+        snapshot.projects = ProjectStore(self.projects.path)
         snapshot.results = (
             ResultTracker(self.results.state_path)
             if self.results is not None and self.results.state_path is not None
@@ -1051,14 +1058,22 @@ class Tower:
         if previous_key is None and self.visible_rows and 0 <= self.selected < len(self.visible_rows):
             previous_key = self.visible_rows[self.selected]["key"]
 
-        filtered = [r for r in self.rows if render.row_matches_filter(r, self.filter_text)]
+        hidden_window_refs = self.projects.hidden_refs()
+        display_rows = [r for r in self.rows
+                        if str(r.get("window_ref") or "") not in hidden_window_refs]
+        display_windows = self.window_assets
+        filtered = [r for r in display_rows if render.row_matches_filter(r, self.filter_text)]
 
-        panes = [r for r in self.rows if r.get("pane_id")]
+        panes = [r for r in display_rows if r.get("pane_id")]
         work_panes = [r for r in panes if not r.get("tower_runtime")]
         groups = self.work_groups.all()
+        visible_targets = {str(row.get("target_id") or "") for row in work_panes}
+        visible_groups = [group for group in groups if any(
+            str(target) in visible_targets for target in group.get("member_target_ids") or ()
+        )]
         if (not self.filter_text and self.view_mode != TERMINAL_STRUCTURE_VIEW
-                and not work_panes and not groups and not self.folders.all()):
-            self.visible_rows = zero_state_rows()
+                and not work_panes and not visible_groups and not self.folders.all()):
+            self.visible_rows = zero_state_rows(include_projects=bool(self.projects.all()))
         elif self.view_mode == TERMINAL_STRUCTURE_VIEW:
             self.visible_rows = navigator_rows(filtered, set() if self.filter_text else self.collapsed)
         else:
@@ -1067,9 +1082,10 @@ class Tower:
                 self.visible_rows = render.sort_by_attention(matching)
             else:
                 self.visible_rows = folder_tree.build_rows(
-                    self.folders, self.window_assets, work_panes, self.filter_text,
+                    self.folders, display_windows, work_panes, self.filter_text,
                     self.collapsed_other, self.collapsed_agents,
                     flatten_single_pane_windows=True,
+                    hidden_window_refs=hidden_window_refs,
                 )
 
         if not self.visible_rows:

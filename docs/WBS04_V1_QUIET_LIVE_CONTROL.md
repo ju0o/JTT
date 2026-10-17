@@ -38,10 +38,10 @@ order is used for its LIVE grid; otherwise the selected Pane's existing
 physical Window defines the related grid. At most four tiles are shown and a
 selected Pane is kept in that bounded set. No physical tmux layout is applied.
 
-## Saved-data compatibility and rollback
+## Saved-data compatibility at WBS-04-1/04-2
 
-This stage adds no persistent file, schema, migration, or automatic screen
-save:
+The initial read-only stages added no persistent file, schema, migration, or
+automatic screen save:
 
 - `folders.json` remains schema version 1 (`folders` and `windows`).
 - `work-groups.json` retains its existing `groups` and `managed_resources`
@@ -51,8 +51,8 @@ save:
 - Result, visit, name override, binding, and remote-host state are not rewritten
   by entering or drawing this screen.
 
-Rollback is a source-code rollback to the preceding commit. Since no new saved
-state is introduced, no user data migration or restoration is required.
+Rollback for those initial stages is a source-code rollback to the preceding
+commit. No user data migration or restoration was required.
 
 ## LIVE and direct-input boundary
 
@@ -108,8 +108,48 @@ input action is invoked by this screen.
   keys are refused before that handler so another host cannot be selected by
   key alone. Direct Agent input and saved control-room layouts remain outside
   this WBS.
-- WBS-04-3 and later: project editing, saved control-room layouts, and direct
-  input remain outside this stage.
+
+## WBS-04-3 logical project model
+
+Projects are intentionally a separate, optional metadata store because the
+existing concepts have different ownership:
+
+- `folders.json` (`FolderStore`) classifies Window assets in the normal
+  computer-centered view. Existing folders and their names are not converted,
+  renamed, or rewritten by Project operations.
+- `work-groups.json` (`WorkGroupStore`) groups Agent Pane targets and retains
+  its member labels, order, LIVE layout slots, and managed-resource records.
+- `worksets.json` (`WorksetStore`) stores launch recipes/templates, not live
+  Window membership.
+- `projects.json` (`ProjectStore`, schema version 1) groups exact `window_ref`
+  values across hosts. It stores project order, per-project Window order,
+  project collapse state, and Tower-only hidden Window references. It is
+  distinct from WBS-04-4 saved control-room layouts.
+
+There is no migration or write to any prior store. A Window can belong to at
+most one Tower Project; moving it requires confirmation and changes only the
+logical reference. Removing a Window or deleting its Project does not move,
+rename, stop, or recreate the physical Window or Agent. Project deletion is
+confirmed and canceled by default. Hidden Windows are omitted from Tower's
+normal list and LIVE selection but remain in Project editing so they can be
+restored. Missing `window_ref` values remain in the Project and display as
+disconnected; a newly discovered Window is never substituted by Pane ID.
+
+The Project file is created only on the first explicit Project edit, with
+schema validation, mode `0600`, a private temporary file, fsync, and atomic
+replacement. Corrupt, unsupported, or externally changed state refuses writes
+instead of replacing the file. A source rollback does not require migrating or
+restoring Folder, Work Group, or Workset data.
+
+The Control Room adds a “My projects” tree only when a Project exists. Space on
+a Pane opens the optional Project manager/create flow; Space on a Project
+opens its editor. Project selection scopes the center LIVE grid by exact Window
+references, and the right LIVE pane continues to follow the complete selected
+Pane identity. The 4-card display bound remains unchanged; the selected Pane is
+kept in the visible slice.
+
+- WBS-04-4 and later: saved control-room layouts and direct input remain
+  outside this stage.
 
 ## WBS-04-2 keyboard and feature-access contract
 
