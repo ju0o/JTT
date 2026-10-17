@@ -15,13 +15,17 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import List, Optional, Tuple
 
 from ..adapters.base import ResultCandidate
+from ..detection import process as process_detection
 from ..state.overrides import FIELDS as OVERRIDE_FIELDS, ROLE_IDS
 from ..detection.result import pane_result_identity
 from ..detection.providers import ResultProvider, ResultTarget, normalize_candidate
+from ..detection.sshdest import find_ssh_client, host_from_destination
 from ..tmux import capture as tmux_capture
+from ..tmux import navigation as tmux_navigation
 from ..tmux.navigation import focus_local_pane
 
 MAX_PROMPT_CHARS = 32000
@@ -34,6 +38,175 @@ MAX_IDENTITY_CHARS = 80
 RECOVERY_LINES = 800
 RECOVERY_BYTES = 256 * 1024
 LONG_PROMPT_CONFIRM_CHARS = 2000
+
+
+class FocusTargetStatus(str, Enum):
+    """Point-in-time outcome of validating a possible local focus target."""
+
+    ALLOWED = "ALLOWED"
+    STALE = "STALE"
+    REMOTE_UNSUPPORTED = "REMOTE_UNSUPPORTED"
+    AMBIGUOUS = "AMBIGUOUS"
+    SELF_TARGET = "SELF_TARGET"
+    NOT_FOUND = "NOT_FOUND"
+    UNVERIFIED = "UNVERIFIED"
+
+
+@dataclass(frozen=True)
+class FocusTargetValidation:
+    """Read-only eligibility result; never a token that authorizes later focus."""
+
+    status: FocusTargetStatus
+    pane_id: str = ""
+    identity: tuple = ()
+
+    @property
+    def allowed(self) -> bool:
+        return self.status is FocusTargetStatus.ALLOWED
+
+
+_FOCUS_IDENTITY_FIELDS = (
+    "target_id", "tmux_host", "session", "session_id", "window_id",
+    "pane_id", "pane_pid", "transport", "transport_target",
+)
+
+
+def _focus_target_id(host: str, session: str, pane_id: str, pane_pid: str) -> str:
+    """Match Tower's stable target-id recipe using observed physical fields."""
+
+    identity = "\0".join((host or "", session or "", pane_id or "", pane_pid or ""))
+    return hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()
+
+
+def validate_focus_target(tower, row: dict) -> FocusTargetValidation:
+    """Validate a row against the current local tmux/process snapshots.
+
+    This is deliberately read-only. ``ALLOWED`` is a point-in-time result,
+    not permission to use a previously validated identity later: a future
+    focus handoff must call this again immediately before selecting a pane.
+    """
+
+    if not isinstance(row, dict) or row.get("kind") != "pane":
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED)
+    if row.get("remote") or row.get("transport") == "remote_tmux":
+        return FocusTargetValidation(FocusTargetStatus.REMOTE_UNSUPPORTED)
+
+    pane_id = str(row.get("pane_id") or row.get("key") or "")
+    if not _LOCAL_PANE_KEY_RE.fullmatch(pane_id) or row.get("key") != pane_id:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    own_pane_id = str(getattr(tower, "own_pane_id", "") or "")
+    if not own_pane_id:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    if pane_id == own_pane_id or row.get("tower_runtime"):
+        return FocusTargetValidation(FocusTargetStatus.SELF_TARGET, pane_id)
+
+    local_host = str(getattr(tower, "local_host", "") or "").strip()
+    row_host = str(row.get("tmux_host") or "").strip()
+    if not local_host or not row_host:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    if row_host.casefold() != local_host.casefold():
+        return FocusTargetValidation(FocusTargetStatus.REMOTE_UNSUPPORTED, pane_id)
+
+    # Empty transport_target is valid only for a local pane; all other
+    # identity fields must be present and strings before comparison.
+    if any(not isinstance(row.get(field), str) for field in _FOCUS_IDENTITY_FIELDS):
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    session = row.get("session", "")
+    session_id = row.get("session_id", "")
+    window_id = row.get("window_id", "")
+    pane_pid = row.get("pane_pid", "")
+    transport = row.get("transport", "")
+    transport_target = row.get("transport_target", "").strip()
+    if (
+        not row.get("target_id") or not session or not session_id
+        or not session_id.startswith("$") or not window_id.startswith("@")
+        or not pane_pid.isdecimal()
+    ):
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    if transport not in {"local", "ssh"}:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    if (transport == "local" and transport_target) or (transport == "ssh" and not transport_target):
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+
+    current_rows = getattr(tower, "rows", None)
+    if not isinstance(current_rows, (list, tuple)):
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    same_key = [
+        candidate for candidate in current_rows
+        if isinstance(candidate, dict)
+        and not candidate.get("placeholder")
+        and str(candidate.get("pane_id") or candidate.get("key") or "") == pane_id
+    ]
+    local_key_rows = [
+        candidate for candidate in same_key
+        if not candidate.get("remote")
+        and str(candidate.get("tmux_host") or "").strip().casefold() == local_host.casefold()
+    ]
+    if len(local_key_rows) > 1:
+        return FocusTargetValidation(FocusTargetStatus.AMBIGUOUS, pane_id)
+    expected_identity = tuple(row.get(field) for field in _FOCUS_IDENTITY_FIELDS)
+    matches = [
+        candidate for candidate in local_key_rows
+        if tuple(candidate.get(field) for field in _FOCUS_IDENTITY_FIELDS) == expected_identity
+    ]
+    if len(matches) > 1:
+        return FocusTargetValidation(FocusTargetStatus.AMBIGUOUS, pane_id)
+    if not matches:
+        return FocusTargetValidation(
+            FocusTargetStatus.STALE if same_key else FocusTargetStatus.NOT_FOUND,
+            pane_id,
+        )
+    if _focus_target_id(local_host, session, pane_id, pane_pid) != row.get("target_id"):
+        return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+
+    observed = tmux_navigation.read_local_pane_identities()
+    if observed is None:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    physical = [identity for identity in observed if identity.pane_id == pane_id]
+    if not physical:
+        return FocusTargetValidation(FocusTargetStatus.NOT_FOUND, pane_id)
+    if len(physical) > 1:
+        return FocusTargetValidation(FocusTargetStatus.AMBIGUOUS, pane_id)
+    actual = physical[0]
+    if actual.pane_dead != "0":
+        return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+    actual_tuple = (
+        actual.session, actual.session_id, actual.window_id,
+        actual.pane_id, actual.pane_pid,
+    )
+    expected_physical = (session, session_id, window_id, pane_id, pane_pid)
+    if actual_tuple != expected_physical:
+        return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+    if _focus_target_id(local_host, actual.session, actual.pane_id, actual.pane_pid) != row.get("target_id"):
+        return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+
+    processes = process_detection.process_snapshot()
+    if not processes:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    pane_process = processes.get(pane_pid)
+    if not pane_process or not pane_process.get("ppid"):
+        return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+    cmdline_map = {str(pid): str(info.get("args") or "") for pid, info in processes.items()}
+    ppid_map = {str(pid): str(info.get("ppid") or "") for pid, info in processes.items()}
+    actual_target, ssh_stale = find_ssh_client(pane_pid, cmdline_map, ppid_map)
+    if transport == "local":
+        if ssh_stale:
+            return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+        if actual_target:
+            return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+    else:
+        expected_target = host_from_destination(transport_target).casefold()
+        observed_target = host_from_destination(actual_target).casefold()
+        if ssh_stale:
+            return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+        if not expected_target or not observed_target or expected_target != observed_target:
+            return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+
+    return FocusTargetValidation(
+        FocusTargetStatus.ALLOWED,
+        pane_id,
+        expected_identity,
+    )
 
 _ANSI_RE = re.compile(
     r"\x1b\[[0-?]*[ -/]*[@-~]"
