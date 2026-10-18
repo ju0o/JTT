@@ -73,6 +73,30 @@ def test_control_room_picker_is_compact_when_wide_and_safe_when_narrow(height, w
         assert any("Esc 취소" in text for _y, _x, text, _attr in frame)
 
 
+def test_confirmation_picker_mouse_click_only_selects_and_enter_remains_required(monkeypatch):
+    screen = Screen(44, 160, [curses.KEY_MOUSE, "\x1b"])
+
+    def clicked_confirmation_row():
+        frame = screen.frames[-1]
+        y, x, _text, _attr = max(
+            (item for item in frame if "조작 화면으로 이동" in item[2]),
+            key=lambda item: item[0],
+        )
+        return (0, x + 2, y, 0, curses.BUTTON1_CLICKED)
+
+    monkeypatch.setattr(widgets.curses, "getmouse", clicked_confirmation_row)
+    result = widgets.run_list_picker(
+        screen, "Agent 조작 화면으로 이동",
+        [("cancel", "취소"), ("confirm", "조작 화면으로 이동")],
+        preamble=["선택한 터미널로 이동합니다."], centered=True,
+    )
+
+    assert result.cancelled is True
+    selected = max((item for item in screen.frames[-1] if "조작 화면으로 이동" in item[2]),
+                   key=lambda item: item[0])
+    assert selected[3] & curses.A_REVERSE
+
+
 def test_saved_screen_menu_explains_screen_vs_reusable_layout():
     assert "작업 구성" in t("control_room.screens_help_screen")
     assert "분할 모양만" in t("control_room.screens_help_layout")

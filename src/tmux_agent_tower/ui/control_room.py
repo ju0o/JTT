@@ -3,8 +3,7 @@
 The room observes only the ``live_lines`` already carried by the Tower
 refresh snapshot and delegates tile rendering to the established LIVE view
 renderer. A separate, explicit confirmation may hand focus to one verified
-local tmux Pane; the optional in-panel action sends one explicitly confirmed
-text line to a locally verified Agent, not arbitrary terminal keystrokes.
+local tmux Pane; the room never relays Agent input.
 """
 
 from __future__ import annotations
@@ -655,14 +654,10 @@ def _draw_navigation(stdscr, region, lines) -> None:
         safe_add(stdscr, y + offset, x, render.truncate_to_width(text, max(0, width)), attr)
 
 
-def _draw_window_navigation(stdscr, region, lines, scroll: int = 0) -> None:
+def _draw_window_navigation(stdscr, region, lines, scroll: int = 0) -> int:
     x, y, width, height = region
     cursor = next((index for index, line in enumerate(lines) if line.get("cursor")), 0)
-    top = max(0, min(scroll, max(0, len(lines) - height)))
-    if cursor < top:
-        top = cursor
-    elif height and cursor >= top + height:
-        top = cursor - height + 1
+    top = _window_navigation_start(lines, scroll, height)
     for offset, line in enumerate(lines[top:top + height]):
         kind = line["kind"]
         selectable = kind in {"window", "window_hidden", "window_disconnected"}
@@ -678,23 +673,30 @@ def _draw_window_navigation(stdscr, region, lines, scroll: int = 0) -> None:
                 (curses.A_BOLD if selectable and line.get("selected") else
                  _heading_attr() if not selectable else curses.A_NORMAL))
         safe_add(stdscr, y + offset, x, render.truncate_to_width(prefix + str(line.get("text") or ""), width), attr)
+    return top
 
 
-def _draw_pane_list(stdscr, region, rows, selected_identity, scroll: int = 0) -> None:
+def _window_navigation_start(lines, scroll: int, height: int) -> int:
+    cursor = next((index for index, line in enumerate(lines) if line.get("cursor")), 0)
+    top = max(0, min(scroll, max(0, len(lines) - height)))
+    if cursor < top:
+        top = cursor
+    elif height and cursor >= top + height:
+        top = cursor - height + 1
+    return top
+
+
+def _draw_pane_list(stdscr, region, rows, selected_identity, scroll: int = 0) -> int:
     x, y, width, height = region
     row_height = 2
     capacity = max(0, height // row_height)
     selected_index = next((index for index, row in enumerate(rows)
                            if pane_identity(row) == selected_identity), 0)
-    top = max(0, min(scroll, max(0, len(rows) - capacity)))
-    if selected_index < top:
-        top = selected_index
-    elif capacity and selected_index >= top + capacity:
-        top = selected_index - capacity + 1
+    top = _pane_list_start(rows, selected_identity, scroll, height)
     visible = rows[top:top + capacity]
     if not visible:
         safe_add(stdscr, y, x, t("control_room.window_no_panes"), curses.A_DIM)
-        return
+        return top
     for offset, row in enumerate(visible):
         line_y = y + offset * row_height
         selected = pane_identity(row) == selected_identity
@@ -711,6 +713,19 @@ def _draw_pane_list(stdscr, region, rows, selected_identity, scroll: int = 0) ->
             agent = str(row.get("agent") or t("state.unknown"))
             detail = f"  {agent} · {symbol} {t(status_key)}"
         safe_add(stdscr, line_y + 1, x, render.truncate_to_width(detail, width), curses.A_DIM)
+    return top
+
+
+def _pane_list_start(rows, selected_identity, scroll: int, height: int) -> int:
+    capacity = max(0, height // 2)
+    selected_index = next((index for index, row in enumerate(rows)
+                           if pane_identity(row) == selected_identity), 0)
+    top = max(0, min(scroll, max(0, len(rows) - capacity)))
+    if selected_index < top:
+        top = selected_index
+    elif capacity and selected_index >= top + capacity:
+        top = selected_index - capacity + 1
+    return top
 
 
 def _layout_rectangles(region, layout: str) -> list[tuple[int, int, int, int]]:
@@ -864,13 +879,14 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
          original: dict, groups=(), *, active_panel: int = 0, cursor_key=None,
          collapsed=None, focus_scroll: int = 0, layout: str = "grid-4",
          grid_rows_override: list[dict] | None = None, selected_window_ref: str = "",
-         pane_scroll: int = 0, nav_scroll: int = 0, input_mode: bool = False) -> bool:
+         pane_scroll: int = 0, nav_scroll: int = 0,
+         hit_test_state: dict | None = None) -> bool:
     """Draw Window folders, that Window's Panes, and one selected Pane LIVE."""
 
     stdscr.erase()
     height, width = stdscr.getmaxyx()
     safe_add(stdscr, 0, 2, t("control_room.title"), curses.A_BOLD)
-    mode_label = t("control_room.input_mode" if input_mode else "control_room.read_only")
+    mode_label = t("control_room.read_only")
     hidden_refs = _hidden_project_refs(tower)
     panes = [row for row in pane_rows(getattr(tower, "rows", ()))
              if str(row.get("window_ref") or "") not in hidden_refs]
@@ -880,6 +896,8 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
     nav_lines = window_navigation_lines(
         tower, panes, selected_window_ref, cursor_key, collapsed,
     )
+    if hit_test_state is not None:
+        hit_test_state.clear()
     nav_line = next((line for line in nav_lines if line.get("node_key") == cursor_key), None)
     if nav_line is None and cursor_key is None:
         nav_line = next((line for line in nav_lines if line.get("window_ref") == selected_window_ref), None)
@@ -893,10 +911,14 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
             x, y, region_width, _region_height = region
             heading_attr = curses.A_REVERSE | curses.A_BOLD if index == active_panel else _heading_attr()
             safe_add(stdscr, y, x, render.truncate_to_width(heading, max(0, region_width)), heading_attr)
-        _draw_window_navigation(
-            stdscr, (regions[0][0], regions[0][1] + 1, regions[0][2], max(0, regions[0][3] - 1)),
+        nav_region = (regions[0][0], regions[0][1] + 1, regions[0][2], max(0, regions[0][3] - 1))
+        nav_start = _draw_window_navigation(
+            stdscr, nav_region,
             nav_lines, nav_scroll,
         )
+        if hit_test_state is not None:
+            hit_test_state["nav_region"] = nav_region
+            hit_test_state["nav_start"] = nav_start
         pane_region = (regions[1][0], regions[1][1] + 1, regions[1][2], max(0, regions[1][3] - 1))
         right_region = (regions[2][0], regions[2][1] + 1, regions[2][2], max(0, regions[2][3] - 1))
         window_panes = _window_panes_for_display(
@@ -904,7 +926,11 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
         )
         same_window = str(selected.get("window_ref") or "") == selected_window_ref
         right_row = selected if current or same_window else _empty_window_row(selected_window_ref, nav_lines)
-        _draw_pane_list(stdscr, pane_region, window_panes, selected_identity, pane_scroll)
+        pane_start = _draw_pane_list(stdscr, pane_region, window_panes, selected_identity, pane_scroll)
+        if hit_test_state is not None:
+            hit_test_state["pane_region"] = pane_region
+            hit_test_state["pane_start"] = pane_start
+            hit_test_state["right_region"] = right_region
         _draw_grid(
             stdscr, tower, right_region,
             [right_row],
@@ -916,7 +942,10 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
         region = regions[active_panel]
         content = (region[0], region[1], region[2], max(0, region[3] - 1))
         if active_panel == 0:
-            _draw_window_navigation(stdscr, content, nav_lines, nav_scroll)
+            nav_start = _draw_window_navigation(stdscr, content, nav_lines, nav_scroll)
+            if hit_test_state is not None:
+                hit_test_state["nav_region"] = content
+                hit_test_state["nav_start"] = nav_start
         elif active_panel == 1:
             safe_add(stdscr, content[1], content[0],
                      render.truncate_to_width(t("control_room.panel_grid"), content[2]), _heading_attr())
@@ -924,7 +953,10 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
             window_panes = _window_panes_for_display(
                 panes, selected_window_ref, selected, selected_identity, current,
             )
-            _draw_pane_list(stdscr, pane_region, window_panes, selected_identity, pane_scroll)
+            pane_start = _draw_pane_list(stdscr, pane_region, window_panes, selected_identity, pane_scroll)
+            if hit_test_state is not None:
+                hit_test_state["pane_region"] = pane_region
+                hit_test_state["pane_start"] = pane_start
         else:
             safe_add(stdscr, content[1], content[0],
                      render.truncate_to_width(t("control_room.panel_focus"), content[2]), _heading_attr())
@@ -935,6 +967,8 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
                 stdscr, tower, right_region, [right_row],
                 selected_identity if current else None, width, focus_scroll, "focus",
             )
+            if hit_test_state is not None:
+                hit_test_state["right_region"] = right_region
 
     footer_lines = _footer_lines(width, active_panel, cursor_kind)
     safe_add(stdscr, max(0, height - 2), 2, footer_lines[0], curses.A_DIM)
@@ -1002,26 +1036,12 @@ def _copy_key_is_unambiguous(rows, row: dict | None) -> bool:
     return len(matching) == 1 and pane_identity(matching[0]) is not None
 
 
-def _right_input_candidate(row: dict | None) -> bool:
-    if (not isinstance(row, dict) or row.get("kind") != "pane" or row.get("remote")
-            or row.get("tower_runtime")):
-        return False
-    if row.get("transport") != "local":
-        return False
-    return bool(
-        str(row.get("auto_agent") or "").strip().casefold() in {"codex", "claude", "opencode"}
-        and row.get("auto_agent_source") == "process"
-        and row.get("agent_process_alive") is True
-    )
-
-
 def action_menu_items(row: dict | None, *, cursor_kind: str = "pane", has_group: bool = False,
                       has_folder: bool = False, copy_safe: bool = True,
                       live_routes_safe: bool = True,
                       project_management: bool = False,
-                      direct_control_available: bool | None = None,
-                      right_input_available: bool | None = None) -> list[tuple[str, str]]:
-    """Existing routes plus explicit text submission and a separate handoff."""
+                      direct_control_available: bool | None = None) -> list[tuple[str, str]]:
+    """Existing routes plus a separate, confirmed focus handoff."""
 
     items: list[tuple[str, str]] = [("screens", t("control_room.menu_screens"))]
     if has_group and live_routes_safe:
@@ -1034,12 +1054,6 @@ def action_menu_items(row: dict | None, *, cursor_kind: str = "pane", has_group:
         items.append(("layout_live", t("control_room.menu_layout_live")))
     if row and cursor_kind == "pane" and copy_safe:
         items.append(("copy", t("control_room.menu_copy")))
-    if row and cursor_kind == "pane":
-        if right_input_available is None:
-            right_input_available = _right_input_candidate(row)
-        items.append(("right_input" if right_input_available else "right_input_unavailable",
-                      t("control_room.menu_right_input" if right_input_available
-                        else "control_room.right_input_unavailable")))
     if project_management:
         items.append(("projects", t("control_room.menu_projects")))
     items.extend([
@@ -1103,6 +1117,12 @@ def _handoff_confirmation_lines(row: dict) -> list[str]:
 
 
 def _request_agent_handoff(stdscr, tower, row: dict):
+    if row.get("remote") or row.get("transport") == "remote_tmux":
+        show_message_screen(
+            stdscr, t("control_room.handoff_title"),
+            [t("control_room.handoff_unavailable")],
+        )
+        return control_actions.FocusHandoffStatus.FAILED
     pick = run_list_picker(
         stdscr,
         t("control_room.handoff_title"),
@@ -1135,60 +1155,28 @@ def _request_agent_handoff(stdscr, tower, row: dict):
     return result.status
 
 
-def _request_right_input(stdscr, tower, row: dict):
-    """Compose then explicitly confirm one text paste and one Enter."""
+def _request_right_handoff(stdscr, tower, row: dict, is_current: bool):
+    """Use the same explicit, focus-only handoff from Right click and Enter."""
 
-    if not _right_input_candidate(row):
-        show_message_screen(stdscr, t("control_room.input_title"),
-                            [t("control_room.right_input_unavailable")])
-        return None
-    current, current_valid = _resolve_selection(
-        getattr(tower, "rows", ()), str(row.get("key") or ""), pane_identity(row), row,
-    )
-    expected_agent = str(row.get("auto_agent") or "")
-    validation = (control_actions.validate_focus_target(tower, current, expected_agent)
-                  if current_valid else None)
-    if not current_valid or not validation or not validation.allowed:
-        show_message_screen(stdscr, t("control_room.input_title"),
-                            [t("control_room.input_target_changed")])
-        return control_actions.TextSubmissionStatus.REFUSED
-    row = current
-    target = t("control_room.input_target").format(
-        task=row.get("display_name") or row.get("task_name") or t("task.terminal"),
-        agent=row.get("agent") or t("state.unknown"),
-        computer=_host_label(row),
-        window=row.get("window_name") or row.get("window_index") or t("state.unknown"),
-    )
-    text = prompt_text(
-        stdscr, t("control_room.input_prompt"),
-        context_lines=[target, t("control_room.input_scope")],
-    )
-    if not text or not text.strip():
-        return None
-    pick = run_list_picker(
-        stdscr, t("control_room.input_title"),
-        [("cancel", t("menu.cancel")), ("submit", t("control_room.input_confirm"))],
-        preamble=[target, t("control_room.input_confirm_warning")],
-        footer_hint=t("wizard.hint_list"), centered=True,
-    )
-    if pick.cancelled or pick.selected_key != "submit":
-        return None
-    current, valid = _resolve_selection(
-        getattr(tower, "rows", ()), str(row.get("key") or ""), pane_identity(row), row,
-    )
-    if not valid or pane_identity(current) != pane_identity(row):
-        show_message_screen(stdscr, t("control_room.input_title"),
-                            [t("control_room.input_target_changed")])
-        return control_actions.TextSubmissionStatus.REFUSED
-    result = control_actions.submit_user_text_once(tower, current, text)
-    message_key = {
-        control_actions.TextSubmissionStatus.SUBMITTED: "control_room.input_submitted",
-        control_actions.TextSubmissionStatus.PASTED_NOT_SUBMITTED: "control_room.input_pasted_not_submitted",
-        control_actions.TextSubmissionStatus.REFUSED: "control_room.input_target_changed",
-        control_actions.TextSubmissionStatus.FAILED: "control_room.input_failed",
-    }.get(result.status, "control_room.input_failed")
-    show_message_screen(stdscr, t("control_room.input_title"), [t(message_key)])
-    return result.status
+    if not is_current:
+        show_message_screen(
+            stdscr, t("control_room.handoff_title"),
+            [t("control_room.handoff_rejected")],
+        )
+        return control_actions.FocusHandoffStatus.FAILED
+    if row.get("remote") or row.get("transport") == "remote_tmux":
+        show_message_screen(
+            stdscr, t("control_room.handoff_title"),
+            [t("control_room.handoff_unavailable")],
+        )
+        return control_actions.FocusHandoffStatus.FAILED
+    if not _focus_handoff_menu_available(tower, row):
+        show_message_screen(
+            stdscr, t("control_room.handoff_title"),
+            [t("control_room.handoff_rejected")],
+        )
+        return control_actions.FocusHandoffStatus.FAILED
+    return _request_agent_handoff(stdscr, tower, row)
 
 
 def _screen_confirm(stdscr, title: str, message: str) -> bool:
@@ -1484,12 +1472,6 @@ def _open_action_menu(stdscr, tower, row, groups, selected_home, cursor_kind, na
                 [t("control_room.handoff_unavailable")],
             )
             return
-        if pick.selected_key == "right_input_unavailable":
-            show_message_screen(stdscr, t("control_room.input_title"),
-                                [t("control_room.right_input_unavailable")])
-            return
-        if pick.selected_key == "right_input":
-            return _request_right_input(stdscr, tower, row)
         if pick.selected_key == "agent_handoff":
             return _request_agent_handoff(stdscr, tower, row)
         _run_action(
@@ -1550,13 +1532,29 @@ def initial_pane(panes, selected_home: dict | None, groups=()) -> dict | None:
     return panes[0]
 
 
-def _enable_room_mouse() -> bool:
+def _enable_room_mouse() -> int | None:
+    """Enable only single-left-click reporting and return the prior mask."""
+
     try:
-        mask = getattr(curses, "ALL_MOUSE_EVENTS", 0) | getattr(curses, "REPORT_MOUSE_POSITION", 0)
-        curses.mousemask(mask)
-        return bool(mask)
+        mask = getattr(curses, "BUTTON1_CLICKED", 0)
+        if not mask:
+            return None
+        available, previous_mask = curses.mousemask(mask)
+        if not available & mask:
+            curses.mousemask(previous_mask)
+            return None
+        return previous_mask
+    except (AttributeError, TypeError, ValueError, curses.error):
+        return None
+
+
+def _restore_room_mouse(previous_mask: int | None) -> None:
+    if previous_mask is None:
+        return
+    try:
+        curses.mousemask(previous_mask)
     except (AttributeError, curses.error):
-        return False
+        pass
 
 
 def _read_room_mouse(stdscr, key):
@@ -1564,15 +1562,15 @@ def _read_room_mouse(stdscr, key):
         return None
     try:
         _device, x, y, _z, state = curses.getmouse()
-    except (AttributeError, curses.error):
+    except (AttributeError, TypeError, ValueError, curses.error):
         return None
-    click = state & (getattr(curses, "BUTTON1_CLICKED", 0)
-                     | getattr(curses, "BUTTON1_PRESSED", 0)
-                     | getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0))
-    if not click:
+    double_click = getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0)
+    if double_click and state & double_click:
         return None
-    double = bool(state & getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0))
-    return x, y, double
+    click = getattr(curses, "BUTTON1_CLICKED", 0)
+    if not click or not state & click:
+        return None
+    return x, y
 
 
 def open_control_room(stdscr, tower) -> None:
@@ -1630,7 +1628,7 @@ def open_control_room(stdscr, tower) -> None:
     focus_scroll = 0
     pane_scroll = 0
     nav_scroll = 0
-    input_mode = False
+    hit_test_state: dict = {}
 
     keypad = getattr(stdscr, "keypad", None)
     if keypad:
@@ -1641,7 +1639,7 @@ def open_control_room(stdscr, tower) -> None:
     needs_draw = True
     if async_refresh:
         live_view._start_refresh(tower)
-    mouse_enabled = _enable_room_mouse()
+    previous_mouse_mask = _enable_room_mouse()
     try:
         while True:
             if async_refresh and live_view._apply_refresh(tower):
@@ -1682,7 +1680,7 @@ def open_control_room(stdscr, tower) -> None:
                     collapsed=collapsed, focus_scroll=focus_scroll,
                     layout=layout, grid_rows_override=view_rows,
                     selected_window_ref=selected_window_ref, pane_scroll=pane_scroll,
-                    nav_scroll=nav_scroll, input_mode=input_mode,
+                    nav_scroll=nav_scroll, hit_test_state=hit_test_state,
                 )
                 current_nav = window_navigation_lines(
                     tower, _visible_panes(tower), selected_window_ref, cursor_key, collapsed,
@@ -1718,12 +1716,13 @@ def open_control_room(stdscr, tower) -> None:
             if nav_line is None:
                 nav_line = next((line for line in nav_items if line.get("window_ref") == selected_window_ref), None)
             cursor_kind = nav_line.get("kind", "window") if nav_line else "window"
-            center_rows = [row for row in current_panes
-                           if str(row.get("window_ref") or "") == selected_window_ref]
+            center_rows = _window_panes_for_display(
+                current_panes, selected_window_ref, selected, selected_identity, is_current,
+            )
 
             mouse = _read_room_mouse(stdscr, key)
             if mouse:
-                mouse_x, mouse_y, double_click = mouse
+                mouse_x, mouse_y = mouse
                 screen_height, screen_width = stdscr.getmaxyx()
                 wide = screen_width >= 110 and screen_height >= 22
                 if wide:
@@ -1735,10 +1734,17 @@ def open_control_room(stdscr, tower) -> None:
                 if hit_panel is not None:
                     active_panel = hit_panel
                     if active_panel == 0:
-                        region = panel_regions(screen_width, screen_height)[0]
-                        body_y = region[1] + (1 if wide else 0)
-                        line_index = mouse_y - body_y + nav_scroll
-                        if 0 <= line_index < len(nav_items):
+                        region = hit_test_state.get("nav_region")
+                        if region is not None:
+                            x, y, region_width, region_height = region
+                            top = int(hit_test_state.get("nav_start", 0))
+                            line_index = mouse_y - y + top
+                        else:
+                            x = y = region_width = region_height = 0
+                            line_index = -1
+                        if (region is not None and x <= mouse_x < x + region_width
+                                and y <= mouse_y < y + region_height
+                                and 0 <= line_index < len(nav_items)):
                             target = nav_items[line_index]
                             cursor_key = target.get("node_key")
                             if target.get("kind") in {"window", "window_hidden", "window_disconnected"}:
@@ -1753,14 +1759,26 @@ def open_control_room(stdscr, tower) -> None:
                                     view_context = _context_for(chosen, target, tower)
                                 focus_scroll = pane_scroll = 0
                     elif active_panel == 1:
-                        region = panel_regions(screen_width, screen_height)[1]
-                        body_y = region[1] + (1 if wide else 1)
-                        index = (mouse_y - body_y) // 2 + pane_scroll
-                        if 0 <= index < len(center_rows):
+                        region = hit_test_state.get("pane_region")
+                        if region is not None:
+                            x, y, region_width, region_height = region
+                            top = int(hit_test_state.get("pane_start", 0))
+                            index = (mouse_y - y) // 2 + top
+                        else:
+                            x = y = region_width = region_height = 0
+                            index = -1
+                        if (region is not None and x <= mouse_x < x + region_width
+                                and y <= mouse_y < y + region_height
+                                and 0 <= index < len(center_rows)):
                             selected_key, selected_identity, original, cursor_key = _set_selection(center_rows[index])
                             focus_scroll = 0
-                    elif active_panel == 2 and double_click and is_current:
-                        _request_right_input(stdscr, tower, selected)
+                    elif active_panel == 2:
+                        region = hit_test_state.get("right_region")
+                        if region is not None:
+                            x, y, region_width, region_height = region
+                            if (x <= mouse_x < x + region_width
+                                    and y <= mouse_y < y + region_height):
+                                _request_right_handoff(stdscr, tower, selected, is_current)
                 needs_draw = True
                 continue
 
@@ -1831,13 +1849,8 @@ def open_control_room(stdscr, tower) -> None:
                     # Pane selection is distinct from activating input. This
                     # preserves the documented Tab → RIGHT → Enter fallback.
                     active_panel = 2
-                elif is_current:
-                    input_mode = True
-                    needs_draw = True
-                    _request_right_input(stdscr, tower, selected)
-                    input_mode = False
                 else:
-                    show_message_screen(stdscr, t("control_room.input_title"), [t("control_room.input_target_changed")])
+                    _request_right_handoff(stdscr, tower, selected, is_current)
                 needs_draw = True
                 continue
 
@@ -1916,11 +1929,7 @@ def open_control_room(stdscr, tower) -> None:
                 show_message_screen(stdscr, t("detail.result"), [message or t("control.no_result")])
                 needs_draw = True
     finally:
-        if mouse_enabled:
-            try:
-                curses.mousemask(0)
-            except curses.error:
-                pass
+        _restore_room_mouse(previous_mouse_mask)
         stdscr.timeout(200)
         try:
             store = _screen_store(tower)

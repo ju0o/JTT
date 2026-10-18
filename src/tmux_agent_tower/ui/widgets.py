@@ -397,6 +397,26 @@ def run_list_picker(
                 first_draw = False
             key_code = read_key(stdscr)
 
+            if key_code == getattr(curses, "KEY_MOUSE", object()):
+                try:
+                    _device, mouse_x, mouse_y, _z, mouse_state = curses.getmouse()
+                except (AttributeError, curses.error):
+                    continue
+                if (mouse_state & getattr(curses, "BUTTON1_DOUBLE_CLICKED", 0)
+                        or not mouse_state & getattr(curses, "BUTTON1_CLICKED", 0)):
+                    continue
+                inside_x = (
+                    left + 1 <= mouse_x < left + dialog_width - 1
+                    if use_dialog else 0 <= mouse_x < width
+                )
+                if inside_x and list_top <= mouse_y < list_top + max_rows:
+                    clicked_index = top + mouse_y - list_top
+                    if clicked_index < len(visible):
+                        selected_index = clicked_index
+                # A click only changes the highlight. Enter remains the
+                # explicit confirmation action; Esc remains available.
+                continue
+
             if editing_search:
                 if is_escape(key_code) or is_enter(key_code):
                     editing_search = False

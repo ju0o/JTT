@@ -192,6 +192,7 @@ def test_remote_and_self_rows_never_get_an_actionable_handoff_menu(monkeypatch):
     )
     assert "agent_handoff" not in [key for key, _label in items]
     assert "agent_handoff_unavailable" in [key for key, _label in items]
+    assert not any(key.startswith("right_input") for key, _label in items)
 
     self_row = _row(key="%1", pane_id="%1")
     tower = _tower(self_row)
@@ -218,6 +219,140 @@ def test_explicit_confirmation_cancel_does_not_validate_or_select(monkeypatch):
     result = control_room._open_action_menu(Screen(24, 80), tower, row, [], None, "pane")
 
     assert result is None
+
+
+def test_right_entry_cancel_is_focus_only_and_never_submits_agent_text(monkeypatch):
+    row = _row()
+    tower = _tower(row)
+    picks = []
+    monkeypatch.setattr(control_room, "run_list_picker", lambda *_a, **_kw: (
+        picks.append("confirm") or SimpleNamespace(cancelled=True, selected_key="cancel")
+    ))
+    monkeypatch.setattr(
+        control_room.control_actions, "handoff_focus_target",
+        lambda *_a: pytest.fail("cancel must not change tmux focus"),
+    )
+    monkeypatch.setattr(
+        control_room.control_actions, "submit_user_text_once",
+        lambda *_a: pytest.fail("Control Room must not send Agent text"),
+    )
+    monkeypatch.setattr(
+        control_room.control_actions, "send_prompt",
+        lambda *_a, **_kw: pytest.fail("Control Room must not relay Agent keys"),
+    )
+    monkeypatch.setattr(control_room, "show_message_screen", lambda *_a: None)
+
+    assert control_room._request_right_handoff(Screen(24, 80), tower, row, True) is None
+    assert picks == ["confirm"]
+
+
+def test_right_entry_stale_and_remote_are_rejected_without_confirmation(monkeypatch):
+    row = _row()
+    tower = _tower(row)
+    notices = []
+    monkeypatch.setattr(control_room, "run_list_picker", lambda *_a, **_kw: pytest.fail(
+        "stale and remote rows must not open a confirm picker"
+    ))
+    monkeypatch.setattr(control_room, "show_message_screen", lambda _s, _t, lines: notices.extend(lines))
+    monkeypatch.setattr(
+        control_room.control_actions, "handoff_focus_target",
+        lambda *_a: pytest.fail("rejected target must not change tmux focus"),
+    )
+
+    control_room._request_right_handoff(Screen(24, 80), tower, row, False)
+    remote = _row(remote=True, transport="remote_tmux", transport_target="asus")
+    control_room._request_right_handoff(Screen(24, 80), tower, remote, True)
+
+    assert notices == [
+        control_room.t("control_room.handoff_rejected"),
+        control_room.t("control_room.handoff_unavailable"),
+    ]
+
+
+def test_confirmed_right_entry_uses_existing_handoff_api_for_verified_local_pane(monkeypatch):
+    row = _row()
+    tower = _tower(row)
+    picks = []
+    handoffs = []
+    monkeypatch.setattr(control_room, "run_list_picker", lambda *_a, **_kw: (
+        picks.append(1) or SimpleNamespace(cancelled=False, selected_key="confirm")
+    ))
+    monkeypatch.setattr(
+        control_room.control_actions, "handoff_focus_target",
+        lambda selected_tower, selected_row: handoffs.append((selected_tower, selected_row))
+        or SimpleNamespace(status=actions.FocusHandoffStatus.FOCUSED,
+                           validation=_allowed(), stage="complete"),
+    )
+    monkeypatch.setattr(
+        control_room.control_actions, "submit_user_text_once",
+        lambda *_a: pytest.fail("Right handoff must not submit text"),
+    )
+
+    result = control_room._request_right_handoff(Screen(24, 80), tower, row, True)
+
+    assert result is actions.FocusHandoffStatus.FOCUSED
+    assert picks == [1]
+    assert handoffs == [(tower, row)]
+
+
+@pytest.mark.parametrize("entry", ["right_enter", "right_click"])
+def test_control_room_right_entry_uses_handoff_confirmation_not_input(monkeypatch, entry):
+    row = _row()
+    tower = _tower(row)
+    picker_calls = []
+    handoff_calls = []
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(control_room, "_enable_room_mouse", lambda: 0)
+    monkeypatch.setattr(control_room, "_restore_room_mouse", lambda _mask: None)
+    monkeypatch.setattr(control_room, "show_message_screen", lambda *_a: None)
+    monkeypatch.setattr(control_room, "run_list_picker", lambda *_a, **_kw: (
+        picker_calls.append(1) or SimpleNamespace(cancelled=True, selected_key="cancel")
+    ))
+    monkeypatch.setattr(
+        control_room.control_actions, "handoff_focus_target",
+        lambda *_a: handoff_calls.append(1) or pytest.fail("cancel must not focus"),
+    )
+    monkeypatch.setattr(
+        control_room.control_actions, "submit_user_text_once",
+        lambda *_a: pytest.fail("right entry must not submit Agent text"),
+    )
+
+    mouse_event = {}
+    if entry == "right_enter":
+        screen = Screen(24, 80, ["\t", "\t", "\n", "q"])
+    else:
+        screen = Screen(40, 120, [curses.KEY_MOUSE, curses.KEY_MOUSE, "q"])
+        original_draw = control_room.draw
+        state = {}
+        click_count = 0
+
+        def capture_draw(*args, **kwargs):
+            result = original_draw(*args, **kwargs)
+            state.update(kwargs["hit_test_state"])
+            return result
+
+        monkeypatch.setattr(control_room, "draw", capture_draw)
+        original_read_key = control_room.read_key
+
+        def read_key(current_screen):
+            nonlocal click_count
+            key = original_read_key(current_screen)
+            if key == curses.KEY_MOUSE:
+                click_count += 1
+                region = state["right_region"]
+                button_state = (curses.BUTTON1_CLICKED if click_count == 1
+                                else curses.BUTTON1_DOUBLE_CLICKED)
+                mouse_event["value"] = (0, region[0], region[1], 0, button_state)
+            return key
+
+        monkeypatch.setattr(control_room, "read_key", read_key)
+        monkeypatch.setattr(control_room.curses, "getmouse", lambda: mouse_event["value"])
+
+    control_room.open_control_room(screen, tower)
+    assert picker_calls == [1]
+    assert handoff_calls == []
+    assert screen.timeouts[-1] == 200
 
 
 def test_handoff_confirmation_defaults_to_cancel_on_wide_dialog(monkeypatch):

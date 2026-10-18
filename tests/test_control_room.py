@@ -70,6 +70,71 @@ class Screen:
         return next(self.keys)
 
 
+def _mouse_driven_room(monkeypatch, tower, keys, *, target_kind, target, resize_to=None):
+    """Drive an isolated fake curses loop and click a rendered identity."""
+    screen = Screen(40, 120)
+    hit_state = {}
+    original_draw = control_room.draw
+    mouse_event = {}
+    drawn_tiles = []
+
+    def capture_draw(*args, **kwargs):
+        result = original_draw(*args, **kwargs)
+        hit_state.clear()
+        hit_state.update(kwargs.get("hit_test_state") or {})
+        return result
+
+    def read_key(_screen):
+        key = next(keys)
+        if key == curses.KEY_RESIZE and resize_to is not None:
+            _screen.size = resize_to
+        if key == curses.KEY_MOUSE:
+            if target_kind == "window":
+                region = hit_state["nav_region"]
+                top = hit_state["nav_start"]
+                nav = control_room.window_navigation_lines(
+                    tower, control_room._visible_panes(tower),
+                    str(tower.visible_rows[0].get("window_ref") or ""),
+                )
+                index = next(i for i, line in enumerate(nav) if line.get("window_ref") == target)
+                mouse_event["value"] = (0, region[0], region[1] + index - top, 0,
+                                         curses.BUTTON1_CLICKED)
+            elif target_kind == "pane":
+                region = hit_state["pane_region"]
+                top = hit_state["pane_start"]
+                rows = [row for row in control_room._visible_panes(tower)
+                        if row.get("window_ref") == target[0]]
+                index = next(i for i, row in enumerate(rows)
+                             if control_room.pane_identity(row) == target[1])
+                mouse_event["value"] = (0, region[0], region[1] + (index - top) * 2, 0,
+                                         curses.BUTTON1_CLICKED)
+            else:
+                region = hit_state["right_region"]
+                mouse_event["value"] = (0, region[0], region[1], 0, curses.BUTTON1_CLICKED)
+        return key
+
+    monkeypatch.setattr(control_room, "draw", capture_draw)
+    monkeypatch.setattr(control_room, "read_key", read_key)
+    monkeypatch.setattr(control_room.curses, "getmouse", lambda: mouse_event["value"])
+    monkeypatch.setattr(control_room, "_enable_room_mouse", lambda: 0)
+    monkeypatch.setattr(control_room, "_restore_room_mouse", lambda _mask: None)
+    if target_kind == "right":
+        monkeypatch.setattr(control_room, "run_list_picker", lambda *_a, **_kw: SimpleNamespace(
+            cancelled=True, selected_key="cancel",
+        ))
+    monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(control_room.live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_room.live_view, "_draw_tile",
+                        lambda _screen, _tower, row, *_args: drawn_tiles.append(row.get("target_id")))
+    monkeypatch.setattr(control_room.control_actions, "submit_user_text_once",
+                        lambda *_a: pytest.fail("mouse navigation must never submit Agent text"))
+    monkeypatch.setattr(control_room.control_actions, "send_prompt",
+                        lambda *_a, **_kw: pytest.fail("mouse navigation must never relay Agent keys"))
+    control_room.open_control_room(screen, tower)
+    screen.drawn_tiles = drawn_tiles
+    return screen
+
+
 def _visible_width(text):
     return sum(2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
 
@@ -148,6 +213,189 @@ def test_project_tree_groups_exact_cross_host_window_refs_and_keeps_duplicate_pa
     assert pane_lines[0]["node_key"] != pane_lines[1]["node_key"]
     assert control_room._row_for_nav_line(pane_lines[0], [main, asus]) is asus
     assert control_room._scope_grid_rows(asus, [main, asus], [], project_line) == [asus, main]
+
+
+def _mouse_tower(rows, assets=None):
+    return SimpleNamespace(
+        rows=rows, visible_rows=rows, selected=0,
+        window_assets=assets or [], own_pane_id="%999", local_host="mainpc",
+        projects=SimpleNamespace(all=lambda: [], hidden_refs=lambda: set()),
+        work_groups=SimpleNamespace(all=lambda: []),
+        start_background_refresh=lambda: False, _apply_filter=lambda: None,
+    )
+
+
+def test_scrolled_window_mouse_hit_uses_rendered_start_and_selects_clicked_identity(monkeypatch):
+    rows = [_pane(f"%{index}", target=f"target-{index}", window_ref=f"window-{index}",
+                  window_id=f"@{index}", window_index=str(index), window_name=f"Window {index}")
+            for index in range(50)]
+    tower = _mouse_tower(rows)
+    nav = control_room.window_navigation_lines(tower, rows, rows[0]["window_ref"])
+    first = next(i for i, line in enumerate(nav) if line.get("window_ref") == rows[0]["window_ref"])
+    target = rows[-1]["window_ref"]
+    target_index = next(i for i, line in enumerate(nav) if line.get("window_ref") == target)
+    keys = iter([curses.KEY_DOWN] * (target_index - first) + [curses.KEY_MOUSE, "q"])
+
+    _mouse_driven_room(monkeypatch, tower, keys, target_kind="window", target=target)
+
+    assert tower.selected == len(rows) - 1
+
+
+def test_scrolled_pane_mouse_hit_uses_rendered_start_after_resize(monkeypatch):
+    window_ref = "pane-window"
+    rows = [_pane(f"%{index}", target=f"pane-target-{index}", pane_index=index,
+                  window_ref=window_ref, window_id="@1") for index in range(20)]
+    tower = _mouse_tower(rows)
+    target_identity = control_room.pane_identity(rows[-1])
+    keys = iter(["\t"] + [curses.KEY_DOWN] * (len(rows) - 1)
+                + [curses.KEY_RESIZE, curses.KEY_MOUSE, "q"])
+
+    _mouse_driven_room(
+        monkeypatch, tower, keys, target_kind="pane",
+        target=(window_ref, target_identity), resize_to=(24, 80),
+    )
+
+    assert tower.selected == len(rows) - 1
+
+
+def test_mouse_click_after_window_change_selects_first_pane_of_new_window(monkeypatch):
+    first = _pane("%1", target="first", window_ref="window-first", window_id="@1")
+    second = _pane("%2", target="second", window_ref="window-second", window_id="@2",
+                   window_name="Second")
+    rows = [first, second]
+    tower = _mouse_tower(rows)
+    screen = Screen(40, 120)
+    state = {}
+    mouse_event = {}
+    original_draw = control_room.draw
+
+    def capture_draw(*args, **kwargs):
+        result = original_draw(*args, **kwargs)
+        state.clear()
+        state.update(kwargs["hit_test_state"])
+        return result
+
+    events = iter([curses.KEY_MOUSE, "\t", curses.KEY_MOUSE, "q"])
+    click_count = 0
+
+    def read_key(_screen):
+        nonlocal click_count
+        key = next(events)
+        if key == curses.KEY_MOUSE:
+            click_count += 1
+            if click_count == 1:
+                nav = control_room.window_navigation_lines(tower, rows, first["window_ref"])
+                index = next(i for i, line in enumerate(nav)
+                             if line.get("window_ref") == second["window_ref"])
+                region = state["nav_region"]
+                y = region[1] + index - state["nav_start"]
+                mouse_event["value"] = (0, region[0], y, 0, curses.BUTTON1_CLICKED)
+            else:
+                region = state["pane_region"]
+                mouse_event["value"] = (0, region[0], region[1], 0, curses.BUTTON1_CLICKED)
+        return key
+
+    monkeypatch.setattr(control_room, "draw", capture_draw)
+    monkeypatch.setattr(control_room, "read_key", read_key)
+    monkeypatch.setattr(control_room.curses, "getmouse", lambda: mouse_event["value"])
+    monkeypatch.setattr(control_room, "_enable_room_mouse", lambda: 0)
+    monkeypatch.setattr(control_room, "_restore_room_mouse", lambda _mask: None)
+    monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(control_room.live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_room.live_view, "_draw_tile", lambda *_args: None)
+
+    control_room.open_control_room(screen, tower)
+
+    assert tower.selected == 1
+
+
+def test_same_window_name_on_different_hosts_clicks_exact_window_identity(monkeypatch):
+    main = _pane("%1", target="main-pane", window_ref="main-ref", window_id="@1",
+                 window_name="Shared", tmux_host="mainpc", execution_host="mainpc")
+    remote = _pane("%1", target="remote-pane", window_ref="remote-ref", window_id="@1",
+                   window_name="Shared", tmux_host="asus", execution_host="asus",
+                   remote=True, transport="remote_tmux", transport_target="asus")
+    tower = _mouse_tower([main, remote])
+
+    _mouse_driven_room(monkeypatch, tower, iter([curses.KEY_MOUSE, "q"]),
+                       target_kind="window", target="remote-ref")
+
+    assert tower.selected == 1
+
+
+def test_room_mouse_mask_is_restored_and_only_single_click_is_actionable(monkeypatch):
+    calls = []
+
+    def mousemask(mask):
+        calls.append(mask)
+        return (mask, 0x1234) if len(calls) == 1 else (mask, 0)
+
+    monkeypatch.setattr(control_room.curses, "mousemask", mousemask)
+    previous = control_room._enable_room_mouse()
+    control_room._restore_room_mouse(previous)
+    assert previous == 0x1234
+    assert calls == [curses.BUTTON1_CLICKED, 0x1234]
+
+    monkeypatch.setattr(control_room.curses, "getmouse", lambda: (0, 0, 2, 0, curses.BUTTON1_PRESSED))
+    assert control_room._read_room_mouse(None, curses.KEY_MOUSE) is None
+    monkeypatch.setattr(control_room.curses, "getmouse", lambda: (0, 0, 2, 0, curses.BUTTON1_DOUBLE_CLICKED))
+    assert control_room._read_room_mouse(None, curses.KEY_MOUSE) is None
+    monkeypatch.setattr(control_room.curses, "getmouse", lambda: (0, 0, 2, 0, curses.BUTTON1_CLICKED))
+    assert control_room._read_room_mouse(None, curses.KEY_MOUSE) == (0, 2)
+
+
+def test_control_room_restores_preexisting_curses_mouse_mask_on_exit(monkeypatch):
+    row = _pane("%3", pid="3003")
+    tower = _mouse_tower([row])
+    screen = Screen(24, 80, ["q"])
+    calls = []
+
+    def mousemask(mask):
+        calls.append(mask)
+        return curses.BUTTON1_CLICKED, 0x2468
+
+    monkeypatch.setattr(control_room.curses, "mousemask", mousemask)
+    monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(control_room.live_view.curses, "doupdate", lambda: None)
+
+    control_room.open_control_room(screen, tower)
+
+    assert calls == [curses.BUTTON1_CLICKED, 0x2468]
+
+
+def test_mouse_handoff_cancel_keeps_project_and_saved_screen_catalogs(monkeypatch):
+    row = _pane("%8", target="cancel-target", pid="8008", window_ref="window-cancel")
+    project_data = [{"project_id": "keep", "display_name": "Keep", "window_refs": ["window-cancel"]}]
+    screen_data = [{"screen_id": "saved", "name": "Keep screen"}]
+    project_store = SimpleNamespace(
+        all=lambda: project_data, hidden_refs=lambda: set(), memberships=lambda: {},
+    )
+
+    class ScreenStore:
+        corrupt = False
+
+        def last_view(self):
+            return None
+
+        def screens(self):
+            return screen_data
+
+        def templates(self):
+            return []
+
+        def save_last_view(self, *_args):
+            return None
+
+    tower = _mouse_tower([row])
+    tower.projects = project_store
+    tower.control_screens = ScreenStore()
+    project_before, screens_before = list(project_data), list(screen_data)
+
+    _mouse_driven_room(monkeypatch, tower, iter([curses.KEY_MOUSE, "q"]),
+                       target_kind="right", target=None)
+
+    assert project_data == project_before
+    assert screen_data == screens_before
 
 
 def test_hidden_and_disconnected_project_windows_remain_manageable_without_rebinding():
@@ -714,8 +962,7 @@ def test_space_menu_reopens_existing_saved_group_window_layout_and_settings_rout
     tower = SimpleNamespace(rows=[row], work_groups=SimpleNamespace(all=lambda: [group]))
     items = control_room.action_menu_items(row, has_group=True)
     assert [key for key, _label in items] == [
-        "screens", "group_live", "window_live", "layout_live", "copy", "right_input_unavailable",
-        "details", "settings",
+        "screens", "group_live", "window_live", "layout_live", "copy", "details", "settings",
         "agent_handoff",
     ]
 
@@ -1074,81 +1321,46 @@ def test_keyboard_center_selection_updates_right_live_within_selected_window(mon
     assert tower.selected == 1
 
 
-def test_right_input_cancel_and_remote_peer_never_call_submission(monkeypatch):
+def test_action_menu_never_offers_direct_text_submission():
     local = _pane("%4", target="local", auto_agent="Codex",
                    auto_agent_source="process", agent_process_alive=True)
     remote = _pane("%4", target="peer", remote=True, tmux_host="asus", execution_host="asus",
                    transport="remote_tmux", transport_target="asus", auto_agent="OpenCode")
     ssh_client = _pane("%5", target="ssh-client", transport="ssh", transport_target="asus",
                        auto_agent="Claude", auto_agent_source="process", agent_process_alive=True)
-    tower = SimpleNamespace(rows=[local])
-    shown = []
-    monkeypatch.setattr(control_room, "prompt_text", lambda *_a, **_k: "hello")
-    monkeypatch.setattr(control_room, "run_list_picker",
-                        lambda *_a, **_k: SimpleNamespace(cancelled=True, selected_key="cancel"))
-    monkeypatch.setattr(control_room.control_actions, "validate_focus_target",
-                        lambda *_a: control_room.control_actions.FocusTargetValidation(
-                            control_room.control_actions.FocusTargetStatus.ALLOWED, local["pane_id"],
-                            control_room.pane_identity(local),
-                        ))
-    monkeypatch.setattr(control_room.control_actions, "submit_user_text_once",
-                        lambda *_a: pytest.fail("cancelled text must not be sent"))
-    monkeypatch.setattr(control_room, "show_message_screen", lambda *_a: shown.append(True))
-
-    assert control_room._request_right_input(None, tower, local) is None
-    assert not shown
-    assert not control_room._right_input_candidate(remote)
-    assert not control_room._right_input_candidate(ssh_client)
-    assert "right_input_unavailable" in [key for key, _label in control_room.action_menu_items(remote)]
+    for row in (local, remote, ssh_client):
+        keys = [key for key, _label in control_room.action_menu_items(row)]
+        assert not any(key.startswith("right_input") for key in keys)
 
 
-def test_narrow_keyboard_can_reach_right_input_and_cancel_without_submission(monkeypatch):
-    row = _pane("%4", target="local", auto_agent="Codex", window_ref="window-a",
+def test_narrow_keyboard_right_enter_opens_cancelled_focus_handoff(monkeypatch):
+    row = _pane("%4", target="local", pid="4404", auto_agent="Codex", window_ref="window-a",
                 auto_agent_source="process", agent_process_alive=True)
     tower = SimpleNamespace(
         rows=[row], visible_rows=[row], selected=0,
+        own_pane_id="%99", local_host="mainpc",
         work_groups=SimpleNamespace(all=lambda: []),
         start_background_refresh=lambda: False,
     )
     screen = Screen(24, 80, ["\t", "\t", "\n", "q"])
-    prompts, pickers = [], []
+    pickers, focus = [], []
     monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
     monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
-    monkeypatch.setattr(control_room, "prompt_text", lambda *_a, **_k: prompts.append(True) or "hello")
-    monkeypatch.setattr(control_room.control_actions, "validate_focus_target",
-                        lambda *_a: control_room.control_actions.FocusTargetValidation(
-                            control_room.control_actions.FocusTargetStatus.ALLOWED, row["pane_id"],
-                            control_room.pane_identity(row),
-                        ))
     monkeypatch.setattr(control_room, "run_list_picker", lambda *_a, **_k: pickers.append(True)
                         or SimpleNamespace(cancelled=True, selected_key="cancel"))
     monkeypatch.setattr(control_room.control_actions, "submit_user_text_once",
-                        lambda *_a: pytest.fail("cancelled text must not be sent"))
+                        lambda *_a: pytest.fail("Control Room must not submit text"))
+    monkeypatch.setattr(control_room.control_actions, "handoff_focus_target",
+                        lambda *_a: focus.append(True) or pytest.fail("cancel must not focus"))
+    monkeypatch.setattr(control_room, "_enable_room_mouse", lambda: 0)
+    monkeypatch.setattr(control_room, "_restore_room_mouse", lambda _mask: None)
+    monkeypatch.setattr(control_room, "show_message_screen", lambda *_a: None)
 
     control_room.open_control_room(screen, tower)
 
-    assert len(prompts) == len(pickers) == 1
+    assert len(pickers) == 1
+    assert focus == []
     assert screen.timeouts[-1] == 200
-
-
-def test_right_input_refuses_stale_target_before_opening_composer(monkeypatch):
-    row = _pane("%4", target="local", auto_agent="Codex",
-                auto_agent_source="process", agent_process_alive=True)
-    tower = SimpleNamespace(rows=[row])
-    shown = []
-    monkeypatch.setattr(control_room.control_actions, "validate_focus_target",
-                        lambda *_a: control_room.control_actions.FocusTargetValidation(
-                            control_room.control_actions.FocusTargetStatus.STALE, row["pane_id"],
-                        ))
-    monkeypatch.setattr(control_room, "prompt_text",
-                        lambda *_a, **_k: pytest.fail("stale identity must block composer"))
-    monkeypatch.setattr(control_room, "show_message_screen",
-                        lambda _s, _title, lines: shown.extend(lines))
-
-    result = control_room._request_right_input(None, tower, row)
-
-    assert result is control_room.control_actions.TextSubmissionStatus.REFUSED
-    assert shown == ["Pane 신원이 바뀌었거나 확인되지 않아 전송하지 않았습니다."]
 
 
 def test_mouse_center_selection_updates_the_single_right_live(monkeypatch):
@@ -1162,19 +1374,12 @@ def test_mouse_center_selection_updates_the_single_right_live(monkeypatch):
         work_groups=SimpleNamespace(all=lambda: []),
         start_background_refresh=lambda: False,
     )
-    screen = Screen(40, 120, ["mouse", "q"])
-    shown = []
-    center = control_room.panel_regions(120, 40)[1]
-    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
-    monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
-    monkeypatch.setattr(control_room, "_read_room_mouse",
-                        lambda _screen, key: (center[0] + 1, center[1] + 1 + 2, False)
-                        if key == "mouse" else None)
-    monkeypatch.setattr(live_view, "_draw_tile", lambda _s, _t, row, *_a: shown.append(row["target_id"]))
+    screen = _mouse_driven_room(
+        monkeypatch, tower, iter([curses.KEY_MOUSE, "q"]), target_kind="pane",
+        target=("window-a", control_room.pane_identity(second)),
+    )
 
-    control_room.open_control_room(screen, tower)
-
-    assert shown == ["first", "second"]
+    assert screen.drawn_tiles[-1] == "second"
     assert tower.selected == 1
 
 
