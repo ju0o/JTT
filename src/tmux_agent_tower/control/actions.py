@@ -19,6 +19,7 @@ from enum import Enum
 from typing import List, Optional, Tuple
 
 from ..adapters.base import ResultCandidate
+from ..detection import identity as identity_detection
 from ..detection import process as process_detection
 from ..state.overrides import FIELDS as OVERRIDE_FIELDS, ROLE_IDS
 from ..detection.result import pane_result_identity
@@ -62,6 +63,15 @@ class FocusHandoffStatus(str, Enum):
     PARTIAL = "PARTIAL"
 
 
+class TextSubmissionStatus(str, Enum):
+    """One explicit user-text attempt into a freshly checked local Pane."""
+
+    SUBMITTED = "SUBMITTED"
+    PASTED_NOT_SUBMITTED = "PASTED_NOT_SUBMITTED"
+    REFUSED = "REFUSED"
+    FAILED = "FAILED"
+
+
 @dataclass(frozen=True)
 class FocusTargetValidation:
     """Read-only eligibility result; never a token that authorizes later focus."""
@@ -84,6 +94,13 @@ class FocusHandoffResult:
     stage: str = ""
 
 
+@dataclass(frozen=True)
+class TextSubmissionResult:
+    status: TextSubmissionStatus
+    validation: FocusTargetValidation
+    stage: str = ""
+
+
 _FOCUS_IDENTITY_FIELDS = (
     "target_id", "tmux_host", "session", "session_id", "window_id",
     "pane_id", "pane_pid", "transport", "transport_target",
@@ -97,7 +114,7 @@ def _focus_target_id(host: str, session: str, pane_id: str, pane_pid: str) -> st
     return hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()
 
 
-def validate_focus_target(tower, row: dict) -> FocusTargetValidation:
+def validate_focus_target(tower, row: dict, expected_agent: str = "") -> FocusTargetValidation:
     """Validate a row against the current local tmux/process snapshots.
 
     This is deliberately read-only. ``ALLOWED`` is a point-in-time result,
@@ -207,6 +224,18 @@ def validate_focus_target(tower, row: dict) -> FocusTargetValidation:
         return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
     cmdline_map = {str(pid): str(info.get("args") or "") for pid, info in processes.items()}
     ppid_map = {str(pid): str(info.get("ppid") or "") for pid, info in processes.items()}
+    if expected_agent:
+        # Only local Agent processes can be verified from this host's process
+        # table. An SSH client's live connection does not prove that an Agent
+        # still owns the remote terminal rather than a remote shell.
+        if transport != "local":
+            return FocusTargetValidation(FocusTargetStatus.REMOTE_UNSUPPORTED, pane_id)
+        _agent_pid, agent_args = identity_detection._deepest_agent(
+            pane_pid, cmdline_map, ppid_map,
+        )
+        observed_agent = identity_detection.agent_name_from_args(agent_args) or ""
+        if observed_agent.casefold() != str(expected_agent).strip().casefold():
+            return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
     actual_target, ssh_stale = find_ssh_client(pane_pid, cmdline_map, ppid_map)
     if transport == "local":
         if ssh_stale:
@@ -602,6 +631,43 @@ def submit_input(pane_id: str, key: str = "Enter") -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def submit_user_text_once(tower, row: dict, text: str) -> TextSubmissionResult:
+    """Paste and submit one user-authored line after two identity checks.
+
+    This does not relay arbitrary keyboard events. Validation is repeated
+    after paste and before the single Enter; a changed target is never retried.
+    A race between tmux validation and tmux's paste/send operation remains.
+    """
+
+    if (not isinstance(text, str) or not text.strip() or len(text) > MAX_PROMPT_CHARS
+            or any(ord(character) < 0x20 or ord(character) == 0x7f for character in text)):
+        return TextSubmissionResult(
+            TextSubmissionStatus.REFUSED,
+            FocusTargetValidation(FocusTargetStatus.UNVERIFIED), "invalid_text",
+        )
+    detected_name = str(row.get("auto_agent") or "").strip()
+    detected = detected_name.casefold()
+    if (detected not in {"codex", "claude", "opencode"}
+            or row.get("auto_agent_source") != "process"
+            or row.get("agent_process_alive") is not True
+            or row.get("transport") != "local"):
+        return TextSubmissionResult(
+            TextSubmissionStatus.REFUSED,
+            FocusTargetValidation(FocusTargetStatus.UNVERIFIED), "agent_not_supported",
+        )
+    first = validate_focus_target(tower, row, detected_name)
+    if not first.allowed:
+        return TextSubmissionResult(TextSubmissionStatus.REFUSED, first, "before_paste")
+    if not send_text(first.pane_id, text):
+        return TextSubmissionResult(TextSubmissionStatus.FAILED, first, "paste")
+    second = validate_focus_target(tower, row, detected_name)
+    if not second.allowed or second.identity != first.identity:
+        return TextSubmissionResult(TextSubmissionStatus.PASTED_NOT_SUBMITTED, second, "before_submit")
+    if not submit_input(first.pane_id, "Enter"):
+        return TextSubmissionResult(TextSubmissionStatus.PASTED_NOT_SUBMITTED, second, "submit")
+    return TextSubmissionResult(TextSubmissionStatus.SUBMITTED, second, "complete")
 
 
 def send_prompt_to_pane(pane_id: str, text: str, submit_key: str = "Enter") -> bool:

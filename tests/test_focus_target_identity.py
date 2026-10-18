@@ -85,6 +85,29 @@ def test_validates_exact_local_pane_without_focusing_or_sending(monkeypatch):
     assert result.pane_id == "%44"
 
 
+def test_text_submission_validation_requires_matching_live_agent_process(monkeypatch):
+    row = _row(transport="local")
+    processes = _processes()
+    processes["4401"] = {"ppid": "4400", "args": "codex"}
+    _install_snapshot(monkeypatch, row, processes=processes)
+
+    allowed = actions.validate_focus_target(_tower(row), row, "Codex")
+    assert allowed.status is actions.FocusTargetStatus.ALLOWED
+
+    processes["4401"] = {"ppid": "4400", "args": "claude"}
+    stale = actions.validate_focus_target(_tower(row), row, "Codex")
+    assert stale.status is actions.FocusTargetStatus.STALE
+
+
+def test_text_submission_validation_does_not_treat_ssh_client_as_local_agent(monkeypatch):
+    row = _row(transport="ssh", transport_target="asus")
+    _install_snapshot(monkeypatch, row, processes=_processes(ssh_destination="asus"))
+
+    result = actions.validate_focus_target(_tower(row), row, "Claude")
+
+    assert result.status is actions.FocusTargetStatus.REMOTE_UNSUPPORTED
+
+
 @pytest.mark.parametrize(
     ("physical_changes", "expected"),
     [

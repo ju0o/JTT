@@ -169,7 +169,7 @@ def test_hidden_and_disconnected_project_windows_remain_manageable_without_rebin
     assert not any(line.get("row") is replacement and line.get("project_id") for line in hidden_lines)
 
 
-def test_project_selection_scopes_center_grid_and_right_live_to_same_snapshot(monkeypatch):
+def test_project_selection_never_expands_center_or_right_into_other_windows(monkeypatch):
     main_ref, asus_ref = "e" * 64, "f" * 64
     main = _pane("%1", target="main-target", window_ref=main_ref,
                  tmux_host="mainpc", execution_host="mainpc", live_lines=["MAIN_ONLY"])
@@ -198,7 +198,7 @@ def test_project_selection_scopes_center_grid_and_right_live_to_same_snapshot(mo
     )
 
     assert result is True
-    assert drawn == ["asus-target", "main-target", "main-target"]
+    assert drawn == ["main-target"]
 
 
 def test_final_draw_uses_project_navigation_model_and_hides_empty_project_section(monkeypatch):
@@ -239,7 +239,7 @@ def test_final_draw_uses_project_navigation_model_and_hides_empty_project_sectio
     drawn_text = "\n".join(text for _y, _x, text, _attr in screen.writes)
     assert "실제 저장 프로젝트" in drawn_text
     assert "숨긴 창" in drawn_text
-    assert t("project_manage.disconnected") in drawn_text
+    assert "연결 안 됨" in drawn_text
 
 
 @pytest.mark.parametrize("height,width", [(18, 60), (24, 80), (40, 120)])
@@ -287,59 +287,27 @@ def test_project_window_visibility_excludes_project_panes_but_keeps_management_a
     )][-4:] == ["projects", "details", "settings", "agent_handoff"]
 
 
-def test_project_creation_and_keyboard_navigation_keep_grid_and_focus_on_exact_remote_pane(
-    monkeypatch, tmp_path,
-):
-    from tmux_agent_tower.state.projects import ProjectStore
-    from tmux_agent_tower.ui import projects as project_ui
-
+def test_keyboard_window_navigation_keeps_cross_host_pane_identity(monkeypatch):
     main_ref, asus_ref = "3" * 64, "4" * 64
     main = _pane("%1", target="main-target", window_ref=main_ref,
                  tmux_host="mainpc", execution_host="mainpc", live_lines=["MAIN_ONLY"])
     asus = _pane("%1", target="asus-target", window_ref=asus_ref,
                  tmux_host="asus", execution_host="asus", remote=True,
                  transport="remote_tmux", transport_target="asus", live_lines=["ASUS_ONLY"])
-    store = ProjectStore(tmp_path / "projects.json")
     tower = SimpleNamespace(
         rows=[main, asus], visible_rows=[main, asus], selected=0,
         window_assets=[
             {"window_ref": main_ref, "display_name": "Main", "tmux_host": "mainpc"},
             {"window_ref": asus_ref, "display_name": "ASUS", "tmux_host": "asus"},
         ],
-        projects=store, work_groups=SimpleNamespace(all=lambda: []),
+        projects=SimpleNamespace(all=lambda: [], hidden_refs=lambda: set()),
+        work_groups=SimpleNamespace(all=lambda: []),
         start_background_refresh=lambda: False, _apply_filter=lambda: None,
     )
-    screen = Screen(40, 120, [" "])
+    screen = Screen(40, 120, [curses.KEY_DOWN, curses.KEY_DOWN, "\t", "\t", "q"])
     monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
     monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
-    monkeypatch.setattr(
-        control_room, "run_list_picker",
-        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="projects"),
-    )
-    monkeypatch.setattr(
-        project_ui, "run_list_picker",
-        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="create"),
-    )
-    monkeypatch.setattr(project_ui, "prompt_text", lambda *_args, **_kwargs: "Cross-host project")
     selected_tiles = []
-
-    def add_remote_window(stdscr, current_tower, project_id):
-        store.add_windows(project_id, [asus_ref])
-        nav = control_room.navigation_lines(
-            [main, asus], main["key"], control_room.pane_identity(main),
-            projects=store.all(), window_assets=tower.window_assets,
-            hidden_refs=store.hidden_refs(),
-        )
-        current_cursor = next(i for i, line in enumerate(nav)
-                              if line["kind"] == "pane" and line.get("row") is main
-                              and not line.get("project_id"))
-        target_cursor = next(i for i, line in enumerate(nav)
-                             if line["kind"] == "pane" and line.get("row") is main
-                             and line.get("project_id") == project_id)
-        screen.keys = iter([curses.KEY_DOWN] * (target_cursor - current_cursor)
-                           + ["\t", curses.KEY_DOWN, "q"])
-
-    monkeypatch.setattr(project_ui, "open_project_editor", add_remote_window)
     monkeypatch.setattr(
         live_view, "_draw_tile",
         lambda _screen, _tower, row, _index, _y, x, *_args: selected_tiles.append(
@@ -349,17 +317,9 @@ def test_project_creation_and_keyboard_navigation_keep_grid_and_focus_on_exact_r
 
     control_room.open_control_room(screen, tower)
 
-    assert store.all()[0]["display_name"] == "Cross-host project"
-    assert store.all()[0]["window_refs"] == [main_ref, asus_ref]
-    center_x = control_room.panel_regions(120, 40)[1][0]
     right_x = control_room.panel_regions(120, 40)[2][0]
-    assert [target for target, _x in selected_tiles[-3:]] == [
-        "main-target", "asus-target", "asus-target",
-    ]
-    assert all(center_x <= x < right_x for _target, x in selected_tiles[-3:-1])
-    assert selected_tiles[-1][1] == right_x
-    drawn_text = "\n".join(text for _y, _x, text, _attr in screen.writes)
-    assert "Cross-host project" in drawn_text
+    assert selected_tiles[-1] == ("asus-target", right_x)
+    assert tower.selected == 1
 
 
 def test_hidden_and_disconnected_project_windows_accept_arrow_enter_and_space(monkeypatch):
@@ -485,7 +445,7 @@ def test_reused_pane_id_with_new_pid_is_stale_and_old_output_is_hidden():
 
 
 @pytest.mark.parametrize("height,width", [(18, 60), (24, 80), (40, 100), (40, 120)])
-def test_fake_viewports_render_three_read_only_panels_without_fresh_capture(monkeypatch, height, width):
+def test_fake_viewports_render_window_panel_without_fresh_capture(monkeypatch, height, width):
     rows = [_pane("%1", pane_index=0), _pane("%2", pane_index=1)]
     selected = rows[1]
     tower = SimpleNamespace(rows=rows)
@@ -502,25 +462,30 @@ def test_fake_viewports_render_three_read_only_panels_without_fresh_capture(monk
     ) is True
 
     frame = "\n".join(text for _y, _x, text, _attr in screen.writes)
-    assert "작업 위치" in frame
-    assert "관련 Pane LIVE" in frame
-    assert "선택한 작업 LIVE" in frame
-    assert "Task %2" in frame
-    assert "한국어 출력" in frame
+    assert "폴더 · Window" in frame
+    if width >= 110 and height >= 22:
+        assert "선택 Window의 Pane" in frame
+        assert "선택 Pane LIVE" in frame
+        assert "Task %2" in frame
+        assert "한국어 출력" in frame
+    else:
+        assert "Tab/Shift+Tab" in frame
+        assert "Task %2" not in frame
+        assert "한국어 출력" not in frame
     assert "Shift+Tab" in frame
     assert "Space" in frame
-    assert "Y 최신 답변 복사" in frame
+    assert "Y 최신 답변 복사" not in frame  # Footer guidance is contextual; Y remains available.
     assert all(0 <= y < height and 0 <= x < width for y, x, _text, _attr in screen.writes)
     assert all(x + _visible_width(text) <= width for _y, x, text, _attr in screen.writes)
 
 
-def test_wide_view_uses_side_by_side_panels_but_short_view_stacks_them():
+def test_wide_view_uses_three_columns_but_narrow_view_reuses_one_panel():
     wide = control_room.panel_regions(120, 40)
     short = control_room.panel_regions(120, 18)
 
     assert len(wide) == len(short) == 3
     assert len({region[1] for region in wide}) == 1
-    assert short[0][1] < short[1][1] < short[2][1]
+    assert short[0] == short[1] == short[2]
 
 
 @pytest.mark.parametrize(
@@ -545,7 +510,7 @@ def test_remote_peer_live_is_reported_unavailable_without_capture(monkeypatch):
     )
 
     assert control_room.draw(
-        screen, tower, "%2", control_room.pane_identity(remote), remote,
+        screen, tower, "%2", control_room.pane_identity(remote), remote, active_panel=2,
     ) is True
     frame = "\n".join(text for _y, _x, text, _attr in screen.writes)
     assert "실시간 화면을 사용할 수 없습니다." in frame
@@ -571,7 +536,7 @@ def test_arrow_selection_syncs_identity_and_y_reuses_existing_copy_handler(monke
             return False
 
     tower = Tower()
-    screen = Screen(24, 80, [curses.KEY_DOWN, "y", "q"])
+    screen = Screen(24, 80, ["\t", curses.KEY_DOWN, "y", "q"])
     copied = []
     monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
     monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
@@ -607,7 +572,7 @@ def test_y_is_refused_after_refresh_reuses_selected_pane_id(monkeypatch):
             return True
 
     tower = Tower()
-    screen = Screen(24, 80, ["y", "q"])
+    screen = Screen(24, 80, ["\t", "y", "q"])
     copied = []
     notices = []
     monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
@@ -652,9 +617,9 @@ def test_tab_and_shift_tab_switch_panels_without_changing_selected_pane_identity
 
 
 def test_active_panel_is_reverse_highlighted_and_right_arrows_scroll_snapshot_only(monkeypatch):
-    row = _pane("%6", live_lines=[f"LINE_{index}" for index in range(12)])
+    row = _pane("%6", live_lines=[f"LINE_{index}" for index in range(40)])
     tower = SimpleNamespace(rows=[row])
-    screen = Screen(24, 80)
+    screen = Screen(40, 120)
     monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
     monkeypatch.setattr(control_room.curses, "has_colors", lambda: False)
     assert control_room.draw(
@@ -662,8 +627,8 @@ def test_active_panel_is_reverse_highlighted_and_right_arrows_scroll_snapshot_on
         active_panel=1,
         cursor_key=("pane", control_room.pane_identity(row)),
     ) is True
-    center_x = control_room.panel_regions(80, 24)[1][0]
-    center_heading = next(item for item in screen.writes if item[0] == 8 and item[1] == center_x)
+    center_x = control_room.panel_regions(120, 40)[1][0]
+    center_heading = next(item for item in screen.writes if item[0] == 2 and item[1] == center_x)
     assert center_heading[3] & curses.A_REVERSE
 
     tower = SimpleNamespace(
@@ -706,7 +671,7 @@ def test_center_selection_updates_the_read_only_focus_panel(monkeypatch):
     assert "LIVE_FIRST_ONLY" not in right_text
 
 
-def test_left_tree_can_select_and_collapse_a_group_without_persisting_it(monkeypatch):
+def test_left_window_navigation_does_not_expose_work_group_panes(monkeypatch):
     first = _pane("%1", target="one", work_group_id="g1", work_group_name="Saved group")
     second = _pane("%2", target="two", pane_index=1, work_group_id="g1", work_group_name="Saved group")
     group = {"group_id": "g1", "member_order": ["one", "two"], "layout": "split-2"}
@@ -716,7 +681,7 @@ def test_left_tree_can_select_and_collapse_a_group_without_persisting_it(monkeyp
         work_groups=SimpleNamespace(all=lambda: [group]),
         start_background_refresh=lambda: False,
     )
-    screen = Screen(24, 80, [curses.KEY_LEFT, "\n", "q"])
+    screen = Screen(24, 80, ["\t", "q"])
     frames = []
     original_draw = control_room.draw
 
@@ -731,13 +696,9 @@ def test_left_tree_can_select_and_collapse_a_group_without_persisting_it(monkeyp
 
     control_room.open_control_room(screen, tower)
 
-    group_node = next(
-        line["node_key"] for line in control_room.navigation_lines(
-            [first, second], "%1", control_room.pane_identity(first),
-        ) if line["kind"] == "project"
-    )
-    assert frames[1][0] == group_node
-    assert group_node in frames[2][1]
+    assert not any(line["kind"] == "pane" for line in control_room.window_navigation_lines(
+        tower, [first, second], ""
+    ))
     assert tower.selected == 0
     assert group == before
 
@@ -753,7 +714,8 @@ def test_space_menu_reopens_existing_saved_group_window_layout_and_settings_rout
     tower = SimpleNamespace(rows=[row], work_groups=SimpleNamespace(all=lambda: [group]))
     items = control_room.action_menu_items(row, has_group=True)
     assert [key for key, _label in items] == [
-        "screens", "group_live", "window_live", "layout_live", "copy", "details", "settings",
+        "screens", "group_live", "window_live", "layout_live", "copy", "right_input_unavailable",
+        "details", "settings",
         "agent_handoff",
     ]
 
@@ -786,7 +748,7 @@ def test_space_key_opens_visible_one_step_menu_for_selected_window_live(monkeypa
         work_groups=SimpleNamespace(all=lambda: []),
         start_background_refresh=lambda: False,
     )
-    screen = Screen(24, 80, [" ", "q"])
+    screen = Screen(24, 80, ["\t", " ", "q"])
     picked = []
     routed = []
     monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
@@ -893,7 +855,7 @@ def test_enter_on_pane_details_is_metadata_only():
     assert not any("PRIVATE_TERMINAL_BODY" in line for line in lines)
 
 
-def test_enter_from_control_room_opens_metadata_details_not_agent_input(monkeypatch):
+def test_enter_from_window_panel_does_not_send_agent_input(monkeypatch):
     from tmux_agent_tower.ui import control_view
 
     row = _pane("%8", live_lines=["PRIVATE_AGENT_OUTPUT"])
@@ -917,7 +879,7 @@ def test_enter_from_control_room_opens_metadata_details_not_agent_input(monkeypa
 
     control_room.open_control_room(screen, tower)
 
-    assert shown and shown[0][0] == "현재 작업 상세"
+    assert not shown
     assert not any("PRIVATE_AGENT_OUTPUT" in line for _title, lines in shown for line in lines)
 
 
@@ -937,3 +899,304 @@ def test_group_header_scope_uses_saved_member_order_without_changing_store():
 
     assert [row["target_id"] for row in scoped] == ["second", "first"]
     assert group == before
+
+
+def test_window_navigation_is_folder_first_and_never_duplicates_panes_or_cross_host_keys(tmp_path):
+    from tmux_agent_tower.state.folders import FolderStore
+    from tmux_agent_tower.state.projects import ProjectStore
+
+    local_ref, peer_ref = "a" * 64, "b" * 64
+    local = _pane("%1", target="local-1", window_ref=local_ref,
+                  transport="ssh", transport_target="asus", auto_agent="Codex")
+    peer = _pane("%1", target="peer-1", window_ref=peer_ref, remote=True,
+                 tmux_host="asus", execution_host="asus", transport="remote_tmux",
+                 transport_target="asus", auto_agent="OpenCode")
+    folders = FolderStore(tmp_path / "folders.json")
+    folder = folders.create("업무 폴더")
+    folders.move_window(local_ref, folder["folder_id"])
+    projects = ProjectStore(tmp_path / "projects.json")
+    project = projects.create("Remote project", [local_ref, peer_ref])
+    tower = SimpleNamespace(
+        rows=[local, peer], folders=folders, projects=projects,
+        window_assets=[
+            {"window_ref": local_ref, "display_name": "MainPC Window", "tmux_host": "mainpc"},
+            {"window_ref": peer_ref, "display_name": "ASUS Window", "tmux_host": "asus", "remote": True},
+        ],
+    )
+
+    lines = control_room.window_navigation_lines(tower, [local, peer])
+    windows = [line for line in lines if line["kind"].startswith("window")]
+
+    assert [line["window_ref"] for line in windows] == [local_ref, peer_ref]
+    assert not any(line["kind"] == "pane" for line in lines)
+    assert "MainPC SSH 창 → asus" in windows[0]["text"]
+    assert "ASUS 원격 Window" in windows[1]["text"]
+    assert "폴더 업무 폴더" in windows[0]["text"]
+    assert project["project_id"] in [line.get("project_id") for line in windows]
+    assert control_room.pane_identity(windows[0]["member_rows"][0]) != control_room.pane_identity(
+        windows[1]["member_rows"][0]
+    )
+
+
+def test_collapsed_folder_and_project_keep_disconnected_window_references_hidden(tmp_path):
+    from tmux_agent_tower.state.folders import FolderStore
+    from tmux_agent_tower.state.projects import ProjectStore
+
+    folder_ref, project_ref = "c" * 64, "d" * 64
+    folders = FolderStore(tmp_path / "folders.json")
+    folder = folders.create("Closed folder")
+    folders.move_window(folder_ref, folder["folder_id"])
+    folders.toggle_folder(folder["folder_id"])
+    projects = ProjectStore(tmp_path / "projects.json")
+    project = projects.create("Closed project", [project_ref])
+    projects.toggle_project(project["project_id"])
+    tower = SimpleNamespace(rows=[], folders=folders, projects=projects, window_assets=[])
+
+    lines = control_room.window_navigation_lines(tower, [])
+
+    assert not any(line.get("window_ref") in {folder_ref, project_ref} for line in lines)
+    assert all(line["kind"] != "pane" for line in lines)
+
+    projects.toggle_project(project["project_id"])
+    expanded = control_room.window_navigation_lines(tower, [])
+    disconnected = [line for line in expanded if line["kind"] == "window_disconnected"]
+    assert [line["window_ref"] for line in disconnected] == [project_ref]
+
+
+def test_window_navigation_fold_changes_use_existing_folder_and_project_stores(tmp_path):
+    from tmux_agent_tower.state.folders import FolderStore
+    from tmux_agent_tower.state.projects import ProjectStore
+
+    folder_ref, project_ref = "e" * 64, "f" * 64
+    folders = FolderStore(tmp_path / "folders.json")
+    folder = folders.create("Folder")
+    folders.move_window(folder_ref, folder["folder_id"])
+    projects = ProjectStore(tmp_path / "projects.json")
+    project = projects.create("Project", [project_ref])
+    tower = SimpleNamespace(rows=[], folders=folders, projects=projects, window_assets=[])
+    collapsed = control_room._initial_navigation_collapsed(tower)
+
+    for kind, key, item_id in (
+        ("folder_header", ("folder", folder["folder_id"]), folder["folder_id"]),
+        ("project_header", ("project", project["project_id"]), project["project_id"]),
+    ):
+        store = folders if kind == "folder_header" else projects
+        line = {"kind": kind, "node_key": key,
+                "folder_id" if kind == "folder_header" else "project_id": item_id}
+        assert control_room._set_navigation_collapsed(tower, line, collapsed, True)
+        assert item_id in {item.get("folder_id") or item.get("project_id")
+                           for item in store.all() if item.get("collapsed")}
+        assert control_room._set_navigation_collapsed(tower, line, collapsed, False)
+        assert item_id not in {item.get("folder_id") or item.get("project_id")
+                               for item in store.all() if item.get("collapsed")}
+
+
+def test_final_draw_lists_only_selected_window_panes_and_one_live_tile(monkeypatch):
+    first_ref, second_ref = "c" * 64, "d" * 64
+    first = _pane("%1", target="first", window_ref=first_ref,
+                  display_name="창 A 작업", live_lines=["FIRST_PRIVATE_OUTPUT"])
+    first_peer = _pane("%2", target="first-peer", pane_index=1, window_ref=first_ref,
+                       display_name="창 A 보조", live_lines=["PEER_PRIVATE_OUTPUT"])
+    second = _pane("%1", target="other-host", window_ref=second_ref,
+                   tmux_host="asus", execution_host="asus", remote=True,
+                   transport="remote_tmux", transport_target="asus",
+                   display_name="창 B 작업", live_lines=["OTHER_WINDOW_OUTPUT"])
+    tower = SimpleNamespace(rows=[first, first_peer, second], window_assets=[
+        {"window_ref": first_ref, "display_name": "MainPC 창 A", "tmux_host": "mainpc"},
+        {"window_ref": second_ref, "display_name": "ASUS 창 B", "tmux_host": "asus", "remote": True},
+    ], projects=SimpleNamespace(all=lambda: [], hidden_refs=lambda: set()))
+    screen = Screen(40, 120)
+    tiles = []
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(live_view, "_draw_tile", lambda _s, _t, row, *_a: tiles.append(row["target_id"]))
+
+    assert control_room.draw(
+        screen, tower, first["key"], control_room.pane_identity(first), first,
+        selected_window_ref=first_ref,
+    ) is True
+
+    frame = "\n".join(text for _y, _x, text, _attr in screen.writes)
+    assert "창 A 작업" in frame and "창 A 보조" in frame
+    assert "창 B 작업" not in frame
+    assert "FIRST_PRIVATE_OUTPUT" not in frame
+    assert "PEER_PRIVATE_OUTPUT" not in frame
+    assert tiles == ["first"]
+
+
+def test_switching_to_empty_window_hides_old_live_and_shows_disconnected_placeholder(monkeypatch):
+    previous = _pane("%1", target="previous", window_ref="window-previous",
+                     live_lines=["OLD_PRIVATE_OUTPUT"])
+    tower = SimpleNamespace(
+        rows=[previous], window_assets=[
+            {"window_ref": "window-previous", "display_name": "이전 창"},
+            {"window_ref": "window-empty", "display_name": "연결 끊긴 창"},
+        ], projects=SimpleNamespace(all=lambda: [], hidden_refs=lambda: set()),
+    )
+    screen = Screen(40, 120)
+    tiles = []
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(live_view, "_draw_tile", lambda _s, _t, row, *_a: tiles.append(dict(row)))
+
+    control_room.draw(
+        screen, tower, previous["key"], control_room.pane_identity(previous), previous,
+        selected_window_ref="window-empty",
+    )
+
+    frame = "\n".join(text for _y, _x, text, _attr in screen.writes)
+    assert "이 Window에는 연결된 Pane이 없습니다." in frame
+    assert tiles[0]["display_name"] == "연결 끊긴 창"
+    assert tiles[0]["live_lines"]
+    assert "OLD_PRIVATE_OUTPUT" not in " ".join(tiles[0]["live_lines"])
+
+
+def test_keyboard_center_selection_updates_right_live_within_selected_window(monkeypatch):
+    ref_a, ref_b = "e" * 64, "f" * 64
+    first = _pane("%1", target="one", window_ref=ref_a, live_lines=["LIVE_ONE"])
+    second = _pane("%2", target="two", pane_index=1, window_ref=ref_a, live_lines=["LIVE_TWO"])
+    other = _pane("%3", target="other", window_ref=ref_b, live_lines=["LIVE_OTHER"])
+    tower = SimpleNamespace(
+        rows=[first, second, other], visible_rows=[first, second, other], selected=0,
+        window_assets=[{"window_ref": ref_a, "display_name": "Window A"},
+                       {"window_ref": ref_b, "display_name": "Window B"}],
+        projects=SimpleNamespace(all=lambda: [], hidden_refs=lambda: set()),
+        work_groups=SimpleNamespace(all=lambda: []), start_background_refresh=lambda: False,
+    )
+    screen = Screen(40, 120, ["\t", curses.KEY_DOWN, "q"])
+    shown = []
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(live_view, "_draw_tile", lambda _s, _t, row, *_a: shown.append(row["target_id"]))
+
+    control_room.open_control_room(screen, tower)
+
+    assert shown[-1] == "two"
+    assert "other" not in shown
+    assert tower.selected == 1
+
+
+def test_right_input_cancel_and_remote_peer_never_call_submission(monkeypatch):
+    local = _pane("%4", target="local", auto_agent="Codex",
+                   auto_agent_source="process", agent_process_alive=True)
+    remote = _pane("%4", target="peer", remote=True, tmux_host="asus", execution_host="asus",
+                   transport="remote_tmux", transport_target="asus", auto_agent="OpenCode")
+    ssh_client = _pane("%5", target="ssh-client", transport="ssh", transport_target="asus",
+                       auto_agent="Claude", auto_agent_source="process", agent_process_alive=True)
+    tower = SimpleNamespace(rows=[local])
+    shown = []
+    monkeypatch.setattr(control_room, "prompt_text", lambda *_a, **_k: "hello")
+    monkeypatch.setattr(control_room, "run_list_picker",
+                        lambda *_a, **_k: SimpleNamespace(cancelled=True, selected_key="cancel"))
+    monkeypatch.setattr(control_room.control_actions, "validate_focus_target",
+                        lambda *_a: control_room.control_actions.FocusTargetValidation(
+                            control_room.control_actions.FocusTargetStatus.ALLOWED, local["pane_id"],
+                            control_room.pane_identity(local),
+                        ))
+    monkeypatch.setattr(control_room.control_actions, "submit_user_text_once",
+                        lambda *_a: pytest.fail("cancelled text must not be sent"))
+    monkeypatch.setattr(control_room, "show_message_screen", lambda *_a: shown.append(True))
+
+    assert control_room._request_right_input(None, tower, local) is None
+    assert not shown
+    assert not control_room._right_input_candidate(remote)
+    assert not control_room._right_input_candidate(ssh_client)
+    assert "right_input_unavailable" in [key for key, _label in control_room.action_menu_items(remote)]
+
+
+def test_narrow_keyboard_can_reach_right_input_and_cancel_without_submission(monkeypatch):
+    row = _pane("%4", target="local", auto_agent="Codex", window_ref="window-a",
+                auto_agent_source="process", agent_process_alive=True)
+    tower = SimpleNamespace(
+        rows=[row], visible_rows=[row], selected=0,
+        work_groups=SimpleNamespace(all=lambda: []),
+        start_background_refresh=lambda: False,
+    )
+    screen = Screen(24, 80, ["\t", "\t", "\n", "q"])
+    prompts, pickers = [], []
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(control_room, "prompt_text", lambda *_a, **_k: prompts.append(True) or "hello")
+    monkeypatch.setattr(control_room.control_actions, "validate_focus_target",
+                        lambda *_a: control_room.control_actions.FocusTargetValidation(
+                            control_room.control_actions.FocusTargetStatus.ALLOWED, row["pane_id"],
+                            control_room.pane_identity(row),
+                        ))
+    monkeypatch.setattr(control_room, "run_list_picker", lambda *_a, **_k: pickers.append(True)
+                        or SimpleNamespace(cancelled=True, selected_key="cancel"))
+    monkeypatch.setattr(control_room.control_actions, "submit_user_text_once",
+                        lambda *_a: pytest.fail("cancelled text must not be sent"))
+
+    control_room.open_control_room(screen, tower)
+
+    assert len(prompts) == len(pickers) == 1
+    assert screen.timeouts[-1] == 200
+
+
+def test_right_input_refuses_stale_target_before_opening_composer(monkeypatch):
+    row = _pane("%4", target="local", auto_agent="Codex",
+                auto_agent_source="process", agent_process_alive=True)
+    tower = SimpleNamespace(rows=[row])
+    shown = []
+    monkeypatch.setattr(control_room.control_actions, "validate_focus_target",
+                        lambda *_a: control_room.control_actions.FocusTargetValidation(
+                            control_room.control_actions.FocusTargetStatus.STALE, row["pane_id"],
+                        ))
+    monkeypatch.setattr(control_room, "prompt_text",
+                        lambda *_a, **_k: pytest.fail("stale identity must block composer"))
+    monkeypatch.setattr(control_room, "show_message_screen",
+                        lambda _s, _title, lines: shown.extend(lines))
+
+    result = control_room._request_right_input(None, tower, row)
+
+    assert result is control_room.control_actions.TextSubmissionStatus.REFUSED
+    assert shown == ["Pane 신원이 바뀌었거나 확인되지 않아 전송하지 않았습니다."]
+
+
+def test_mouse_center_selection_updates_the_single_right_live(monkeypatch):
+    first = _pane("%1", target="first", window_ref="window-a", live_lines=["FIRST_LIVE"])
+    second = _pane("%2", target="second", pane_index=1, window_ref="window-a",
+                   live_lines=["SECOND_LIVE"])
+    tower = SimpleNamespace(
+        rows=[first, second], visible_rows=[first, second], selected=0,
+        window_assets=[{"window_ref": "window-a", "display_name": "Window A"}],
+        projects=SimpleNamespace(all=lambda: [], hidden_refs=lambda: set()),
+        work_groups=SimpleNamespace(all=lambda: []),
+        start_background_refresh=lambda: False,
+    )
+    screen = Screen(40, 120, ["mouse", "q"])
+    shown = []
+    center = control_room.panel_regions(120, 40)[1]
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(control_room.live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(control_room, "_read_room_mouse",
+                        lambda _screen, key: (center[0] + 1, center[1] + 1 + 2, False)
+                        if key == "mouse" else None)
+    monkeypatch.setattr(live_view, "_draw_tile", lambda _s, _t, row, *_a: shown.append(row["target_id"]))
+
+    control_room.open_control_room(screen, tower)
+
+    assert shown == ["first", "second"]
+    assert tower.selected == 1
+
+
+@pytest.mark.parametrize("height,width", [(24, 80), (22, 110), (40, 120)])
+def test_window_pane_live_layout_keeps_all_writes_inside_viewport(monkeypatch, height, width):
+    ref = "9" * 64
+    rows = [_pane(f"%{index}", target=f"target-{index}", pane_index=index,
+                  window_ref=ref, display_name=f"업무 작업 {index}",
+                  live_lines=[f"LIVE_{index}"]) for index in range(1, 7)]
+    tower = SimpleNamespace(
+        rows=rows, window_assets=[{"window_ref": ref, "display_name": "한국어 작업 창"}],
+        projects=SimpleNamespace(all=lambda: [], hidden_refs=lambda: set()),
+    )
+    screen = Screen(height, width)
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(live_view, "_draw_tile", lambda *_args: None)
+
+    assert control_room.draw(
+        screen, tower, rows[0]["key"], control_room.pane_identity(rows[0]), rows[0],
+        selected_window_ref=ref, active_panel=1,
+    ) is True
+    assert all(0 <= y < height and 0 <= x < width for y, x, _text, _attr in screen.writes)
+    assert all(x + _visible_width(text) <= width for _y, x, text, _attr in screen.writes)
+    frame = "\n".join(text for _y, _x, text, _attr in screen.writes)
+    assert "업무 작업 6" in frame

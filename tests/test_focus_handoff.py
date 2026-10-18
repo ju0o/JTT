@@ -313,7 +313,7 @@ def test_handoff_confirmation_target_and_return_guidance_fit_fixture_screens(hei
 def test_control_room_remains_running_after_handoff_and_keeps_observation_status(monkeypatch):
     row = _row()
     tower = _tower(row)
-    screen = Screen(24, 80, [" ", "q"])
+    screen = Screen(24, 80, ["\t", " ", "q"])
     picks = iter((
         SimpleNamespace(cancelled=False, selected_key="agent_handoff"),
         SimpleNamespace(cancelled=False, selected_key="confirm"),

@@ -127,7 +127,7 @@ def test_restored_screen_never_rebinds_on_host_pid_or_window_mismatch(tmp_path):
     try:
         control_room.draw(
             screen, tower, old["key"], control_room.pane_identity(old), old,
-            layout="focus", grid_rows_override=[old],
+            layout="focus", grid_rows_override=[old], active_panel=2,
         )
     finally:
         monkeypatch.undo()
@@ -234,6 +234,7 @@ def test_last_view_reconnect_updates_center_and_right_after_exact_pane_returns(
     monkeypatch.setattr(control_view, "_copy_result",
                         lambda _tower, key, _screen: copied.append(key) or "copied")
     draw_calls = []
+    pane_list_calls = []
     draw_grid = control_room._draw_grid
     regions = control_room.panel_regions(width, height)
 
@@ -249,22 +250,20 @@ def test_last_view_reconnect_updates_center_and_right_after_exact_pane_returns(
                          *args, **kwargs)
 
     monkeypatch.setattr(control_room, "_draw_grid", capture_grid)
+    monkeypatch.setattr(control_room, "_draw_pane_list",
+                        lambda _screen, _region, rows, selected_identity, *_a:
+                        pane_list_calls.append(([dict(row) for row in rows], selected_identity)))
     agent_starts = []
     tower.start_agent = lambda *args, **kwargs: agent_starts.append((args, kwargs))
 
-    control_room.open_control_room(Screen(height, width, [-1, "y", "q"]), tower)
+    control_room.open_control_room(Screen(height, width, [-1, "\t", "\t", "y", "q"]), tower)
 
-    assert len(draw_calls) >= 4
-    first_frame, restored_frame = draw_calls[:2], draw_calls[-2:]
-    assert first_frame[0][1][0]["_live_stale"] is True
-    assert first_frame[0][1][0]["live_lines"] == []
-    center = next(rows for panel, rows, _identity in restored_frame if panel == 1)
-    right = next(rows for panel, rows, _identity in restored_frame if panel == 2)
-    assert len(center) == 2 and len(right) == 1
-    assert center[0]["key"] == pane["key"]
-    assert center[1]["key"].startswith("saved-screen-stale:")
-    assert center[1]["live_lines"] == []
-    assert right[0]["key"] == pane["key"]
+    assert draw_calls
+    assert pane_list_calls
+    right = draw_calls[-1][1]
+    center = pane_list_calls[-1][0]
+    assert len(center) == len(right) == 1
+    assert center[0]["key"] == right[0]["key"] == pane["key"]
     assert control_room.pane_identity(center[0]) == control_room.pane_identity(right[0])
     assert center[0]["live_lines"] == right[0]["live_lines"] == ["CURRENT_PANE_OUTPUT"]
     assert agent_starts == []
@@ -272,6 +271,35 @@ def test_last_view_reconnect_updates_center_and_right_after_exact_pane_returns(
     persisted = (tmp_path / "control-screens.json").read_text(encoding="utf-8")
     assert "CURRENT_PANE_OUTPUT" not in persisted
     assert "MUST_NOT_BE_RESTORED" not in persisted
+
+
+def test_last_view_restores_its_selected_window_not_the_previously_open_window(monkeypatch, tmp_path):
+    first = _pane("%1", host="mainpc", session="work", window="@1", pid="101",
+                  target="first-window-pane", window_ref="window-first",
+                  display_name="첫 창 작업", live_lines=["FIRST_WINDOW_OUTPUT"])
+    saved = _pane("%2", host="mainpc", session="work", window="@2", pid="202",
+                  target="saved-window-pane", window_ref="window-saved",
+                  display_name="저장된 창 작업", live_lines=["SAVED_WINDOW_OUTPUT"])
+    store = ControlScreenStore(tmp_path / "control-screens.json")
+    store.save_last_view([saved], saved, "focus", {"window_ref": "window-saved"})
+    tower = SimpleNamespace(
+        rows=[first, saved], visible_rows=[first, saved], selected=0,
+        projects=None, window_assets=[
+            {"window_ref": "window-first", "display_name": "첫 창"},
+            {"window_ref": "window-saved", "display_name": "저장된 창"},
+        ], work_groups=SimpleNamespace(all=lambda: []), control_screens=store,
+        start_background_refresh=lambda: None,
+    )
+    shown = []
+    monkeypatch.setattr(live_view, "_start_refresh", lambda _tower: False)
+    monkeypatch.setattr(live_view, "_apply_refresh", lambda _tower: False)
+    monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
+    monkeypatch.setattr(live_view, "_draw_tile", lambda _s, _t, row, *_a: shown.append(row["target_id"]))
+
+    control_room.open_control_room(Screen(40, 120, ["q"]), tower)
+
+    assert shown == ["saved-window-pane"]
+    assert tower.selected == 1
 
 
 def test_duplicate_pane_ids_across_hosts_restore_only_matching_host(tmp_path):
@@ -388,11 +416,11 @@ def test_menu_save_then_restart_restores_four_panes_and_selected_right_live(monk
         start_background_refresh=lambda: False,
     )
     captured.clear()
-    screen = Screen(24, 80, ["q"])
+    screen = Screen(24, 80, ["\t", "\t", "q"])
     control_room.open_control_room(screen, next_tower)
     right_x = control_room.panel_regions(80, 24)[2][0]
     assert captured[-1] == ("target-2", right_x)
-    assert len(captured) >= 5  # four saved center slots plus the selected right LIVE
+    assert len(captured) == 1  # The new Right panel observes only the selected Pane.
     assert {name: (tmp_path / name).read_bytes() for name in protected_files} == protected_files
 
 
@@ -428,9 +456,12 @@ def test_saved_grid_layouts_fit_common_terminal_sizes_and_show_unused_slots(monk
     screen = Screen(height, width)
     monkeypatch.setattr(live_view.curses, "doupdate", lambda: None)
     monkeypatch.setattr(live_view, "_draw_tile", lambda *_a: None)
+    tiles = []
+    monkeypatch.setattr(live_view, "_draw_tile", lambda _s, _t, row, *_a: tiles.append(row["target_id"]))
     assert control_room.draw(
         screen, tower, "%8", control_room.pane_identity(rows[0]), rows[0],
-        layout="grid-4", grid_rows_override=rows,
+        layout="grid-4", grid_rows_override=rows, active_panel=2,
+        selected_window_ref="window-8",
     ) is True
     assert all(0 <= y < height and 0 <= x < width for y, x, _text, _attr in screen.writes)
-    assert sum("사용 가능한 Pane 없음" in text for _y, _x, text, _attr in screen.writes) == 3
+    assert tiles == ["target-8"]
