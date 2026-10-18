@@ -919,8 +919,203 @@ def test_normalize_newlines_keeps_spaces_korean_and_blank_lines():
     assert hashlib.sha256(normalize_newlines(windows).encode()).hexdigest() == hashlib.sha256(
         sample.encode()
     ).hexdigest()
-    assert normalize_newlines(" a \r\n한글\r") == " a \n한글\n"
+    assert normalize_newlines(" a \r\n한글\r") == " a \n한글\r"
     assert normalize_newlines(" a \r\n한글\r") != "a\n한글\n"
+
+
+def _long_markdown_clipboard_fixture():
+    paragraphs = [
+        f"문단 {index:03d}: Tower는 줄바꿈만 정규화하고 한글·English·특수문자 § {index}를 보존합니다.\n"
+        f"세부 설명 {index:03d}: 본문, 들여쓰기와 문단 경계를 그대로 확인합니다."
+        for index in range(72)
+    ]
+    return (
+        "TOWER_CLIPBOARD_START\n"
+        "# 긴 한국어 Markdown Result\n\n"
+        + "\n\n".join(paragraphs)
+        + "\n\n줄 끝 공백 보존 표식  \n"
+        + "\n```python\n"
+        + "def verify(text):\n    return text == '한글 / English / §'\n"
+        + "```\n\n"
+        + "끝 문단: 마지막 개행도 보존합니다.\n"
+        + "TOWER_CLIPBOARD_END\n"
+    )
+
+
+@pytest.mark.parametrize("source_eol,clipboard_eol", [("\n", "\r\n"), ("\r\n", "\n")])
+def test_long_markdown_readback_allows_only_lf_crlf_normalization(
+    monkeypatch, source_eol, clipboard_eol,
+):
+    import hashlib
+
+    from tmux_agent_tower.clipboard import copy_text, normalize_newlines
+
+    lf_source = _long_markdown_clipboard_fixture()
+    source = lf_source if source_eol == "\n" else lf_source.replace("\n", "\r\n")
+    readback = lf_source if clipboard_eol == "\n" else lf_source.replace("\n", "\r\n")
+    assert len(source.encode("utf-8")) >= 8192
+    assert "문단 071" in source
+    assert "return text == '한글 / English / §'" in source
+    assert "줄 끝 공백 보존 표식  " in source
+    assert source.endswith("TOWER_CLIPBOARD_END" + source_eol)
+
+    writes = []
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard.choose_clipboard_tool", lambda *_args: "clip.exe"
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard._default_run",
+        lambda argv, data: writes.append((argv, data)) or 0,
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard._read_tool_clipboard",
+        lambda _tool, _which: readback,
+    )
+
+    exact_byte_match = source.encode("utf-8") == readback.encode("utf-8")
+    normalized_text_match = normalize_newlines(source) == normalize_newlines(readback)
+    assert exact_byte_match is False
+    assert normalized_text_match is True
+    assert hashlib.sha256(normalize_newlines(source).encode("utf-8")).hexdigest() == (
+        hashlib.sha256(normalize_newlines(readback).encode("utf-8")).hexdigest()
+    )
+    outcome = copy_text(
+        source, destination="local_host", allow_buffer_fallback=False,
+        which=lambda name: "powershell.exe" if name == "powershell.exe" else "clip.exe",
+        environ={"TOWER_UNAME": "microsoft-standard"}, system="linux",
+    )
+    assert len(writes) == 1
+    assert outcome.clipboard is True
+    assert outcome.tool == "clip.exe"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda text: text.replace("문단 035:", "문단 035", 1),
+        lambda text: text.replace(
+            "문단 035: Tower는 줄바꿈만 정규화하고 한글·English·특수문자 § 35를 보존합니다.\r\n"
+            "세부 설명 035: 본문, 들여쓰기와 문단 경계를 그대로 확인합니다.\r\n\r\n",
+            "",
+            1,
+        ),
+        lambda text: text.replace("return text == '한글 / English / §'", "return False", 1),
+        lambda text: text.replace("줄 끝 공백 보존 표식  ", "줄 끝 공백 보존 표식", 1),
+        lambda text: text.removesuffix("\r\n"),
+        lambda text: text.replace("\r\n\r\n문단 035:", "\r\n문단 035:", 1),
+    ],
+    ids=[
+        "character", "middle-paragraph", "code-block", "trailing-spaces",
+        "final-newline", "paragraph-break",
+    ],
+)
+def test_long_markdown_readback_rejects_non_newline_changes(monkeypatch, mutation):
+    from tmux_agent_tower.clipboard import _host_matches
+
+    source = _long_markdown_clipboard_fixture()
+    readback = mutation(source.replace("\n", "\r\n"))
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard._read_tool_clipboard",
+        lambda _tool, _which: readback,
+    )
+    monkeypatch.setattr("tmux_agent_tower.clipboard.time.sleep", lambda _seconds: None)
+
+    assert _host_matches("clip.exe", source, lambda _name: "powershell.exe") is False
+
+
+def test_copy_text_readback_failure_is_not_clipboard_success(monkeypatch):
+    from tmux_agent_tower.clipboard import copy_text
+
+    writes = []
+    body = _long_markdown_clipboard_fixture()
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard.choose_clipboard_tool", lambda *_args: "clip.exe"
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard._default_run",
+        lambda argv, data: writes.append((argv, data)) or 0,
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard._read_tool_clipboard",
+        lambda _tool, _which: body.replace("문단 035:", "문단 035", 1),
+    )
+    monkeypatch.setattr("tmux_agent_tower.clipboard.time.sleep", lambda _seconds: None)
+
+    outcome = copy_text(
+        body, destination="local_host", allow_buffer_fallback=False,
+        which=lambda name: "powershell.exe" if name == "powershell.exe" else "clip.exe",
+        environ={"TOWER_UNAME": "microsoft-standard"}, system="linux",
+    )
+
+    assert len(writes) == 1
+    assert outcome.clipboard is False
+    assert outcome.buffer is False
+
+
+def test_copy_text_missing_readback_is_not_clipboard_success(monkeypatch):
+    from tmux_agent_tower.clipboard import copy_text
+
+    writes = []
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard.choose_clipboard_tool", lambda *_args: "clip.exe"
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard._default_run",
+        lambda argv, data: writes.append((argv, data)) or 0,
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard._read_tool_clipboard",
+        lambda _tool, _which: None,
+    )
+    monkeypatch.setattr("tmux_agent_tower.clipboard.time.sleep", lambda _seconds: None)
+
+    outcome = copy_text(
+        _long_markdown_clipboard_fixture(), destination="local_host",
+        allow_buffer_fallback=False,
+        which=lambda name: "powershell.exe" if name == "powershell.exe" else "clip.exe",
+        environ={"TOWER_UNAME": "microsoft-standard"}, system="linux",
+    )
+
+    assert len(writes) == 1
+    assert outcome.clipboard is False
+    assert outcome.buffer is False
+
+
+def test_lone_carriage_return_is_not_an_accepted_newline_conversion(monkeypatch):
+    from tmux_agent_tower.clipboard import _host_matches, normalize_newlines
+
+    source = "line one\nline two"
+    readback = "line one\rline two"
+    monkeypatch.setattr(
+        "tmux_agent_tower.clipboard._read_tool_clipboard",
+        lambda _tool, _which: readback,
+    )
+    assert normalize_newlines(readback) != normalize_newlines(source)
+    assert _host_matches("clip.exe", source, lambda _name: "powershell.exe") is False
+
+
+def test_incomplete_result_never_reaches_clipboard_router(monkeypatch):
+    tower, tracker = _ready_tower()
+    _mock_complete_result(monkeypatch)
+    monkeypatch.setattr(
+        "tmux_agent_tower.ui.control_view.get_result",
+        lambda *_args, **_kwargs: (True, "", {
+            "state": "ready", "text": BODY, "complete": False,
+            "turn_complete": True, "body_complete": False,
+            "fingerprint": "partial-fp",
+        }),
+    )
+    clipboard_calls = []
+    monkeypatch.setattr(
+        "tmux_agent_tower.ui.control_view.copy_text",
+        lambda *_args, **_kwargs: clipboard_calls.append(True),
+    )
+
+    notice = _copy_result(tower, "%9")
+
+    assert clipboard_calls == []
+    assert tracker.snapshot("%9").state == "ready"
+    assert "클립보드" not in notice
 
 
 def test_crlf_readback_matches_and_a_real_change_does_not(monkeypatch):

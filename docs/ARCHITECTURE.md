@@ -458,6 +458,13 @@ to one destination only, and successful native clipboard writes are verified
 by reading back the content. Phone copy uses the browser clipboard and does
 not depend on PC settings.
 
+For native text Clipboard readback, only LF and CRLF line endings are treated
+as equivalent. Readback verification still compares the complete normalized
+text, preserving all other characters, whitespace, Markdown, and final
+newlines. `READBACK_VERIFIED` therefore does not mean the original UTF-8 bytes
+are identical: `EXACT_BYTE_MATCH` and `NORMALIZED_TEXT_MATCH` are distinct
+checks. A tmux-buffer fallback is not a verified computer Clipboard write.
+
 The selected destination is configurable in Settings. The user-facing labels
 are "자동으로 선택 (추천)", "이 컴퓨터", "현재 접속한 터미널", and
 "Tower 복사함"; implementation details remain outside the default screen.

@@ -529,9 +529,9 @@ def _read_process(argv: List[str]) -> Optional[str]:
 
 
 def normalize_newlines(text: str) -> str:
-    """Turn CRLF and a lone CR into LF. Every other character stays."""
+    """Normalize CRLF to LF; preserve lone CR and every other character."""
 
-    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return (text or "").replace("\r\n", "\n")
 
 
 def _decode_powershell_stdout(data: bytes) -> Optional[str]:
