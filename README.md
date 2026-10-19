@@ -1,9 +1,43 @@
-# Tmux Agent Tower
+# JTT — Ju0 Terminal Tower
 
 **English | [한국어](README.ko.md)**
 
-Keep your tmux coding agents in view. Find the task that needs attention and
-start local or SSH work from one TUI.
+JTT is a local, open-source workspace for independent interactive terminals.
+Each terminal owns a local PTY and shell; the selected terminal is rendered
+and operated directly in the RIGHT panel. JTT has no hosted service and does
+not manage Agent accounts, prompts, or model APIs.
+
+## Current JTT RC
+
+This repository also retains the earlier tmux Agent monitor. The standalone
+JTT application is the separate `jtt` command; the existing `tower` command
+and its legacy behavior are unchanged.
+
+For a source checkout, run `./scripts/jtt-setup-dev` to create/use the
+checkout-local `.venv-jtt` and install dependencies, then run
+`./scripts/jtt-dev`. Setup is explicit and may contact the configured Python
+package index; JTT startup does not install packages. Opening JTT does not
+create a shell. Use the explicit new-terminal action when one is wanted.
+
+JTT keys: `Ctrl+G` then `n` creates a terminal; `h`/`l` changes cards; `w`
+focuses the workspace panel; `d` detaches the UI while keeping terminals
+running; `?` shows help; `Esc` cancels a pending prefix. In terminal input
+mode with the selected terminal's valid input lease, `Ctrl+G Ctrl+G` sends one
+literal Ctrl+G byte to that terminal. In terminal input mode,
+`Ctrl+]` returns to navigation. Navigation `q` also detaches without stopping
+shells. See [JTT terminal support and safety](docs/JTT_TERMINAL_SUPPORT.md)
+for data locations, cleanup guidance, and VT compatibility limits.
+
+JTT is an interactive local terminal, not a security sandbox. Shells run as
+the current user and can access that user's normal files and network. The
+current pyte-based renderer supports a bounded VT subset; it does not claim
+full xterm or every Agent TUI's compatibility. The user-confirmed Windows
+Terminal/WSL2 core UX result is separate from automated tests.
+
+## Legacy Tmux Agent Tower
+
+The following documentation describes the existing `tower` tmux Agent
+monitor, not the standalone JTT terminal workspace.
 
 ![Tmux Agent Tower showing synthetic Shell demo tasks](media/tower-readme-loop.gif)
 
