@@ -377,6 +377,33 @@ def test_prefix_h_l_releases_lease_before_changing_card_and_invalid_is_consumed(
     assert not registry.clients["session-b"].sent
 
 
+def test_prefix_w_releases_input_and_help_lists_prefix_commands(tmp_path, monkeypatch):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([_identity("session-a", 101, "gen-a")])
+    store.set_terminal_ids(store.DEFAULT_ID, ["session-a"])
+    state = jtt.build_state(store, registry)
+    screen = FakeScreen()
+    binding = renderer._managed_binding(state)
+    binding.refresh()
+    assert binding.enter(screen, state)
+
+    assert _prefix(screen, state, "W") is False
+    assert state["active_panel"] == 0
+    assert not binding.input_mode
+    assert not registry.clients["session-a"].lease
+
+    shown = {}
+    monkeypatch.setattr(
+        jtt, "show_message_screen",
+        lambda _screen, title, lines: shown.update(title=title, lines=lines),
+    )
+    assert _prefix(screen, state, "?") is False
+    assert shown["title"] == "JTT 키 안내"
+    assert any("Ctrl+G n" in line for line in shown["lines"])
+    assert any("Ctrl+G h/l" in line for line in shown["lines"])
+    assert any("Ctrl+]" in line for line in shown["lines"])
+
+
 def test_prefix_cancel_timeout_and_detach_are_one_shot(tmp_path):
     store = JTTWorkspaceStore(tmp_path / "jtt")
     registry = FakeRegistry([])
