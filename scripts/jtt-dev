@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -n "${PYTHONPATH:-}" ]; then
+    PYTHONPATH="$repo_dir/src:$PYTHONPATH"
+else
+    PYTHONPATH="$repo_dir/src"
+fi
+export PYTHONPATH
+exec python3 -m tmux_agent_tower.jtt "$@"

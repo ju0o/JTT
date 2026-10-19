@@ -2291,6 +2291,14 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
     curses.doupdate()
 
 
+def open_approved_control_room(stdscr, tower) -> None:
+    """Use the approved three-panel renderer for the normal Tower L route."""
+
+    from .ux_preview_v2 import open_tower_control_room
+
+    open_tower_control_room(stdscr, tower)
+
+
 def main(stdscr, session: Optional[str] = None) -> None:
     setup_colors()
     stdscr.keypad(True)
@@ -2521,9 +2529,7 @@ def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
             continue
 
         if matches_letter(key, "l"):
-            from .control_room import open_control_room
-
-            open_control_room(stdscr, tower)
+            open_approved_control_room(stdscr, tower)
             _request_background_refresh(tower)
             draw(stdscr, tower, remote_state=remote_state)
             continue

@@ -448,6 +448,25 @@ def test_overwrite_cancel_and_delete_cancel_preserve_saved_screen(monkeypatch, t
     assert store.get_screen(saved["screen_id"]) == original
 
 
+def test_saving_more_than_four_panes_is_rejected_without_truncating_store(monkeypatch, tmp_path):
+    store = ControlScreenStore(tmp_path / "control-screens.json")
+    rows = [_pane(f"%{index}", pid=f"{100 + index}", target=f"target-{index}",
+                  window_ref=f"window-{index}") for index in range(1, 6)]
+    shown = []
+    monkeypatch.setattr(control_room, "run_list_picker", lambda *_a, **_k: SimpleNamespace(
+        cancelled=False, selected_key="save",
+    ))
+    monkeypatch.setattr(control_room, "prompt_text", lambda *_a, **_k: pytest.fail("must not prompt to save a truncated view"))
+    monkeypatch.setattr(control_room, "show_message_screen", lambda *_a: shown.append(True))
+    state = {"layout": "grid-4", "view_rows": rows, "selected_row": rows[-1],
+             "context": {"project_id": None, "window_ref": rows[-1]["window_ref"]}}
+
+    control_room._open_screen_menu(None, SimpleNamespace(control_screens=store), state, rows, [], None)
+
+    assert store.screens() == []
+    assert shown == [True]
+
+
 @pytest.mark.parametrize("height,width", [(18, 60), (24, 80), (40, 120)])
 def test_saved_grid_layouts_fit_common_terminal_sizes_and_show_unused_slots(monkeypatch, height, width):
     rows = [_pane("%8", target="target-8", pid="808", window_ref="window-8",
