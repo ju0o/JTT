@@ -61,6 +61,52 @@ def test_existing_nonprivate_jtt_home_is_rejected_without_chmod(tmp_path):
     assert not root.exists()
 
 
+@pytest.mark.parametrize("renderer_state", ["dependency_missing", "initialization_failed"])
+def test_renderer_failure_prevents_registry_and_supervisor_creation(
+        tmp_path, monkeypatch, renderer_state):
+    import tmux_agent_tower.terminal.manager as manager
+
+    root = tmp_path / "jtt" / "terminals"
+    monkeypatch.setattr(manager, "_probe_renderer", lambda: renderer_state)
+    monkeypatch.setattr(manager.subprocess, "Popen",
+                        lambda *_args, **_kwargs: pytest.fail("Popen must not run"))
+
+    with pytest.raises(TerminalError, match="VT 렌더러"):
+        TerminalRegistry(root=root).create("must not start")
+    assert not root.exists()
+    assert not root.parent.exists()
+
+
+@pytest.mark.skipif(not renderer_available(), reason="live-shell preservation requires pyte")
+@pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash is not available")
+def test_renderer_preflight_does_not_hide_or_restart_existing_session(tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.manager as manager
+
+    home = _safe_test_home(monkeypatch, tmp_path)
+    root = tmp_path / "r"
+    registry = TerminalRegistry(root=root)
+    original = registry.create("preserved shell")
+    session_id = original.identity.session_id
+    shell_pid = original.identity.shell_pid
+    supervisor_pid = original.identity.supervisor_pid
+    original.close()
+
+    monkeypatch.setattr(manager, "_probe_renderer", lambda: "dependency_missing")
+    listed = registry.list_sessions()
+    assert len(listed) == 1
+    assert listed[0].session_id == session_id
+    assert listed[0].shell_pid == shell_pid
+    reconnected = registry.connect(session_id)
+    try:
+        assert reconnected.identity.shell_pid == shell_pid
+        assert reconnected.identity.supervisor_pid == supervisor_pid
+        assert os.kill(shell_pid, 0) is None
+    finally:
+        reconnected.close()
+        registry.stop(session_id)
+    assert home.exists()
+
+
 def _screen_text(update):
     if update.screen is None:
         return ""
@@ -243,6 +289,7 @@ def test_large_valid_snapshot_fits_transport_and_oversize_recovers(monkeypatch):
     owner.session_id = "a" * 32
     owner.generation = "b" * 32
     owner.state = "running"
+    owner.renderer_state = "ready"
 
     encoded = owner._screen_payload()
     assert encoded is not None
@@ -275,34 +322,16 @@ def test_large_valid_snapshot_fits_transport_and_oversize_recovers(monkeypatch):
     assert owner.snapshot_synced is True
 
 
-def test_optional_renderer_absence_blocks_input_and_does_not_autostart(tmp_path, monkeypatch):
-    account_shell = Path(pwd.getpwuid(os.getuid()).pw_shell).resolve()
-    if account_shell != Path("/bin/bash").resolve():
-        pytest.skip("test contract deliberately uses the account's /bin/bash login shell")
-    _safe_test_home(monkeypatch, tmp_path)
-    # Simulate an installation without pyte in the child interpreter. This
-    # remains deterministic when CI installs the package's declared renderer
-    # dependency into site-packages.
-    child_bootstrap = tmp_path / "renderer-absent"
-    child_bootstrap.mkdir(mode=0o700)
-    (child_bootstrap / "sitecustomize.py").write_text(
-        "import sys\nsys.modules['pyte'] = None\n", encoding="utf-8"
-    )
-    monkeypatch.setenv("PYTHONPATH", str(child_bootstrap))
-    registry = TerminalRegistry(root=tmp_path / "r")
-    client = registry.create("renderer unavailable")
-    session_id = client.identity.session_id
-    try:
-        update = client.poll()
-        assert not update.renderer_available
-        assert not update.synced
-        assert update.screen is None
-        with pytest.raises(TerminalError, match="stream_gap|renderer_unavailable"):
-            client.acquire()
-        assert not client.lease
-    finally:
-        client.close()
-        registry.stop(session_id)
+def test_optional_renderer_absence_blocks_shell_creation_before_popen(tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.manager as manager
+
+    root = tmp_path / "r"
+    monkeypatch.setattr(manager, "_probe_renderer", lambda: "dependency_missing")
+    monkeypatch.setattr(manager.subprocess, "Popen",
+                        lambda *_args, **_kwargs: pytest.fail("shell supervisor must not start"))
+    with pytest.raises(TerminalError, match="pyte"):
+        TerminalRegistry(root=root).create("renderer unavailable")
+    assert not root.exists()
 
 
 def _proc_start(pid):

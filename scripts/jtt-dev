@@ -2,10 +2,49 @@
 set -eu
 
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-if [ -n "${PYTHONPATH:-}" ]; then
-    PYTHONPATH="$repo_dir/src:$PYTHONPATH"
-else
-    PYTHONPATH="$repo_dir/src"
+venv_dir="$repo_dir/.venv-jtt"
+python_bin="$venv_dir/bin/python"
+setup_cmd="$repo_dir/scripts/jtt-setup-dev"
+
+if [ ! -x "$python_bin" ]; then
+    printf '%s\n' "JTT 개발 Python 환경이 없습니다: $venv_dir" \
+        "다음 명령을 명시적으로 실행해 준비하세요: $setup_cmd" >&2
+    exit 2
 fi
-export PYTHONPATH
-exec python3 -m tmux_agent_tower.jtt "$@"
+
+if ! env PYTHONNOUSERSITE=1 PYTHONPATH="$repo_dir/src" \
+    "$python_bin" - "$venv_dir" <<'PY'
+import importlib.metadata
+from pathlib import Path
+import sys
+
+expected_venv = Path(sys.argv[1]).resolve()
+if Path(sys.prefix).resolve() != expected_venv:
+    raise SystemExit("선택된 Python이 .venv-jtt 환경이 아닙니다.")
+try:
+    import pyte
+    version = importlib.metadata.version("pyte")
+    package_path = Path(pyte.__file__).resolve()
+    package_path.relative_to(expected_venv)
+    screen = pyte.Screen(4, 2)
+    stream = pyte.Stream(screen)
+    stream.feed("\x1b[H JTT")
+    if "JTT" not in "".join(screen.display):
+        raise RuntimeError("VT parser smoke test did not render its marker")
+except Exception as exc:
+    reason = "pyte import or VT initialization failed ({})".format(type(exc).__name__)
+    print(reason, file=sys.stderr)
+    raise SystemExit(1)
+print("pyte {} ready".format(version))
+PY
+then
+    printf '%s\n' "JTT의 격리 렌더러를 확인하지 못해 터미널을 시작하지 않았습니다." \
+        "전역 패키지는 변경하지 않습니다. 복구 명령: $setup_cmd" >&2
+    exit 2
+fi
+
+# A single, known import root keeps the CLI and its sys.executable-spawned PTY
+# worker on the same interpreter and this exact source checkout.
+export PYTHONNOUSERSITE=1
+export PYTHONPATH="$repo_dir/src"
+exec "$python_bin" -m tmux_agent_tower.jtt "$@"

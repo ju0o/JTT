@@ -50,8 +50,14 @@ from tmux_agent_tower.terminal.manager import (  # noqa: E402
 
 try:
     import pyte
-except ImportError:  # Renderer is optional here; input stays disabled without it.
+except ImportError as exc:
     pyte = None
+    _PYTE_IMPORT_STATE = "dependency_missing" if exc.name == "pyte" else "import_failed"
+except Exception:
+    pyte = None
+    _PYTE_IMPORT_STATE = "import_failed"
+else:
+    _PYTE_IMPORT_STATE = "ready"
 
 
 MAX_OUTPUT_EVENTS = 128
@@ -165,6 +171,7 @@ class PtyOwner:
         self.screen = None
         self.stream = None
         self.screen_error = False
+        self.renderer_state = _PYTE_IMPORT_STATE
         self.snapshot_synced = False
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self.supervisor_start = _process_start_or_fail(os.getpid())
@@ -189,19 +196,29 @@ class PtyOwner:
 
     @property
     def renderer_available(self) -> bool:
-        return self.screen is not None and not self.screen_error
+        return (self.screen is not None and not self.screen_error
+                and self.renderer_state not in {
+                    "dependency_missing", "import_failed", "initialization_failed", "parse_failed",
+                })
 
     def _open_vt(self) -> None:
         if pyte is None:
-            return
+            self.renderer_state = _PYTE_IMPORT_STATE
+            raise TerminalError("renderer_" + self.renderer_state)
         try:
             self.screen = pyte.Screen(self.columns, self.lines)
             self.stream = pyte.Stream(self.screen)
             self.screen.write_process_input = self._terminal_reply
-        except Exception:
+            self.stream.feed("\x1b[0m")
+            if len(self.screen.display) != self.lines:
+                raise ValueError("VT screen shape mismatch")
+            self.renderer_state = "ready"
+        except Exception as exc:
             self.screen = None
             self.stream = None
             self.screen_error = True
+            self.renderer_state = "initialization_failed"
+            raise TerminalError("renderer_initialization_failed") from exc
 
     def _start_shell(self) -> None:
         try:
@@ -281,6 +298,7 @@ class PtyOwner:
             "columns": self.columns,
             "lines": self.lines,
             "renderer_available": self.renderer_available,
+            "renderer_state": self.renderer_state,
             "created_at": self.created_at,
         })
         self.metadata.update(extra)
@@ -408,6 +426,7 @@ class PtyOwner:
             "columns": self.columns,
             "lines": self.lines,
             "renderer_available": self.renderer_available,
+            "renderer_state": self.renderer_state,
             "synced": self.renderer_available and self._state() == "running",
             "sequence": self.sequence,
         }
@@ -423,6 +442,7 @@ class PtyOwner:
         if not self.renderer_available:
             return None
         try:
+            self.renderer_state = "ready"
             cells = []
             for y in range(self.lines):
                 row = self.screen.buffer[y]
@@ -438,10 +458,11 @@ class PtyOwner:
                 # A large but valid screen is a temporary transport limitation,
                 # not a VT parser failure. Keep the renderer recoverable and
                 # fail closed for input until a complete snapshot fits again.
+                self.renderer_state = "snapshot_too_large"
                 return None
             return packed
         except Exception:
-            self.screen_error = True
+            self.renderer_state = "snapshot_unavailable"
             return None
 
     def _poll(self, request):
@@ -568,6 +589,7 @@ class PtyOwner:
             self.screen.resize(lines=lines, columns=columns)
         except Exception:
             self.screen_error = True
+            self.renderer_state = "initialization_failed"
             raise TerminalError("renderer_resize_failed")
         try:
             os.killpg(self.child.pid, signal.SIGWINCH)
@@ -609,6 +631,7 @@ class PtyOwner:
                     self.stream.feed(decoded)
             except Exception:
                 self.screen_error = True
+                self.renderer_state = "parse_failed"
                 self.lease_owner = None
                 self._store_state(self._state(), renderer_error="vt_parse_failed")
 

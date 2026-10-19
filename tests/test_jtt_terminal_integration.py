@@ -309,3 +309,92 @@ def test_real_curses_launch_and_quit_does_not_autostart_a_shell(monkeypatch):
         if ui is not None:
             ui.terminate()
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(monkeypatch):
+    if Path(pwd.getpwuid(os.getuid()).pw_shell).resolve() != Path("/bin/bash").resolve():
+        pytest.skip("fixture deliberately exercises the account's /bin/bash login shell")
+
+    root = Path(tempfile.mkdtemp(prefix="jtt-prefix-it-"))
+    root.chmod(0o700)
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    import pyte
+    pyte_root = Path(pyte.__file__).resolve().parent.parent
+    _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
+    registry = TerminalRegistry(root=root / "state" / "terminals")
+    ui = None
+    session_id = None
+    shell_pid = None
+    try:
+        assert registry.list_sessions() == ()
+        ui = _UIProcess(root, source_root, pyte_root)
+        _wait_for_ui_text(ui, "터미널 배치")
+        assert registry.list_sessions() == ()  # UI startup is still read-only.
+
+        ui.send(b"\x07n")
+        _wait_for_ui_text(ui, "Ctrl+]")  # The sole new shell acquired RIGHT input.
+        sessions = registry.list_sessions()
+        assert len(sessions) == 1
+        session_id = sessions[0].session_id
+        shell_pid = sessions[0].shell_pid
+        marker = "JTT_PREFIX_N_" + uuid.uuid4().hex[:8]
+        ui.send(("printf '%s\\n' '" + marker + "'\n").encode("ascii"))
+        _wait_for_ui_text(ui, marker)
+
+        # Prove Ctrl+G never leaks, and the second Ctrl+G arrives as exactly
+        # one byte at the selected PTY while it is waiting for one raw byte.
+        ctrl_probe = "read -r -n 1 -s key; printf 'JTT_CTRL_G_ORD=%d\\n' \"'$key\""
+        ui.send((ctrl_probe + "\n").encode("ascii"))
+        ui.send(b"\x07\x07")
+        _wait_for_ui_text(ui, "JTT_CTRL_G_ORD=7")
+
+        ui.send(b"\x1d")
+        _wait_for_ui_text(ui, "관찰 중")
+        ui.send(b"q")
+        assert ui.exit() == 0
+        ui = None
+        assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
+            (session_id, shell_pid)
+        ]
+
+        ui = _UIProcess(root, source_root, pyte_root)
+        _wait_for_ui_text(ui, "JTT_PREFIX_N_")
+        assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
+            (session_id, shell_pid)
+        ]  # Reconnect never creates a replacement PTY.
+        # Prefix state starts clear after reconnect: bare n is not a command.
+        ui.send(b"n")
+        time.sleep(0.15)
+        assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
+            (session_id, shell_pid)
+        ]
+        # Prefix detach releases only the UI client and leaves the shell alive.
+        ui.send(b"\x07d")
+        assert ui.exit() == 0
+        ui = None
+        assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
+            (session_id, shell_pid)
+        ]
+
+        # A further UI connection remains attached to the same PTY and q also
+        # disconnects without creating or terminating a shell.
+        ui = _UIProcess(root, source_root, pyte_root)
+        _wait_for_ui_text(ui, "JTT_PREFIX_N_")
+        assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
+            (session_id, shell_pid)
+        ]
+        ui.send(b"q")
+        assert ui.exit() == 0
+        ui = None
+        assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
+            (session_id, shell_pid)
+        ]
+    finally:
+        if ui is not None:
+            ui.terminate()
+        if session_id is not None:
+            try:
+                registry.stop(session_id)
+            except (OSError, RuntimeError, ValueError):
+                pass
+        shutil.rmtree(root, ignore_errors=True)

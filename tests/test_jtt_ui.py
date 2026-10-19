@@ -1,5 +1,7 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import curses
+from types import SimpleNamespace
+import time
 
 from tmux_agent_tower.state.jtt_workspaces import JTTWorkspaceStore
 from tmux_agent_tower.terminal import TerminalIdentity
@@ -17,8 +19,10 @@ class FakeUpdate:
     more: bool = False
     columns: int = 80
     lines: int = 24
-    screen: object = None
+    screen: object = field(default_factory=lambda: SimpleNamespace(
+        rows=(), cursor_x=0, cursor_y=0, cursor_visible=False))
     renderer_available: bool = True
+    renderer_state: str = "ready"
 
 
 class FakeClient:
@@ -30,11 +34,13 @@ class FakeClient:
         self.sent = []
         self.closed = False
         self.update = FakeUpdate()
+        self.acquire_count = 0
 
     def poll(self):
         return self.update
 
     def acquire(self):
+        self.acquire_count += 1
         self.lease = True
         return True
 
@@ -68,12 +74,27 @@ class FakeRegistry:
 
     def create(self, name=None):
         self.created += 1
-        raise AssertionError("the state builder must not start a shell")
+        session_id = f"session-created-{self.created}"
+        identity = _identity(session_id, 900 + self.created, f"gen-created-{self.created}")
+        self.identities = (*self.identities, identity)
+        self.clients[session_id] = FakeClient(identity)
+        return self.clients[session_id]
 
 
 def _identity(session_id, pid, generation):
     return TerminalIdentity(session_id, generation, 1000, "s1", pid, f"p{pid}",
-                             "/bin/bash", session_id, "running")
+                             "/bin/bash", session_id, "running", renderer_state="ready")
+
+
+class FakeScreen:
+    def getmaxyx(self):
+        return (40, 120)
+
+
+def _prefix(screen, state, command):
+    assert renderer._handle_key(screen, state, "\x07") is False
+    assert state["jtt_prefix_pending"]
+    return renderer._handle_key(screen, state, command)
 
 
 def test_build_state_is_read_only_and_maps_cards_to_exact_sessions(tmp_path):
@@ -200,3 +221,178 @@ def test_empty_workspace_can_reach_new_terminal_with_keyboard(tmp_path):
     assert state["center_action_index"] == 1
     assert renderer._handle_key(screen, state, "\n") is False
     assert activated == [1]
+
+
+def test_renderer_failure_keeps_running_shell_distinct_from_disconnected(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([_identity("session-a", 101, "gen-a")])
+    store.set_terminal_ids(store.DEFAULT_ID, ["session-a"])
+    state = jtt.build_state(store, registry)
+    state["active_panel"] = 2
+    client = registry.clients["session-a"]
+    client.update = FakeUpdate(synced=False, renderer_available=False,
+                               renderer_state="dependency_missing", screen=None)
+
+    jtt._refresh_and_resize(state, FakeScreen())
+    row = state["panes"][0]
+    assert row["status"] == "WORKING"
+    assert row["terminal_shell_state"] == "running"
+    assert row["terminal_view_state"] == "renderer_missing"
+    assert "셸 실행 중" in renderer._status(row)
+    assert "연결 끊김" not in renderer._status(row)
+    assert row["terminal_preview"] == "터미널 화면 미리보기 없음"
+    assert renderer._managed_binding(state).input_mode is False
+
+
+def test_renderer_parse_failure_and_resync_have_distinct_states(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([_identity("session-a", 101, "gen-a")])
+    store.set_terminal_ids(store.DEFAULT_ID, ["session-a"])
+    state = jtt.build_state(store, registry)
+    binding = renderer._managed_binding(state)
+    client = registry.clients["session-a"]
+    client.update = FakeUpdate(synced=False, renderer_available=False,
+                               renderer_state="parse_failed", screen=None)
+    binding.refresh()
+    assert binding.terminal_view_state == "renderer_error"
+    client.update = FakeUpdate(synced=False, renderer_available=True,
+                               renderer_state="ready", gap=True, screen=None)
+    binding.refresh()
+    assert binding.terminal_view_state == "resyncing"
+
+
+def test_supervisor_failure_is_not_reported_as_shell_exit(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([_identity("session-a", 101, "gen-a")])
+    store.set_terminal_ids(store.DEFAULT_ID, ["session-a"])
+    state = jtt.build_state(store, registry)
+    binding = renderer._managed_binding(state)
+    registry.clients["session-a"].poll = lambda: (_ for _ in ()).throw(OSError("fixture"))
+    jtt._refresh_and_resize(state, FakeScreen())
+    row = state["panes"][0]
+    assert row["terminal_shell_state"] == "running"
+    assert row["terminal_view_state"] == "supervisor_connection_failed"
+    assert renderer._status(row) == "! Supervisor 연결 실패"
+
+
+def test_bare_navigation_n_does_not_create_and_prefix_n_creates_one_then_acquires_once(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([])
+    state = jtt.build_state(store, registry)
+    screen = FakeScreen()
+    state["stdscr"] = screen
+
+    assert renderer._handle_key(screen, state, "n") is False
+    assert registry.created == 0
+    assert _prefix(screen, state, "N") is False
+    assert registry.created == 1
+    assert len(state["panes"]) == 1
+    assert state["active_panel"] == 2
+    assert state["jtt_pending_auto_acquire"] is not None
+    jtt._refresh_and_resize(state, screen)
+    binding = renderer._managed_binding(state)
+    assert binding is not None and binding.input_mode
+    assert registry.clients["session-created-1"].acquire_count == 1
+    jtt._refresh_and_resize(state, screen)
+    assert registry.clients["session-created-1"].acquire_count == 1
+    assert registry.created == 1
+
+
+def test_new_terminal_renderer_failure_clears_auto_acquire_without_input(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([])
+    state = jtt.build_state(store, registry)
+    screen = FakeScreen()
+    state["stdscr"] = screen
+    assert _prefix(screen, state, "n") is False
+    client = registry.clients["session-created-1"]
+    client.update = FakeUpdate(synced=False, renderer_available=False,
+                               renderer_state="initialization_failed", screen=None)
+
+    jtt._refresh_and_resize(state, screen)
+    assert state["jtt_pending_auto_acquire"] is None
+    assert client.acquire_count == 0
+    assert not client.lease
+    assert "VT 렌더러 오류" in state["jtt_notice"]
+    assert registry.created == 1
+
+
+def test_input_mode_bare_n_q_tab_are_forwarded_and_ctrl_bracket_releases(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([_identity("session-a", 101, "gen-a")])
+    store.set_terminal_ids(store.DEFAULT_ID, ["session-a"])
+    state = jtt.build_state(store, registry)
+    state["active_panel"] = 2
+    screen = FakeScreen()
+    binding = renderer._managed_binding(state)
+    binding.refresh()
+    assert binding.enter(screen, state)
+
+    assert renderer._handle_key(screen, state, "n") is False
+    assert renderer._handle_key(screen, state, "q") is False
+    assert renderer._handle_key(screen, state, "\t") is False
+    assert registry.created == 0
+    assert registry.clients["session-a"].sent == [b"n", b"q", b"\t"]
+    assert renderer._handle_key(screen, state, "\x1d") is False
+    assert not binding.input_mode
+
+
+def test_prefix_double_ctrl_g_sends_one_byte_only_to_valid_leased_target(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([_identity("session-a", 101, "gen-a"),
+                              _identity("session-b", 202, "gen-b")])
+    store.set_terminal_ids(store.DEFAULT_ID, ["session-a", "session-b"])
+    state = jtt.build_state(store, registry)
+    state["pane_index"] = 0
+    state["selected_target_id"] = "session-a"
+    state["selected_signature"] = renderer._pane_signature(state["panes"][0])
+    screen = FakeScreen()
+    binding = renderer._managed_binding(state)
+    binding.refresh()
+    assert binding.enter(screen, state)
+
+    assert _prefix(screen, state, "\x07") is False
+    assert registry.clients["session-a"].sent == [b"\x07"]
+    assert registry.clients["session-b"].sent == []
+    assert not state["jtt_prefix_pending"]
+
+
+def test_prefix_h_l_releases_lease_before_changing_card_and_invalid_is_consumed(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([_identity("session-a", 101, "gen-a"),
+                              _identity("session-b", 202, "gen-b")])
+    store.set_terminal_ids(store.DEFAULT_ID, ["session-a", "session-b"])
+    state = jtt.build_state(store, registry)
+    screen = FakeScreen()
+    binding = renderer._managed_binding(state)
+    binding.refresh()
+    assert binding.enter(screen, state)
+
+    assert _prefix(screen, state, "L") is False
+    assert state["pane_index"] == 1
+    assert state["active_panel"] == 1
+    assert not binding.input_mode and not registry.clients["session-a"].lease
+    assert _prefix(screen, state, "z") is False
+    assert registry.created == 0
+    assert not registry.clients["session-b"].sent
+
+
+def test_prefix_cancel_timeout_and_detach_are_one_shot(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([])
+    state = jtt.build_state(store, registry)
+    screen = FakeScreen()
+    state["stdscr"] = screen
+    assert renderer._handle_key(screen, state, "\x07") is False
+    assert renderer._handle_key(screen, state, "\x1b") is False
+    assert not state["jtt_prefix_pending"]
+    assert registry.created == 0
+
+    assert renderer._handle_key(screen, state, "\x07") is False
+    state["jtt_prefix_deadline"] = time.monotonic() - 1
+    assert renderer._handle_key(screen, state, "n") is False
+    assert registry.created == 0
+    assert not state["jtt_prefix_pending"]
+
+    assert _prefix(screen, state, "d") is True
+    assert registry.created == 0

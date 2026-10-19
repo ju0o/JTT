@@ -353,6 +353,18 @@ def _draw_box(stdscr, rect, title: str, active: bool = False) -> tuple[int, int,
 
 
 def _status(row: dict) -> str:
+    if row.get("terminal_kind") == "tower_managed":
+        view_state = str(row.get("terminal_view_state") or "unknown")
+        return {
+            "running_ready": "● 터미널 실행 중",
+            "renderer_missing": "● 셸 실행 중 · 렌더러 없음",
+            "renderer_error": "● 셸 실행 중 · 렌더러 오류",
+            "resyncing": "↻ 화면 재동기화 중",
+            "supervisor_connection_failed": "! Supervisor 연결 실패",
+            "session_unavailable": "? 세션 조회 불가",
+            "exited": "× 셸 종료",
+            "starting": "○ 시작 중",
+        }.get(view_state, "◇ 상태 확인 중")
     if row.get("_live_stale") or row.get("stale"):
         return "× 연결 끊김"
     return {
@@ -365,6 +377,13 @@ def _status(row: dict) -> str:
 
 
 def _status_attr(row: dict) -> int:
+    if row.get("terminal_kind") == "tower_managed":
+        view_state = str(row.get("terminal_view_state") or "unknown")
+        if view_state in {"exited", "supervisor_connection_failed", "renderer_error"}:
+            return _color(_COLOR_ERROR, curses.A_DIM)
+        if view_state in {"renderer_missing", "resyncing", "session_unavailable", "starting"}:
+            return _color(_COLOR_WAITING, curses.A_DIM)
+        return _color(_COLOR_WORKING, curses.A_DIM)
     status = str(row.get("status") or "UNKNOWN").upper()
     pair = _COLOR_WORKING if status == "WORKING" else _COLOR_WAITING if status == "WAITING" else _COLOR_ERROR if status == "DEAD" else 0
     return _color(pair, curses.A_DIM) if pair else curses.A_DIM
@@ -480,7 +499,10 @@ def _draw_card(stdscr, rect, row: dict, selected: bool) -> None:
         status = _status(row)
         _put(stdscr, y + 2, x + 1, width - 2, f"{agent}  ·  {status}", _status_attr(row))
     if height > 5:
-        preview = ("연결 끊김" if row.get("_live_stale") or row.get("stale") else
+        if row.get("terminal_kind") == "tower_managed":
+            preview = str(row.get("terminal_preview") or "터미널 화면 미리보기 없음")
+        else:
+            preview = ("연결 끊김" if row.get("_live_stale") or row.get("stale") else
                    next((str(line).strip() for line in row.get("live_lines", ()) if str(line).strip()),
                         "미리보기 없음"))
         _put(stdscr, y + 3, x + 1, width - 2, preview, curses.A_DIM)
@@ -559,7 +581,17 @@ def _draw_right(stdscr, rect, state: dict, active: bool) -> None:
         if binding is not None:
             binding.draw(stdscr, inner, active)
         else:
-            _put(stdscr, inner[1], inner[0], inner[2], "연결되지 않음 · 입력 차단")
+            labels = {
+                "renderer_missing": "셸 실행 중 · VT 렌더러 없음 · 입력 차단",
+                "renderer_error": "셸 실행 중 · VT 렌더러 오류 · 입력 차단",
+                "resyncing": "화면 재동기화 중 · 입력 차단",
+                "supervisor_connection_failed": "Supervisor 연결 실패 · 입력 차단",
+                "session_unavailable": "세션 조회 불가 · 입력 차단",
+                "exited": "셸 종료",
+            }
+            view_state = str(row.get("terminal_view_state") or "unknown")
+            _put(stdscr, inner[1], inner[0], inner[2],
+                 labels.get(view_state, "터미널 화면 대기 중 · 입력 차단"))
         _append_hit(state, rect, "right", 0)
         return
     ix, iy, iw, ih = inner
@@ -622,11 +654,99 @@ def draw_preview_v2(stdscr, state: dict) -> None:
     else:
         _draw_right(stdscr, regions[2], state, True)
     _draw_dialog(stdscr, state)
+    if state.get("runtime_mode") == "jtt":
+        _draw_jtt_footer(stdscr, state, width, height)
     try:
         stdscr.noutrefresh()
         curses.doupdate()
     except curses.error:
         pass
+
+
+_JTT_PREFIX_TIMEOUT = 1.5
+
+
+def _is_ctrl_g(key) -> bool:
+    return key in ("\x07", 7)
+
+
+def _clear_jtt_prefix(state: dict) -> None:
+    state["jtt_prefix_pending"] = False
+    state["jtt_prefix_deadline"] = 0.0
+
+
+def _expire_jtt_prefix(state: dict, now: float | None = None) -> None:
+    if not state.get("jtt_prefix_pending"):
+        return
+    if (time.monotonic() if now is None else now) >= float(state.get("jtt_prefix_deadline") or 0.0):
+        _clear_jtt_prefix(state)
+
+
+def _draw_jtt_footer(stdscr, state: dict, width: int, height: int) -> None:
+    if height < 1:
+        return
+    _expire_jtt_prefix(state)
+    notice = str(state.get("jtt_notice") or "")
+    now = time.monotonic()
+    if notice and not state.get("jtt_notice_until"):
+        state["jtt_notice_until"] = now + 2.0
+    if notice and now < float(state.get("jtt_notice_until") or 0.0):
+        text = notice
+    elif state.get("jtt_prefix_pending"):
+        text = "Ctrl+G → n 새 터미널 · h/l 이동 · w 작업공간 · d 종료 · ? 도움 · Esc 취소 · Ctrl+G 전송"
+    elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
+        text = "Ctrl+] 탐색 복귀 · Ctrl+G 명령"
+    else:
+        text = "Ctrl+G 명령 · Tab/Shift+Tab 패널 · Enter 입력 · Q 종료"
+    compact = "Ctrl+G 명령 · Enter 입력 · Q 종료"
+    if width < 100:
+        if state.get("jtt_prefix_pending"):
+            text = "Ctrl+G: n 새터미널 h/l 이동 w 작업공간 d 종료 ? 도움 Esc 취소"
+        elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
+            text = "Ctrl+] 탐색 · Ctrl+G 명령"
+        elif not notice or now >= float(state.get("jtt_notice_until") or 0.0):
+            text = compact
+    _put(stdscr, height - 1, 1, max(1, width - 2), text, curses.A_DIM)
+
+
+def _handle_jtt_prefix(stdscr, state: dict, key) -> tuple[bool, bool]:
+    """Consume JTT's global Ctrl+G prefix before any PTY key forwarding.
+
+    Returns (consumed, detach). Unknown prefix commands are intentionally
+    consumed so they can never leak into a terminal program.
+    """
+
+    if state.get("runtime_mode") != "jtt":
+        return False, False
+    _expire_jtt_prefix(state)
+    if state.get("jtt_prefix_pending"):
+        _clear_jtt_prefix(state)
+        if _is_ctrl_g(key):
+            binding = _managed_binding(state)
+            sender = getattr(binding, "send_literal_ctrl_g", None) if binding is not None else None
+            ok = bool(sender and sender(state))
+            if not ok:
+                state["jtt_notice"] = "Ctrl+G 전송 차단 · RIGHT 입력 권한과 화면 신원을 확인하세요."
+                state["jtt_notice_until"] = 0.0
+            return True, False
+        if key in ("\x1b", 27):
+            state["jtt_notice"] = "JTT 명령 취소"
+            state["jtt_notice_until"] = 0.0
+            return True, False
+        command = key.lower() if isinstance(key, str) and len(key) == 1 else None
+        handler = state.get("jtt_prefix_handler")
+        if command in {"n", "h", "l", "w", "d", "?"} and callable(handler):
+            return True, bool(handler(stdscr, state, command))
+        state["jtt_notice"] = "알 수 없는 Ctrl+G 명령 · ? 도움"
+        state["jtt_notice_until"] = 0.0
+        return True, False
+    if _is_ctrl_g(key):
+        state["jtt_prefix_pending"] = True
+        state["jtt_prefix_deadline"] = time.monotonic() + _JTT_PREFIX_TIMEOUT
+        state["jtt_notice"] = ""
+        state["jtt_notice_until"] = 0.0
+        return True, False
+    return False, False
 
 
 _PANE_IDENTITY_FIELDS = (
@@ -1467,6 +1587,9 @@ def _handle_key(stdscr, state: dict, key) -> bool:
     """Apply one keyboard action; return True only when preview should quit."""
 
     height, width = stdscr.getmaxyx()
+    consumed, detach = _handle_jtt_prefix(stdscr, state, key)
+    if consumed:
+        return detach
     binding = _managed_binding(state)
     if binding is not None and binding.handle_key(key):
         return False
@@ -1621,6 +1744,11 @@ def _handle_key(stdscr, state: dict, key) -> bool:
                     state["dialog"] = {"title": title, "body": state.get("workspace_name", "")}
             else:
                 state["active_panel"] = 2
+                if binding is not None:
+                    binding.enter(stdscr, state)
+                elif (_selected_row(state) or {}).get("terminal_kind") == "tower_managed":
+                    state["jtt_notice"] = "선택한 터미널에 연결할 수 없어 입력을 차단했습니다."
+                    state["jtt_notice_until"] = 0.0
         elif state["active_panel"] == 2:
             if binding is not None:
                 binding.enter(stdscr, state)

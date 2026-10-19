@@ -29,6 +29,9 @@ class ManagedTerminalBinding:
         self.closed = False
         self.screen = None
         self.status = "연결 중"
+        self.shell_state = str(getattr(identity, "state", "unknown")).lower()
+        self.renderer_state = str(getattr(identity, "renderer_state", "unknown"))
+        self.terminal_view_state = "starting"
         self.last_resize: tuple[int, int] | None = None
 
     def matches(self, row: dict) -> bool:
@@ -51,37 +54,54 @@ class ManagedTerminalBinding:
         try:
             update = self.client.poll()
         except (OSError, RuntimeError, ValueError):
-            self._stale("세션 연결을 확인할 수 없음")
+            self._stale("Supervisor 연결 실패 · 입력 차단")
             return
         renderer_ready = bool(getattr(update, "renderer_available", True))
+        self.renderer_state = str(getattr(update, "renderer_state", "ready" if renderer_ready else "dependency_missing"))
         self.synced = (bool(getattr(update, "synced", False))
                        and not bool(getattr(update, "gap", False)) and renderer_ready)
         lease_lost = self.input_mode and not bool(getattr(self.client, "lease", True))
         if lease_lost:
             self.input_mode = False
         self.screen = getattr(update, "screen", None)
-        state = str(getattr(update, "state", "unknown")).lower()
-        if state not in {"running", "active"}:
+        self.shell_state = str(getattr(update, "state", "unknown")).lower()
+        if self.shell_state not in {"running", "active"}:
             self.synced = False
             self._revoke()
-            self.status = "터미널 종료" if state in {"exited", "dead", "stopped"} else "상태 확인 불가"
+            if self.shell_state in {"exited", "dead", "stopped"}:
+                self.terminal_view_state = "exited"
+                self.status = "셸 종료"
+            else:
+                self.terminal_view_state = "session_unavailable"
+                self.status = "셸 상태 확인 불가 · 입력 차단"
         elif not renderer_ready:
             self._revoke()
-            self.status = "VT 렌더러 없음 · 입력 차단"
+            self.terminal_view_state = (
+                "renderer_missing" if self.renderer_state == "dependency_missing"
+                else "renderer_error"
+            )
+            self.status = ("셸 실행 중 · VT 렌더러 없음 · 입력 차단"
+                           if self.terminal_view_state == "renderer_missing"
+                           else "셸 실행 중 · VT 렌더러 오류 · 입력 차단")
         elif not self.synced:
             self._revoke()
+            self.terminal_view_state = "resyncing"
             self.status = "화면 재동기화 중 · 입력 차단"
         elif lease_lost:
+            self.terminal_view_state = "running_ready"
             self.status = "입력 권한 만료 · 입력 차단"
         elif self.input_mode:
+            self.terminal_view_state = "running_ready"
             self.status = "입력 중 · Ctrl+] 탐색 복귀"
         else:
+            self.terminal_view_state = "running_ready"
             self.status = "관찰 중 · 클릭 또는 Enter로 입력"
 
-    def _stale(self, message: str) -> None:
+    def _stale(self, message: str, view_state: str = "supervisor_connection_failed") -> None:
         self.synced = False
         self.screen = None
         self.status = message
+        self.terminal_view_state = view_state
         self._revoke()
 
     def _revoke(self) -> None:
@@ -96,8 +116,10 @@ class ManagedTerminalBinding:
 
     def enter(self, _stdscr, state: dict) -> bool:
         row = renderer._selected_row(state)
-        if not row or not self.matches(row) or not self.synced:
+        if (not row or not self.matches(row) or not self.synced or self.screen is None
+                or self.renderer_state != "ready"):
             self.status = "세션 신원 또는 화면 동기화 확인 실패 · 입력 차단"
+            self.terminal_view_state = "resyncing"
             self.release()
             return False
         try:
@@ -111,6 +133,26 @@ class ManagedTerminalBinding:
         self.input_mode = False
         self.status = "다른 연결이 입력 중이거나 동기화가 불확실함 · 입력 차단"
         return False
+
+    def send_literal_ctrl_g(self, state: dict) -> bool:
+        """Send one Ctrl+G only to this exact, synchronized leased terminal."""
+
+        row = renderer._selected_row(state)
+        if (not self.input_mode or not bool(getattr(self.client, "lease", False))
+                or not self.synced or self.screen is None
+                or self.renderer_state != "ready" or not row or not self.matches(row)):
+            self.release()
+            self.status = "Ctrl+G 전송 조건 불일치 · 입력 차단"
+            return False
+        try:
+            result = self.client.send(b"\x07")
+        except (OSError, RuntimeError, ValueError):
+            self._stale("Ctrl+G 입력 전달 실패 · 입력 차단")
+            return False
+        if result != 1:
+            self._stale("Ctrl+G 입력 전달 확인 실패 · 입력 차단")
+            return False
+        return True
 
     def handle_key(self, key) -> bool:
         if not self.input_mode:
@@ -266,20 +308,25 @@ def _basic_color_index(value) -> int | None:
 
 def _session_rows(registry: TerminalRegistry, workspace: dict,
                  clients: dict[str, ManagedTerminalBinding], *, attach: bool = True) -> list[dict]:
+    lookup_failed = False
     try:
         identities = {str(item.session_id): item for item in registry.list_sessions()}
     except (OSError, RuntimeError, ValueError):
         identities = {}
+        lookup_failed = True
     rows = []
     for session_id in workspace.get("terminal_ids", ()):
         identity = identities.get(str(session_id))
         if identity is None:
             rows.append({
                 "kind": "pane", "key": str(session_id), "target_id": str(session_id),
-                "display_name": "연결 끊긴 터미널", "agent": "Shell", "status": "DEAD",
+                "display_name": "터미널 상태 확인 불가", "agent": "Shell", "status": "UNKNOWN",
                 "stale": True, "_live_stale": True, "live_lines": [],
                 "terminal_kind": "tower_managed", "managed_id": str(session_id),
                 "managed_identity": {"session_id": str(session_id)},
+                "terminal_shell_state": "unknown", "terminal_renderer_state": "unknown",
+                "terminal_view_state": "supervisor_connection_failed" if lookup_failed else "session_unavailable",
+                "terminal_preview": "세션 조회 불가",
             })
             continue
         binding = clients.get(str(session_id))
@@ -297,19 +344,49 @@ def _session_rows(registry: TerminalRegistry, workspace: dict,
                 binding = None
         if not attach:
             binding = None
+        shell_state = str(getattr(identity, "state", "unknown")).lower()
+        renderer_state = str(getattr(identity, "renderer_state", "unknown"))
+        if shell_state in {"exited", "dead", "stopped"}:
+            view_state = "exited"
+        elif not attach:
+            view_state = "starting" if shell_state == "running" else "session_unavailable"
+        elif binding is None:
+            view_state = "supervisor_connection_failed"
+        elif renderer_state == "dependency_missing":
+            view_state = "renderer_missing"
+        elif renderer_state not in {"ready", "unknown"}:
+            view_state = "renderer_error"
+        elif shell_state == "running":
+            view_state = "resyncing"
+        else:
+            view_state = "session_unavailable"
         row = {
             "kind": "pane", "key": str(session_id), "target_id": str(session_id),
             "display_name": str(getattr(identity, "name", "") or "터미널"),
-            "agent": "Shell", "status": "WORKING" if str(identity.state).lower() == "running" else "DEAD",
-            "stale": binding is None and attach, "_live_stale": binding is None,
+            "agent": "Shell", "status": "WORKING" if shell_state == "running" else "DEAD",
+            "stale": shell_state != "running", "_live_stale": binding is None,
             "live_lines": [], "terminal_kind": "tower_managed", "managed_id": str(session_id),
             "managed_identity": {"session_id": str(identity.session_id),
                                  "generation": str(identity.generation),
                                  "shell_pid": int(identity.shell_pid)},
             "pane_id": str(session_id), "pane_pid": str(identity.shell_pid),
+            "terminal_shell_state": shell_state,
+            "terminal_renderer_state": renderer_state,
+            "terminal_view_state": view_state,
+            "terminal_preview": "터미널 화면 미리보기 없음",
         }
+        if binding is not None and binding.synced and binding.screen is not None:
+            row["terminal_preview"] = _screen_preview(binding.screen) or "터미널 화면이 비어 있음"
         rows.append(row)
     return rows
+
+
+def _screen_preview(screen) -> str:
+    for row in getattr(screen, "rows", ()):
+        text = "".join(str(getattr(cell, "text", "") or "") for cell in row).strip()
+        if text:
+            return text
+    return ""
 
 
 def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
@@ -369,12 +446,17 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
         "jtt_registry": registry,
         "jtt_workspaces": workspaces,
         "jtt_notice": "",
+        "jtt_notice_until": 0.0,
+        "jtt_prefix_pending": False,
+        "jtt_prefix_deadline": 0.0,
+        "jtt_pending_auto_acquire": None,
         "jtt_action_handler": _activate_jtt_action,
         "jtt_center_action_handler": lambda stdscr, state, index: (
             _save_configuration(stdscr, state) if index == 0 else _create_terminal(stdscr, state)
         ),
         "jtt_space_handler": _settings_menu,
         "jtt_workspace_handler": _attach_choice,
+        "jtt_prefix_handler": _handle_prefix_command,
     }
     return state
 
@@ -491,12 +573,18 @@ def _settings_menu(stdscr, state: dict) -> None:
     else:
         show_message_screen(
             stdscr, "JTT 키 안내",
-            ["Tab: 패널 이동", "방향키: 항목 선택", "Enter: 입력 또는 선택",
-             "입력 모드에서 Ctrl+]: 탐색 모드", "q: 화면 연결 해제 (셸은 유지)"],
+            ["탐색: Tab/Shift+Tab 패널 · Enter 입력 · Q 연결 해제",
+             "Ctrl+G n: 새 터미널 · h/l: 카드 이동 · w: 작업공간",
+             "Ctrl+G d: UI 연결 해제 (셸 유지) · ?: 도움",
+             "Ctrl+G Esc: 취소 · Ctrl+G 두 번: 입력 중 Ctrl+G 전달",
+             "입력 중 bare n/q/Tab은 터미널로 전달됩니다.",
+             "Ctrl+]는 입력 모드에서 탐색 복귀입니다."],
         )
 
 
 def _create_terminal(stdscr, state: dict) -> None:
+    renderer._release_managed_input(state)
+    state["jtt_pending_auto_acquire"] = None
     session_id = ""
     client = None
     try:
@@ -508,9 +596,17 @@ def _create_terminal(stdscr, state: dict) -> None:
         state["jtt_store"].set_terminal_ids(workspace_id, [*workspace["terminal_ids"], session_id])
         _refresh_workspaces(state, workspace_id)
         state["pane_index"] = max(0, len(state["panes"]) - 1)
-        state["active_panel"] = 1
-        state["jtt_notice"] = "새 로컬 셸 터미널을 만들었습니다."
-    except (OSError, RuntimeError, ValueError, WorkspaceStoreError):
+        state["active_panel"] = 2
+        state["center_actions_focused"] = False
+        state["selected_target_id"] = str(state["panes"][state["pane_index"]].get("target_id") or "")
+        state["selected_signature"] = renderer._pane_signature(state["panes"][state["pane_index"]])
+        state["jtt_pending_auto_acquire"] = {
+            "session_id": session_id,
+            "deadline": time.monotonic() + 2.5,
+        }
+        state["jtt_notice"] = "새 로컬 셸 생성 · 화면과 입력 준비 확인 중"
+        state["jtt_notice_until"] = 0.0
+    except (OSError, RuntimeError, ValueError, WorkspaceStoreError) as exc:
         if session_id:
             try:
                 state["jtt_registry"].stop(session_id)
@@ -522,7 +618,58 @@ def _create_terminal(stdscr, state: dict) -> None:
             except (OSError, RuntimeError, ValueError):
                 pass
         state["managed_terminals"].pop(session_id, None)
-        state["jtt_notice"] = "새 터미널을 만들지 못했습니다. 기존 작업은 변경되지 않았습니다."
+        detail = str(exc).strip()
+        state["jtt_notice"] = (detail[:120] if detail else
+                                "새 터미널을 만들지 못했습니다. 기존 작업은 변경되지 않았습니다.")
+        state["jtt_notice_until"] = 0.0
+
+
+def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
+    if command == "n":
+        _create_terminal(stdscr, state)
+        return False
+    if command in {"h", "l"}:
+        renderer._release_managed_input(state)
+        state["jtt_pending_auto_acquire"] = None
+        if state["panes"]:
+            delta = -1 if command == "h" else 1
+            state["pane_index"] = (state["pane_index"] + delta) % len(state["panes"])
+            row = renderer._selected_row(state)
+            state["selected_target_id"] = str((row or {}).get("target_id") or "")
+            state["selected_signature"] = renderer._pane_signature(row)
+            state["active_panel"] = 1
+            state["center_actions_focused"] = False
+            renderer._ensure_card_visible(state, *state.get("last_size", (24, 80)))
+            state["jtt_notice"] = "카드 이동 · 입력 모드 해제"
+        else:
+            state["jtt_notice"] = "이동할 터미널 카드가 없습니다."
+        state["jtt_notice_until"] = 0.0
+        return False
+    if command == "w":
+        renderer._release_managed_input(state)
+        state["jtt_pending_auto_acquire"] = None
+        state["active_panel"] = 0
+        state["center_actions_focused"] = False
+        state["jtt_notice"] = "작업공간 탐색"
+        state["jtt_notice_until"] = 0.0
+        return False
+    if command == "d":
+        renderer._release_managed_input(state)
+        state["jtt_pending_auto_acquire"] = None
+        renderer._clear_jtt_prefix(state)
+        return True
+    if command == "?":
+        show_message_screen(
+            stdscr, "JTT 키 안내",
+            ["Ctrl+G n: 새 터미널 (명시적 생성)",
+             "Ctrl+G h/l: 이전/다음 카드 (입력 권한 해제)",
+             "Ctrl+G w: 작업공간 패널", "Ctrl+G d: UI 연결 해제 (셸 유지)",
+             "Ctrl+G ?: 이 도움말", "Ctrl+G Esc: 접두 취소 · Ctrl+G 두 번: 입력 중 Ctrl+G 전송",
+             "입력 모드에서는 bare n/q/Tab을 터미널로 전달합니다.",
+             "Ctrl+]는 입력 모드에서 탐색 복귀입니다."],
+        )
+        return False
+    return False
 
 
 def _activate_jtt_action(stdscr, state: dict, choice: dict) -> None:
@@ -537,23 +684,65 @@ def _refresh_and_resize(state: dict, stdscr) -> None:
     state["last_size"] = (height, width)
     renderer._ensure_card_visible(state, height, width)
     binding = renderer._managed_binding(state)
+    row = renderer._selected_row(state)
+    if binding is not None:
+        binding.refresh()
+        row = renderer._selected_row(state)
+        if row is not None:
+            row.update(
+                status="DEAD" if binding.terminal_view_state == "exited" else "WORKING",
+                stale=binding.terminal_view_state == "exited",
+                _live_stale=not binding.synced,
+                terminal_shell_state=binding.shell_state,
+                terminal_renderer_state=binding.renderer_state,
+                terminal_view_state=binding.terminal_view_state,
+                terminal_preview=(_screen_preview(binding.screen)
+                                  if binding.synced and binding.screen is not None
+                                  else "터미널 화면 미리보기 없음"),
+                live_lines=[],
+            )
+    _resolve_pending_auto_acquire(state, binding, row)
     if binding is None:
         return
-    binding.refresh()
-    row = renderer._selected_row(state)
-    if row is not None:
-        if binding.status.startswith("터미널 종료"):
-            row.update(status="DEAD", stale=True, _live_stale=True, live_lines=[])
-        elif binding.synced:
-            row.update(status="WORKING", stale=False, _live_stale=False)
-        else:
-            row.update(status="UNKNOWN", stale=False, _live_stale=True, live_lines=[])
     regions, wide = renderer._regions(width, height, 2)
     rect = regions.get(2, (0, 0, width, height))
     inner_width = max(1, rect[2] - 2)
     inner_height = max(1, rect[3] - 3)
     if binding.input_mode:
         binding.resize(inner_width, inner_height)
+
+
+def _resolve_pending_auto_acquire(state: dict, binding, row) -> None:
+    pending = state.get("jtt_pending_auto_acquire")
+    if not pending:
+        return
+    if str((row or {}).get("managed_id") or "") != pending["session_id"]:
+        state["jtt_pending_auto_acquire"] = None
+        return
+    if binding is not None and binding.matches(row):
+        if (binding.terminal_view_state == "running_ready" and binding.synced
+                and binding.renderer_state == "ready"):
+            # Clear before attempting so refresh can never retry a failed lease.
+            state["jtt_pending_auto_acquire"] = None
+            if binding.enter(state.get("stdscr"), state):
+                state["jtt_notice"] = "터미널 준비 완료 · 입력 중 · Ctrl+] 탐색 복귀"
+            else:
+                state["jtt_notice"] = binding.status
+            state["jtt_notice_until"] = 0.0
+            return
+        if binding.terminal_view_state in {
+            "renderer_missing", "renderer_error", "exited",
+            "supervisor_connection_failed", "session_unavailable",
+        }:
+            state["jtt_pending_auto_acquire"] = None
+            state["jtt_notice"] = binding.status
+            state["jtt_notice_until"] = 0.0
+            return
+    if time.monotonic() >= float(pending["deadline"]):
+        state["jtt_pending_auto_acquire"] = None
+        state["jtt_notice"] = (binding.status if binding is not None
+                                else "Supervisor 연결 실패 · 자동 입력을 시작하지 않았습니다.")
+        state["jtt_notice_until"] = 0.0
 
 
 def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry) -> None:
@@ -570,14 +759,6 @@ def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry) -> None:
         while True:
             _refresh_and_resize(state, stdscr)
             renderer.draw_preview_v2(stdscr, state)
-            notice = state.get("jtt_notice")
-            if notice:
-                try:
-                    height, width = stdscr.getmaxyx()
-                    safe_add(stdscr, height - 1, 1, truncate_to_width(notice, max(1, width - 2)), curses.A_DIM)
-                except curses.error:
-                    pass
-                state["jtt_notice"] = ""
             try:
                 key = stdscr.get_wch()
             except curses.error:
@@ -587,6 +768,8 @@ def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry) -> None:
             if renderer._handle_key(stdscr, state, key):
                 return
     finally:
+        renderer._clear_jtt_prefix(state)
+        state["jtt_pending_auto_acquire"] = None
         renderer._release_managed_input(state)
         for binding in list(clients.values()):
             # close() disconnects the UI client only; the PTY shell remains alive.

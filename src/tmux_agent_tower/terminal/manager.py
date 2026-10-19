@@ -62,6 +62,7 @@ class TerminalIdentity:
     exit_code: Optional[int] = None
     exit_signal: Optional[int] = None
     termination: Optional[str] = None
+    renderer_state: str = "unknown"
 
     @property
     def pid(self) -> int:
@@ -106,20 +107,44 @@ class TerminalUpdate:
     screen: Optional[TerminalScreen] = None
     renderer_available: bool = False
     snapshot_sequence: int = 0
+    renderer_state: str = "unknown"
+
+
+def _probe_renderer() -> str:
+    """Import and initialize the supported VT renderer without side effects."""
+
+    try:
+        import pyte
+    except ImportError as exc:
+        return "dependency_missing" if exc.name == "pyte" else "import_failed"
+    except Exception:
+        return "import_failed"
+    try:
+        screen = pyte.Screen(4, 2)
+        stream = pyte.Stream(screen)
+        stream.feed("\x1b[0m")
+        if len(screen.display) != 2:
+            return "initialization_failed"
+    except Exception:
+        return "initialization_failed"
+    return "ready"
 
 
 def renderer_available() -> bool:
-    """Return whether the optional pyte renderer is importable.
+    """Return whether pyte imports and initializes the supported VT path."""
 
-    The PTY engine does not install or vendor a renderer. Consumers must not
-    advertise full terminal rendering when this returns false.
-    """
+    return _probe_renderer() == "ready"
 
-    try:
-        import pyte  # noqa: F401
-    except ImportError:
-        return False
-    return True
+
+def _require_renderer() -> None:
+    state = _probe_renderer()
+    messages = {
+        "dependency_missing": "VT 렌더러 pyte가 없습니다. scripts/jtt-setup-dev를 실행하세요.",
+        "import_failed": "VT 렌더러 pyte를 불러오지 못했습니다. .venv-jtt 환경을 복구하세요.",
+        "initialization_failed": "VT 렌더러 초기화가 실패했습니다. .venv-jtt 설치를 확인하세요.",
+    }
+    if state != "ready":
+        raise TerminalError(messages.get(state, "VT 렌더러를 사용할 수 없어 셸을 만들지 않았습니다."))
 
 
 def _proc_start(pid: int) -> Optional[str]:
@@ -359,6 +384,9 @@ def _identity(value: Dict[str, Any]) -> TerminalIdentity:
             exit_code=(int(value["exit_code"]) if value.get("exit_code") is not None else None),
             exit_signal=(int(value["exit_signal"]) if value.get("exit_signal") is not None else None),
             termination=(str(value["termination"]) if value.get("termination") else None),
+            renderer_state=str(value.get("renderer_state") or (
+                "ready" if value.get("renderer_available") else "dependency_missing"
+            )),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise TerminalError("terminal identity is incomplete") from exc
@@ -430,7 +458,7 @@ class TerminalRegistry:
                     ident.session_id, ident.generation, ident.supervisor_pid,
                     ident.supervisor_start, ident.shell_pid, ident.shell_start,
                     ident.shell_path, ident.name, state, ident.exit_code,
-                    ident.exit_signal, ident.termination,
+                    ident.exit_signal, ident.termination, ident.renderer_state,
                 ))
             except (TerminalError, OSError):
                 # A malformed or foreign entry must never be treated as a session.
@@ -438,6 +466,10 @@ class TerminalRegistry:
         return tuple(sorted(sessions, key=lambda item: item.session_id))
 
     def create(self, name: Optional[str] = None) -> "TerminalClient":
+        # Fail before creating the registry/session directory or spawning a
+        # supervisor. Existing sessions remain listable/connectable if the
+        # renderer is later removed from the development environment.
+        _require_renderer()
         _ensure_private_root(self.root)
         shell_path, _home = _validate_shell()
         display_name = _validate_name(name)
@@ -724,6 +756,11 @@ class TerminalClient:
             snapshot_sequence=int(response.get("snapshot_sequence", 0)),
             screen=screen,
             renderer_available=bool(response.get("renderer_available")),
+            renderer_state=str(response.get("renderer_state") or (
+                "ready" if response.get("renderer_available") and self.synced
+                else "snapshot_unavailable" if response.get("renderer_available")
+                else "dependency_missing"
+            )),
         )
 
     def acquire(self) -> bool:
