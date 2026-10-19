@@ -276,14 +276,19 @@ def test_large_valid_snapshot_fits_transport_and_oversize_recovers(monkeypatch):
 
 
 def test_optional_renderer_absence_blocks_input_and_does_not_autostart(tmp_path, monkeypatch):
-    if not renderer_available():
-        pytest.skip("system Python has no pyte; fail-closed branch is already the default")
     account_shell = Path(pwd.getpwuid(os.getuid()).pw_shell).resolve()
     if account_shell != Path("/bin/bash").resolve():
         pytest.skip("test contract deliberately uses the account's /bin/bash login shell")
     _safe_test_home(monkeypatch, tmp_path)
-    # Do not inherit the test-only pyte path into the worker. No dependency is installed.
-    monkeypatch.delenv("PYTHONPATH", raising=False)
+    # Simulate an installation without pyte in the child interpreter. This
+    # remains deterministic when CI installs the package's declared renderer
+    # dependency into site-packages.
+    child_bootstrap = tmp_path / "renderer-absent"
+    child_bootstrap.mkdir(mode=0o700)
+    (child_bootstrap / "sitecustomize.py").write_text(
+        "import sys\nsys.modules['pyte'] = None\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(child_bootstrap))
     registry = TerminalRegistry(root=tmp_path / "r")
     client = registry.create("renderer unavailable")
     session_id = client.identity.session_id
