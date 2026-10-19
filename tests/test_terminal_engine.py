@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import pwd
 import random
+import re
 import shutil
 import signal
 import stat
+import subprocess
 import time
 import zlib
 
@@ -17,6 +19,19 @@ import pytest
 from tmux_agent_tower.terminal import TerminalError, TerminalRegistry, renderer_available
 from tmux_agent_tower.terminal.manager import MAX_FRAME, _ensure_private_root, _worker_is_same_process
 from tmux_agent_tower.terminal import _worker
+
+
+@pytest.mark.skipif(_worker.pyte is None, reason="pyte renderer is unavailable")
+def test_private_sgr_extension_does_not_disable_terminal_renderer():
+    screen = _worker._JttScreen(20, 3)
+    stream = _worker.pyte.Stream(screen)
+
+    # xterm-like applications may emit a private SGR extension. pyte dispatches
+    # it with private=True although its base Screen handler lacks that keyword.
+    stream.feed("\x1b[?1m\x1b[31mJTT_RENDER_OK")
+
+    assert "JTT_RENDER_OK" in "".join(screen.display)
+    assert screen.cursor.attrs.fg == "red"
 
 
 def _safe_test_home(monkeypatch, tmp_path):
@@ -337,6 +352,195 @@ def test_optional_renderer_absence_blocks_shell_creation_before_popen(tmp_path, 
 def _proc_start(pid):
     try:
         raw = Path("/proc/{}/stat".format(pid)).read_text(encoding="ascii")
-        return raw.rsplit(")", 1)[1].split()[19]
+        fields = raw.rsplit(")", 1)[1].split()
+        if fields[0] in ("Z", "X"):
+            return None
+        return fields[19]
     except (OSError, IndexError, ValueError):
         return None
+
+
+def _proc_session_and_group(pid):
+    try:
+        fields = Path("/proc/{}/stat".format(pid)).read_text(
+            encoding="ascii"
+        ).rsplit(")", 1)[1].split()
+        if fields[0] in ("Z", "X"):
+            return None
+        # Fields after comm begin with state, ppid, pgrp, session.
+        return int(fields[3]), int(fields[2])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+@pytest.mark.skipif(not renderer_available(), reason="supervisor crash test requires pyte")
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux process identities are required")
+def test_supervisor_crash_makes_session_stale_and_shell_exits(tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.manager as manager
+
+    _safe_test_home(monkeypatch, tmp_path)
+    registry = TerminalRegistry(root=tmp_path / "r")
+    worker_processes = []
+    popen = manager.subprocess.Popen
+
+    def capture_worker(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        worker_processes.append(process)
+        return process
+
+    monkeypatch.setattr(manager.subprocess, "Popen", capture_worker)
+    client = registry.create("crashed supervisor fixture")
+    session_id = client.identity.session_id
+    shell_pid = client.identity.shell_pid
+    supervisor_pid = client.identity.supervisor_pid
+    assert len(worker_processes) == 1
+    assert worker_processes[0].pid == supervisor_pid
+    client.close()
+
+    try:
+        if _proc_start(shell_pid) is None:
+            registry.stop(session_id)
+            worker_processes[0].wait(timeout=5)
+            pytest.skip("fixture shell exited before the supervisor-crash check")
+        os.kill(supervisor_pid, signal.SIGKILL)
+        worker_processes[0].wait(timeout=5)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if (_proc_start(supervisor_pid) is None
+                    and _proc_start(shell_pid) is None):
+                break
+            time.sleep(0.02)
+
+        assert _proc_start(supervisor_pid) is None
+        assert _proc_start(shell_pid) is None
+        listed = registry.list_sessions()
+        assert len(listed) == 1
+        assert listed[0].session_id == session_id
+        assert listed[0].state == "exited"
+        with pytest.raises(TerminalError, match="supervisor identity is stale"):
+            registry.connect(session_id)
+    finally:
+        if _proc_start(shell_pid) is not None:
+            _worker._signal_session_processes(shell_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux process identities are required")
+@pytest.mark.parametrize("unsupported_call", ["pidfd_open", "pidfd_send_signal"])
+def test_pidfd_syscall_unavailable_falls_back_to_checked_pid_signal(
+        monkeypatch, unsupported_call):
+    if unsupported_call == "pidfd_send_signal" and not hasattr(signal, "pidfd_send_signal"):
+        pytest.skip("Python does not expose pidfd_send_signal")
+    child = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+    try:
+        if unsupported_call == "pidfd_open":
+            def unavailable(*_args, **_kwargs):
+                raise OSError(_worker.errno.ENOSYS, "pidfd_open unavailable")
+
+            monkeypatch.setattr(_worker.os, "pidfd_open", unavailable)
+        else:
+            def unavailable(*_args, **_kwargs):
+                raise OSError(_worker.errno.ENOSYS, "pidfd_send_signal unavailable")
+
+            monkeypatch.setattr(signal, "pidfd_send_signal", unavailable)
+
+        _worker._signal_session_processes(child.pid, signal.SIGTERM)
+        assert child.wait(timeout=3) == -signal.SIGTERM
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=3)
+
+
+@pytest.mark.skipif(not renderer_available(), reason="process cleanup requires optional pyte renderer")
+@pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash is not available")
+@pytest.mark.parametrize("exit_shell_first", [False, True])
+def test_explicit_stop_terminates_child_in_separate_process_group(
+        tmp_path, monkeypatch, exit_shell_first):
+    account_shell = Path(pwd.getpwuid(os.getuid()).pw_shell).resolve()
+    if account_shell != Path("/bin/bash").resolve():
+        pytest.skip("test contract deliberately uses the account's /bin/bash login shell")
+    _safe_test_home(monkeypatch, tmp_path)
+    registry = TerminalRegistry(root=tmp_path / "r")
+    client = registry.create("process group cleanup")
+    session_id = client.identity.session_id
+    shell_pid = client.identity.shell_pid
+    other = None
+    other_session_id = None
+    other_shell_pid = None
+    child_pid = None
+    try:
+        other = registry.create("unrelated terminal")
+        other_session_id = other.identity.session_id
+        other_shell_pid = other.identity.shell_pid
+        assert other_session_id != session_id
+        assert _proc_start(other_shell_pid) is not None
+        assert client.acquire()
+        marker = "JTT_CHILD_PG_" + os.urandom(6).hex()
+        command = (
+            "python3 -c 'import os,signal,time; os.setpgid(0,0); "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print(\"{}\" + str(os.getpid()), flush=True); time.sleep(60)' &\n"
+        ).format(marker)
+        client.send(command.encode("utf-8"))
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            text = _screen_text(client.poll())
+            match = re.search(re.escape(marker) + r"(\d+)", text)
+            if match:
+                child_pid = int(match.group(1))
+                break
+            time.sleep(0.03)
+        assert child_pid is not None, "fixture child PID marker was not rendered"
+        assert _proc_start(child_pid) is not None
+        assert _proc_session_and_group(child_pid) == (shell_pid, child_pid)
+        assert child_pid != shell_pid
+
+        if exit_shell_first:
+            # Disown the fixture job so Bash does not send it SIGHUP on exit;
+            # the terminal stop must still clean its retained PTY session.
+            client.send(b"disown -a\nexit\n")
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                client.poll()
+                if client.state == "exited":
+                    break
+                time.sleep(0.03)
+            assert client.state == "exited"
+            assert _proc_start(child_pid) is not None, (
+                "Bash exit unexpectedly ended the disowned fixture child"
+            )
+
+        registry.stop(session_id)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and _proc_start(child_pid) is not None:
+            time.sleep(0.02)
+        assert _proc_start(child_pid) is None, (
+            "explicit stop left a live child in another process group "
+            "within the shell's session"
+        )
+        assert _proc_start(other_shell_pid) is not None, (
+            "stopping one terminal affected a different terminal session"
+        )
+    finally:
+        client.close()
+        # Contain the intentionally failing pre-fix case: never leave its
+        # private fixture child behind if the assertion above fails.
+        if child_pid is not None and _proc_start(child_pid) is not None:
+            identity = _proc_session_and_group(child_pid)
+            if identity == (shell_pid, child_pid):
+                try:
+                    os.killpg(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        try:
+            if (tmp_path / "r" / session_id).exists():
+                registry.stop(session_id)
+        except (OSError, TerminalError):
+            pass
+        if other is not None:
+            other.close()
+            try:
+                if other_session_id and (tmp_path / "r" / other_session_id).exists():
+                    registry.stop(other_session_id)
+            except (OSError, TerminalError):
+                pass

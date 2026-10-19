@@ -398,3 +398,118 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
             except (OSError, RuntimeError, ValueError):
                 pass
         shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.skipif(shutil.which("vim") is None, reason="interactive Vim TUI is unavailable")
+def test_vim_alternate_screen_unicode_keys_resize_and_shell_return(monkeypatch):
+    """Exercise an installed, no-config TUI only inside a fresh JTT PTY."""
+
+    if Path(pwd.getpwuid(os.getuid()).pw_shell).resolve() != Path("/bin/bash").resolve():
+        pytest.skip("fixture deliberately exercises the account's /bin/bash login shell")
+
+    root = Path(tempfile.mkdtemp(prefix="jtt-vim-it-"))
+    root.chmod(0o700)
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    import pyte
+    pyte_root = Path(pyte.__file__).resolve().parent.parent
+    _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
+    registry = TerminalRegistry(root=root / "state" / "terminals")
+    client = None
+    session_id = None
+    try:
+        client = registry.create("Isolated Vim fixture")
+        session_id = client.identity.session_id
+        initial = client.poll()
+        assert initial.synced and initial.screen is not None
+        assert client.acquire()
+
+        # No user file is opened: Vim uses a new unnamed buffer, ignores user
+        # vimrc/plugins/history, and is told not to create a swap file.
+        command = b"vim -Nu NONE -n -i NONE\n"
+        assert client.send(command) == len(command)
+        deadline = time.monotonic() + 6.0
+        tui_output = bytearray()
+        update = initial
+        while time.monotonic() < deadline:
+            update = client.poll()
+            tui_output.extend(update.output)
+            if b"\x1b[?1049h" in tui_output and update.synced and not update.more:
+                break
+            time.sleep(0.02)
+        assert update.synced and not update.more and update.screen is not None
+        assert b"\x1b[?1049h" in tui_output  # Vim entered its alternate screen.
+
+        marker = "JTT_VIM_한글"
+        insertion = ("i" + marker + "\r\nNEXT").encode("utf-8")
+        assert client.send(insertion) == len(insertion)
+
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            update = client.poll()
+            tui_output.extend(update.output)
+            if update.synced and not update.more and marker in _binding_text(update):
+                break
+            time.sleep(0.02)
+        assert update.synced and not update.more and update.screen is not None
+        assert marker in _binding_text(update)
+        assert 0 <= update.screen.cursor_x < update.columns
+        assert 0 <= update.screen.cursor_y < update.lines
+        wide_positions = []
+        for row in update.screen.rows:
+            wide_positions.extend(index for index, cell in enumerate(row) if cell.text == "한")
+        assert wide_positions
+        assert any(row[x + 2].text == "글" for row in update.screen.rows
+                   for x, cell in enumerate(row[:-2]) if cell.text == "한")
+
+        # Escape leaves insert mode; arrow and Enter are delivered to Vim.
+        movement = b"\x1b\x1b[A\r"
+        assert client.send(movement) == len(movement)
+        client.resize(100, 30)
+        resize_deadline = time.monotonic() + 4.0
+        while time.monotonic() < resize_deadline:
+            update = client.poll()
+            tui_output.extend(update.output)
+            if update.synced and not update.more and update.columns == 100 and update.lines == 30:
+                break
+            time.sleep(0.02)
+        assert update.synced and update.columns == 100 and update.lines == 30
+        assert update.screen is not None and len(update.screen.rows) == 30
+
+        # Ask the running TUI itself to report the dimensions it observed.
+        assert client.send(b":echo 'JTT_VIM_SIZE=' . &lines . 'x' . &columns\r") > 0
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            update = client.poll()
+            tui_output.extend(update.output)
+            if (update.synced and not update.more
+                    and "JTT_VIM_SIZE=30x100" in _binding_text(update)):
+                break
+            time.sleep(0.02)
+        assert "JTT_VIM_SIZE=30x100" in _binding_text(update)
+
+        assert client.send(b":q!\r") == 4
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            update = client.poll()
+            tui_output.extend(update.output)
+            if b"\x1b[?1049l" in tui_output and update.synced and not update.more:
+                break
+            time.sleep(0.02)
+        assert b"\x1b[?1049l" in tui_output  # Vim restored the shell screen.
+        after = "JTT_AFTER_VIM_" + uuid.uuid4().hex[:8]
+        shell_command = f"printf '%s\\n' '{after}'\n".encode("ascii")
+        assert client.send(shell_command) == len(shell_command)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            update = client.poll()
+            if update.synced and after in _binding_text(update):
+                break
+            time.sleep(0.02)
+        assert update.synced and after in _binding_text(update)
+        assert client.identity.session_id == session_id
+    finally:
+        if client is not None:
+            client.close()
+        if session_id is not None:
+            registry.stop(session_id)
+        shutil.rmtree(root, ignore_errors=True)

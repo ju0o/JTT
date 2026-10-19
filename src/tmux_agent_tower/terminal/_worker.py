@@ -25,6 +25,7 @@ import subprocess
 import sys
 import termios
 import time
+from typing import Optional
 import uuid
 import zlib
 
@@ -60,6 +61,23 @@ else:
     _PYTE_IMPORT_STATE = "ready"
 
 
+if pyte is not None:
+    class _JttScreen(pyte.Screen):
+        """Screen adapter for xterm's private SGR extension marker.
+
+        pyte's parser dispatches CSI ``? ... m`` with ``private=True`` but its
+        Screen handler only accepts numeric attributes. Private SGR has no
+        portable rendition semantics, so ignore that extension instead of
+        taking the otherwise healthy terminal offline.
+        """
+
+        def select_graphic_rendition(self, *attrs: int, private: bool = False) -> None:
+            if not private:
+                super().select_graphic_rendition(*attrs)
+else:
+    _JttScreen = None
+
+
 MAX_OUTPUT_EVENTS = 128
 MAX_OUTPUT_BYTES = 1024 * 1024
 READ_CHUNK = 8192
@@ -89,6 +107,102 @@ def _process_start_or_fail(pid: int) -> str:
     if not value:
         raise TerminalError("cannot identify process start")
     return value
+
+
+def _session_processes(session_id: int) -> dict[int, str]:
+    """Return live ``/proc`` members of one PTY-owned process session.
+
+    A shell can place a background job in another process group without
+    leaving its session. Signalling only the shell's process group therefore
+    leaks that job on explicit terminal stop. The PTY child is started as a
+    fresh session leader, so its session ID is the scope boundary here.
+    """
+
+    members = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+            if fields[0] in ("Z", "X") or int(fields[3]) != session_id:
+                continue
+            members[int(entry.name)] = fields[19]
+        except (OSError, IndexError, ValueError):
+            # Processes can exit while /proc is enumerated. The next scan
+            # observes the stable set; malformed/unreadable entries are not
+            # signalled.
+            continue
+    return members
+
+
+def _process_start_in_session(pid: int, session_id: int) -> Optional[str]:
+    try:
+        fields = Path("/proc/{}/stat".format(pid)).read_text(
+            encoding="ascii"
+        ).rsplit(")", 1)[1].split()
+        if fields[0] in ("Z", "X") or int(fields[3]) != session_id:
+            return None
+        return fields[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _signal_session_processes(session_id: int, signum: int,
+                              already_signalled: Optional[set[tuple[int, str]]] = None
+                              ) -> set[tuple[int, str]]:
+    """Signal only still-matching process identities in the owned session."""
+
+    sent = already_signalled if already_signalled is not None else set()
+    for pid, start in _session_processes(session_id).items():
+        identity = (pid, start)
+        if identity in sent:
+            continue
+        # Re-read immediately before signalling so an exited PID reused by an
+        # unrelated process is not acted upon.
+        pidfd_open = getattr(os, "pidfd_open", None)
+        pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+        pidfd = None
+        if pidfd_open is not None and pidfd_send_signal is not None:
+            try:
+                pidfd = pidfd_open(pid, 0)
+            except ProcessLookupError:
+                continue
+            except OSError as exc:
+                # Python may expose the API while the running kernel or a
+                # seccomp profile denies the syscall. Use the documented
+                # start-time/session recheck fallback for those cases.
+                if exc.errno not in (errno.ENOSYS, errno.EINVAL, errno.EPERM):
+                    raise
+            else:
+                try:
+                    if _process_start_in_session(pid, session_id) != start:
+                        continue
+                    try:
+                        pidfd_send_signal(pidfd, signum)
+                    except ProcessLookupError:
+                        continue
+                    except OSError as exc:
+                        if exc.errno not in (errno.ENOSYS, errno.EINVAL, errno.EPERM):
+                            raise
+                        # Some kernels expose pidfd_open but not pidfd_send_signal.
+                        # Close this descriptor and use the checked kill(2) path.
+                    else:
+                        sent.add(identity)
+                        continue
+                finally:
+                    os.close(pidfd)
+
+        # Older Linux/Python combinations without pidfd support still recheck
+        # both session membership and process start time immediately before
+        # kill(2); pidfd is preferred because it closes the PID-reuse race.
+        if _process_start_in_session(pid, session_id) != start:
+            continue
+        try:
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            continue
+        sent.add(identity)
+    return sent
 
 
 def _safe_child_setup(slave_fd: int) -> None:
@@ -206,7 +320,7 @@ class PtyOwner:
             self.renderer_state = _PYTE_IMPORT_STATE
             raise TerminalError("renderer_" + self.renderer_state)
         try:
-            self.screen = pyte.Screen(self.columns, self.lines)
+            self.screen = _JttScreen(self.columns, self.lines)
             self.stream = pyte.Stream(self.screen)
             self.screen.write_process_input = self._terminal_reply
             self.stream.feed("\x1b[0m")
@@ -410,7 +524,7 @@ class PtyOwner:
         if op == "resize":
             return self._resize(client_id, request), False
         if op == "stop":
-            if self._state() == "running":
+            if self.child is not None:
                 self._store_state("stopping", termination="requested")
                 self._terminate_child()
             return self._base(ok=True, state=self._state()), True
@@ -686,32 +800,60 @@ class PtyOwner:
             return
         pid = child.pid
         expected_start = self.shell_start
-        if _proc_start(pid) == expected_start:
+        current_start = _proc_start(pid)
+        if expected_start and current_start not in (None, expected_start):
+            raise TerminalError("shell identity changed during stop")
+        if not expected_start:
+            # Startup can fail after Popen but before /proc identity capture.
+            # At that point the fresh shell has received no terminal input or
+            # commands, and Popen still owns its unreaped child PID.
+            child.terminate()
             try:
-                if os.getpgid(pid) == pid:
-                    os.killpg(pid, signal.SIGTERM)
-                else:
-                    os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+                child.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=2.0)
+            self._check_child()
+            return
+
+        # Every PTY shell starts a fresh session (setsid in _safe_child_setup).
+        # Terminate its live members by verified PID/start-time within that
+        # session, not just its process group: shells can put jobs in their
+        # own process groups while keeping those jobs in the same session.
+        term_sent = set()
+        try:
+            _signal_session_processes(pid, signal.SIGTERM, term_sent)
+            term_deadline = time.monotonic() + 2.0
+            while time.monotonic() < term_deadline:
+                child.poll()  # Reap the shell if it has exited.
+                if not _session_processes(pid):
+                    break
+                _signal_session_processes(pid, signal.SIGTERM, term_sent)
+                time.sleep(0.05)
+
+            # Escalate only against processes still observed in this PTY's
+            # session. This also catches stubborn children in separate groups.
+            kill_deadline = time.monotonic() + 2.0
+            while time.monotonic() < kill_deadline:
+                remaining = _session_processes(pid)
+                if not remaining:
+                    break
+                _signal_session_processes(pid, signal.SIGKILL)
+                child.poll()
+                time.sleep(0.02)
+        except OSError as exc:
+            raise TerminalError("cannot inspect PTY process session") from exc
+
         try:
             child.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            if _proc_start(pid) == expected_start:
-                try:
-                    if os.getpgid(pid) == pid:
-                        os.killpg(pid, signal.SIGKILL)
-                    else:
-                        os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            child.wait(timeout=2.0)
+        except subprocess.TimeoutExpired as exc:
+            raise TerminalError("PTY shell did not exit after session termination") from exc
         self._check_child()
 
     def _shutdown(self):
         self.lease_owner = None
         self.lease_deadline = 0.0
-        if self._state() == "running":
+        if self.child is not None:
             self._terminate_child()
         for conn in tuple(self.clients):
             self._drop_client(conn)
