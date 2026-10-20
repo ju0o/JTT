@@ -88,8 +88,27 @@ def _specs(count):
 
 
 def _kit_choice(state, kit_id):
-    return next(index for index, item in enumerate(state["choices"])
-                if item.get("kind") == "work_kit" and item.get("id") == kit_id)
+    return {"kind": "work_kit", "id": kit_id}
+
+
+def _preview_kit(state, kit_id):
+    jtt._preview_work_kit(state, _kit_choice(state, kit_id))
+
+
+def _run_archive_action(monkeypatch, state, action, record_id=None, confirmation="delete",
+                        before_confirmation=None):
+    def picker(_screen, title, _items, **_kwargs):
+        if title == "보관함":
+            return SimpleNamespace(cancelled=False, selected_key=action)
+        if title in {"저장한 작업공간", "Work Kit"}:
+            return SimpleNamespace(cancelled=False, selected_key=record_id)
+        if before_confirmation is not None:
+            before_confirmation()
+        return SimpleNamespace(cancelled=confirmation is None,
+                               selected_key=confirmation)
+
+    monkeypatch.setattr(jtt, "run_list_picker", picker)
+    jtt._archive_menu(None, state)
 
 
 def test_work_kit_store_is_read_only_until_explicit_create_and_round_trips(tmp_path):
@@ -188,6 +207,26 @@ def test_delete_work_kit_revalidates_full_snapshot_and_removes_only_selected(tmp
     removed = store.delete_kit(first["id"], expected_snapshot=first)
     assert removed == first
     assert JTTWorkKitStore(store.root).kits() == [second]
+
+
+def test_rename_work_kit_revalidates_full_snapshot_and_preserves_terminal_definitions(tmp_path):
+    store = JTTWorkKitStore(tmp_path / "state")
+    first = store.create_kit("First", "Keep definition", _specs(2))
+    second = store.create_kit("Second", "Other", _specs(1))
+    before = store.path.read_bytes()
+
+    renamed = store.rename_kit(first["id"], "Renamed", expected_snapshot=first)
+
+    assert renamed["id"] == first["id"]
+    assert renamed["name"] == "Renamed"
+    assert renamed["description"] == first["description"]
+    assert renamed["terminals"] == first["terminals"]
+    assert store.kits() == [renamed, second]
+    with pytest.raises(WorkKitStoreError, match="changed"):
+        store.rename_kit(first["id"], "Stale", expected_snapshot=first)
+    with pytest.raises(WorkKitStoreError, match="name"):
+        store.rename_kit(first["id"], second["name"], expected_snapshot=renamed)
+    assert store.path.read_bytes() != before
 
 
 def test_delete_work_kit_atomic_replace_failure_preserves_original(tmp_path, monkeypatch):
@@ -420,29 +459,32 @@ def test_invalid_optional_work_kit_data_does_not_block_workspaces_or_overwrite(
     state = jtt.build_state(workspace_store, registry, attach_default=False)
 
     assert state["jtt_work_kit_error"] is True
-    assert any(item.get("id") == saved["id"] for item in state["choices"])
-    assert not any(item.get("id") == "action:work-kit-create" for item in state["choices"])
-    unavailable = next(item for item in state["choices"]
-                       if item.get("id") == "work-kit-unavailable")
-    assert unavailable["kind"] == "info"
-    assert "사용 불가" in unavailable["label"]
+    assert not any(item.get("id") == saved["id"] for item in state["choices"])
+    assert not any(item.get("kind") in {"workspace", "work_kit"}
+                   for item in state["choices"])
+    assert any(item.get("id") == "action:archive" for item in state["choices"])
 
     screen = FakeScreen(height=24, width=80)
     rect = renderer._regions(80, 24, 0)[0][0]
     renderer._draw_left(screen, rect, state, True)
-    assert "Work Kit 사용 불가" in screen.text()
+    assert "보관함" in screen.text()
 
-    monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: pytest.fail("must not prompt"))
-    jtt._create_work_kit(None, state)
+    menu_rows = []
+    selections = iter(("load_workspace", saved["id"]))
+    def choose_archive(_screen, title, items, **_kwargs):
+        menu_rows.append((title, items))
+        return SimpleNamespace(cancelled=False, selected_key=next(selections))
+    monkeypatch.setattr(jtt, "run_list_picker", choose_archive)
+    jtt._archive_menu(None, state)
+    assert state["workspace_id"] == saved["id"]
+    assert "현재 터미널 구성 저장" in dict(menu_rows[0][1])["save"]
+    assert "Work Kit 템플릿 만들기" not in dict(menu_rows[0][1]).values()
     with pytest.raises(WorkKitStoreError):
         kit_store.create_kit("Should not overwrite", "", _specs(1))
     assert kit_store.path.read_bytes() == original_kit_bytes
     assert stat.S_IMODE(kit_store.path.stat().st_mode) == original_mode
     assert workspace_store.path.read_bytes() == workspace_bytes
 
-    saved_index = next(index for index, item in enumerate(state["choices"])
-                       if item.get("id") == saved["id"])
-    renderer._set_choice(state, saved_index)
     assert [row["managed_id"] for row in state["panes"]] == ["session-valid"]
     assert registry.connected == ["session-valid"]
 
@@ -451,7 +493,8 @@ def test_ui_create_flow_persists_only_work_kit_file(tmp_path, monkeypatch):
     workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
     workspace_store.set_terminal_ids(workspace_store.DEFAULT_ID, [])
     workspaces_before = workspace_store.path.read_bytes()
-    state = jtt.build_state(workspace_store, FakeRegistry())
+    registry = FakeRegistry()
+    state = jtt.build_state(workspace_store, registry)
     responses = iter(["Dev Kit", "개발용", "2", "API", "백엔드", "  ~/not-probed  ",
                       "Tests", "검증", ""])
     monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: next(responses))
@@ -464,7 +507,8 @@ def test_ui_create_flow_persists_only_work_kit_file(tmp_path, monkeypatch):
     assert kits[0]["name"] == "Dev Kit"
     assert kits[0]["terminals"][0]["working_directory"] == "  ~/not-probed  "
     assert workspace_store.path.read_bytes() == workspaces_before
-    assert state["work_kit_preview"]["id"] == kits[0]["id"]
+    assert state["work_kit_preview"] is None
+    assert registry.created == 0
     assert state["jtt_notice"] == "Dev Kit Work Kit 저장 완료 · 터미널 2개 구성 · 아직 실행되지 않음"
 
 
@@ -482,7 +526,7 @@ def test_work_kit_create_reports_committed_when_directory_sync_fails(tmp_path, m
 
     kits = state["jtt_work_kit_store"].kits()
     assert [kit["name"] for kit in kits] == ["Committed Kit"]
-    assert state["work_kit_preview"]["id"] == kits[0]["id"]
+    assert state["work_kit_preview"] is None
     assert workspace_store.path.read_bytes() == workspace_before
     assert "Work Kit 저장 완료" in state["jtt_notice"]
     assert "디렉터리 동기화 확인 필요" in state["jtt_notice"]
@@ -496,12 +540,9 @@ def test_work_kit_delete_reports_committed_and_refreshes_after_directory_sync_fa
     selected = kit_store.create_kit("Delete", "Selected", _specs(1))
     keep = kit_store.create_kit("Keep", "Other", _specs(1))
     state = jtt.build_state(workspace_store, FakeRegistry())
-    renderer._set_choice(state, _kit_choice(state, selected["id"]))
-    monkeypatch.setattr(jtt, "run_list_picker", lambda *_args, **_kwargs:
-                        SimpleNamespace(cancelled=False, selected_key="delete"))
     _fail_directory_fsync(monkeypatch)
 
-    jtt._confirm_and_delete_work_kit(None, state)
+    _run_archive_action(monkeypatch, state, "delete_kit", selected["id"])
 
     assert kit_store.kits() == [keep]
     assert state["work_kit_preview"] is None
@@ -520,7 +561,7 @@ def test_workspace_save_reports_committed_and_refreshes_after_directory_sync_fai
     jtt._save_configuration(None, state)
 
     saved = next(item for item in store.workspaces() if item["name"] == "Committed workspace")
-    assert any(item.get("id") == saved["id"] for item in state["choices"])
+    assert not any(item.get("id") == saved["id"] for item in state["choices"])
     assert state["workspace_id"] == saved["id"]
     assert "구성 저장 반영됨" in state["jtt_notice"]
     assert "디렉터리 동기화 확인 필요" in state["jtt_notice"]
@@ -532,13 +573,11 @@ def test_workspace_delete_reports_committed_and_refreshes_after_directory_sync_f
     saved = store.create_workspace("Delete workspace")
     store.set_terminal_ids(saved["id"], ["session-to-preserve"])
     state = jtt.build_state(store, FakeRegistry())
-    renderer._set_choice(state, next(index for index, item in enumerate(state["choices"])
-                                     if item.get("id") == saved["id"]))
     monkeypatch.setattr(jtt, "run_list_picker", lambda *_args, **_kwargs:
                         SimpleNamespace(cancelled=False, selected_key="delete"))
     _fail_directory_fsync(monkeypatch)
 
-    jtt._confirm_and_delete_workspace(None, state)
+    jtt._confirm_and_delete_workspace(None, state, saved["id"])
 
     remaining = {item["id"]: item for item in store.workspaces()}
     assert saved["id"] not in remaining
@@ -636,10 +675,7 @@ def test_work_kit_selection_and_prefix_new_never_touch_pty_or_workspace_data(tmp
     before_calls = (registry.created, tuple(registry.connected), tuple(registry.stopped),
                     tuple(registry.sent))
 
-    work_kit_choice = next(index for index, choice in enumerate(state["choices"])
-                           if choice.get("kind") == "work_kit" and choice.get("id") == kit["id"])
-    renderer._set_choice(state, work_kit_choice)
-    assert state["choices"][state["nav_index"]]["id"] == kit["id"]
+    _preview_kit(state, kit["id"])
     assert state["panes"][0]["terminal_kind"] == "work_kit_template"
     assert state["panes"][0]["terminal_view_state"] == "not_running"
     assert "target_id" not in state["panes"][0]
@@ -667,7 +703,7 @@ def test_work_kit_selection_and_prefix_new_never_touch_pty_or_workspace_data(tmp
                    prefix_byte=24, input_escape_byte=25),
 ], ids=["built-in", "custom"])
 def test_saved_workspace_reconnects_exact_sessions_and_keybindings_after_work_kit_preview(
-        tmp_path, keybindings):
+        tmp_path, keybindings, monkeypatch):
     workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
     default = workspace_store.workspaces()[0]
     workspace_store.set_terminal_ids(default["id"], ["session-a"])
@@ -685,13 +721,14 @@ def test_saved_workspace_reconnects_exact_sessions_and_keybindings_after_work_ki
     kit_store = JTTWorkKitStore(workspace_store.root)
     kit = kit_store.create_kit("Preview", "", _specs(1))
     state = jtt.build_state(workspace_store, registry, keybindings=keybindings)
-    kit_index = _kit_choice(state, kit["id"])
-
-    renderer._set_choice(state, kit_index)
+    _run_archive_action(monkeypatch, state, "preview_kit", kit["id"])
     assert registry.connected == ["session-a"]
-    saved_index = next(index for index, item in enumerate(state["choices"])
-                       if item.get("kind") == "workspace" and item.get("id") == saved["id"])
-    renderer._set_choice(state, saved_index)
+    default_window = next(item for item in state["choices"]
+                          if item.get("kind") == "logical_window"
+                          and item.get("workspace_id") == default["id"])
+    jtt._attach_layout_choice(state, default_window)
+    assert state["work_kit_preview"] is None
+    _run_archive_action(monkeypatch, state, "load_workspace", saved["id"])
 
     assert state["work_kit_preview"] is None
     identities_before_switch = [
@@ -735,7 +772,7 @@ def test_work_kit_preview_cards_and_right_are_unmistakably_not_live(tmp_path, co
     kit_store = JTTWorkKitStore(workspace_store.root)
     kit = kit_store.create_kit(f"Kit {count}", "Preview only", _specs(count))
     state = jtt.build_state(workspace_store, FakeRegistry())
-    renderer._set_choice(state, _kit_choice(state, kit["id"]))
+    _preview_kit(state, kit["id"])
     screen = FakeScreen()
 
     rects = renderer.card_rectangles(count, (5, 5, 80, 26))
@@ -753,7 +790,7 @@ def test_work_kit_preview_cards_and_right_are_unmistakably_not_live(tmp_path, co
     assert not any(hit[4] == "center_action" for hit in state["hit_boxes"])
 
 
-def test_narrow_left_layout_keeps_work_kits_and_actions_inside_panel(tmp_path):
+def test_narrow_left_layout_keeps_flat_windows_and_archive_inside_panel(tmp_path):
     workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
     kit_store = JTTWorkKitStore(workspace_store.root)
     for index in range(5):
@@ -768,16 +805,16 @@ def test_narrow_left_layout_keeps_work_kits_and_actions_inside_panel(tmp_path):
     rows = [y for y, _x, _text in screen.writes]
     assert rows and min(rows) >= 0 and max(rows) < 24
     written = screen.text()
-    assert "Work Kit" in written
-    assert "저장한 작업" in written
+    assert "보관함" in written
+    assert "Work Kit" not in written
     assert all(y + height <= 23 for _x, y, _width, height, kind, _index in state["hit_boxes"]
                if kind == "left")
     screen.writes.clear()
     state["nav_index"] = next(index for index, item in enumerate(state["choices"])
-                               if item.get("id") == "action:work-kit-create")
+                               if item.get("id") == "action:archive")
     state["hit_boxes"] = []
     renderer._draw_left(screen, rect, state, True)
-    assert "새 Work Kit" in screen.text()
+    assert "보관함" in screen.text()
 
 
 def _uncertain_terminal_state(tmp_path):
@@ -870,14 +907,6 @@ def test_saved_workspace_delete_is_confirmed_and_does_not_stop_terminal(tmp_path
     )
     registry = FakeRegistry([identity])
     state = jtt.build_state(store, registry)
-    choice_index = next(index for index, item in enumerate(state["choices"])
-                        if item.get("kind") == "workspace" and item.get("id") == saved["id"])
-    renderer._set_choice(state, choice_index)
-    logical_window_index = next(index for index, item in enumerate(state["choices"])
-                                if item.get("kind") == "logical_window"
-                                and item.get("workspace_id") == saved["id"]
-                                and item.get("window_id") == "window-default")
-    renderer._set_choice(state, logical_window_index)
     saved_snapshot = next(item for item in store.workspaces() if item["id"] == saved["id"])
     captured = {}
 
@@ -887,7 +916,7 @@ def test_saved_workspace_delete_is_confirmed_and_does_not_stop_terminal(tmp_path
 
     monkeypatch.setattr(jtt, "run_list_picker", confirm)
 
-    jtt._confirm_and_delete_workspace(None, state)
+    jtt._confirm_and_delete_workspace(None, state, saved["id"])
 
     remaining = {item["id"]: item for item in store.workspaces()}
     assert saved["id"] not in remaining
@@ -907,8 +936,6 @@ def test_saved_workspace_delete_cancel_and_selection_revalidation_do_not_write(t
     first = store.create_workspace("First")
     second = store.create_workspace("Second")
     state = jtt.build_state(store, FakeRegistry())
-    renderer._set_choice(state, next(index for index, item in enumerate(state["choices"])
-                                     if item.get("id") == first["id"]))
     before = store.path.read_bytes()
     calls = []
 
@@ -917,7 +944,7 @@ def test_saved_workspace_delete_cancel_and_selection_revalidation_do_not_write(t
         return SimpleNamespace(cancelled=True, selected_key=None)
 
     monkeypatch.setattr(jtt, "run_list_picker", cancel)
-    jtt._confirm_and_delete_workspace(None, state)
+    jtt._confirm_and_delete_workspace(None, state, first["id"])
     assert store.path.read_bytes() == before
     assert calls[0][0][2][0][0] == "cancel"
 
@@ -926,20 +953,17 @@ def test_saved_workspace_delete_cancel_and_selection_revalidation_do_not_write(t
     def change_selection(*_args, **_kwargs):
         nonlocal calls
         calls += 1
-        renderer._set_choice(
-            state, next(index for index, item in enumerate(state["choices"])
-                        if item.get("id") == second["id"]),
-        )
+        current_first = next(item for item in store.workspaces() if item["id"] == first["id"])
+        store.rename_workspace(first["id"], "First changed", expected_snapshot=current_first)
         return SimpleNamespace(cancelled=False, selected_key="delete")
 
-    renderer._set_choice(state, next(index for index, item in enumerate(state["choices"])
-                                     if item.get("id") == first["id"]))
     monkeypatch.setattr(jtt, "run_list_picker", change_selection)
-    jtt._confirm_and_delete_workspace(None, state)
+    jtt._confirm_and_delete_workspace(None, state, first["id"])
 
     assert calls == 1
-    assert store.path.read_bytes() == before
+    assert store.path.read_bytes() != before
     assert {item["id"] for item in store.workspaces()} >= {first["id"], second["id"]}
+    assert next(item for item in store.workspaces() if item["id"] == first["id"])["name"] == "First changed"
     assert "차단" in state["jtt_notice"]
 
 
@@ -949,30 +973,38 @@ def test_work_kit_delete_cancel_and_selection_revalidation_do_not_write(tmp_path
     first = kits.create_kit("First", "One", _specs(1))
     second = kits.create_kit("Second", "Two", _specs(2))
     state = jtt.build_state(store, FakeRegistry())
-    renderer._set_choice(state, _kit_choice(state, first["id"]))
     before = kits.path.read_bytes()
     calls = []
 
-    def cancel(*args, **kwargs):
-        calls.append((args, kwargs))
-        return SimpleNamespace(cancelled=True, selected_key=None)
+    def cancel(_screen, title, items, **kwargs):
+        calls.append((title, items, kwargs))
+        if title == "Work Kit 삭제":
+            assert items[0][0] == "cancel"
+            return SimpleNamespace(cancelled=True, selected_key=None)
+        if title == "보관함":
+            return SimpleNamespace(cancelled=False, selected_key="delete_kit")
+        if title == "Work Kit":
+            return SimpleNamespace(cancelled=False, selected_key=first["id"])
+        raise AssertionError(f"unexpected archive picker: {title}")
 
     monkeypatch.setattr(jtt, "run_list_picker", cancel)
-    jtt._confirm_and_delete_work_kit(None, state)
+    jtt._archive_menu(None, state)
     assert kits.path.read_bytes() == before
-    assert calls[0][0][2][0][0] == "cancel"
+    assert calls[0][0] == "보관함"
+    assert calls[1][0] == "Work Kit"
+    assert calls[2][0] == "Work Kit 삭제"
 
-    def change_selection(*_args, **_kwargs):
-        renderer._set_choice(state, _kit_choice(state, second["id"]))
-        return SimpleNamespace(cancelled=False, selected_key="delete")
+    def change_selected_kit():
+        current = next(item for item in kits.kits() if item["id"] == first["id"])
+        kits.rename_kit(first["id"], "First changed", expected_snapshot=current)
 
-    renderer._set_choice(state, _kit_choice(state, first["id"]))
-    monkeypatch.setattr(jtt, "run_list_picker", change_selection)
-    jtt._confirm_and_delete_work_kit(None, state)
+    _run_archive_action(monkeypatch, state, "delete_kit", first["id"],
+                        before_confirmation=change_selected_kit)
 
-    assert kits.path.read_bytes() == before
+    assert kits.path.read_bytes() != before
     assert [kit["id"] for kit in kits.kits()] == [first["id"], second["id"]]
-    assert "차단" in state["jtt_notice"]
+    assert next(item for item in kits.kits() if item["id"] == first["id"])["name"] == "First changed"
+    assert "삭제하지 못했습니다" in state["jtt_notice"]
 
 
 def test_work_kit_delete_changes_only_selected_template(tmp_path, monkeypatch):
@@ -982,16 +1014,12 @@ def test_work_kit_delete_changes_only_selected_template(tmp_path, monkeypatch):
     second = kit_store.create_kit("Second", "Two", _specs(2))
     workspace_path = store.path
     state = jtt.build_state(store, FakeRegistry())
-    renderer._set_choice(state, _kit_choice(state, first["id"]))
-    monkeypatch.setattr(jtt, "run_list_picker", lambda *_args, **_kwargs:
-                        SimpleNamespace(cancelled=False, selected_key="delete"))
-
-    jtt._confirm_and_delete_work_kit(None, state)
+    _run_archive_action(monkeypatch, state, "delete_kit", first["id"])
 
     assert kit_store.kits() == [second]
     assert not workspace_path.exists()
     assert state["work_kit_preview"] is None
-    assert "Work Kit 템플릿만 삭제" in state["jtt_notice"]
+    assert "Work Kit 템플릿을 삭제했습니다" in state["jtt_notice"]
 
 
 def test_uncertain_card_cleanup_preserves_shared_reference_without_stopping_session(

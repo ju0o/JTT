@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from tmux_agent_tower.state.jtt_workspaces import JTTWorkspaceStore
+from tmux_agent_tower.state.jtt_work_kits import JTTWorkKitStore
 from tmux_agent_tower.terminal import TerminalIdentity
 from tmux_agent_tower.ui import jtt
 from tmux_agent_tower.ui import ux_preview_v2 as renderer
@@ -94,8 +95,14 @@ def _identity(session_id, pid, generation, state="running", renderer_state="read
 
 
 class FakeScreen:
+    def __init__(self):
+        self.writes = []
+
     def getmaxyx(self):
         return (40, 120)
+
+    def addnstr(self, y, x, text, _length, attr=0):
+        self.writes.append((y, x, text, attr))
 
 
 def _prefix(screen, state, command):
@@ -307,6 +314,119 @@ def test_mini_live_cache_reports_only_output_change_and_clears_unsynced_sample(t
     assert renderer._status(row) == "↻ 셸 실행 중 · 화면 재동기화"
 
 
+def test_mini_live_requires_exact_session_generation_pid_and_clears_reused_identity(
+        tmp_path, monkeypatch):
+    from tmux_agent_tower.terminal import TerminalCell, TerminalScreen
+
+    identity = _identity("session-a", 101, "generation-a")
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    store.set_terminal_ids(store.DEFAULT_ID, [identity.session_id])
+    persisted_before = store.path.read_bytes()
+    state = jtt.build_state(store, FakeRegistry([identity]))
+
+    class SpySampler:
+        def __init__(self):
+            self.result = None
+            self.submissions = []
+
+        def submit(self, _registry, token, targets):
+            self.submissions.append((token, tuple(targets)))
+            return True
+
+        def take(self):
+            result, self.result = self.result, None
+            return result
+
+    sampler = SpySampler()
+    state["mini_live_sampler"] = sampler
+    screen = FakeScreen()
+    token, targets = jtt._visible_mini_targets(state, 120, 40)
+    assert targets == [("session-a", "generation-a", 101)]
+    cells = ((TerminalCell("private-screen", "default", "default", False, False,
+                           False, False, False, False),),)
+    sample = {
+        "session_id": "session-a", "generation": "generation-a",
+        "shell_pid": 101, "sequence": 1,
+        "screen": TerminalScreen(cells, 0, 0, True), "synced": True,
+    }
+
+    sampler.result = (token, [{**sample, "generation": "old-generation"}])
+    jtt._refresh_mini_live(state, screen)
+    row = state["panes"][0]
+    assert "mini_screen" not in row
+    assert not state["mini_live_cache"]
+
+    sampler.result = (token, [{**sample, "shell_pid": 999}])
+    jtt._refresh_mini_live(state, screen)
+    assert "mini_screen" not in row
+    assert not state["mini_live_cache"]
+
+    sampler.result = (token, [sample])
+    jtt._refresh_mini_live(state, screen)
+    exact = ("session-a", "generation-a", 101)
+    assert state["mini_live_cache"][exact]["screen"].rows[0][0].text == "private-screen"
+    assert row["mini_live_state"] == "synced"
+
+    row["managed_identity"]["generation"] = "generation-reused"
+    jtt._refresh_mini_live(state, screen)
+    assert not state["mini_live_cache"]
+    assert "mini_screen" not in row
+    assert "mini_live_state" not in row
+    assert store.path.read_bytes() == persisted_before
+
+
+def test_mini_live_sampler_uses_observe_only_without_lease_send_or_resize():
+    import queue
+    import threading
+    from tmux_agent_tower.terminal import TerminalCell, TerminalScreen
+
+    session_id, generation, shell_pid = "session-a", "gen-a", 101
+    screen = TerminalScreen(((TerminalCell("view", "default", "default", False,
+                                           False, False, False, False, False),),), 0, 0, True)
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+        def observe(self):
+            self.calls.append("observe")
+            return SimpleNamespace(session_id=session_id, generation=generation,
+                                   shell_pid=shell_pid, state="running", synced=True,
+                                   sequence=5, screen=screen)
+        def close(self):
+            self.calls.append("close")
+        def acquire(self):
+            raise AssertionError("Mini LIVE must not acquire input")
+        def send(self, _data):
+            raise AssertionError("Mini LIVE must not send input")
+        def resize(self, *_size):
+            raise AssertionError("Mini LIVE must not resize the PTY")
+
+    client = Client()
+    class Registry:
+        def connect(self, requested, timeout):
+            assert requested == session_id and timeout == 0.25
+            return client
+
+    sampler = jtt._MiniLiveSampler.__new__(jtt._MiniLiveSampler)
+    sampler._requests = queue.Queue(maxsize=2)
+    sampler._results = queue.Queue(maxsize=1)
+    sampler._lock = threading.Lock()
+    sampler._busy = True
+    sampler._stopping = False
+    token = ("workspace", "window", ((session_id, generation, shell_pid),))
+    sampler._requests.put_nowait((Registry(), token, ((session_id, generation, shell_pid),)))
+    sampler._requests.put_nowait(None)
+
+    sampler._run()
+
+    result_token, samples = sampler._results.get_nowait()
+    assert result_token == token
+    assert samples[0]["synced"] is True
+    assert (samples[0]["session_id"], samples[0]["generation"], samples[0]["shell_pid"]) == (
+        session_id, generation, shell_pid,
+    )
+    assert client.calls == ["observe", "close"]
+
 def test_mini_sampler_close_replaces_full_pending_queue_with_stop_sentinel():
     import queue
     import threading
@@ -390,7 +510,7 @@ def test_missing_or_unsynced_session_is_stale_and_cannot_enter(tmp_path):
     assert registry.clients["session-a"].sent == []
 
 
-def test_workspace_switch_attaches_only_selected_sessions_and_releases_old_client(tmp_path):
+def test_workspace_switch_attaches_only_selected_sessions_and_releases_old_client(tmp_path, monkeypatch):
     store = JTTWorkspaceStore(tmp_path / "jtt")
     registry = FakeRegistry([_identity("session-a", 101, "gen-a"),
                               _identity("session-b", 202, "gen-b")])
@@ -404,15 +524,288 @@ def test_workspace_switch_attaches_only_selected_sessions_and_releases_old_clien
     assert not registry.clients["session-a"].closed
     assert registry.connected == ["session-a"]
 
-    saved_index = next(i for i, choice in enumerate(state["choices"])
-                       if choice["id"] == saved["id"])
-    renderer._set_choice(state, saved_index)
+    selections = iter(("load_workspace", saved["id"]))
+    monkeypatch.setattr(jtt, "run_list_picker", lambda *_args, **_kwargs: SimpleNamespace(
+        cancelled=False, selected_key=next(selections),
+    ))
+    jtt._archive_menu(FakeScreen(), state)
     assert [row["managed_id"] for row in state["panes"]] == ["session-b"]
     assert set(state["managed_terminals"]) == {"session-b"}
     assert registry.clients["session-a"].closed
     assert not registry.clients["session-b"].closed
     assert registry.connected == ["session-a", "session-b"]
     assert renderer._managed_binding(state).session_id == "session-b"
+
+
+def test_flat_left_projects_default_and_windows_from_all_folders_without_mutating_ids(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    workspace = store.workspaces()[0]
+    layouts = jtt.JTTLayoutStore(store.root)
+    folder = layouts.create_folder(workspace["id"], "Build")
+    window = layouts.create_window(workspace["id"], folder["id"], "Window 1")
+    state = jtt.build_state(store, FakeRegistry(()))
+
+    windows = [item for item in state["choices"] if item.get("kind") == "logical_window"]
+    assert [item["window_id"] for item in windows] == ["window-default", window["id"]]
+    assert all(item.get("kind") not in {"workspace", "logical_folder", "work_kit"}
+               for item in state["choices"])
+    assert windows[0]["window_name"] == "Window 1"
+    assert "기본 폴더" in windows[0]["label"]
+    assert "Build" in windows[1]["label"]
+    stored = layouts.layout(workspace["id"], workspace["terminal_ids"])
+    assert next(item for item in stored["windows"] if item["id"] == "window-default")["name"] == "기본 Window"
+    assert not any(item.get("kind") == "logical_folder" for item in state["choices"])
+
+
+def test_left_window_navigation_enter_mouse_and_explicit_tabs_keep_expected_focus(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    layouts = jtt.JTTLayoutStore(store.root)
+    workspace = store.workspaces()[0]
+    folder = layouts.create_folder(workspace["id"], "Other")
+    created = layouts.create_window(workspace["id"], folder["id"], "Second")
+    state = jtt.build_state(store, FakeRegistry(()))
+    screen = FakeScreen()
+    second_index = next(index for index, item in enumerate(state["choices"])
+                        if item.get("kind") == "logical_window" and item.get("window_id") == created["id"])
+
+    assert renderer._handle_key(screen, state, curses.KEY_DOWN) is False
+    assert state["selected_window_id"] == created["id"]
+    assert state["active_panel"] == 0
+    state["nav_index"] = 0
+    assert renderer._handle_key(screen, state, "\n") is False
+    assert state["selected_window_id"] == "window-default"
+    assert state["active_panel"] == 1
+    state["hit_boxes"] = [(0, 0, 20, 1, "left", second_index)]
+    assert renderer._hit_test(state, 2, 0) == "left"
+    assert state["selected_window_id"] == created["id"]
+    assert state["active_panel"] == 0
+    assert renderer._handle_key(screen, state, "\t") is False
+    assert state["active_panel"] == 1
+    assert renderer._handle_key(screen, state, curses.KEY_BTAB) is False
+    assert state["active_panel"] == 0
+
+
+def test_archive_returns_to_default_workspace_with_exact_refs_and_releases_lease(
+        tmp_path, monkeypatch):
+    from tmux_agent_tower.state.jtt_keys import JTTKeybindings
+
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    default = store.workspaces()[0]
+    store.set_terminal_ids(default["id"], ["session-default"])
+    saved = store.create_workspace("Saved")
+    store.set_terminal_ids(saved["id"], ["session-saved"])
+    identities = [
+        _identity("session-default", 101, "gen-default"),
+        _identity("session-saved", 202, "gen-saved"),
+    ]
+    registry = FakeRegistry(identities)
+    keybindings = JTTKeybindings(prefix="Ctrl+X", prefix_byte=24)
+    state = jtt.build_state(store, registry, keybindings=keybindings)
+    archive_actions = []
+    selected_archive_actions = iter(("load_workspace", "return_default"))
+
+    def pick(_screen, title, items, **_kwargs):
+        if title == "보관함":
+            keys = [key for key, _label in items]
+            archive_actions.append(keys)
+            selected = next(selected_archive_actions)
+            assert selected in keys
+            return SimpleNamespace(cancelled=False, selected_key=selected)
+        assert title == "저장한 작업공간"
+        return SimpleNamespace(cancelled=False, selected_key=saved["id"])
+
+    monkeypatch.setattr(jtt, "run_list_picker", pick)
+    jtt._archive_menu(FakeScreen(), state)
+    assert "return_default" not in archive_actions[0]
+    assert state["workspace_id"] == saved["id"]
+    assert [row["managed_id"] for row in state["panes"]] == ["session-saved"]
+
+    saved_binding = state["managed_terminals"]["session-saved"]
+    saved_binding.refresh()
+    monkeypatch.setattr(renderer, "_set_jtt_control_byte_input",
+                        lambda _state, _enabled: True)
+    assert saved_binding.enter(None, state) is True
+    assert registry.clients["session-saved"].lease is True
+
+    jtt._archive_menu(FakeScreen(), state)
+
+    assert "return_default" in archive_actions[1]
+    assert state["workspace_id"] == JTTWorkspaceStore.DEFAULT_ID
+    assert state["selected_window_id"] == "window-default"
+    assert state["window_refs"] == ("session-default",)
+    assert [row["managed_id"] for row in state["panes"]] == ["session-default"]
+    assert saved_binding.closed is True
+    assert saved_binding.input_mode is False
+    assert registry.clients["session-saved"].lease is False
+    assert registry.created == 0
+    assert [(item.session_id, item.generation, item.shell_pid) for item in registry.list_sessions()] == [
+        (item.session_id, item.generation, item.shell_pid) for item in identities
+    ]
+    assert state["jtt_keybindings"] is keybindings
+
+
+def test_new_window_action_creates_empty_metadata_only_and_preserves_terminal_identity(
+        tmp_path, monkeypatch):
+    identity = _identity("session-a", 101, "gen-a")
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    store.set_terminal_ids(store.DEFAULT_ID, [identity.session_id])
+    registry = FakeRegistry([identity])
+    state = jtt.build_state(store, registry)
+    before_ids = list(store.workspaces()[0]["terminal_ids"])
+    before_identity = [(item.session_id, item.generation, item.shell_pid)
+                       for item in registry.list_sessions()]
+    prompts = []
+
+    def prompt(_screen, label, **kwargs):
+        prompts.append((label, kwargs.get("initial")))
+        return kwargs["initial"]
+
+    monkeypatch.setattr(jtt, "prompt_text", prompt)
+    action = next(item for item in state["choices"] if item.get("id") == "action:new-window")
+    state["nav_index"] = state["choices"].index(action)
+    assert renderer._handle_key(FakeScreen(), state, "\n") is False
+
+    workspace, layout, _ = jtt._workspace_layout(state)
+    created = next(item for item in layout["windows"] if item["id"] == state["selected_window_id"])
+    assert prompts == [("새 Window 이름: ", "Window 2")]
+    assert created["name"] == "Window 2" and created["terminal_ids"] == []
+    assert workspace["terminal_ids"] == before_ids
+    assert state["panes"] == []
+    assert registry.created == 0 and registry.stop_calls == []
+    assert [(item.session_id, item.generation, item.shell_pid)
+            for item in registry.list_sessions()] == before_identity
+    assert state["active_panel"] == 0
+
+
+def test_archive_left_action_opens_unified_saved_configuration_and_work_kit_menu(
+        tmp_path, monkeypatch):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    kit = JTTWorkKitStore(store.root).create_kit("Kit", "Preview only", [
+        {"name": "Shell", "role": "Local", "working_directory": None},
+    ])
+    state = jtt.build_state(store, FakeRegistry(()))
+    archive_index = next(index for index, item in enumerate(state["choices"])
+                         if item.get("id") == "action:archive")
+    captured = {}
+
+    def cancel_archive(_screen, title, items, **_kwargs):
+        captured["title"] = title
+        captured["items"] = items
+        return SimpleNamespace(cancelled=True, selected_key=None)
+
+    monkeypatch.setattr(jtt, "run_list_picker", cancel_archive)
+    state["nav_index"] = archive_index
+    assert renderer._handle_key(FakeScreen(), state, "\n") is False
+    assert captured["title"] == "보관함"
+    assert {item[0] for item in captured["items"]} >= {"save", "load_workspace", "create_kit"}
+    assert not any(item.get("id") == kit["id"] for item in state["choices"])
+    assert not any(item.get("kind") in {"workspace", "work_kit"} for item in state["choices"])
+    assert state["work_kit_preview"] is None
+
+    screen = FakeScreen()
+    rect = renderer._regions(160, 44, 0)[0][0]
+    renderer._draw_left(screen, rect, state, True)
+    archive_hit = next(item for item in state["hit_boxes"]
+                       if item[4] == "left" and state["choices"][item[5]]["id"] == "action:archive")
+    assert renderer._hit_test(state, archive_hit[0], archive_hit[1]) == "left"
+    assert captured["title"] == "보관함"
+
+
+def test_archive_renames_disambiguate_records_and_preserve_exact_references(
+        tmp_path, monkeypatch):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    first = store.create_workspace("Duplicate")
+    second = store.create_workspace("Duplicate")
+    store.set_terminal_ids(first["id"], ["session-one"])
+    store.set_terminal_ids(second["id"], ["session-two", "session-three"])
+    kit_store = JTTWorkKitStore(store.root)
+    kit = kit_store.create_kit("Duplicate", "Template stays separate", [{
+        "name": "Shell", "role": "Local", "working_directory": None,
+    }])
+    kit_bytes = kit_store.path.read_bytes()
+    registry = FakeRegistry([
+        _identity("session-one", 101, "gen-one"),
+        _identity("session-two", 202, "gen-two"),
+        _identity("session-three", 303, "gen-three"),
+    ])
+    state = jtt.build_state(store, registry, attach_default=False)
+    workspace_bytes_before = store.path.read_bytes()
+    selections = iter(("rename_workspace", second["id"],
+                       "rename_kit", kit["id"]))
+    record_labels = {}
+
+    def pick(_screen, title, items, **_kwargs):
+        if title in {"저장한 작업공간", "Work Kit"}:
+            record_labels[title] = items
+        return SimpleNamespace(cancelled=False, selected_key=next(selections))
+
+    monkeypatch.setattr(jtt, "run_list_picker", pick)
+    names = iter(("Second renamed", "Kit renamed"))
+    monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: next(names))
+
+    jtt._archive_menu(FakeScreen(), state)
+    workspace_bytes = store.path.read_bytes()
+    jtt._archive_menu(FakeScreen(), state)
+
+    assert len({key for key, _label in record_labels["저장한 작업공간"]}) == 2
+    assert all("·" in label for _key, label in record_labels["저장한 작업공간"])
+    current = {item["id"]: item for item in store.workspaces()}
+    assert current[first["id"]]["name"] == "Duplicate"
+    assert current[second["id"]]["name"] == "Second renamed"
+    assert current[first["id"]]["terminal_ids"] == ["session-one"]
+    assert current[second["id"]]["terminal_ids"] == ["session-two", "session-three"]
+    renamed_kit = kit_store.kits()[0]
+    assert renamed_kit["id"] == kit["id"] and renamed_kit["name"] == "Kit renamed"
+    assert renamed_kit["terminals"] == kit["terminals"]
+    assert kit_store.path.read_bytes() != kit_bytes
+    assert store.path.read_bytes() == workspace_bytes
+    assert workspace_bytes != workspace_bytes_before
+    assert registry.created == 0 and registry.stop_calls == []
+
+
+def test_prefix_new_targets_only_selected_logical_window_and_preserves_existing_identity(
+        tmp_path):
+    from tmux_agent_tower.state.jtt_keys import JTTKeybindings
+
+    original = _identity("session-existing", 201, "gen-existing")
+
+    class CreatingRegistry(FakeRegistry):
+        def create(self, *_args, **_kwargs):
+            self.created += 1
+            created = _identity("session-created", 303, "gen-created")
+            self.identities = (*self.identities, created)
+            client = FakeClient(created)
+            self.clients[created.session_id] = client
+            return client
+
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    store.set_terminal_ids(store.DEFAULT_ID, [original.session_id])
+    workspace = store.workspaces()[0]
+    layouts = jtt.JTTLayoutStore(store.root)
+    folder = layouts.create_folder(workspace["id"], "Other")
+    selected_window = layouts.create_window(workspace["id"], folder["id"], "Target")
+    bindings = JTTKeybindings(prefix="Ctrl+X", input_escape="Ctrl+Y",
+                              prefix_byte=24, input_escape_byte=25)
+    registry = CreatingRegistry([original])
+    state = jtt.build_state(store, registry, keybindings=bindings)
+    choice = next(item for item in state["choices"]
+                  if item.get("kind") == "logical_window"
+                  and item.get("window_id") == selected_window["id"])
+    jtt._attach_layout_choice(state, choice)
+    original_before = (original.session_id, original.generation, original.shell_pid)
+
+    assert jtt._handle_prefix_command(None, state, "n") is False
+
+    workspace, layout, _ = jtt._workspace_layout(state)
+    by_id = {item["id"]: item for item in layout["windows"]}
+    assert by_id["window-default"]["terminal_ids"] == [original.session_id]
+    assert by_id[selected_window["id"]]["terminal_ids"] == ["session-created"]
+    assert registry.created == 1
+    assert [(item.session_id, item.generation, item.shell_pid) for item in registry.list_sessions()
+            if item.session_id == original.session_id] == [original_before]
+    assert state["selected_window_id"] == selected_window["id"]
+    assert state["panes"][state["pane_index"]]["managed_id"] == "session-created"
+    assert state["managed_terminals"]["session-created"].input_escape_byte == 25
 
 
 def test_empty_workspace_can_reach_new_terminal_with_keyboard(tmp_path):

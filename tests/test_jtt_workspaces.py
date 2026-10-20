@@ -45,6 +45,28 @@ def test_workspace_configuration_is_private_and_round_trips(tmp_path):
     assert payload["schema_version"] == 1
 
 
+def test_rename_saved_workspace_revalidates_snapshot_and_preserves_exact_terminal_refs(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "private" / "jtt")
+    saved = store.create_workspace("Original")
+    store.set_terminal_ids(saved["id"], ["session-a", "session-b"])
+    snapshot = next(item for item in store.workspaces() if item["id"] == saved["id"])
+    before = store.path.read_bytes()
+
+    renamed = store.rename_workspace(saved["id"], "Renamed", expected_snapshot=snapshot)
+
+    assert renamed["id"] == saved["id"]
+    assert renamed["name"] == "Renamed"
+    assert renamed["terminal_ids"] == ["session-a", "session-b"]
+    assert next(item for item in store.workspaces() if item["id"] == saved["id"])["terminal_ids"] == [
+        "session-a", "session-b",
+    ]
+    with pytest.raises(WorkspaceStoreError, match="changed"):
+        store.rename_workspace(saved["id"], "Stale", expected_snapshot=snapshot)
+    with pytest.raises(WorkspaceStoreError, match="default"):
+        store.rename_workspace(store.DEFAULT_ID, "No", expected_snapshot=store.workspaces()[0])
+    assert store.path.read_bytes() != before
+
+
 def test_workspace_directory_sync_failure_reports_committed_replacement(tmp_path, monkeypatch):
     store = JTTWorkspaceStore(tmp_path / "private")
     existing = store.create_workspace("Existing")

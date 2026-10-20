@@ -33,11 +33,16 @@ dialog or cancels a pending prefix. See [JTT terminal support and safety](docs/J
 for data locations, cleanup guidance, and VT compatibility limits. The default
 prefix/input escape (`Ctrl+G` / `Ctrl+]`) can be changed in the private JTT-only
 `keybindings.json`; the support guide documents its strict schema and key list.
-Work Kits are local templates rather than saved running terminals: selecting one
-only previews non-running cards and never starts a shell or command. See
+Saved workspace configurations and Work Kits are accessed from the single
+LEFT `Archive` entry, but remain separate data types: loading a saved workspace
+reconnects its exact stored terminal references, while previewing a Work Kit
+shows non-running template cards and never starts a shell or command. See
 [JTT Work Kits](docs/JTT_WORK_KITS.md) for the local storage scope.
 
-JTT logical folders and windows are an additive organization layer. Existing
+LEFT shows the current workspace's logical Windows as a flat list; folder
+hierarchy remains available in Settings → folder/window management. The
+default internal Window is labeled `Window 1` without changing its stored ID or
+name. JTT logical folders and windows are an additive organization layer. Existing
 `workspaces.json` `terminal_ids` remain the canonical session references, and
 Work Kits are not rewritten. Layout assignments are stored separately in the
 private JTT-only `jtt_layouts.json`; legacy or unassigned terminal references
