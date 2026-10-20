@@ -756,7 +756,10 @@ def _attach_choice(state: dict, choice: dict) -> None:
         if session_id not in expected_ids:
             clients.pop(session_id).close()
 
-    rows = _session_rows(state["jtt_registry"], workspace, clients, attach=True)
+    rows = _session_rows(
+        state["jtt_registry"], workspace, clients, attach=True,
+        keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS),
+    )
     state["managed_cards"][workspace_id] = rows
     state["jtt_workspaces"] = workspaces
     state["workspace_id"] = workspace_id

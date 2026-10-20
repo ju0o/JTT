@@ -11,6 +11,7 @@ from tmux_agent_tower.state.jtt_work_kits import (
     WorkKitStoreError,
     layout_for_terminal_count,
 )
+from tmux_agent_tower.state.jtt_keys import DEFAULT_JTT_KEYBINDINGS, JTTKeybindings
 from tmux_agent_tower.state.jtt_workspaces import JTTWorkspaceStore
 from tmux_agent_tower.terminal import TerminalIdentity
 from tmux_agent_tower.ui import jtt
@@ -314,22 +315,30 @@ def test_work_kit_selection_and_prefix_new_never_touch_pty_or_workspace_data(tmp
     assert workspace_store.path.read_bytes() == workspace_before
 
 
-def test_saved_workspace_reconnects_exact_session_after_work_kit_preview(tmp_path):
+@pytest.mark.parametrize("keybindings", [
+    DEFAULT_JTT_KEYBINDINGS,
+    JTTKeybindings(prefix="Ctrl+X", input_escape="Ctrl+Y",
+                   prefix_byte=24, input_escape_byte=25),
+], ids=["built-in", "custom"])
+def test_saved_workspace_reconnects_exact_sessions_and_keybindings_after_work_kit_preview(
+        tmp_path, keybindings):
     workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
     default = workspace_store.workspaces()[0]
     workspace_store.set_terminal_ids(default["id"], ["session-a"])
     saved = workspace_store.create_workspace("Saved")
-    workspace_store.set_terminal_ids(saved["id"], ["session-b"])
+    workspace_store.set_terminal_ids(saved["id"], ["session-b", "session-c"])
     identities = [
         TerminalIdentity("session-a", "gen-a", 1000, "s1", 101, "p101", "/bin/bash",
                          "A", "running", renderer_state="ready"),
         TerminalIdentity("session-b", "gen-b", 1000, "s1", 202, "p202", "/bin/bash",
                          "B", "running", renderer_state="ready"),
+        TerminalIdentity("session-c", "gen-c", 1000, "s1", 303, "p303", "/bin/bash",
+                         "C", "running", renderer_state="ready"),
     ]
     registry = FakeRegistry(identities)
     kit_store = JTTWorkKitStore(workspace_store.root)
     kit = kit_store.create_kit("Preview", "", _specs(1))
-    state = jtt.build_state(workspace_store, registry)
+    state = jtt.build_state(workspace_store, registry, keybindings=keybindings)
     kit_index = _kit_choice(state, kit["id"])
 
     renderer._set_choice(state, kit_index)
@@ -339,8 +348,39 @@ def test_saved_workspace_reconnects_exact_session_after_work_kit_preview(tmp_pat
     renderer._set_choice(state, saved_index)
 
     assert state["work_kit_preview"] is None
-    assert [row["managed_id"] for row in state["panes"]] == ["session-b"]
-    assert registry.connected == ["session-a", "session-b"]
+    identities_before_switch = [
+        (row["managed_id"], row["managed_identity"]["shell_pid"]) for row in state["panes"]
+    ]
+    assert identities_before_switch == [("session-b", 202), ("session-c", 303)]
+    assert registry.connected == ["session-a", "session-b", "session-c"]
+
+    for session_id in ("session-b", "session-c"):
+        binding = state["managed_terminals"][session_id]
+        assert binding.input_escape_byte == keybindings.input_escape_byte
+        assert binding.input_escape_name == keybindings.input_escape
+
+    renderer._move_pane(state, 1, 44, 160)
+    assert renderer._selected_row(state)["managed_id"] == "session-c"
+    assert renderer._selected_row(state)["managed_identity"]["shell_pid"] == 303
+    renderer._move_pane(state, -1, 44, 160)
+    assert renderer._selected_row(state)["managed_id"] == "session-b"
+    assert [(row["managed_id"], row["managed_identity"]["shell_pid"])
+            for row in state["panes"]] == identities_before_switch
+
+    screen = FakeScreen()
+    assert renderer._handle_key(screen, state, chr(keybindings.prefix_byte)) is False
+    assert state["jtt_prefix_pending"] is True
+    assert renderer._handle_key(screen, state, "\x1b") is False
+    assert state["jtt_prefix_pending"] is False
+
+    escape_binding = state["managed_terminals"]["session-b"]
+    escape_binding.input_mode = True
+    escape_binding.client.lease = True
+    escape_binding.synced = True
+    escape_binding.screen = object()
+    assert escape_binding.handle_key(chr(keybindings.input_escape_byte)) is True
+    assert escape_binding.input_mode is False
+    assert registry.sent == []
 
 
 @pytest.mark.parametrize("count", [1, 2, 3, 4])
