@@ -520,6 +520,8 @@ class PtyOwner:
             return self._base(ok=True, state=self._state()), False
         if client["client_id"] != client_id:
             raise TerminalError("client_mismatch")
+        if op == "observe":
+            return self._observe(), False
         if op == "poll":
             return self._poll(request), False
         if op == "acquire":
@@ -561,10 +563,14 @@ class PtyOwner:
         return "running" if self.child.poll() is None else "exited"
 
     def _screen_payload(self):
+        payload, renderer_state = self._serialize_screen()
+        self.renderer_state = renderer_state
+        return payload
+
+    def _serialize_screen(self):
         if not self.renderer_available:
-            return None
+            return None, self.renderer_state
         try:
-            self.renderer_state = "ready"
             cells = []
             for y in range(self.lines):
                 row = self.screen.buffer[y]
@@ -577,15 +583,33 @@ class PtyOwner:
             }, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
             packed = base64.b64encode(zlib.compress(raw, level=1)).decode("ascii")
             if len(packed) > MAX_SCREEN_B64:
-                # A large but valid screen is a temporary transport limitation,
-                # not a VT parser failure. Keep the renderer recoverable and
-                # fail closed for input until a complete snapshot fits again.
-                self.renderer_state = "snapshot_too_large"
-                return None
-            return packed
+                return None, "snapshot_too_large"
+            return packed, "ready"
         except Exception:
-            self.renderer_state = "snapshot_unavailable"
-            return None
+            return None, "snapshot_unavailable"
+
+    def _observe(self):
+        """Return one event-loop-consistent screen without poll side effects."""
+        payload, renderer_state = self._serialize_screen()
+        shell_state = self._state()
+        synced = (payload is not None and self.renderer_available and not self.screen_error
+                  and shell_state == "running")
+        return {
+            "ok": True,
+            "protocol": PROTOCOL,
+            "session_id": self.session_id,
+            "generation": self.generation,
+            "shell_pid": int(self.metadata.get("shell_pid") or 0),
+            "terminal_state": shell_state,
+            "renderer_available": self.renderer_available,
+            "renderer_state": renderer_state,
+            "synced": synced,
+            "columns": self.columns,
+            "lines": self.lines,
+            "output_sequence": self.sequence,
+            "snapshot_revision": self.sequence,
+            "screen_z": payload if synced else None,
+        }
 
     def _poll(self, request):
         try:

@@ -309,6 +309,62 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_read_only_observe_keeps_two_pty_screens_distinct_and_does_not_take_lease(monkeypatch):
+    if Path(pwd.getpwuid(os.getuid()).pw_shell).resolve() != Path("/bin/bash").resolve():
+        pytest.skip("fixture deliberately exercises the account's /bin/bash login shell")
+
+    root = Path(tempfile.mkdtemp(prefix="jtt-observe-it-"))
+    root.chmod(0o700)
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    import pyte
+    pyte_root = Path(pyte.__file__).resolve().parent.parent
+    _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
+    registry = TerminalRegistry(root=root / "state" / "terminals")
+    created = []
+    observers = []
+    active = []
+    try:
+        for name, marker in (("Mini A", "JTT_MINI_A"), ("Mini B", "JTT_MINI_B")):
+            client = registry.create(name)
+            created.append(client.identity.session_id)
+            assert client.acquire()
+            client.send(f"printf '%s\\n' {marker}\n".encode("ascii"))
+            _wait_for_marker(jtt.ManagedTerminalBinding(client, client.identity), marker)
+            active.append(client)
+
+        first_observer = registry.connect(created[0])
+        second_observer = registry.connect(created[1])
+        observers.extend((first_observer, second_observer))
+        first_sequence = active[0]._sequence
+        second_sequence = active[1]._sequence
+        first_screen = first_observer.observe()
+        second_screen = second_observer.observe()
+        first_text = "\n".join("".join(cell.text for cell in row) for row in first_screen.screen.rows)
+        second_text = "\n".join("".join(cell.text for cell in row) for row in second_screen.screen.rows)
+
+        assert first_screen.synced and second_screen.synced
+        assert "JTT_MINI_A" in first_text and "JTT_MINI_B" not in first_text
+        assert "JTT_MINI_B" in second_text and "JTT_MINI_A" not in second_text
+        assert first_observer._sequence == 0 and second_observer._sequence == 0
+        assert not first_observer.lease and not second_observer.lease
+        assert active[0]._sequence == first_sequence and active[1]._sequence == second_sequence
+        assert active[0].lease and active[1].lease
+        assert (first_screen.columns, first_screen.lines) == (80, 24)
+        assert (second_screen.columns, second_screen.lines) == (80, 24)
+
+        # The original input owners remain able to write after observation.
+        active[0].send(b"printf 'JTT_AFTER_OBSERVE\\n'\n")
+        assert "JTT_AFTER_OBSERVE" in _screen_text(_wait_for_text(active[0], "JTT_AFTER_OBSERVE"))
+    finally:
+        for observer in observers:
+            observer.close()
+        for client in active:
+            client.close()
+        for session_id in created:
+            registry.stop(session_id)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_real_curses_launch_and_prefix_detach_does_not_autostart_a_shell(monkeypatch):
     root = Path(tempfile.mkdtemp(prefix="jtt-tty-"))
     root.chmod(0o700)

@@ -37,6 +37,18 @@ Work Kits are local templates rather than saved running terminals: selecting one
 only previews non-running cards and never starts a shell or command. See
 [JTT Work Kits](docs/JTT_WORK_KITS.md) for the local storage scope.
 
+JTT logical folders and windows are an additive organization layer. Existing
+`workspaces.json` `terminal_ids` remain the canonical session references, and
+Work Kits are not rewritten. Layout assignments are stored separately in the
+private JTT-only `jtt_layouts.json`; legacy or unassigned terminal references
+appear once in a virtual default folder/window until the user organizes them.
+Deleting a folder or logical window only returns its terminal references to
+that default location; it never stops a PTY. Mini LIVE previews are in-memory,
+read-only observations of visible cards only. They do not acquire input leases,
+resize PTYs, consume the interactive output cursor, or persist screen contents;
+stale or unsynchronized previews are cleared. An output-change marker means
+only that terminal output changed, not that a command or Agent turn completed.
+
 JTT is an interactive local terminal, not a security sandbox. Shells run as
 the current user and can access that user's normal files and network. The
 current pyte-based renderer supports a bounded VT subset; it does not claim

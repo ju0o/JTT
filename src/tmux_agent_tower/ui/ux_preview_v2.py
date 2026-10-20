@@ -296,6 +296,10 @@ _COLOR_SELECTED = 2
 _COLOR_WORKING = 3
 _COLOR_WAITING = 4
 _COLOR_ERROR = 5
+_MINI_COLOR_NAMES = {
+    "black": 0, "red": 1, "green": 2, "brown": 3,
+    "yellow": 3, "blue": 4, "magenta": 5, "cyan": 6, "white": 7,
+}
 
 
 def _setup_colors() -> None:
@@ -332,6 +336,52 @@ def _color(pair: int, fallback: int = 0) -> int:
         return fallback
 
 
+def _mini_cell_attr(style) -> int:
+    foreground, background, bold, italic, underline, reverse, blink, strike = style
+    attr = curses.A_NORMAL
+    if bold:
+        attr |= curses.A_BOLD
+    if italic and hasattr(curses, "A_ITALIC"):
+        attr |= curses.A_ITALIC
+    if underline:
+        attr |= curses.A_UNDERLINE
+    if reverse:
+        attr |= curses.A_REVERSE
+    if blink and hasattr(curses, "A_BLINK"):
+        attr |= curses.A_BLINK
+    if strike and hasattr(curses, "A_STRIKEOUT"):
+        attr |= curses.A_STRIKEOUT
+
+    def basic_color(value):
+        if isinstance(value, int):
+            return (value, False) if 0 <= value <= 7 else (None, False)
+        name = str(value or "default").lower()
+        bright = name.startswith("bright")
+        if bright:
+            name = name[6:]
+        return _MINI_COLOR_NAMES.get(name), bright
+
+    fg_index, fg_bright = basic_color(foreground)
+    bg_index, _bg_bright = basic_color(background)
+    if fg_bright:
+        attr |= curses.A_BOLD
+    if fg_index is not None or bg_index is not None:
+        pair = 8 + (fg_index if fg_index is not None else 7) * 8 + (
+            bg_index if bg_index is not None else 7
+        )
+        try:
+            if pair < curses.COLOR_PAIRS:
+                curses.init_pair(
+                    pair,
+                    fg_index if fg_index is not None else -1,
+                    bg_index if bg_index is not None else -1,
+                )
+                attr |= curses.color_pair(pair)
+        except (AttributeError, curses.error):
+            pass
+    return attr
+
+
 def _put(stdscr, y: int, x: int, width: int, text: str, attr: int = 0) -> None:
     if width <= 0:
         return
@@ -361,6 +411,8 @@ def _status(row: dict) -> str:
     if row.get("terminal_kind") == "work_kit_template":
         return "템플릿 · 실행되지 않음"
     if row.get("terminal_kind") == "tower_managed":
+        if row.get("mini_live_state") == "synced" and row.get("mini_screen") is not None:
+            return "● 셸 실행 중 · 카드 화면 관찰됨"
         view_state = str(row.get("terminal_view_state") or "unknown")
         return {
             "running_ready": "● 셸 실행 중 · 화면 준비됨",
@@ -387,6 +439,8 @@ def _status_attr(row: dict) -> int:
     if row.get("terminal_kind") == "work_kit_template":
         return _color(_COLOR_WAITING, curses.A_DIM)
     if row.get("terminal_kind") == "tower_managed":
+        if row.get("mini_live_state") == "synced" and row.get("mini_screen") is not None:
+            return _color(_COLOR_WORKING, curses.A_DIM)
         view_state = str(row.get("terminal_view_state") or "unknown")
         if view_state in {"exited", "supervisor_connection_failed", "renderer_error"}:
             return _color(_COLOR_ERROR, curses.A_DIM)
@@ -408,7 +462,8 @@ def _draw_left(stdscr, rect, state: dict, active: bool) -> None:
     ix, iy, iw, ih = _draw_box(stdscr, rect, "내 작업공간", active, unicode=unicode)
     choices = state["choices"]
     windows = [(i, item) for i, item in enumerate(choices)
-               if item.get("group") == "windows" and item.get("kind") == "workspace"]
+               if item.get("group") == "windows"
+               and item.get("kind") in ("workspace", "logical_folder", "logical_window")]
     remote = [(i, item) for i, item in enumerate(choices)
               if item.get("group") == "remote" and item.get("kind") in ("workspace", "info")]
     work_kits = [(i, item) for i, item in enumerate(choices)
@@ -530,8 +585,16 @@ def _draw_card(stdscr, rect, row: dict, selected: bool, *, unicode: bool = False
     if height > 4:
         agent = str(row.get("agent") or "Agent")
         status = _status(row)
+        activity = str(row.get("terminal_activity") or "")
+        if activity:
+            status = f"{status} · {activity}"
         _put(stdscr, y + 2, x + 1, width - 2, f"{agent}  ·  {status}", _status_attr(row))
-    if height > 5:
+    mini_screen = row.get("mini_screen")
+    if mini_screen is not None and height > 5:
+        max_rows = max(0, min(4, height - 4))
+        for offset, cells in enumerate(getattr(mini_screen, "rows", ())[:max_rows]):
+            _draw_mini_row(stdscr, x + 2, y + 3 + offset, width - 4, cells)
+    elif height > 5:
         if row.get("terminal_kind") == "work_kit_template":
             preview = "템플릿 · 셸 실행 전"
         elif row.get("terminal_kind") == "tower_managed":
@@ -541,6 +604,27 @@ def _draw_card(stdscr, rect, row: dict, selected: bool, *, unicode: bool = False
                    next((str(line).strip() for line in row.get("live_lines", ()) if str(line).strip()),
                         "미리보기 없음"))
         _put(stdscr, y + 3, x + 1, width - 2, preview, curses.A_DIM)
+
+
+def _draw_mini_row(stdscr, x: int, y: int, width: int, cells) -> None:
+    cursor = 0
+    for cell in cells:
+        text = str(getattr(cell, "text", "") or "")
+        if not text:
+            continue
+        cell_width = display_width(text)
+        if cell_width <= 0 or cursor + cell_width > width:
+            break
+        style = (getattr(cell, "foreground", "default"),
+                 getattr(cell, "background", "default"),
+                 bool(getattr(cell, "bold", False)),
+                 bool(getattr(cell, "italic", False)),
+                 bool(getattr(cell, "underline", False)),
+                 bool(getattr(cell, "reverse", False)),
+                 bool(getattr(cell, "blink", False)),
+                 bool(getattr(cell, "strikethrough", False)))
+        _put(stdscr, y, x + cursor, cell_width, text, _mini_cell_attr(style))
+        cursor += cell_width
 
 
 def _draw_center(stdscr, rect, state: dict, active: bool) -> None:
@@ -1109,6 +1193,14 @@ def _set_choice(state: dict, choice_index: int) -> None:
         if callable(handler):
             handler(state, choice)
         return
+    if choice.get("kind") in ("logical_folder", "logical_window") and state.get("runtime_mode") == "jtt":
+        _release_managed_input(state)
+        state["nav_index"] = choice_index
+        state["center_actions_focused"] = False
+        handler = state.get("jtt_layout_choice_handler")
+        if callable(handler):
+            handler(state, choice)
+        return
     if choice.get("kind") != "workspace":
         return
     _release_managed_input(state)
@@ -1144,7 +1236,7 @@ def _activate_choice(state: dict, choice_index: int) -> None:
         return
     choice = state["choices"][choice_index]
     state["nav_index"] = choice_index
-    if choice.get("kind") in ("workspace", "work_kit"):
+    if choice.get("kind") in ("workspace", "work_kit", "logical_folder", "logical_window"):
         _set_choice(state, choice_index)
         state["active_panel"] = 1
     elif choice.get("kind") == "action":
@@ -1192,7 +1284,7 @@ def _hit_test(state: dict, x: int, y: int) -> str | None:
         if bx <= x < bx + width and by <= y < by + height:
             if kind == "left":
                 choice = state["choices"][index]
-                if choice.get("kind") in ("workspace", "work_kit"):
+                if choice.get("kind") in ("workspace", "work_kit", "logical_folder", "logical_window"):
                     _set_choice(state, index)
                     state["active_panel"] = 0
                 else:
@@ -1935,12 +2027,14 @@ def _handle_key(stdscr, state: dict, key) -> bool:
         delta = -1 if key == curses.KEY_UP else 1
         if state["active_panel"] == 0:
             selectable = [i for i, item in enumerate(state["choices"])
-                          if item.get("kind") in ("workspace", "work_kit", "action")]
+                          if item.get("kind") in ("workspace", "work_kit", "logical_folder",
+                                                   "logical_window", "action")]
             if selectable:
                 current = selectable.index(state["nav_index"]) if state["nav_index"] in selectable else 0
                 next_choice = selectable[max(0, min(len(selectable) - 1, current + delta))]
                 state["nav_index"] = next_choice
-                if state["choices"][next_choice].get("kind") in ("workspace", "work_kit"):
+                if state["choices"][next_choice].get("kind") in (
+                        "workspace", "work_kit", "logical_folder", "logical_window"):
                     _set_choice(state, next_choice)
         elif state["active_panel"] == 1:
             if state.get("center_actions_focused"):

@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 import curses
+import os
+import stat
 from types import SimpleNamespace
 
 import pytest
@@ -117,7 +119,6 @@ def test_build_state_is_read_only_and_maps_cards_to_exact_sessions(tmp_path):
     assert state["runtime_mode"] == "jtt"
     assert registry.created == 0
     assert registry.clients["session-a"].closed is False
-
     renderer._set_choice(state, 0)
     state["pane_index"] = 1
     selected = renderer._selected_row(state)
@@ -125,6 +126,212 @@ def test_build_state_is_read_only_and_maps_cards_to_exact_sessions(tmp_path):
     assert selected["managed_id"] == "session-b"
     assert binding.matches(selected)
     assert binding.session_id == selected["managed_id"]
+
+
+def test_logical_window_selection_filters_cards_without_changing_canonical_refs(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([_identity("session-a", 101, "gen-a"),
+                             _identity("session-b", 202, "gen-b"),
+                             _identity("session-c", 303, "gen-c")])
+    store.set_terminal_ids(store.DEFAULT_ID, ["session-a", "session-b", "session-c"])
+    layouts = jtt.JTTLayoutStore(store.root)
+    folder = layouts.create_folder(store.DEFAULT_ID, "Review")
+    window = layouts.create_window(store.DEFAULT_ID, folder["id"], "Code")
+    layouts.move_terminal(store.DEFAULT_ID, "session-b", window["id"],
+                          ["session-a", "session-b", "session-c"])
+
+    state = jtt.build_state(store, registry)
+    choice_index = next(index for index, item in enumerate(state["choices"])
+                        if item.get("kind") == "logical_window"
+                        and item.get("window_id") == window["id"])
+    renderer._set_choice(state, choice_index)
+
+    assert [row["managed_id"] for row in state["panes"]] == ["session-b"]
+    assert store.workspaces()[0]["terminal_ids"] == ["session-a", "session-b", "session-c"]
+    assert registry.stop_calls == []
+
+
+def test_deleting_logical_window_recovers_sessions_without_stopping_them(tmp_path, monkeypatch):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([_identity("session-a", 101, "gen-a"),
+                             _identity("session-b", 202, "gen-b")])
+    canonical = ["session-a", "session-b"]
+    store.set_terminal_ids(store.DEFAULT_ID, canonical)
+    layouts = jtt.JTTLayoutStore(store.root)
+    folder = layouts.create_folder(store.DEFAULT_ID, "Review")
+    window = layouts.create_window(store.DEFAULT_ID, folder["id"], "Code")
+    for session_id in canonical:
+        layouts.move_terminal(store.DEFAULT_ID, session_id, window["id"], canonical)
+    state = jtt.build_state(store, registry)
+    choice = next(item for item in state["choices"]
+                  if item.get("kind") == "logical_window" and item.get("window_id") == window["id"])
+    jtt._attach_layout_choice(state, choice)
+    workspace, layout, _ = jtt._workspace_layout(state)
+    state["stdscr"] = FakeScreen()
+    monkeypatch.setattr(jtt, "run_list_picker", lambda *_a, **_k:
+                        SimpleNamespace(cancelled=False, selected_key="delete"))
+
+    jtt._delete_layout_item(FakeScreen(), state, workspace, layout, "delete_window")
+
+    recovered = state["jtt_layout_store"].layout(store.DEFAULT_ID, canonical)
+    assert recovered["windows"][0]["terminal_ids"] == canonical
+    assert [row["managed_id"] for row in state["panes"]] == canonical
+    assert registry.stop_calls == []
+    assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
+        ("session-a", 101), ("session-b", 202),
+    ]
+
+
+def test_mini_sampler_requests_visible_center_cards_only_and_clears_when_hidden(tmp_path):
+    identities = [_identity(f"session-{index}", 100 + index, f"gen-{index}")
+                  for index in range(24)]
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    store.set_terminal_ids(store.DEFAULT_ID, [item.session_id for item in identities])
+    state = jtt.build_state(store, FakeRegistry(identities))
+
+    class SpySampler:
+        def __init__(self):
+            self.submissions = []
+            self.result = None
+
+        def submit(self, registry, token, targets):
+            self.submissions.append((registry, token, tuple(targets)))
+            return True
+
+        def take(self):
+            result, self.result = self.result, None
+            return result
+
+    sampler = SpySampler()
+    state["mini_live_sampler"] = sampler
+    state["active_panel"] = 1
+    screen = FakeScreen()
+    token, visible = jtt._visible_mini_targets(state, 120, 40)
+    jtt._refresh_mini_live(state, screen)
+
+    assert sampler.submissions[-1][1] == token
+    assert sampler.submissions[-1][2] == tuple(visible)
+    visible_ids = {target[0] for target in visible}
+    assert len(visible_ids) < len(identities)
+    for row in state["panes"]:
+        if row["managed_id"] not in visible_ids:
+            assert "mini_screen" not in row
+
+    visible_row = next(row for row in state["panes"] if row["managed_id"] in visible_ids)
+    visible_row["mini_screen"] = object()
+    before = len(sampler.submissions)
+    state["active_panel"] = 0
+    jtt._refresh_mini_live(state, screen)
+    assert len(sampler.submissions) == before
+    assert "mini_screen" not in visible_row
+
+
+def test_mini_live_cache_reports_only_output_change_and_clears_unsynced_sample(tmp_path, monkeypatch):
+    from tmux_agent_tower.terminal import TerminalCell, TerminalScreen
+
+    identity = _identity("session-a", 101, "gen-a")
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    store.set_terminal_ids(store.DEFAULT_ID, [identity.session_id])
+    state = jtt.build_state(store, FakeRegistry([identity]))
+
+    class SpySampler:
+        def __init__(self):
+            self.result = None
+        def submit(self, _registry, _token, _targets):
+            return True
+        def take(self):
+            result, self.result = self.result, None
+            return result
+
+    sampler = SpySampler()
+    state["mini_live_sampler"] = sampler
+    screen = FakeScreen()
+    token, targets = jtt._visible_mini_targets(state, 120, 40)
+    cells = ((TerminalCell("before", "default", "default", False, False, False,
+                           False, False, False),),)
+    sampler.result = (token, [{
+        "session_id": identity.session_id, "generation": identity.generation,
+        "shell_pid": identity.shell_pid, "sequence": 10,
+        "screen": TerminalScreen(cells, 0, 0, True), "synced": True,
+    }])
+    ticks = iter((10.0, 11.0, 12.0, 13.0, 17.0))
+    monkeypatch.setattr(jtt.time, "monotonic", lambda: next(ticks))
+
+    jtt._refresh_mini_live(state, screen)
+    row = state["panes"][0]
+    row["terminal_view_state"] = "resyncing"
+    original_view_state = row["terminal_view_state"]
+    assert row["mini_screen"].rows[0][0].text == "before"
+    assert row["mini_live_state"] == "synced"
+    assert "카드 화면 관찰됨" in renderer._status(row)
+    assert "재동기화" not in renderer._status(row)
+    assert renderer._status_attr(row) == renderer._color(renderer._COLOR_WORKING, curses.A_DIM)
+    assert row["terminal_view_state"] == original_view_state
+    sampler.result = (token, [{
+        "session_id": identity.session_id, "generation": identity.generation,
+        "shell_pid": identity.shell_pid, "sequence": 11,
+        "screen": TerminalScreen(((TerminalCell(
+            "after", "default", "default", False, False, False, False, False, False
+        ),),), 0, 0, True), "synced": True,
+    }])
+    jtt._refresh_mini_live(state, screen)
+    assert row["mini_screen"].rows[0][0].text == "after"
+    assert row["mini_live_state"] == "synced"
+    assert row["terminal_activity"] == "출력 변화"
+    assert "카드 화면 관찰됨" in renderer._status(row)
+    assert row["terminal_view_state"] == original_view_state
+
+    sampler.result = (token, [{
+        "session_id": identity.session_id, "generation": identity.generation,
+        "shell_pid": identity.shell_pid, "sequence": 12,
+        "screen": None, "synced": False,
+    }])
+    jtt._refresh_mini_live(state, screen)
+    assert "mini_screen" not in row
+    assert "mini_live_state" not in row
+    assert "terminal_activity" not in row
+    assert renderer._status(row) == "↻ 셸 실행 중 · 화면 재동기화"
+
+    sampler.result = (token, [{
+        "session_id": identity.session_id, "generation": identity.generation,
+        "shell_pid": identity.shell_pid, "sequence": 13,
+        "screen": TerminalScreen(cells, 0, 0, True), "synced": True,
+    }])
+    jtt._refresh_mini_live(state, screen)
+    assert row["mini_live_state"] == "synced"
+    assert "mini_screen" in row
+    jtt._refresh_mini_live(state, screen)
+    assert "mini_screen" not in row
+    assert "mini_live_state" not in row
+    assert "terminal_activity" not in row
+    assert renderer._status(row) == "↻ 셸 실행 중 · 화면 재동기화"
+
+
+def test_mini_sampler_close_replaces_full_pending_queue_with_stop_sentinel():
+    import queue
+    import threading
+
+    sampler = jtt._MiniLiveSampler.__new__(jtt._MiniLiveSampler)
+    sampler._requests = queue.Queue(maxsize=1)
+    sampler._requests.put_nowait((None, "pending", ()))
+    sampler._results = queue.Queue(maxsize=1)
+    sampler._lock = threading.Lock()
+    sampler._busy = True
+    sampler._stopping = False
+
+    class JoinSpy:
+        def __init__(self):
+            self.timeout = None
+        def join(self, timeout=None):
+            self.timeout = timeout
+
+    sampler._thread = JoinSpy()
+    sampler.close()
+
+    assert sampler._stopping is True
+    assert sampler._requests.get_nowait() is None
+    assert sampler._requests.empty()
+    assert sampler._thread.timeout == 0.5
 
 
 def test_input_mode_sends_keys_to_exact_selected_session_and_ctrl_bracket_releases(tmp_path):
@@ -630,6 +837,104 @@ def test_prefix_x_exited_card_revalidates_after_modal(tmp_path, monkeypatch, mut
     else:
         assert "변경되어 카드 제거를 차단" in state["jtt_notice"]
         assert state["jtt_store"].workspaces()[0]["terminal_ids"] == ["session-a", "session-b"]
+
+
+def test_layout_menu_creates_and_renames_folder_and_window_without_starting_ptys(
+        tmp_path, monkeypatch):
+    identity = _identity("session-a", 101, "gen-a")
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    store.set_terminal_ids(store.DEFAULT_ID, [identity.session_id])
+    registry = FakeRegistry([identity])
+    state = jtt.build_state(store, registry)
+    actions = iter(("create_folder", "rename_folder", "create_window", "rename_window"))
+    names = iter(("Feature", "Product", "Checks", "Verify"))
+    monkeypatch.setattr(
+        jtt, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key=next(actions)),
+    )
+    monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: next(names))
+
+    for _ in range(4):
+        jtt._layout_menu(FakeScreen(), state)
+
+    workspace, layout, _ = jtt._workspace_layout(state)
+    product = next(item for item in layout["folders"] if item["name"] == "Product")
+    verify = next(item for item in layout["windows"] if item["name"] == "Verify")
+    assert verify["folder_id"] == product["id"]
+    assert state["selected_folder_id"] == product["id"]
+    assert state["selected_window_id"] == verify["id"]
+    assert workspace["terminal_ids"] == [identity.session_id]
+    assert registry.created == 0 and registry.stop_calls == []
+    assert registry.stop_calls == []
+
+
+def test_layout_create_reconciles_committed_directory_fsync_failure(tmp_path, monkeypatch):
+    identity = _identity("session-a", 101, "gen-a")
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    store.set_terminal_ids(store.DEFAULT_ID, [identity.session_id])
+    registry = FakeRegistry([identity])
+    state = jtt.build_state(store, registry)
+    monkeypatch.setattr(
+        jtt, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="create_folder"),
+    )
+    monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: "Committed folder")
+    original_fsync = os.fsync
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("injected directory fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+    jtt._layout_menu(FakeScreen(), state)
+
+    workspace, layout, _ = jtt._workspace_layout(state)
+    committed = next(item for item in layout["folders"]
+                     if item["name"] == "Committed folder")
+    assert state["selected_folder_id"] == committed["id"]
+    assert "폴더 생성 반영됨" in state["jtt_notice"]
+    assert "디렉터리 동기화 확인 필요" in state["jtt_notice"]
+    assert workspace["terminal_ids"] == [identity.session_id]
+    assert registry.created == 0 and registry.stop_calls == []
+
+
+def test_layout_delete_reconciles_committed_directory_fsync_failure(tmp_path, monkeypatch):
+    identity = _identity("session-a", 101, "gen-a")
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    store.set_terminal_ids(store.DEFAULT_ID, [identity.session_id])
+    registry = FakeRegistry([identity])
+    layouts = jtt.JTTLayoutStore(store.root)
+    folder = layouts.create_folder(store.DEFAULT_ID, "Review")
+    window = layouts.create_window(store.DEFAULT_ID, folder["id"], "Code")
+    layouts.move_terminal(store.DEFAULT_ID, identity.session_id, window["id"],
+                          [identity.session_id])
+    state = jtt.build_state(store, registry)
+    choice = next(item for item in state["choices"]
+                  if item.get("kind") == "logical_window"
+                  and item.get("window_id") == window["id"])
+    jtt._attach_layout_choice(state, choice)
+    workspace, layout, _ = jtt._workspace_layout(state)
+    monkeypatch.setattr(
+        jtt, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="delete"),
+    )
+    original_fsync = os.fsync
+
+    def fail_directory_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("injected directory fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+    jtt._delete_layout_item(FakeScreen(), state, workspace, layout, "delete_window")
+
+    recovered = state["jtt_layout_store"].layout(store.DEFAULT_ID, [identity.session_id])
+    assert recovered["windows"][0]["terminal_ids"] == [identity.session_id]
+    assert state["selected_window_id"] == "window-default"
+    assert "Window 삭제 반영됨" in state["jtt_notice"]
+    assert "디렉터리 동기화 확인 필요" in state["jtt_notice"]
+    assert [row["managed_id"] for row in state["panes"]] == [identity.session_id]
     assert registry.stop_calls == []
 
 

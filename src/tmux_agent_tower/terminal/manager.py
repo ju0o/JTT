@@ -110,6 +110,22 @@ class TerminalUpdate:
     renderer_state: str = "unknown"
 
 
+@dataclass(frozen=True)
+class TerminalObservation:
+    """Read-only current screen sample; it never advances a client poll cursor."""
+
+    session_id: str
+    generation: str
+    shell_pid: int
+    sequence: int
+    state: str
+    synced: bool
+    columns: int
+    lines: int
+    screen: Optional[TerminalScreen]
+    renderer_state: str
+
+
 def _probe_renderer() -> str:
     """Import and initialize the supported VT renderer without side effects."""
 
@@ -559,7 +575,7 @@ class TerminalRegistry:
             detail = str(last_error)
         raise TerminalError(detail)
 
-    def connect(self, session_id: str) -> "TerminalClient":
+    def connect(self, session_id: str, *, timeout: float = 3.0) -> "TerminalClient":
         session_dir, metadata = _validate_identity(self.root, session_id)
         identity = _identity(metadata)
         if identity.state not in ("running", "exited"):
@@ -574,7 +590,7 @@ class TerminalRegistry:
             raise TerminalError("terminal control socket is not private")
         if len(os.fsencode(sock_path)) > MAX_UNIX_SOCKET_PATH_BYTES:
             raise TerminalError("terminal socket path is too long for this platform")
-        return TerminalClient(session_dir, identity)
+        return TerminalClient(session_dir, identity, timeout=timeout)
 
     def stop(
         self,
@@ -650,7 +666,7 @@ def _remove_private_session(path: Path) -> None:
 class TerminalClient:
     """A reconnectable client for one supervisor-owned PTY."""
 
-    def __init__(self, session_dir: Path, identity: TerminalIdentity):
+    def __init__(self, session_dir: Path, identity: TerminalIdentity, *, timeout: float = 3.0):
         self._session_dir = session_dir
         self.identity = identity
         self.state = identity.state
@@ -658,8 +674,14 @@ class TerminalClient:
         self.lease = False
         self._sequence = 0
         self._client_id = uuid.uuid4().hex
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise TerminalError("terminal connection timeout is invalid") from exc
+        if not 0 < timeout <= 30:
+            raise TerminalError("terminal connection timeout is invalid")
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.settimeout(3.0)
+        self._sock.settimeout(timeout)
         self._closed = False
         try:
             self._sock.connect(str(session_dir / SOCKET_NAME))
@@ -731,45 +753,9 @@ class TerminalClient:
             raise TerminalError("terminal output frame is invalid") from exc
         self._sequence = int(response.get("sequence", self._sequence))
         self.synced = bool(response.get("synced"))
-        screen_value = None
-        encoded_screen = response.get("screen_z")
-        if isinstance(encoded_screen, str):
-            try:
-                packed = base64.b64decode(encoded_screen, validate=True)
-                decompressor = zlib.decompressobj()
-                raw_screen = decompressor.decompress(packed, 4 * 1024 * 1024 + 1)
-                if len(raw_screen) > 4 * 1024 * 1024 or not decompressor.eof:
-                    raise ValueError("snapshot exceeds limit")
-                screen_value = json.loads(raw_screen.decode("utf-8"))
-            except (ValueError, zlib.error, UnicodeDecodeError, json.JSONDecodeError):
-                self.synced = False
-        elif response.get("renderer_available"):
+        screen = _decode_screen(response)
+        if screen is None and response.get("renderer_available"):
             self.synced = False
-        screen = None
-        if isinstance(screen_value, dict):
-            try:
-                rows = tuple(
-                    tuple(TerminalCell(
-                        text=str(cell[0]),
-                        foreground=str(cell[1]),
-                        background=str(cell[2]),
-                        bold=bool(cell[3]),
-                        italic=bool(cell[4]),
-                        underline=bool(cell[5]),
-                        reverse=bool(cell[6]),
-                        blink=bool(cell[7]),
-                        strikethrough=bool(cell[8]),
-                    ) for cell in row)
-                    for row in screen_value["rows"]
-                )
-                screen = TerminalScreen(
-                    rows=rows,
-                    cursor_x=int(screen_value["cursor_x"]),
-                    cursor_y=int(screen_value["cursor_y"]),
-                    cursor_visible=bool(screen_value["cursor_visible"]),
-                )
-            except (KeyError, TypeError, ValueError):
-                self.synced = False
         return TerminalUpdate(
             output=output,
             sequence=self._sequence,
@@ -787,6 +773,40 @@ class TerminalClient:
                 else "snapshot_unavailable" if response.get("renderer_available")
                 else "dependency_missing"
             )),
+        )
+
+    def observe(self) -> TerminalObservation:
+        """Read an atomic bounded screen snapshot without polling output or leases."""
+        _session_dir, metadata = _validate_identity(
+            self._session_dir.parent, self.identity.session_id
+        )
+        current = _identity(metadata)
+        if (current.session_id != self.identity.session_id
+                or current.generation != self.identity.generation
+                or current.supervisor_pid != self.identity.supervisor_pid
+                or current.supervisor_start != self.identity.supervisor_start
+                or current.shell_pid != self.identity.shell_pid
+                or current.shell_start != self.identity.shell_start):
+            raise TerminalError("stale_identity")
+        response = self._request("observe")
+        if (response.get("session_id") != self.identity.session_id
+                or response.get("generation") != self.identity.generation
+                or int(response.get("shell_pid") or 0) != self.identity.shell_pid):
+            self.synced = False
+            raise TerminalError("stale_identity")
+        screen = _decode_screen(response) if response.get("synced") else None
+        synced = bool(response.get("synced")) and screen is not None
+        return TerminalObservation(
+            session_id=str(response.get("session_id") or ""),
+            generation=str(response.get("generation") or ""),
+            shell_pid=int(response.get("shell_pid") or 0),
+            sequence=int(response.get("output_sequence") or 0),
+            state=str(response.get("terminal_state") or "unknown"),
+            synced=synced,
+            columns=int(response.get("columns") or 0),
+            lines=int(response.get("lines") or 0),
+            screen=screen,
+            renderer_state=str(response.get("renderer_state") or "unknown"),
         )
 
     def acquire(self) -> bool:
@@ -885,3 +905,33 @@ def _read_frame(sock: socket.socket) -> Dict[str, Any]:
             return json.loads(data.decode("utf-8"))
         data.extend(chunk)
     raise ValueError("terminal frame exceeds the allowed size")
+
+
+def _decode_screen(response: dict) -> Optional[TerminalScreen]:
+    encoded = response.get("screen_z")
+    if not isinstance(encoded, str):
+        return None
+    try:
+        packed = base64.b64decode(encoded, validate=True)
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(packed, 4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024 or not decompressor.eof:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict) or not isinstance(value.get("rows"), list):
+            return None
+        rows = tuple(
+            tuple(TerminalCell(
+                text=str(cell[0]), foreground=str(cell[1]), background=str(cell[2]),
+                bold=bool(cell[3]), italic=bool(cell[4]), underline=bool(cell[5]),
+                reverse=bool(cell[6]), blink=bool(cell[7]), strikethrough=bool(cell[8]),
+            ) for cell in row)
+            for row in value["rows"]
+        )
+        return TerminalScreen(
+            rows=rows, cursor_x=int(value["cursor_x"]), cursor_y=int(value["cursor_y"]),
+            cursor_visible=bool(value["cursor_visible"]),
+        )
+    except (ValueError, TypeError, KeyError, IndexError, zlib.error,
+            UnicodeDecodeError, json.JSONDecodeError):
+        return None

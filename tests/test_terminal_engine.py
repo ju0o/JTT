@@ -351,6 +351,41 @@ def test_large_valid_snapshot_fits_transport_and_oversize_recovers(monkeypatch):
     assert owner.snapshot_synced is True
 
 
+@pytest.mark.skipif(not renderer_available(), reason="observe snapshot requires optional pyte renderer")
+def test_observe_snapshot_is_atomic_and_does_not_mutate_worker_cursor_or_lease():
+    import pyte
+
+    screen = pyte.Screen(40, 8)
+    pyte.Stream(screen).feed("\x1b[31mOBSERVE_ONLY\x1b[0m")
+    owner = object.__new__(_worker.PtyOwner)
+    owner.screen = screen
+    owner.screen_error = False
+    owner.lines = 8
+    owner.columns = 40
+    owner.sequence = 27
+    owner.output = [(26, b"before"), (27, b"after")]
+    owner.snapshot_synced = True
+    owner.lease_owner = "active-input-client"
+    owner.lease_deadline = 1234.5
+    owner.child = type("Child", (), {"poll": lambda self: None})()
+    owner.session_id = "a" * 32
+    owner.generation = "b" * 32
+    owner.metadata = {"shell_pid": 4321}
+    owner.renderer_state = "ready"
+
+    before = (owner.sequence, list(owner.output), owner.snapshot_synced,
+              owner.lease_owner, owner.lease_deadline, owner.columns, owner.lines)
+    observation = owner._observe()
+    after = (owner.sequence, list(owner.output), owner.snapshot_synced,
+             owner.lease_owner, owner.lease_deadline, owner.columns, owner.lines)
+
+    assert observation["synced"] is True
+    assert observation["output_sequence"] == 27
+    assert observation["snapshot_revision"] == 27
+    assert observation["columns"] == 40 and observation["lines"] == 8
+    assert before == after
+
+
 def test_optional_renderer_absence_blocks_shell_creation_before_popen(tmp_path, monkeypatch):
     import tmux_agent_tower.terminal.manager as manager
 

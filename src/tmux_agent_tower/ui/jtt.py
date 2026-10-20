@@ -5,8 +5,10 @@ from __future__ import annotations
 import curses
 import locale
 import os
+import queue
 import signal
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -16,6 +18,11 @@ from ..state.jtt_keys import (
     JTTKeybindings,
     JTTKeybindingsError,
     load_jtt_keybindings,
+)
+from ..state.jtt_layouts import (
+    JTTLayoutStore,
+    JTTLayoutStoreCommittedDurabilityError,
+    JTTLayoutStoreError,
 )
 from ..state.jtt_work_kits import (
     JTTWorkKitStore,
@@ -27,7 +34,7 @@ from ..state.jtt_workspaces import (
     WorkspaceStoreCommittedDurabilityError,
     WorkspaceStoreError,
 )
-from ..terminal import TerminalRegistry
+from ..terminal import TerminalRegistry, TerminalScreen
 from . import ux_preview_v2 as renderer
 from .render import display_width, truncate_to_width
 from .widgets import (
@@ -48,6 +55,119 @@ class _JTTTerminationSignal(Exception):
     def __init__(self, signum: int):
         super().__init__(signum)
         self.signum = signum
+
+
+_MINI_REFRESH_SECONDS = 1.0
+_MINI_CACHE_SECONDS = 2.5
+_MINI_MAX_VISIBLE_REQUESTS = 16
+_MINI_MAX_ROWS = 4
+_MINI_MAX_COLUMNS = 64
+
+
+class _MiniLiveSampler:
+    """One bounded background observer; it never polls or acquires input leases."""
+
+    def __init__(self):
+        self._requests = queue.Queue(maxsize=1)
+        self._results = queue.Queue(maxsize=1)
+        self._lock = threading.Lock()
+        self._busy = False
+        self._stopping = False
+        self._thread = threading.Thread(target=self._run, name="jtt-mini-live", daemon=True)
+        self._thread.start()
+
+    def submit(self, registry, token, targets) -> bool:
+        if not targets:
+            return False
+        with self._lock:
+            if self._busy or self._stopping:
+                return False
+            self._busy = True
+            try:
+                self._requests.put_nowait((registry, token, tuple(targets[:_MINI_MAX_VISIBLE_REQUESTS])))
+            except queue.Full:
+                self._busy = False
+                return False
+            return True
+
+    def take(self):
+        try:
+            return self._results.get_nowait()
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        with self._lock:
+            self._stopping = True
+            try:
+                self._requests.get_nowait()
+            except queue.Empty:
+                pass
+            while True:
+                try:
+                    self._requests.put_nowait(None)
+                    break
+                except queue.Full:
+                    try:
+                        self._requests.get_nowait()
+                    except queue.Empty:
+                        continue
+        self._thread.join(timeout=0.5)
+
+    def _run(self) -> None:
+        while True:
+            request = self._requests.get()
+            if request is None:
+                return
+            registry, token, targets = request
+            samples = []
+            try:
+                for session_id, generation, shell_pid in targets:
+                    if self._stopping:
+                        break
+                    try:
+                        client = registry.connect(session_id, timeout=0.25)
+                        try:
+                            observation = client.observe()
+                            valid = (observation.synced
+                                     and observation.session_id == session_id
+                                     and observation.generation == generation
+                                     and observation.shell_pid == shell_pid
+                                     and observation.state == "running"
+                                     and observation.screen is not None)
+                            samples.append({
+                                "session_id": session_id,
+                                "generation": generation,
+                                "shell_pid": shell_pid,
+                                "sequence": observation.sequence,
+                                "screen": _clip_mini_screen(observation.screen) if valid else None,
+                                "synced": valid,
+                            })
+                        finally:
+                            client.close()
+                    except (OSError, RuntimeError, ValueError):
+                        samples.append({"session_id": session_id, "generation": generation,
+                                        "shell_pid": shell_pid, "synced": False, "screen": None})
+                if not self._stopping:
+                    try:
+                        self._results.put_nowait((token, samples))
+                    except queue.Full:
+                        try:
+                            self._results.get_nowait()
+                        except queue.Empty:
+                            pass
+                        self._results.put_nowait((token, samples))
+            finally:
+                with self._lock:
+                    self._busy = False
+
+
+def _clip_mini_screen(screen) -> TerminalScreen | None:
+    if screen is None:
+        return None
+    rows = tuple(tuple(row[:_MINI_MAX_COLUMNS]) for row in screen.rows[:_MINI_MAX_ROWS])
+    return TerminalScreen(rows, int(screen.cursor_x), int(screen.cursor_y),
+                          bool(screen.cursor_visible))
 
 
 @contextmanager
@@ -426,7 +546,7 @@ def _session_rows(registry: TerminalRegistry, workspace: dict,
         if identity is None:
             rows.append({
                 "kind": "pane", "key": str(session_id), "target_id": str(session_id),
-                "display_name": "터미널 상태 확인 불가", "agent": "Shell", "status": "UNKNOWN",
+                "display_name": "터미널 상태 확인 불가", "agent": "Generic Terminal", "status": "UNKNOWN",
                 "stale": True, "_live_stale": True, "live_lines": [],
                 "terminal_kind": "tower_managed", "managed_id": str(session_id),
                 "managed_identity": {"session_id": str(session_id)},
@@ -469,7 +589,7 @@ def _session_rows(registry: TerminalRegistry, workspace: dict,
         row = {
             "kind": "pane", "key": str(session_id), "target_id": str(session_id),
             "display_name": str(getattr(identity, "name", "") or "터미널"),
-            "agent": "Shell", "status": "WORKING" if shell_state == "running" else "DEAD",
+            "agent": "Generic Terminal", "status": "WORKING" if shell_state == "running" else "DEAD",
             "stale": shell_state != "running", "_live_stale": binding is None,
             "live_lines": [], "terminal_kind": "tower_managed", "managed_id": str(session_id),
             "managed_identity": {"session_id": str(identity.session_id),
@@ -489,10 +609,201 @@ def _session_rows(registry: TerminalRegistry, workspace: dict,
 
 def _screen_preview(screen) -> str:
     for row in getattr(screen, "rows", ()):
-        text = "".join(str(getattr(cell, "text", "") or "") for cell in row).strip()
-        if text:
-            return text
+        parts = []
+        for cell in row:
+            text = str(getattr(cell, "text", "") or "")
+            if text:
+                parts.append(text)
+        value = "".join(parts).strip()
+        if value:
+            return value
     return ""
+
+
+def _default_layout(workspace_id: str, terminal_ids) -> dict:
+    ids = list(dict.fromkeys(str(item) for item in terminal_ids if str(item)))
+    return {"workspace_id": workspace_id,
+            "folders": [{"id": "folder-default", "name": "기본 폴더"}],
+            "windows": [{"id": "window-default", "folder_id": "folder-default",
+                         "name": "기본 Window", "folder_name": "기본 폴더",
+                         "terminal_ids": ids}],
+            "placements": {}, "terminal_ids": ids}
+
+
+def _layout_choices(workspace_id: str, layout: dict) -> list[dict]:
+    choices = []
+    for folder in layout["folders"]:
+        folder_id = str(folder["id"])
+        choices.append({"kind": "logical_folder", "group": "windows",
+                        "scope": "logical_folder", "id": f"folder:{workspace_id}:{folder_id}",
+                        "workspace_id": workspace_id, "folder_id": folder_id,
+                        "label": f"▰ {folder['name']}"})
+        for window in layout["windows"]:
+            if window["folder_id"] != folder_id:
+                continue
+            choices.append({"kind": "logical_window", "group": "windows",
+                            "scope": "logical_window",
+                            "id": f"window:{workspace_id}:{window['id']}",
+                            "workspace_id": workspace_id, "folder_id": folder_id,
+                            "window_id": window["id"],
+                            "label": f"  › {window['name']}"})
+    return choices
+
+
+def _workspace_layout(state: dict, workspace_id: str | None = None):
+    """Read current canonical workspace refs before projecting additive layout."""
+    workspace_id = str(workspace_id or state.get("workspace_id") or "")
+    workspaces = state["jtt_store"].workspaces()
+    matches = [item for item in workspaces if str(item.get("id") or "") == workspace_id]
+    if len(matches) != 1:
+        raise WorkspaceStoreError("Workspace identity is no longer available")
+    workspace = dict(matches[0])
+    layout = state["jtt_layout_store"].layout(workspace_id, workspace["terminal_ids"])
+    return workspace, layout, workspaces
+
+
+def _replace_workspace_layout_choices(state: dict, workspace: dict, layout: dict,
+                                      *, selected_choice_id: str | None = None) -> None:
+    choices = [item for item in state["choices"]
+               if item.get("kind") not in {"logical_folder", "logical_window"}]
+    for item in choices:
+        if item.get("kind") == "workspace" and str(item.get("id") or "") == str(workspace["id"]):
+            item["label"] = str(workspace["name"])
+            item["terminal_ids"] = list(workspace["terminal_ids"])
+    workspace_index = next((index for index, item in enumerate(choices)
+                            if item.get("kind") == "workspace"
+                            and str(item.get("id") or "") == str(workspace["id"])), None)
+    insert_at = workspace_index + 1 if workspace_index is not None else next(
+        (index for index, item in enumerate(choices) if item.get("group") == "actions"),
+        len(choices),
+    )
+    logical = _layout_choices(str(workspace["id"]), layout)
+    choices[insert_at:insert_at] = logical
+    state["choices"] = choices
+    state["jtt_layout"] = layout
+    state["jtt_layout_error"] = False
+    if selected_choice_id:
+        index = next((i for i, item in enumerate(choices)
+                      if str(item.get("id") or "") == selected_choice_id), None)
+        if index is not None:
+            state["nav_index"] = index
+
+
+def _clear_mini_live(state: dict) -> None:
+    state["mini_live_scope"] = None
+    state["mini_live_cache"] = {}
+    state["mini_live_last_sequence"] = {}
+    state["mini_live_activity_until"] = {}
+    for row in state.get("panes", ()):
+        row.pop("mini_screen", None)
+        row.pop("mini_live_state", None)
+        row.pop("terminal_activity", None)
+
+
+def _visible_mini_targets(state: dict, width: int, height: int) -> tuple[tuple, list[tuple[str, str, int]]]:
+    """Return exact visible managed-card identities using renderer card geometry."""
+    if state.get("work_kit_preview") is not None:
+        return (), []
+    regions, _wide = renderer._regions(width, height, int(state.get("active_panel", 0)))
+    rect = regions.get(1)
+    if rect is None:
+        return (), []
+    x, y, panel_width, panel_height = rect
+    ix, iy, iw, ih = x + 1, y + 1, panel_width - 2, panel_height - 2
+    card_top = iy + 2
+    card_area = (ix + 1, card_top, max(1, iw - 2), max(1, ih - 5))
+    geometry = renderer.card_rectangles(
+        len(state.get("panes", ())), card_area, scroll_row=int(state.get("card_scroll", 0))
+    )
+    targets = []
+    for index, _x, _y, _width, _height in geometry:
+        row = state["panes"][index]
+        identity = row.get("managed_identity")
+        if row.get("terminal_kind") != "tower_managed" or not isinstance(identity, dict):
+            continue
+        session_id = str(identity.get("session_id") or "")
+        generation = str(identity.get("generation") or "")
+        try:
+            shell_pid = int(identity.get("shell_pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (session_id and generation and shell_pid > 0
+                and str(row.get("managed_id") or "") == session_id):
+            targets.append((session_id, generation, shell_pid))
+    token = (str(state.get("workspace_id") or ""),
+             str(state.get("selected_window_id") or ""),
+             tuple(targets))
+    return token, targets
+
+
+def _refresh_mini_live(state: dict, stdscr) -> None:
+    sampler = state.get("mini_live_sampler")
+    if sampler is None:
+        return
+    height, width = stdscr.getmaxyx()
+    renderer._ensure_card_visible(state, height, width)
+    token, targets = _visible_mini_targets(state, width, height)
+    if token != state.get("mini_live_scope"):
+        _clear_mini_live(state)
+        state["mini_live_scope"] = token
+
+    now = time.monotonic()
+    result = sampler.take()
+    if result is not None:
+        result_token, samples = result
+        if result_token == token:
+            current = set(targets)
+            for sample in samples:
+                identity = (sample["session_id"], sample["generation"], sample["shell_pid"])
+                if identity not in current:
+                    continue
+                row = next((item for item in state["panes"]
+                            if str(item.get("managed_id") or "") == identity[0]
+                            and item.get("managed_identity", {}).get("generation") == identity[1]
+                            and int(item.get("managed_identity", {}).get("shell_pid") or 0) == identity[2]), None)
+                if row is None:
+                    continue
+                if not sample.get("synced") or sample.get("screen") is None:
+                    state["mini_live_cache"].pop(identity, None)
+                    row.pop("mini_screen", None)
+                    row.pop("mini_live_state", None)
+                    row.pop("terminal_activity", None)
+                    continue
+                sequence = int(sample.get("sequence") or 0)
+                previous = state["mini_live_last_sequence"].get(identity)
+                if previous is not None and sequence != previous:
+                    state["mini_live_activity_until"][identity] = now + 1.5
+                state["mini_live_last_sequence"][identity] = sequence
+                state["mini_live_cache"][identity] = {
+                    "screen": sample["screen"], "updated": now,
+                }
+
+    for row in state.get("panes", ()):
+        identity_dict = row.get("managed_identity") or {}
+        try:
+            identity = (str(identity_dict.get("session_id") or ""),
+                        str(identity_dict.get("generation") or ""),
+                        int(identity_dict.get("shell_pid") or 0))
+        except (TypeError, ValueError):
+            identity = ("", "", 0)
+        cached = state["mini_live_cache"].get(identity) if identity in set(targets) else None
+        if cached and now - float(cached["updated"]) <= _MINI_CACHE_SECONDS:
+            row["mini_screen"] = cached["screen"]
+            row["mini_live_state"] = "synced"
+            if now < state["mini_live_activity_until"].get(identity, 0.0):
+                row["terminal_activity"] = "출력 변화"
+            else:
+                row.pop("terminal_activity", None)
+        else:
+            row.pop("mini_screen", None)
+            row.pop("mini_live_state", None)
+            row.pop("terminal_activity", None)
+            if cached:
+                state["mini_live_cache"].pop(identity, None)
+
+    if (targets and now - state.get("mini_live_last_submit", 0.0) >= _MINI_REFRESH_SECONDS
+            and sampler.submit(state["jtt_registry"], token, targets)):
+        state["mini_live_last_submit"] = now
 
 
 def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
@@ -513,8 +824,16 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
         work_kit_error = True
     default = next((item for item in workspaces if item["id"] == store.DEFAULT_ID), workspaces[0])
     saved = [item for item in workspaces if item["id"] != store.DEFAULT_ID]
+    layout_store = JTTLayoutStore(store.root)
+    layout_error = False
+    try:
+        default_layout = layout_store.layout(default["id"], default["terminal_ids"])
+    except JTTLayoutStoreError:
+        default_layout = _default_layout(default["id"], default["terminal_ids"])
+        layout_error = True
     choices = [{"kind": "workspace", "group": "windows", "scope": "jtt_workspace",
                 "id": default["id"], "label": default["name"], "terminal_ids": default["terminal_ids"]}]
+    choices.extend(_layout_choices(default["id"], default_layout))
     choices.extend({"kind": "workspace", "group": "saved", "scope": "jtt_workspace",
                     "id": item["id"], "label": item["name"], "terminal_ids": item["terminal_ids"]}
                    for item in saved)
@@ -524,6 +843,8 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
          "dialog": "구성 저장"},
         {"kind": "action", "group": "actions", "id": "action:settings", "label": "설정 · 메뉴",
          "dialog": "설정 · 메뉴"},
+        {"kind": "action", "group": "actions", "id": "action:layout",
+         "label": "폴더 · Window 관리", "dialog": "폴더 · Window 관리"},
     ])
     selected = default
     rows_by_choice = {
@@ -531,7 +852,9 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
                                   keybindings=keybindings)
         for item in [default, *saved]
     }
-    rows = _session_rows(registry, default, clients, attach=attach_default,
+    default_window = default_layout["windows"][0]
+    active_ids = list(default_window["terminal_ids"])
+    rows = _session_rows(registry, {**default, "terminal_ids": active_ids}, clients, attach=attach_default,
                          keybindings=keybindings)
     rows_by_choice[default["id"]] = rows
     tower = SimpleNamespace(rows=[], visible_rows=[], selected=-1)
@@ -543,7 +866,12 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
         "nav_index": 0,
         "workspace_id": selected["id"],
         "workspace_name": selected["name"],
-        "window_refs": (),
+        "selected_folder_id": "folder-default",
+        "selected_window_id": "window-default",
+        "jtt_layout": default_layout,
+        "jtt_layout_store": layout_store,
+        "jtt_layout_error": layout_error,
+        "window_refs": tuple(active_ids),
         "panes": panes,
         "pane_index": 0,
         "selected_target_id": str((selected_row or {}).get("target_id") or ""),
@@ -575,6 +903,12 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
         "jtt_prefix_pending": False,
         "jtt_prefix_deadline": 0.0,
         "jtt_prefix_target": None,
+        "mini_live_sampler": None,
+        "mini_live_cache": {},
+        "mini_live_last_sequence": {},
+        "mini_live_activity_until": {},
+        "mini_live_scope": None,
+        "mini_live_last_submit": 0.0,
         "jtt_pending_auto_acquire": None,
         "jtt_action_handler": _activate_jtt_action,
         "jtt_work_kit_handler": _preview_work_kit,
@@ -583,6 +917,7 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
         ),
         "jtt_space_handler": _settings_menu,
         "jtt_workspace_handler": _attach_choice,
+        "jtt_layout_choice_handler": _attach_layout_choice,
         "jtt_prefix_handler": _handle_prefix_command,
     }
     return state
@@ -782,14 +1117,35 @@ def _attach_choice(state: dict, choice: dict) -> None:
         state["selected_signature"] = None
         return
 
-    expected_ids = {str(item) for item in workspace.get("terminal_ids", ())}
+    try:
+        layout = state["jtt_layout_store"].layout(workspace_id, workspace["terminal_ids"])
+    except JTTLayoutStoreError:
+        _release_layout_clients(state)
+        _clear_mini_live(state)
+        state["jtt_layout_error"] = True
+        state["panes"] = []
+        state["pane_index"] = 0
+        state["selected_target_id"] = ""
+        state["selected_signature"] = None
+        state["jtt_notice"] = "폴더/Window 배치 오류 · 터미널은 변경하지 않았습니다"
+        state["jtt_notice_until"] = 0.0
+        return
+    default_window = layout["windows"][0]
+    _replace_workspace_layout_choices(
+        state, workspace, layout,
+        selected_choice_id=f"window:{workspace_id}:{default_window['id']}",
+    )
+    state["selected_folder_id"] = default_window["folder_id"]
+    state["selected_window_id"] = default_window["id"]
+    expected_ids = set(default_window["terminal_ids"])
     clients = state["managed_terminals"]
     for session_id in tuple(clients):
         if session_id not in expected_ids:
             clients.pop(session_id).close()
 
     rows = _session_rows(
-        state["jtt_registry"], workspace, clients, attach=True,
+        state["jtt_registry"], {**workspace, "terminal_ids": default_window["terminal_ids"]},
+        clients, attach=True,
         keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS),
     )
     state["managed_cards"][workspace_id] = rows
@@ -803,14 +1159,100 @@ def _attach_choice(state: dict, choice: dict) -> None:
     state["selected_signature"] = renderer._pane_signature(selected)
     state["card_scroll"] = 0
     state["live_scroll"] = 0
+    state["window_refs"] = tuple(default_window["terminal_ids"])
+    _clear_mini_live(state)
+
+
+def _release_layout_clients(state: dict, keep: set[str] | None = None) -> None:
+    keep = keep or set()
+    renderer._release_managed_input(state)
+    for session_id in tuple(state.get("managed_terminals", {})):
+        if session_id not in keep:
+            binding = state["managed_terminals"].pop(session_id)
+            binding.close()
+
+
+def _attach_layout_choice(state: dict, choice: dict) -> None:
+    """Select a logical folder/window and attach only its exact canonical refs."""
+    if state.get("work_kit_preview") is not None:
+        return
+    workspace_id = str(choice.get("workspace_id") or "")
+    if workspace_id != str(state.get("workspace_id") or ""):
+        state["jtt_notice"] = "작업공간이 변경되어 폴더 선택을 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    try:
+        workspace, layout, workspaces = _workspace_layout(state, workspace_id)
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+            JTTLayoutStoreError):
+        _release_layout_clients(state)
+        _clear_mini_live(state)
+        state["jtt_layout_error"] = True
+        state["panes"] = []
+        state["pane_index"] = 0
+        state["selected_target_id"] = ""
+        state["selected_signature"] = None
+        state["jtt_notice"] = "폴더/Window 정보를 안전하게 읽지 못했습니다 · 터미널 입력은 차단됨"
+        state["jtt_notice_until"] = 0.0
+        return
+
+    kind = choice.get("kind")
+    folder_id = str(choice.get("folder_id") or "")
+    if kind == "logical_folder":
+        folder = next((item for item in layout["folders"] if item["id"] == folder_id), None)
+        if folder is None:
+            return
+        windows = [item for item in layout["windows"] if item["folder_id"] == folder_id]
+        ids = list(dict.fromkeys(session_id for item in windows for session_id in item["terminal_ids"]))
+        window_id = ""
+        selected_choice_id = str(choice.get("id") or "")
+    elif kind == "logical_window":
+        window_id = str(choice.get("window_id") or "")
+        window = next((item for item in layout["windows"] if item["id"] == window_id), None)
+        if window is None or window["folder_id"] != folder_id:
+            return
+        folder = next(item for item in layout["folders"] if item["id"] == folder_id)
+        ids = list(window["terminal_ids"])
+        selected_choice_id = str(choice.get("id") or "")
+    else:
+        return
+
+    _replace_workspace_layout_choices(state, workspace, layout,
+                                      selected_choice_id=selected_choice_id)
+    state["jtt_workspaces"] = workspaces
+    state["workspace_name"] = workspace["name"]
+    state["selected_folder_id"] = folder["id"]
+    state["selected_window_id"] = window_id
+    state["window_refs"] = tuple(ids)
+    _release_layout_clients(state, set(ids))
+    rows = _session_rows(
+        state["jtt_registry"], {**workspace, "terminal_ids": ids}, state["managed_terminals"],
+        attach=True, keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS),
+    )
+    state["managed_cards"][workspace_id] = rows
+    state["panes"] = [dict(row) for row in rows]
+    previous_target = str(state.get("selected_target_id") or "")
+    pane_index = next((index for index, row in enumerate(state["panes"])
+                       if str(row.get("managed_id") or "") == previous_target), 0)
+    state["pane_index"] = pane_index if state["panes"] else 0
+    selected = state["panes"][state["pane_index"]] if state["panes"] else None
+    state["selected_target_id"] = str((selected or {}).get("target_id") or "")
+    state["selected_signature"] = renderer._pane_signature(selected)
+    state["card_scroll"] = 0
+    state["live_scroll"] = 0
+    state["active_panel"] = 1
+    state["center_actions_focused"] = False
+    _clear_mini_live(state)
 
 
 def _refresh_workspaces(state: dict, selected_id: str | None = None) -> None:
     stdscr = state.get("stdscr")
+    mini_sampler = state.get("mini_live_sampler")
     refreshed = build_state(state["jtt_store"], state["jtt_registry"],
                             state["managed_terminals"], attach_default=False,
                             keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS))
     refreshed["stdscr"] = stdscr
+    refreshed["mini_live_sampler"] = mini_sampler
     index = next((i for i, choice in enumerate(refreshed["choices"])
                  if choice.get("id") == selected_id), None) if selected_id else None
     if index is None:
@@ -857,8 +1299,7 @@ def _capture_workspace_delete_target(state: dict) -> dict | None:
         return None
     choice = _selected_choice(state)
     workspace_id = str(state.get("workspace_id") or "")
-    if (workspace_id == JTTWorkspaceStore.DEFAULT_ID or not choice
-            or choice.get("kind") != "workspace" or str(choice.get("id") or "") != workspace_id):
+    if workspace_id == JTTWorkspaceStore.DEFAULT_ID or not choice:
         return None
     try:
         matches = [item for item in state["jtt_store"].workspaces()
@@ -867,8 +1308,37 @@ def _capture_workspace_delete_target(state: dict) -> dict | None:
         return None
     if len(matches) != 1 or not matches[0].get("saved"):
         return None
+    selected_choice_id = str(choice.get("id") or "")
+    kind = choice.get("kind")
+    if kind == "workspace":
+        selected_workspace = str(choice.get("id") or "") == workspace_id
+    elif (kind in {"logical_folder", "logical_window"}
+          and str(choice.get("workspace_id") or "") == workspace_id):
+        try:
+            layout = state["jtt_layout_store"].layout(workspace_id, matches[0]["terminal_ids"])
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError, JTTLayoutStoreError):
+            return None
+        if kind == "logical_folder":
+            folder_id = str(choice.get("folder_id") or "")
+            selected_workspace = (
+                selected_choice_id == f"folder:{workspace_id}:{folder_id}"
+                and any(item["id"] == folder_id for item in layout["folders"])
+            )
+        else:
+            folder_id = str(choice.get("folder_id") or "")
+            window_id = str(choice.get("window_id") or "")
+            selected_workspace = (
+                selected_choice_id == f"window:{workspace_id}:{window_id}"
+                and any(item["id"] == window_id and item["folder_id"] == folder_id
+                        for item in layout["windows"])
+            )
+    else:
+        selected_workspace = False
+    if not selected_workspace:
+        return None
     return {"workspace": dict(matches[0]),
             "workspace_id": workspace_id,
+            "selected_choice_id": selected_choice_id,
             "pane_index": int(state.get("pane_index", 0)),
             "selected_target_id": str(state.get("selected_target_id") or ""),
             "selected_signature": state.get("selected_signature")}
@@ -1150,7 +1620,7 @@ def _confirm_and_delete_work_kit(stdscr, state: dict) -> None:
 
 
 def _settings_menu(stdscr, state: dict) -> None:
-    actions = [("new", "새 작업공간"), ("help", "키 안내")]
+    actions = [("new", "새 작업공간"), ("layout", "폴더 · Window 관리"), ("help", "키 안내")]
     if state.get("work_kit_preview") is not None:
         if _capture_work_kit_delete_target(state) is not None:
             actions.append(("delete_kit", "선택한 Work Kit 삭제"))
@@ -1182,6 +1652,8 @@ def _settings_menu(stdscr, state: dict) -> None:
             state["jtt_notice"] = f"{name} 작업공간 생성 반영됨 · 디렉터리 동기화 확인 필요"
         except WorkspaceStoreError:
             state["jtt_notice"] = "작업공간을 안전하게 저장하지 못했습니다."
+    elif result.selected_key == "layout":
+        _layout_menu(stdscr, state)
     elif result.selected_key == "stop":
         _confirm_and_stop_selected_terminal(stdscr, state)
     elif result.selected_key == "delete_workspace":
@@ -1203,6 +1675,303 @@ def _settings_menu(stdscr, state: dict) -> None:
              f"입력 중 {keys.prefix} 두 번 / {keys.prefix} {keys.input_escape}: 해당 키 전송",
              f"{keys.input_escape}는 입력 모드에서 탐색 복귀입니다."],
         )
+
+
+def _layout_menu(stdscr, state: dict) -> None:
+    """Manage logical grouping metadata without starting/stopping PTYs."""
+    if state.get("work_kit_preview") is not None:
+        state["jtt_notice"] = "Work Kit은 템플릿입니다 · Window 배치는 실제 작업공간에서만 변경됩니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    if state.get("jtt_layout_error"):
+        state["jtt_notice"] = "폴더/Window 데이터가 손상되었거나 비공개가 아닙니다 · 변경을 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    try:
+        workspace, layout, _workspaces = _workspace_layout(state)
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+            JTTLayoutStoreError):
+        state["jtt_notice"] = "작업공간 폴더/Window를 확인할 수 없습니다 · 변경을 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+
+    selected_folder = next((item for item in layout["folders"]
+                            if item["id"] == state.get("selected_folder_id")),
+                           layout["folders"][0])
+    selected_window = next((item for item in layout["windows"]
+                            if item["id"] == state.get("selected_window_id")), None)
+    actions = [
+        ("select_folder", "폴더 선택"),
+        ("select_window", "Window 선택"),
+        ("create_folder", "폴더 생성"),
+        ("create_window", "현재 폴더에 Window 생성"),
+    ]
+    if selected_folder["id"] != "folder-default":
+        actions.extend([("rename_folder", "선택 폴더 이름 변경"),
+                        ("delete_folder", "선택 폴더 삭제 · 터미널은 기본 Window로 이동")])
+    if selected_window and selected_window["id"] != "window-default":
+        actions.extend([("rename_window", "선택 Window 이름 변경"),
+                        ("delete_window", "선택 Window 삭제 · 터미널은 기본 Window로 이동")])
+    current_row = renderer._selected_row(state)
+    movable = bool(current_row and current_row.get("terminal_kind") == "tower_managed"
+                   and len(layout["windows"]) > 1)
+    if movable:
+        actions.append(("move_terminal", "선택 터미널을 Window로 이동"))
+    result = run_list_picker(
+        stdscr, "폴더 · Window 관리", actions, centered=True,
+        footer_hint="논리 그룹만 변경 · PTY와 실행 중인 셸은 유지됩니다",
+        preamble=[f"작업공간: {workspace['name']}",
+                  "기존 저장 작업공간과 Work Kit 데이터 형식은 변경하지 않습니다."],
+    )
+    if result.cancelled or result.selected_key is None:
+        return
+    action = result.selected_key
+    if action in {"select_folder", "select_window"}:
+        _pick_layout_item(stdscr, state, layout, action)
+        return
+    if action == "move_terminal":
+        _move_selected_terminal(stdscr, state, workspace, layout)
+        return
+    if action in {"delete_folder", "delete_window"}:
+        _delete_layout_item(stdscr, state, workspace, layout, action)
+        return
+
+    expected_workspace, expected_layout = dict(workspace), layout
+    if action == "create_folder":
+        name = prompt_text(stdscr, "새 폴더 이름: ")
+        if not name:
+            return
+        try:
+            if not _layout_target_unchanged(state, expected_workspace, expected_layout):
+                raise JTTLayoutStoreError("Workspace layout changed")
+            folder = state["jtt_layout_store"].create_folder(workspace["id"], name)
+            state["jtt_notice"] = f"폴더를 만들었습니다 · {folder['name']}"
+            _select_layout_target(state, "logical_folder", folder_id=folder["id"])
+        except JTTLayoutStoreCommittedDurabilityError as exc:
+            _reconcile_committed_layout(state, exc.workspace_id, "logical_folder", exc.item_id)
+            state["jtt_notice"] = _committed_layout_notice("폴더 생성", state)
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+                JTTLayoutStoreError):
+            state["jtt_notice"] = "폴더를 만들지 못했습니다 · 작업공간 상태를 다시 확인하세요."
+    elif action == "create_window":
+        name = prompt_text(stdscr, "새 Window 이름: ")
+        if not name:
+            return
+        try:
+            if not _layout_target_unchanged(state, expected_workspace, expected_layout):
+                raise JTTLayoutStoreError("Workspace layout changed")
+            window = state["jtt_layout_store"].create_window(
+                workspace["id"], selected_folder["id"], name,
+            )
+            state["jtt_notice"] = f"빈 Window를 만들었습니다 · {window['name']} · 터미널은 실행하지 않았습니다."
+            _select_layout_target(state, "logical_window", folder_id=window["folder_id"],
+                                  window_id=window["id"])
+        except JTTLayoutStoreCommittedDurabilityError as exc:
+            _reconcile_committed_layout(state, exc.workspace_id, "logical_window", exc.item_id)
+            state["jtt_notice"] = _committed_layout_notice("Window 생성", state)
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+                JTTLayoutStoreError):
+            state["jtt_notice"] = "Window를 만들지 못했습니다 · 기존 터미널은 변경하지 않았습니다."
+    elif action in {"rename_folder", "rename_window"}:
+        item = selected_folder if action == "rename_folder" else selected_window
+        if item is None:
+            return
+        name = prompt_text(stdscr, f"새 이름 ({item['name']}): ")
+        if not name:
+            return
+        try:
+            if not _layout_target_unchanged(state, expected_workspace, expected_layout):
+                raise JTTLayoutStoreError("Workspace layout changed")
+            if action == "rename_folder":
+                state["jtt_layout_store"].rename_folder(workspace["id"], item["id"], name)
+                state["jtt_notice"] = "폴더 이름을 변경했습니다."
+                _select_layout_target(state, "logical_folder", folder_id=item["id"])
+            else:
+                state["jtt_layout_store"].rename_window(workspace["id"], item["id"], name)
+                state["jtt_notice"] = "Window 이름을 변경했습니다."
+                _select_layout_target(state, "logical_window", folder_id=item["folder_id"],
+                                      window_id=item["id"])
+        except JTTLayoutStoreCommittedDurabilityError as exc:
+            kind = "logical_folder" if action == "rename_folder" else "logical_window"
+            _reconcile_committed_layout(state, exc.workspace_id, kind, exc.item_id)
+            state["jtt_notice"] = _committed_layout_notice(
+                "폴더 이름 변경" if action == "rename_folder" else "Window 이름 변경", state,
+            )
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+                JTTLayoutStoreError):
+            state["jtt_notice"] = "이름을 변경하지 못했습니다 · 작업공간 상태를 다시 확인하세요."
+    state["jtt_notice_until"] = 0.0
+
+
+def _layout_target_unchanged(state: dict, expected_workspace: dict, expected_layout: dict) -> bool:
+    workspace, layout, _workspaces = _workspace_layout(state, expected_workspace["id"])
+    return workspace == expected_workspace and layout == expected_layout
+
+
+def _select_layout_target(state: dict, kind: str, *, folder_id: str,
+                          window_id: str = "") -> None:
+    workspace, layout, _workspaces = _workspace_layout(state)
+    item_id = window_id if kind == "logical_window" else folder_id
+    choice_id = f"{'window' if kind == 'logical_window' else 'folder'}:{workspace['id']}:{item_id}"
+    choice = next((item for item in _layout_choices(workspace["id"], layout)
+                   if item["id"] == choice_id), None)
+    if choice is None:
+        state["jtt_layout_error"] = True
+        state["jtt_notice"] = "변경된 Window를 다시 확인할 수 없습니다 · 화면을 갱신하세요."
+        return
+    _attach_layout_choice(state, choice)
+
+
+def _reconcile_committed_layout(state: dict, workspace_id: str, kind: str,
+                                item_id: str) -> bool:
+    """Reload only after a committed write whose directory durability is uncertain."""
+    try:
+        workspace, layout, _workspaces = _workspace_layout(state, workspace_id)
+        choice_id = (f"folder:{workspace_id}:{item_id}" if kind == "logical_folder"
+                     else f"window:{workspace_id}:{item_id}")
+        choices = _layout_choices(workspace_id, layout)
+        choice = next((entry for entry in choices if entry["id"] == choice_id), None)
+        if choice is None:
+            choice = next(entry for entry in choices
+                          if entry["id"] == f"window:{workspace_id}:window-default")
+        _replace_workspace_layout_choices(state, workspace, layout,
+                                          selected_choice_id=choice["id"])
+        _attach_layout_choice(state, choice)
+        return not state.get("jtt_layout_error", False)
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+            JTTLayoutStoreError):
+        _release_layout_clients(state)
+        _clear_mini_live(state)
+        state["jtt_layout_error"] = True
+        state["panes"] = []
+        state["pane_index"] = 0
+        state["selected_target_id"] = ""
+        state["selected_signature"] = None
+        return False
+
+
+def _committed_layout_notice(action: str, state: dict) -> str:
+    notice = f"{action} 반영됨 · 디렉터리 동기화 확인 필요"
+    if state.get("jtt_layout_error"):
+        return notice + " · 최신 배치를 읽지 못했습니다 · 재시도하지 말고 다시 확인하세요"
+    return notice
+
+
+def _pick_layout_item(stdscr, state: dict, layout: dict, action: str) -> None:
+    if action == "select_folder":
+        items = [(item["id"], item["name"]) for item in layout["folders"]]
+        title = "폴더 선택"
+    else:
+        items = [(item["id"], f"{item['folder_name']} / {item['name']} · {len(item['terminal_ids'])}개")
+                 for item in layout["windows"]]
+        title = "Window 선택"
+    result = run_list_picker(stdscr, title, items, centered=True,
+                             footer_hint="선택은 표시 그룹만 변경 · 터미널은 종료하지 않습니다")
+    if result.cancelled or result.selected_key is None:
+        return
+    current = next((item for item in layout["folders"] if item["id"] == result.selected_key), None) \
+        if action == "select_folder" else next(
+            (item for item in layout["windows"] if item["id"] == result.selected_key), None
+        )
+    if current is None:
+        return
+    choice = next((item for item in _layout_choices(state["workspace_id"], layout)
+                   if (item["kind"] == "logical_folder" if action == "select_folder"
+                       else item["kind"] == "logical_window")
+                   and item.get("folder_id") == (current["id"] if action == "select_folder"
+                                                   else current["folder_id"])
+                   and (action == "select_folder" or item.get("window_id") == current["id"])), None)
+    if choice is not None:
+        _attach_layout_choice(state, choice)
+
+
+def _delete_layout_item(stdscr, state: dict, workspace: dict, layout: dict, action: str) -> None:
+    is_folder = action == "delete_folder"
+    item_id = str(state.get("selected_folder_id") if is_folder else state.get("selected_window_id") or "")
+    items = layout["folders"] if is_folder else layout["windows"]
+    item = next((entry for entry in items if entry["id"] == item_id), None)
+    if item is None or item_id in ({"folder-default"} if is_folder else {"window-default"}):
+        state["jtt_notice"] = "기본 폴더/Window는 삭제할 수 없습니다."
+        return
+    windows = ([entry for entry in layout["windows"] if entry["folder_id"] == item_id]
+               if is_folder else [item])
+    moved = list(dict.fromkeys(session_id for entry in windows for session_id in entry["terminal_ids"]))
+    title = "폴더 삭제" if is_folder else "Window 삭제"
+    label = f"{item['name']} 삭제 · 터미널 {len(moved)}개는 기본 Window로 이동"
+    confirm = run_list_picker(
+        stdscr, title, [("cancel", "취소"), ("delete", label)], centered=True,
+        footer_hint="취소가 기본 선택입니다 · PTY·셸은 종료하지 않습니다",
+        preamble=["해당 작업공간의 논리 배치만 삭제하고 세션 참조는 기본 복구 Window에 남깁니다."],
+    )
+    if confirm.cancelled or confirm.selected_key != "delete":
+        return
+    try:
+        if not _layout_target_unchanged(state, workspace, layout):
+            raise JTTLayoutStoreError("Workspace layout changed")
+        if is_folder:
+            state["jtt_layout_store"].delete_folder(workspace["id"], item_id)
+        else:
+            state["jtt_layout_store"].delete_window(workspace["id"], item_id)
+        _select_layout_target(state, "logical_window", folder_id="folder-default",
+                              window_id="window-default")
+        state["jtt_notice"] = f"{title} 완료 · {len(moved)}개 터미널을 기본 복구 Window에 보존했습니다."
+    except JTTLayoutStoreCommittedDurabilityError as exc:
+        _reconcile_committed_layout(
+            state, exc.workspace_id, "logical_window", "window-default",
+        )
+        state["jtt_notice"] = _committed_layout_notice(title, state)
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+            JTTLayoutStoreError):
+        state["jtt_notice"] = "배치를 안전하게 삭제하지 못했습니다 · 터미널은 종료하지 않았습니다."
+    state["jtt_notice_until"] = 0.0
+
+
+def _move_selected_terminal(stdscr, state: dict, workspace: dict, layout: dict) -> None:
+    row = renderer._selected_row(state)
+    identity = (row or {}).get("managed_identity") or {}
+    session_id = str(identity.get("session_id") or "")
+    if (not session_id or str((row or {}).get("managed_id") or "") != session_id
+            or session_id not in workspace["terminal_ids"]):
+        state["jtt_notice"] = "선택 터미널을 현재 작업공간에서 확인할 수 없습니다."
+        return
+    items = [(item["id"], f"{item['folder_name']} / {item['name']}") for item in layout["windows"]]
+    result = run_list_picker(
+        stdscr, f"{row.get('display_name', '터미널')} 이동", items, centered=True,
+        footer_hint="논리 배치만 변경 · 터미널 프로세스는 유지됩니다",
+    )
+    if result.cancelled or result.selected_key is None:
+        return
+    try:
+        if not _layout_target_unchanged(state, workspace, layout):
+            raise JTTLayoutStoreError("Workspace layout changed")
+        current_workspace, current_layout, _ = _workspace_layout(state, workspace["id"])
+        if session_id not in current_workspace["terminal_ids"]:
+            raise JTTLayoutStoreError("Terminal reference changed")
+        destination = next((item for item in current_layout["windows"]
+                            if item["id"] == result.selected_key), None)
+        if destination is None:
+            raise JTTLayoutStoreError("Destination Window changed")
+        state["jtt_layout_store"].move_terminal(
+            workspace["id"], session_id, destination["id"], current_workspace["terminal_ids"],
+        )
+        _select_layout_target(state, "logical_window", folder_id=destination["folder_id"],
+                              window_id=destination["id"])
+        state["pane_index"] = next((index for index, card in enumerate(state["panes"])
+                                     if str(card.get("managed_id") or "") == session_id), 0)
+        if state["panes"]:
+            selected = state["panes"][state["pane_index"]]
+            state["selected_target_id"] = str(selected.get("target_id") or "")
+            state["selected_signature"] = renderer._pane_signature(selected)
+        state["jtt_notice"] = "터미널을 이동했습니다 · 실행 중인 PTY는 유지됩니다."
+    except JTTLayoutStoreCommittedDurabilityError as exc:
+        _reconcile_committed_layout(
+            state, exc.workspace_id, "logical_window", destination["id"],
+        )
+        state["jtt_notice"] = _committed_layout_notice("터미널 이동", state)
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+            JTTLayoutStoreError):
+        state["jtt_notice"] = "터미널 배치를 변경하지 못했습니다 · 실행 중인 세션은 유지됩니다."
+    state["jtt_notice_until"] = 0.0
 
 
 def _capture_stop_target(state: dict) -> dict | None:
@@ -1368,10 +2137,13 @@ def _create_terminal(stdscr, state: dict) -> None:
         workspace_id = state["workspace_id"]
         workspace = next(item for item in state["jtt_store"].workspaces() if item["id"] == workspace_id)
         state["jtt_store"].set_terminal_ids(workspace_id, [*workspace["terminal_ids"], session_id])
+        placement_notice = _place_created_terminal(state, workspace_id, session_id)
     except WorkspaceStoreCommittedDurabilityError:
+        placement_notice = _place_created_terminal(state, state.get("workspace_id", ""), session_id)
         _select_created_terminal(state, session_id)
         state["jtt_notice"] = (
             "새 로컬 셸 및 작업공간 카드 반영됨 · 디렉터리 동기화 확인 필요"
+            + placement_notice
         )
         state["jtt_notice_until"] = 0.0
         return
@@ -1394,13 +2166,49 @@ def _create_terminal(stdscr, state: dict) -> None:
         return
 
     _select_created_terminal(state, session_id)
-    state["jtt_notice"] = "새 로컬 셸 생성 · 화면과 입력 준비 확인 중"
+    state["jtt_notice"] = "새 로컬 셸 생성 · 화면과 입력 준비 확인 중" + placement_notice
     state["jtt_notice_until"] = 0.0
+
+
+def _place_created_terminal(state: dict, workspace_id: str, session_id: str) -> str:
+    """Place a newly canonical ref; failures leave it in the virtual recovery Window."""
+    selected_window_id = str(state.get("selected_window_id") or "window-default")
+    if selected_window_id == "window-default":
+        return ""
+    try:
+        workspace, layout, _workspaces = _workspace_layout(state, workspace_id)
+        window = next((item for item in layout["windows"]
+                       if item["id"] == selected_window_id), None)
+        if window is None or session_id not in workspace["terminal_ids"]:
+            return " · Window 변경 확인 실패, 기본 복구 Window에 보관"
+        state["jtt_layout_store"].move_terminal(
+            workspace_id, session_id, selected_window_id, workspace["terminal_ids"],
+        )
+        return ""
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+            JTTLayoutStoreError):
+        return " · Window 배치 실패, 기본 복구 Window에 보관"
 
 
 def _select_created_terminal(state: dict, session_id: str) -> None:
     workspace_id = state["workspace_id"]
-    _refresh_workspaces(state, workspace_id)
+    try:
+        workspace, layout, workspaces = _workspace_layout(state, workspace_id)
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+            JTTLayoutStoreError) as exc:
+        raise WorkspaceStoreError("Created terminal workspace is unavailable") from exc
+    target_window = next((item for item in layout["windows"]
+                          if item["id"] == state.get("selected_window_id")
+                          and session_id in item["terminal_ids"]), None)
+    if target_window is None:
+        target_window = layout["windows"][0]
+    choice = next((item for item in _layout_choices(workspace_id, layout)
+                   if item.get("kind") == "logical_window"
+                   and item.get("window_id") == target_window["id"]), None)
+    if choice is None:
+        raise WorkspaceStoreError("Created terminal recovery Window is unavailable")
+    state["jtt_workspaces"] = workspaces
+    _attach_layout_choice(state, choice)
     pane_index = next((index for index, row in enumerate(state["panes"])
                        if str(row.get("managed_id") or "") == session_id), None)
     if pane_index is None:
@@ -1489,6 +2297,8 @@ def _activate_jtt_action(stdscr, state: dict, choice: dict) -> None:
         _save_configuration(stdscr, state)
     elif choice.get("id") == "action:settings":
         _settings_menu(stdscr, state)
+    elif choice.get("id") == "action:layout":
+        _layout_menu(stdscr, state)
 
 
 def _refresh_and_resize(state: dict, stdscr) -> None:
@@ -1563,6 +2373,7 @@ def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry,
     clients: dict[str, ManagedTerminalBinding] = {}
     state = build_state(store, registry, clients, keybindings=keybindings)
     state["stdscr"] = stdscr
+    state["mini_live_sampler"] = _MiniLiveSampler()
     renderer._setup_colors()
     keypad = getattr(stdscr, "keypad", None)
     if keypad:
@@ -1572,6 +2383,7 @@ def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry,
     try:
         while True:
             _refresh_and_resize(state, stdscr)
+            _refresh_mini_live(state, stdscr)
             if state.get("jtt_terminal_mode_fatal"):
                 return
             renderer.draw_preview_v2(stdscr, state)
@@ -1585,6 +2397,9 @@ def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry,
             if should_detach or state.get("jtt_terminal_mode_fatal"):
                 return
     finally:
+        sampler = state.get("mini_live_sampler")
+        if sampler is not None:
+            sampler.close()
         renderer._clear_jtt_prefix(state)
         state["jtt_pending_auto_acquire"] = None
         renderer._release_managed_input(state)
