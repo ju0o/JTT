@@ -411,9 +411,10 @@ def test_real_curses_work_kit_creation_selects_template_without_starting_shells(
         _wait_for_ui_text(ui, "터미널 배치")
         assert registry.list_sessions() == ()
 
-        # With a fresh store the Work Kit create action follows the default
-        # workspace in LEFT. This enters the real text-prompt sequence.
-        ui.send(b"\x1bOB\n")  # xterm application-mode cursor-down, then Enter.
+        # A fresh store exposes the default workspace, its default folder and
+        # Window before the Work Kit create action in LEFT. Walk that real
+        # navigation order, then enter the create form.
+        ui.send(b"\x1bOB\x1bOB\x1bOB\n")  # Three application-mode downs, then Enter.
         _wait_for_ui_text(ui, "Work Kit 이름:")
         ui.send("Integration Kit\nTemplate preview only\n1\nShell\nLocal command line\n\n".encode("utf-8"))
 

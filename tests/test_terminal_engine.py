@@ -386,6 +386,37 @@ def test_observe_snapshot_is_atomic_and_does_not_mutate_worker_cursor_or_lease()
     assert before == after
 
 
+def test_new_client_hello_does_not_claim_an_existing_input_lease():
+    owner = object.__new__(_worker.PtyOwner)
+    owner.session_id = "a" * 32
+    owner.generation = "b" * 32
+    owner.supervisor_start = "fixture-start"
+    owner.child = None
+    owner.lease_owner = "c" * 32
+    owner.columns = 80
+    owner.lines = 24
+    owner.screen = object()
+    owner.screen_error = False
+    owner.renderer_state = "ready"
+    owner.sequence = 0
+    client_id = "d" * 32
+    client = {"client_id": None}
+
+    response, stop_after = owner._dispatch(client, {
+        "op": "hello",
+        "client_id": client_id,
+        "session_id": owner.session_id,
+        "generation": owner.generation,
+        "supervisor_pid": os.getpid(),
+        "supervisor_start": owner.supervisor_start,
+    })
+
+    assert not stop_after
+    assert client["client_id"] == client_id
+    assert owner.lease_owner == "c" * 32
+    assert response["lease"] is False
+
+
 def test_optional_renderer_absence_blocks_shell_creation_before_popen(tmp_path, monkeypatch):
     import tmux_agent_tower.terminal.manager as manager
 

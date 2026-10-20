@@ -517,7 +517,10 @@ class PtyOwner:
                     or request.get("supervisor_start") != self.supervisor_start):
                 raise TerminalError("stale_identity")
             client["client_id"] = client_id
-            return self._base(ok=True, state=self._state()), False
+            # A new connection never owns the session's input lease. The
+            # generic base response reports whether *any* client currently
+            # owns it, which must not be mistaken for this client's ownership.
+            return self._base(ok=True, state=self._state(), lease=False), False
         if client["client_id"] != client_id:
             raise TerminalError("client_mismatch")
         if op == "observe":
