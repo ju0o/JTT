@@ -312,13 +312,32 @@ def test_dev_launcher_removes_only_its_failed_candidate(tmp_path):
     assert not list((home / ".local" / "bin").glob(".jtt-dev-*.tmp"))
 
 
-def test_doctor_is_read_only_and_does_not_create_terminal_or_home(tmp_path, monkeypatch):
-    workspace = tmp_path / "not-created" / "jtt"
-    registry = tmp_path / "runtime" / "jtt" / "terminals"
-    monkeypatch.setenv("JTT_HOME", str(workspace))
+@pytest.mark.parametrize("root_mode", ["explicit", "xdg_state", "runtime_only", "long"])
+def test_doctor_uses_ui_registry_root_without_creating_it(tmp_path, monkeypatch, root_mode):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("JTT_HOME", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
+    if root_mode == "explicit":
+        workspace = tmp_path / "not-created" / "jtt"
+        monkeypatch.setenv("JTT_HOME", str(workspace))
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "ignored-state"))
+    elif root_mode == "xdg_state":
+        state_home = tmp_path / "state-home"
+        workspace = state_home / "jtt"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+    elif root_mode == "runtime_only":
+        workspace = home / ".local" / "state" / "jtt"
+    else:
+        workspace = tmp_path / ("long-jtt-home-" + "x" * 110)
+        monkeypatch.setenv("JTT_HOME", str(workspace))
+
+    registry = workspace / "terminals"
+    decoy_registry = tmp_path / "runtime" / "jtt" / "terminals"
     reported_launcher = tmp_path / "bin" / "jtt"
     monkeypatch.setenv("JTT_LAUNCHER_PATH", str(reported_launcher))
-    monkeypatch.setattr(jtt_diagnostics.terminal_manager, "_default_root", lambda: registry)
+    monkeypatch.setattr(jtt_diagnostics.terminal_manager, "_default_root", lambda: decoy_registry)
     monkeypatch.setattr(jtt_diagnostics, "_renderer_status", lambda: ("pyte fixture ready", True))
     monkeypatch.setattr(jtt_diagnostics, "installation_kind", lambda: "DEV")
     monkeypatch.setattr(jtt_diagnostics.terminal_manager.TerminalRegistry, "create", lambda *_args, **_kwargs: pytest.fail("doctor must not create a PTY"))
@@ -327,30 +346,39 @@ def test_doctor_is_read_only_and_does_not_create_terminal_or_home(tmp_path, monk
     assert jtt_diagnostics.run_doctor(output=output) == 0
     after = set(tmp_path.rglob("*"))
     assert before == after
-    assert not workspace.exists() and not registry.exists()
+    assert not workspace.exists() and not registry.exists() and not decoy_registry.exists()
     text = output.getvalue()
     assert "read-only" in text
     assert f"Executable: {reported_launcher}" in text
+    assert f"Supervisor registry: {registry}" in text
     assert "not created" in text
     assert "running=0" in text
     assert "No PTY, Agent, network request" in text
+    if root_mode == "long":
+        planned = jtt_diagnostics.terminal_manager._planned_socket_path(
+            registry / ("0" * 32), "0" * 32,
+        )
+        assert planned == jtt_diagnostics.terminal_manager._short_socket_root() / ("0" * 32)
+        assert "estimated socket path " in text
 
 
 def test_doctor_reports_long_socket_path_without_creating_runtime_state(tmp_path, monkeypatch):
-    workspace = tmp_path / "workspace-not-created"
-    long_root = tmp_path / ("r" * 90) / ("s" * 90) / "terminals"
+    workspace = tmp_path / ("workspace-not-created-" + "x" * 110)
+    registry = workspace / "terminals"
     monkeypatch.setenv("JTT_HOME", str(workspace))
-    monkeypatch.setattr(jtt_diagnostics.terminal_manager, "_default_root", lambda: long_root)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime-decoy"))
+    monkeypatch.setattr(jtt_diagnostics.terminal_manager, "_default_root", lambda: tmp_path / "wrong-runtime-registry")
     monkeypatch.setattr(jtt_diagnostics, "_renderer_status", lambda: ("pyte fixture ready", True))
     monkeypatch.setattr(jtt_diagnostics, "installation_kind", lambda: "DEV")
     output = io.StringIO()
 
     assert jtt_diagnostics.run_doctor(output=output) == 0
+    assert f"Supervisor registry: {registry}" in output.getvalue()
     assert "estimated socket path " in output.getvalue()
-    planned = jtt_diagnostics.terminal_manager._planned_socket_path(long_root / ("0" * 32), "0" * 32)
+    planned = jtt_diagnostics.terminal_manager._planned_socket_path(registry / ("0" * 32), "0" * 32)
     assert len(os.fsencode(planned)) <= jtt_diagnostics.terminal_manager.MAX_UNIX_SOCKET_PATH_BYTES
     assert not workspace.exists()
-    assert not long_root.exists()
+    assert not registry.exists()
 
 
 def test_official_installer_refuses_existing_path_command_before_writing(tmp_path, monkeypatch):

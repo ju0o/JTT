@@ -67,7 +67,9 @@ def _workspace_summary(root: Path) -> tuple[str, bool]:
 
 def _session_summary() -> tuple[Path | None, str, bool]:
     try:
-        root = terminal_manager._default_root()
+        # JTT UI owns its Registry under the workspace store, not the legacy
+        # Supervisor runtime path (which may be redirected by XDG_RUNTIME_DIR).
+        root = JTTWorkspaceStore().root / "terminals"
         registry = terminal_manager.TerminalRegistry(root=root)
         sessions = registry.list_sessions()
     except terminal_manager.TerminalError:
