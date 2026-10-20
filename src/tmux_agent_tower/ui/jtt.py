@@ -5,9 +5,18 @@ from __future__ import annotations
 import curses
 import locale
 import os
+import signal
+import sys
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
+from ..state.jtt_keys import (
+    DEFAULT_JTT_KEYBINDINGS,
+    JTTKeybindings,
+    JTTKeybindingsError,
+    load_jtt_keybindings,
+)
 from ..state.jtt_workspaces import JTTWorkspaceStore, WorkspaceStoreError
 from ..terminal import TerminalRegistry
 from . import ux_preview_v2 as renderer
@@ -15,10 +24,49 @@ from .render import display_width, truncate_to_width
 from .widgets import prompt_text, run_list_picker, safe_add, show_message_screen
 
 
+class _JTTTerminationSignal(Exception):
+    """Catchable process signal translated into ordinary curses unwinding."""
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+@contextmanager
+def _catch_jtt_termination_signals():
+    """Raise through `_run` so its finally and curses.wrapper restore the TTY."""
+
+    previous = {}
+
+    def unwind(signum, _frame):
+        raise _JTTTerminationSignal(signum)
+
+    candidates = (
+        getattr(signal, "SIGHUP", None),
+        getattr(signal, "SIGTERM", None),
+        getattr(signal, "SIGQUIT", None),
+    )
+    try:
+        for signum in candidates:
+            if signum is not None:
+                previous[signum] = signal.getsignal(signum)
+                signal.signal(signum, unwind)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def _matches_configured_byte(key, byte: int) -> bool:
+    if isinstance(key, str):
+        return len(key) == 1 and ord(key) == byte
+    return isinstance(key, int) and not isinstance(key, bool) and key == byte
+
+
 class ManagedTerminalBinding:
     """Adapts one exact JTT session to the RIGHT panel and input lease."""
 
-    def __init__(self, client, identity):
+    def __init__(self, client, identity, *, keybindings=DEFAULT_JTT_KEYBINDINGS):
         self.client = client
         self.identity = identity
         self.session_id = str(identity.session_id)
@@ -33,6 +81,9 @@ class ManagedTerminalBinding:
         self.renderer_state = str(getattr(identity, "renderer_state", "unknown"))
         self.terminal_view_state = "starting"
         self.last_resize: tuple[int, int] | None = None
+        self.input_escape_byte = keybindings.input_escape_byte
+        self.input_escape_name = keybindings.input_escape
+        self._input_state = None
 
     def matches(self, row: dict) -> bool:
         identity = row.get("managed_identity") or {}
@@ -62,7 +113,10 @@ class ManagedTerminalBinding:
                        and not bool(getattr(update, "gap", False)) and renderer_ready)
         lease_lost = self.input_mode and not bool(getattr(self.client, "lease", True))
         if lease_lost:
-            self.input_mode = False
+            # A lease can be revoked remotely while curses is still in the
+            # pass-through termios mode. Restore local terminal controls at
+            # the same time the UI drops its input-mode state.
+            self._revoke()
         self.screen = getattr(update, "screen", None)
         self.shell_state = str(getattr(update, "state", "unknown")).lower()
         if self.shell_state not in {"running", "active"}:
@@ -92,7 +146,7 @@ class ManagedTerminalBinding:
             self.status = "입력 권한 만료 · 입력 차단"
         elif self.input_mode:
             self.terminal_view_state = "running_ready"
-            self.status = "입력 중 · Ctrl+] 탐색 복귀"
+            self.status = f"입력 중 · {self.input_escape_name} 탐색 복귀"
         else:
             self.terminal_view_state = "running_ready"
             self.status = "관찰 중 · 클릭 또는 Enter로 입력"
@@ -106,10 +160,23 @@ class ManagedTerminalBinding:
 
     def _revoke(self) -> None:
         self.input_mode = False
+        if not self._restore_input_terminal_mode() and self._input_state is not None:
+            self._input_state["jtt_notice"] = "터미널 입력 모드 복구 실패 · UI를 안전 종료합니다"
+            self._input_state["jtt_notice_until"] = 0.0
+            self._input_state["jtt_terminal_mode_fatal"] = True
         try:
             self.client.release()
         except (OSError, RuntimeError, ValueError):
             pass
+
+    def _restore_input_terminal_mode(self) -> bool:
+        input_state = self._input_state
+        if input_state is None:
+            return True
+        if not renderer._set_jtt_control_byte_input(input_state, False):
+            return False
+        self._input_state = None
+        return True
 
     def release(self) -> None:
         self._revoke()
@@ -127,30 +194,50 @@ class ManagedTerminalBinding:
         except (OSError, RuntimeError, ValueError):
             acquired = False
         if acquired:
+            if not renderer._set_jtt_control_byte_input(state, True):
+                # Retry the saved mode snapshot once. If it still cannot be
+                # restored, do not keep running curses against an unknown TTY
+                # mode; _run will exit through curses.wrapper's final guard.
+                restored = renderer._set_jtt_control_byte_input(state, False)
+                try:
+                    self.client.release()
+                except (OSError, RuntimeError, ValueError):
+                    pass
+                self.input_mode = False
+                self.status = "터미널 제어 키 모드를 설정할 수 없음 · 입력 차단"
+                if not restored:
+                    state["jtt_notice"] = "터미널 모드 복구 실패 · UI를 안전 종료합니다"
+                    state["jtt_notice_until"] = 0.0
+                    state["jtt_terminal_mode_fatal"] = True
+                return False
+            self._input_state = state
             self.input_mode = True
-            self.status = "입력 중 · Ctrl+] 탐색 복귀"
+            self.status = f"입력 중 · {self.input_escape_name} 탐색 복귀"
             return True
         self.input_mode = False
         self.status = "다른 연결이 입력 중이거나 동기화가 불확실함 · 입력 차단"
         return False
 
-    def send_literal_ctrl_g(self, state: dict) -> bool:
-        """Send one Ctrl+G only to this exact, synchronized leased terminal."""
+    def send_literal_byte(self, state: dict, byte: int, expected_target=None) -> bool:
+        """Send one configured control byte only to the unchanged leased target."""
 
         row = renderer._selected_row(state)
         if (not self.input_mode or not bool(getattr(self.client, "lease", False))
                 or not self.synced or self.screen is None
-                or self.renderer_state != "ready" or not row or not self.matches(row)):
+                or self.renderer_state != "ready" or not row or not self.matches(row)
+                or expected_target is None
+                or renderer._jtt_prefix_target_snapshot(state) != expected_target
+                or not isinstance(byte, int) or isinstance(byte, bool) or not 0 <= byte <= 0x1F):
             self.release()
-            self.status = "Ctrl+G 전송 조건 불일치 · 입력 차단"
+            self.status = "제어 키 전송 조건 불일치 · 입력 차단"
             return False
         try:
-            result = self.client.send(b"\x07")
+            result = self.client.send(bytes((byte,)))
         except (OSError, RuntimeError, ValueError):
-            self._stale("Ctrl+G 입력 전달 실패 · 입력 차단")
+            self._stale("제어 키 입력 전달 실패 · 입력 차단")
             return False
         if result != 1:
-            self._stale("Ctrl+G 입력 전달 확인 실패 · 입력 차단")
+            self._stale("제어 키 입력 전달 확인 실패 · 입력 차단")
             return False
         return True
 
@@ -159,13 +246,13 @@ class ManagedTerminalBinding:
             return False
         # get_wch() normally returns the control byte as a one-character
         # string, but curses implementations may return its integer code.
-        if key in ("\x1d", 29):  # Ctrl+] is reserved by JTT as a mode escape.
+        if _matches_configured_byte(key, self.input_escape_byte):
             self.release()
             self.status = "관찰 중 · 클릭 또는 Enter로 입력"
             return True
         if key == curses.KEY_RESIZE:
             return False
-        payload = renderer._key_bytes(key)
+        payload = renderer._jtt_key_bytes(key)
         if payload is None:
             return True
         try:
@@ -307,7 +394,8 @@ def _basic_color_index(value) -> int | None:
 
 
 def _session_rows(registry: TerminalRegistry, workspace: dict,
-                 clients: dict[str, ManagedTerminalBinding], *, attach: bool = True) -> list[dict]:
+                 clients: dict[str, ManagedTerminalBinding], *, attach: bool = True,
+                 keybindings=DEFAULT_JTT_KEYBINDINGS) -> list[dict]:
     lookup_failed = False
     try:
         identities = {str(item.session_id): item for item in registry.list_sessions()}
@@ -338,7 +426,7 @@ def _session_rows(registry: TerminalRegistry, workspace: dict,
         })):
             try:
                 client = registry.connect(str(session_id))
-                binding = ManagedTerminalBinding(client, client.identity)
+                binding = ManagedTerminalBinding(client, client.identity, keybindings=keybindings)
                 clients[str(session_id)] = binding
             except (OSError, RuntimeError, ValueError):
                 binding = None
@@ -391,8 +479,10 @@ def _screen_preview(screen) -> str:
 
 def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
                 clients: dict[str, ManagedTerminalBinding] | None = None,
-                *, attach_default: bool = True) -> dict:
+                *, attach_default: bool = True,
+                keybindings: JTTKeybindings | None = None) -> dict:
     clients = clients if clients is not None else {}
+    keybindings = keybindings or load_jtt_keybindings(store.root)
     workspaces = store.workspaces()
     default = next((item for item in workspaces if item["id"] == store.DEFAULT_ID), workspaces[0])
     saved = [item for item in workspaces if item["id"] != store.DEFAULT_ID]
@@ -409,10 +499,12 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
     ])
     selected = default
     rows_by_choice = {
-        item["id"]: _session_rows(registry, item, clients, attach=False)
+        item["id"]: _session_rows(registry, item, clients, attach=False,
+                                  keybindings=keybindings)
         for item in [default, *saved]
     }
-    rows = _session_rows(registry, default, clients, attach=attach_default)
+    rows = _session_rows(registry, default, clients, attach=attach_default,
+                         keybindings=keybindings)
     rows_by_choice[default["id"]] = rows
     tower = SimpleNamespace(rows=[], visible_rows=[], selected=-1)
     panes = list(rows)
@@ -444,11 +536,13 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
         "managed_terminals": clients,
         "jtt_store": store,
         "jtt_registry": registry,
+        "jtt_keybindings": keybindings,
         "jtt_workspaces": workspaces,
         "jtt_notice": "",
         "jtt_notice_until": 0.0,
         "jtt_prefix_pending": False,
         "jtt_prefix_deadline": 0.0,
+        "jtt_prefix_target": None,
         "jtt_pending_auto_acquire": None,
         "jtt_action_handler": _activate_jtt_action,
         "jtt_center_action_handler": lambda stdscr, state, index: (
@@ -496,7 +590,8 @@ def _attach_choice(state: dict, choice: dict) -> None:
 def _refresh_workspaces(state: dict, selected_id: str | None = None) -> None:
     stdscr = state.get("stdscr")
     refreshed = build_state(state["jtt_store"], state["jtt_registry"],
-                            state["managed_terminals"], attach_default=False)
+                            state["managed_terminals"], attach_default=False,
+                            keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS))
     refreshed["stdscr"] = stdscr
     index = next((i for i, choice in enumerate(refreshed["choices"])
                  if choice.get("id") == selected_id), None) if selected_id else None
@@ -547,15 +642,17 @@ def _settings_menu(stdscr, state: dict) -> None:
     elif result.selected_key == "stop":
         _confirm_and_stop_selected_terminal(stdscr, state)
     else:
+        keys = state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS)
         show_message_screen(
             stdscr, "JTT 키 안내",
             ["탐색: Tab/Shift+Tab 패널 · Enter 입력 · q/Q/Esc는 JTT 유지",
-             "Ctrl+G n: 새 터미널 · h/l: 카드 이동 · w: 작업공간",
-             "Ctrl+G x: 선택 터미널 종료 (취소가 기본 선택)",
-             "Ctrl+G d: UI 연결 해제 (셸 유지) · ?: 도움",
-             "Ctrl+G Esc: 접두 취소 · 대화상자 Esc: 닫기",
+             f"{keys.prefix} n: 새 터미널 · h/l: 카드 이동 · w: 작업공간",
+             f"{keys.prefix} x: 선택 터미널 종료 (취소가 기본 선택)",
+             f"{keys.prefix} d: UI 연결 해제 (셸 유지) · ?: 도움",
+             f"{keys.prefix} Esc: 접두 취소 · 대화상자 Esc: 닫기",
              "입력 중 q/Q/Esc 및 bare n/Tab은 터미널로 전달됩니다.",
-             "Ctrl+]는 입력 모드에서 탐색 복귀입니다."],
+             f"입력 중 {keys.prefix} 두 번 / {keys.prefix} {keys.input_escape}: 해당 키 전송",
+             f"{keys.input_escape}는 입력 모드에서 탐색 복귀입니다."],
         )
 
 
@@ -829,7 +926,10 @@ def _create_terminal(stdscr, state: dict) -> None:
     try:
         client = state["jtt_registry"].create()
         session_id = str(client.identity.session_id)
-        state["managed_terminals"][session_id] = ManagedTerminalBinding(client, client.identity)
+        state["managed_terminals"][session_id] = ManagedTerminalBinding(
+            client, client.identity,
+            keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS),
+        )
         workspace_id = state["workspace_id"]
         workspace = next(item for item in state["jtt_store"].workspaces() if item["id"] == workspace_id)
         state["jtt_store"].set_terminal_ids(workspace_id, [*workspace["terminal_ids"], session_id])
@@ -893,6 +993,9 @@ def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
         state["jtt_notice_until"] = 0.0
         return False
     if command == "x":
+        renderer._release_managed_input(state)
+        if state.get("jtt_terminal_mode_fatal"):
+            return False
         _confirm_and_stop_selected_terminal(stdscr, state)
         return False
     if command == "d":
@@ -901,17 +1004,22 @@ def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
         renderer._clear_jtt_prefix(state)
         return True
     if command == "?":
+        renderer._release_managed_input(state)
+        if state.get("jtt_terminal_mode_fatal"):
+            return False
+        keys = state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS)
         show_message_screen(
             stdscr, "JTT 키 안내",
-            ["Ctrl+G n: 새 터미널 (명시적 생성)",
-             "Ctrl+G h/l: 이전/다음 카드 (입력 권한 해제)",
-             "Ctrl+G x: 선택 터미널 종료 (취소가 기본 선택)",
-             "Ctrl+G w: 작업공간 패널", "Ctrl+G d: UI 연결 해제 (셸 유지)",
-             "종료된 셸은 Ctrl+G x로 현재 작업공간 카드 참조만 제거합니다.",
+            [f"{keys.prefix} n: 새 터미널 (명시적 생성)",
+             f"{keys.prefix} h/l: 이전/다음 카드 (입력 권한 해제)",
+             f"{keys.prefix} x: 선택 터미널 종료 (취소가 기본 선택)",
+             f"{keys.prefix} w: 작업공간 패널", f"{keys.prefix} d: UI 연결 해제 (셸 유지)",
+             f"종료된 셸은 {keys.prefix} x로 현재 작업공간 카드 참조만 제거합니다.",
              "탐색 q/Q/Esc는 JTT를 닫지 않으며 입력 중 q/Q/Esc는 터미널로 전달합니다.",
-             "Ctrl+G ?: 도움 · Ctrl+G Esc: 접두 취소 · 대화상자 Esc: 닫기",
-             "입력 중 bare n/Tab은 터미널로 전달 · Ctrl+G 두 번은 Ctrl+G 전송",
-             "Ctrl+]는 입력 모드에서 탐색 복귀입니다."],
+             f"{keys.prefix} ?: 도움 · {keys.prefix} Esc: 접두 취소 · 대화상자 Esc: 닫기",
+             f"입력 중 bare n/Tab은 터미널로 전달 · {keys.prefix} 두 번은 접두 키 전송",
+             f"{keys.prefix} {keys.input_escape}는 {keys.input_escape} 전송",
+             f"{keys.input_escape}는 입력 모드에서 탐색 복귀입니다."],
         )
         return False
     return False
@@ -970,7 +1078,8 @@ def _resolve_pending_auto_acquire(state: dict, binding, row) -> None:
             # Clear before attempting so refresh can never retry a failed lease.
             state["jtt_pending_auto_acquire"] = None
             if binding.enter(state.get("stdscr"), state):
-                state["jtt_notice"] = "터미널 준비 완료 · 입력 중 · Ctrl+] 탐색 복귀"
+                escape_name = state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS).input_escape
+                state["jtt_notice"] = f"터미널 준비 완료 · 입력 중 · {escape_name} 탐색 복귀"
             else:
                 state["jtt_notice"] = binding.status
             state["jtt_notice_until"] = 0.0
@@ -990,9 +1099,10 @@ def _resolve_pending_auto_acquire(state: dict, binding, row) -> None:
         state["jtt_notice_until"] = 0.0
 
 
-def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry) -> None:
+def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry,
+         keybindings: JTTKeybindings | None = None) -> None:
     clients: dict[str, ManagedTerminalBinding] = {}
-    state = build_state(store, registry, clients)
+    state = build_state(store, registry, clients, keybindings=keybindings)
     state["stdscr"] = stdscr
     renderer._setup_colors()
     keypad = getattr(stdscr, "keypad", None)
@@ -1003,6 +1113,8 @@ def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry) -> None:
     try:
         while True:
             _refresh_and_resize(state, stdscr)
+            if state.get("jtt_terminal_mode_fatal"):
+                return
             renderer.draw_preview_v2(stdscr, state)
             try:
                 key = stdscr.get_wch()
@@ -1010,13 +1122,15 @@ def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry) -> None:
                 continue
             if key in (-1, None):
                 continue
-            if renderer._handle_key(stdscr, state, key):
+            should_detach = renderer._handle_key(stdscr, state, key)
+            if should_detach or state.get("jtt_terminal_mode_fatal"):
                 return
     finally:
         renderer._clear_jtt_prefix(state)
         state["jtt_pending_auto_acquire"] = None
         renderer._release_managed_input(state)
         for binding in list(clients.values()):
+            binding._restore_input_terminal_mode()
             # close() disconnects the UI client only; the PTY shell remains alive.
             binding.close()
         state["managed_terminals"].clear()
@@ -1027,8 +1141,23 @@ def _run(stdscr, store: JTTWorkspaceStore, registry: TerminalRegistry) -> None:
 def run_jtt_ui(store: JTTWorkspaceStore | None = None,
                registry: TerminalRegistry | None = None) -> int:
     store = store or JTTWorkspaceStore()
+    try:
+        keybindings = load_jtt_keybindings(store.root)
+    except JTTKeybindingsError:
+        print("JTT 키 설정이 안전하지 않거나 올바르지 않습니다. keybindings.json을 확인하세요.",
+              file=sys.stderr)
+        return 2
     registry = registry or TerminalRegistry(root=store.root / "terminals")
     locale.setlocale(locale.LC_ALL, "")
     os.environ.setdefault("ESCDELAY", "25")
-    curses.wrapper(_run, store, registry)
+    try:
+        with _catch_jtt_termination_signals():
+            curses.wrapper(_run, store, registry, keybindings)
+    except _JTTTerminationSignal as stopped:
+        # Conventional shell status: 128 + signal number (e.g. SIGTERM=143).
+        return 128 + int(stopped.signum)
+    except ValueError:
+        print("JTT curses 종료 복구를 위해 메인 스레드에서 실행해야 합니다.",
+              file=sys.stderr)
+        return 2
     return 0

@@ -79,6 +79,46 @@ clipboard action, login, or model request is started by JTT itself; commands
 typed into a terminal are ordinary user processes and inherit the current
 account's normal access.
 
+While the JTT UI is active, catchable `SIGHUP`, `SIGTERM`, and `SIGQUIT` are
+routed through normal UI unwinding so input leases are released and curses
+restores the prior terminal mode; the process returns the conventional
+`128 + signal` status. `SIGKILL` cannot be caught, so it cannot guarantee that
+terminal-mode cleanup runs. This does not terminate the separately managed
+shell session.
+
+### JTT key configuration
+
+JTT optionally reads `JTT_HOME/keybindings.json`; when `JTT_HOME` is unset,
+this is the `keybindings.json` file in the JTT state directory described above.
+An absent file leaves the defaults unchanged: `Ctrl+G` is the global prefix,
+`Ctrl+]` exits terminal input mode, and the prefix window is fixed at four
+seconds. JTT does not create the file automatically. A custom file uses this
+exact version-1 schema:
+
+```json
+{"version":1,"prefix":"Ctrl+P","input_escape":"Ctrl+K"}
+```
+
+Both keys are configured independently and must be different. Supported names
+are `Ctrl+A` through `Ctrl+Z` except `Ctrl+C`, `Ctrl+H`, `Ctrl+I`, `Ctrl+J`,
+`Ctrl+M`, `Ctrl+Q`, `Ctrl+S`, and `Ctrl+Z`, plus the default-compatible
+`Ctrl+]`. Those excluded chords can be intercepted or aliased by terminal
+signals, flow control, or common terminal controls. Printable keys, terminal
+navigation keys, aliases, extra schema fields, duplicate JSON fields, and
+other spellings are rejected rather than guessed. The prefix timeout is not
+user-configurable.
+
+The state directory must be owned by the current user and private. The config
+must be an owner-readable, owner-only regular file with no execute bit, symlink,
+or hardlink (normally mode `0600`; read-only `0400` is also accepted). Invalid
+or unsafe configuration makes JTT exit before opening the UI or creating a
+terminal; it never silently falls back to defaults. In terminal input mode the
+configured prefix is reserved globally. Doubling it sends one literal prefix
+byte; prefix followed by the configured input-escape key sends that one literal
+byte. Both literal paths require the same selected session identity, a
+synchronized screen, and a valid input lease. The standalone input-escape key
+returns to navigation.
+
 ## Development setup
 
 From a source checkout, run `scripts/jtt-setup-dev` explicitly to create or use

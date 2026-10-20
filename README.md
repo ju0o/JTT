@@ -30,7 +30,9 @@ literal Ctrl+G byte to that terminal. In terminal input mode,
 In navigation, `q`, `Q`, and `Esc` do not close JTT; use `Ctrl+G d` to
 disconnect the UI while keeping shells running. `Esc` also closes an active
 dialog or cancels a pending prefix. See [JTT terminal support and safety](docs/JTT_TERMINAL_SUPPORT.md)
-for data locations, cleanup guidance, and VT compatibility limits.
+for data locations, cleanup guidance, and VT compatibility limits. The default
+prefix/input escape (`Ctrl+G` / `Ctrl+]`) can be changed in the private JTT-only
+`keybindings.json`; the support guide documents its strict schema and key list.
 
 JTT is an interactive local terminal, not a security sandbox. Shells run as
 the current user and can access that user's normal files and network. The

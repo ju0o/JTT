@@ -63,17 +63,25 @@ else:
 
 if pyte is not None:
     class _JttScreen(pyte.Screen):
-        """Screen adapter for xterm's private SGR extension marker.
+        """Screen adapter for unsupported terminal-private CSI extensions.
 
         pyte's parser dispatches CSI ``? ... m`` with ``private=True`` but its
         Screen handler only accepts numeric attributes. Private SGR has no
         portable rendition semantics, so ignore that extension instead of
-        taking the otherwise healthy terminal offline.
+        taking the otherwise healthy terminal offline. The same applies to
+        private device-status reports such as tmux's ``CSI ? 996 n``: JTT has
+        no terminal reply channel here, so it ignores the request rather than
+        inventing a response or failing the renderer.
         """
 
         def select_graphic_rendition(self, *attrs: int, private: bool = False) -> None:
             if not private:
                 super().select_graphic_rendition(*attrs)
+
+        def report_device_status(self, *attrs: int, private: bool = False) -> None:
+            if private:
+                return
+            super().report_device_status(*attrs)
 else:
     _JttScreen = None
 

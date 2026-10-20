@@ -34,6 +34,20 @@ def test_private_sgr_extension_does_not_disable_terminal_renderer():
     assert screen.cursor.attrs.fg == "red"
 
 
+@pytest.mark.skipif(_worker.pyte is None, reason="pyte renderer is unavailable")
+def test_tmux_private_device_status_query_does_not_disable_terminal_renderer():
+    screen = _worker._JttScreen(40, 3)
+    stream = _worker.pyte.Stream(screen)
+
+    # tmux issues this private DSR during terminal initialization. There is no
+    # terminal-response channel in the worker's VT model, so the extension is
+    # ignored while subsequent ordinary rendering continues.
+    stream.feed("\x1b[?996n\x1b[32mJTT_DSR_OK")
+
+    assert "JTT_DSR_OK" in "".join(screen.display)
+    assert screen.cursor.attrs.fg == "green"
+
+
 def _safe_test_home(monkeypatch, tmp_path):
     home = tmp_path / "shell-home"
     home.mkdir(mode=0o700)

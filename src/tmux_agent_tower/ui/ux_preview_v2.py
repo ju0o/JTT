@@ -24,6 +24,7 @@ import termios
 import time
 from pathlib import Path
 
+from ..state.jtt_keys import DEFAULT_JTT_KEYBINDINGS
 from .render import display_width, truncate_to_width
 from .widgets import safe_add
 from .ux_preview import EXPECTED_BASE_SHA, make_preview_tower
@@ -529,7 +530,8 @@ def _draw_center(stdscr, rect, state: dict, active: bool) -> None:
     _put(stdscr, iy, ix + 1, max(1, iw - 2), workspace_name, curses.A_BOLD)
     panes = state["panes"]
     if not panes:
-        empty = ("이 작업공간에 터미널 없음 · Ctrl+G n 새 터미널"
+        keybindings = state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS)
+        empty = (f"이 작업공간에 터미널 없음 · {keybindings.prefix} n 새 터미널"
                  if unicode else "Pane 없음")
         _put(stdscr, iy + 2, ix + 1, max(0, iw - 2), empty, curses.A_DIM)
     else:
@@ -683,13 +685,41 @@ def draw_preview_v2(stdscr, state: dict) -> None:
 _JTT_PREFIX_TIMEOUT = 4.0
 
 
-def _is_ctrl_g(key) -> bool:
-    return key in ("\x07", 7)
-
-
 def _clear_jtt_prefix(state: dict) -> None:
     state["jtt_prefix_pending"] = False
     state["jtt_prefix_deadline"] = 0.0
+    state["jtt_prefix_target"] = None
+
+
+def _jtt_prefix_target_snapshot(state: dict):
+    """Bind a pending literal-control chord to one exact active lease target."""
+
+    row = _selected_row(state)
+    binding = _managed_binding(state)
+    if row is None or binding is None:
+        return None
+    signature = _pane_signature(row)
+    target_id = str(row.get("target_id") or "")
+    selected_signature = state.get("selected_signature")
+    try:
+        pane_index = int(state.get("pane_index", 0))
+    except (TypeError, ValueError):
+        return None
+    if (signature is None or not target_id
+            or str(state.get("selected_target_id") or "") != target_id
+            or selected_signature != signature):
+        return None
+    client = binding.client
+    return (
+        str(state.get("workspace_id") or ""),
+        pane_index,
+        target_id,
+        signature,
+        selected_signature,
+        id(binding), id(client), binding.session_id, binding.generation, binding.shell_pid,
+        bool(binding.input_mode), bool(getattr(client, "lease", False)),
+        bool(binding.synced), binding.screen is not None, binding.renderer_state,
+    )
 
 
 def _expire_jtt_prefix(state: dict, now: float | None = None) -> None:
@@ -704,25 +734,33 @@ def _draw_jtt_footer(stdscr, state: dict, width: int, height: int) -> None:
         return
     _expire_jtt_prefix(state)
     notice = str(state.get("jtt_notice") or "")
+    keybindings = state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS)
+    prefix = keybindings.prefix
+    escape = keybindings.input_escape
+    timeout = f"{keybindings.timeout_seconds:g}초"
     now = time.monotonic()
     if notice and not state.get("jtt_notice_until"):
         state["jtt_notice_until"] = now + 2.0
     if notice and now < float(state.get("jtt_notice_until") or 0.0):
         text = f"JTT — Ju0 Terminal Tower · {notice}"
     elif state.get("jtt_prefix_pending"):
-        text = "JTT — Ju0 Terminal Tower · Ctrl+G 4초 내: n 새 · h/l 카드 · w 작업공간 · x 터미널 종료 · d UI 분리 · ? 도움 · Esc 취소 · Ctrl+G 전송"
+        text = (f"JTT — Ju0 Terminal Tower · {prefix} {timeout} 내: n 새 · h/l 카드 · w 작업공간 · "
+                f"x 종료 · d 분리 · ? 도움 · Esc 취소 · {prefix} {prefix}/{escape} 전송")
     elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
-        text = "JTT — Ju0 Terminal Tower · Ctrl+] 탐색 복귀 · Ctrl+G 명령 대기(4초) · q/Q/Esc 터미널 입력"
+        text = (f"JTT — Ju0 Terminal Tower · {escape} 탐색 복귀 · {prefix} 명령 대기({timeout}) · "
+                "q/Q/Esc 터미널 입력")
     else:
-        text = "JTT — Ju0 Terminal Tower · Ctrl+G 명령(4초) · Tab/Shift+Tab 패널 · Enter 입력 · Ctrl+G d 분리 · Ctrl+G x 종료 · q/Q/Esc 유지"
-    compact = "JTT · Ctrl+G(4초) · Tab · Enter · Ctrl+G d 분리 · Ctrl+G x 종료"
+        text = (f"JTT — Ju0 Terminal Tower · {prefix} 명령({timeout}) · Tab/Shift+Tab 패널 · "
+                f"Enter 입력 · {prefix} d 분리 · {prefix} x 종료 · q/Q/Esc 유지")
+    compact = f"JTT · {prefix}({timeout}) · Tab · Enter · {prefix} d 분리 · {prefix} x 종료"
     # _regions() switches to the compact single-panel layout below 110 cols;
     # keep the footer equally compact so the prefixed stop command stays visible.
     if width < 110:
         if state.get("jtt_prefix_pending"):
-            text = "JTT · Ctrl+G 4초: n 새 h/l 카드 w 작업 x 종료 d 분리 ? 도움 Esc 취소"
+            text = (f"JTT · {prefix} {timeout}: n 새 h/l 카드 w 작업 x 종료 d 분리 "
+                    f"? 도움 Esc 취소 {prefix} {prefix}/{escape} 전송")
         elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
-            text = "JTT · Ctrl+] 탐색 · Ctrl+G(4초) 명령"
+            text = f"JTT · {escape} 탐색 · {prefix}({timeout}) 명령"
         elif not notice or now >= float(state.get("jtt_notice_until") or 0.0):
             text = compact
     _put(stdscr, height - 1, 1, max(1, width - 2), text, curses.A_DIM)
@@ -737,15 +775,27 @@ def _handle_jtt_prefix(stdscr, state: dict, key) -> tuple[bool, bool]:
 
     if state.get("runtime_mode") != "jtt":
         return False, False
+    keybindings = state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS)
     _expire_jtt_prefix(state)
     if state.get("jtt_prefix_pending"):
+        expected_target = state.get("jtt_prefix_target")
         _clear_jtt_prefix(state)
-        if _is_ctrl_g(key):
+        literal_byte = None
+        literal_name = None
+        if keybindings.matches_prefix(key):
+            literal_byte = keybindings.prefix_byte
+            literal_name = keybindings.prefix
+        elif keybindings.matches_input_escape(key):
+            literal_byte = keybindings.input_escape_byte
+            literal_name = keybindings.input_escape
+        if literal_byte is not None:
             binding = _managed_binding(state)
-            sender = getattr(binding, "send_literal_ctrl_g", None) if binding is not None else None
-            ok = bool(sender and sender(state))
+            sender = getattr(binding, "send_literal_byte", None) if binding is not None else None
+            current_target = _jtt_prefix_target_snapshot(state)
+            ok = bool(expected_target is not None and current_target == expected_target
+                      and sender and sender(state, literal_byte, expected_target))
             if not ok:
-                state["jtt_notice"] = "Ctrl+G 전송 차단 · RIGHT 입력 권한과 화면 신원을 확인하세요."
+                state["jtt_notice"] = f"{literal_name} 전송 차단 · RIGHT 입력 권한과 화면 신원을 확인하세요."
                 state["jtt_notice_until"] = 0.0
             return True, False
         if key in ("\x1b", 27):
@@ -756,12 +806,13 @@ def _handle_jtt_prefix(stdscr, state: dict, key) -> tuple[bool, bool]:
         handler = state.get("jtt_prefix_handler")
         if command in {"n", "h", "l", "w", "x", "d", "?"} and callable(handler):
             return True, bool(handler(stdscr, state, command))
-        state["jtt_notice"] = "알 수 없는 Ctrl+G 명령 · ? 도움"
+        state["jtt_notice"] = f"알 수 없는 {keybindings.prefix} 명령 · ? 도움"
         state["jtt_notice_until"] = 0.0
         return True, False
-    if _is_ctrl_g(key):
+    if keybindings.matches_prefix(key):
         state["jtt_prefix_pending"] = True
-        state["jtt_prefix_deadline"] = time.monotonic() + _JTT_PREFIX_TIMEOUT
+        state["jtt_prefix_deadline"] = time.monotonic() + keybindings.timeout_seconds
+        state["jtt_prefix_target"] = _jtt_prefix_target_snapshot(state)
         state["jtt_notice"] = ""
         state["jtt_notice_until"] = 0.0
         return True, False
@@ -1263,10 +1314,12 @@ def _key_bytes(key) -> bytes | None:
     if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
         return b"\x7f"
     if key in (curses.KEY_ENTER, "\n", "\r"):
+        # Preserve the legacy Tower/fixture PTY contract.
         return b"\n"
     arrows = {
         curses.KEY_UP: b"\x1b[A", curses.KEY_DOWN: b"\x1b[B",
         curses.KEY_RIGHT: b"\x1b[C", curses.KEY_LEFT: b"\x1b[D",
+        getattr(curses, "KEY_BTAB", -103): b"\x1b[Z",
         getattr(curses, "KEY_HOME", -100): b"\x1b[H",
         getattr(curses, "KEY_END", -101): b"\x1b[F",
         getattr(curses, "KEY_DC", -102): b"\x1b[3~",
@@ -1280,6 +1333,106 @@ def _key_bytes(key) -> bytes | None:
     if isinstance(key, int) and 0 <= key < 32:
         return bytes((key,))
     return None
+
+
+def _jtt_key_bytes(key) -> bytes | None:
+    """Encode keys for a raw managed PTY without changing legacy fixtures."""
+
+    if key in (curses.KEY_ENTER, "\r"):
+        return b"\r"
+    if key == "\n":
+        return b"\n"
+    return _key_bytes(key)
+
+
+def _set_jtt_control_byte_input(state: dict, enabled: bool) -> bool:
+    """Temporarily pass signal/flow-control bytes through during a JTT lease.
+
+    Curses owns the terminal's cbreak mode. Only ISIG and software flow
+    control are toggled here, preserving curses' input/output and keypad setup.
+    ``curses.wrapper`` remains the final restoration guard on every exit path.
+    """
+
+    saved = state.get("jtt_saved_termios")
+    if not enabled:
+        if saved is None:
+            return True
+        fd, original = saved
+        curses_restored = True
+        try:
+            # curses starts in nl() mode; restore that input mapping before
+            # returning to navigation (the exact termios snapshot is applied
+            # immediately afterward).
+            curses.nl()
+        except curses.error:
+            curses_restored = False
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, original)
+        except (OSError, termios.error):
+            state["jtt_termios_restore_failed"] = True
+            return False
+        if not curses_restored:
+            state["jtt_termios_restore_failed"] = True
+            return False
+        state.pop("jtt_saved_termios", None)
+        state["jtt_termios_restore_failed"] = False
+        return True
+
+    if saved is not None:
+        return True
+    stdscr = state.get("stdscr")
+    if (state.get("runtime_mode") != "jtt" or stdscr is None
+            or not callable(getattr(stdscr, "get_wch", None))):
+        # Direct unit/fixture calls have no owned interactive terminal.
+        return True
+    try:
+        try:
+            fd = sys.stdin.fileno()
+        except (OSError, ValueError, AttributeError):
+            # pytest and some embedded launchers replace sys.stdin with a
+            # non-file proxy; curses.wrapper still owns the controlling stdin
+            # descriptor (fd 0) in those cases.
+            fd = 0
+        if not os.isatty(fd):
+            # UI state fixtures can exercise input routing without owning a
+            # terminal. The real curses path always has a controlling TTY.
+            return True
+        original = termios.tcgetattr(fd)
+    except (OSError, ValueError, AttributeError, termios.error):
+        return False
+
+    leased = list(original)
+    leased[6] = original[6][:]
+    leased[0] &= ~(
+        getattr(termios, "IXON", 0) | getattr(termios, "IXOFF", 0)
+        | getattr(termios, "ICRNL", 0) | getattr(termios, "INLCR", 0)
+        | getattr(termios, "IGNCR", 0)
+    )
+    leased[3] &= ~termios.ISIG
+    state["jtt_saved_termios"] = (fd, original)
+    try:
+        # Python curses defaults to nl(), which turns CR into LF before
+        # get_wch(). nonl() is necessary in addition to clearing ICRNL so the
+        # raw terminal's CR and Ctrl+J remain distinct key events.
+        curses.nonl()
+        termios.tcsetattr(fd, termios.TCSANOW, leased)
+    except (OSError, termios.error, curses.error):
+        # Be defensive if the terminal applied some state before reporting an
+        # error; retain the snapshot if restoration itself also fails.
+        try:
+            curses.nl()
+        except curses.error:
+            state["jtt_termios_restore_failed"] = True
+            return False
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, original)
+        except (OSError, termios.error):
+            state["jtt_termios_restore_failed"] = True
+            return False
+        state.pop("jtt_saved_termios", None)
+        return False
+    state["jtt_termios_restore_failed"] = False
+    return True
 
 
 def _move_pane(state: dict, delta: int, height: int, width: int) -> None:

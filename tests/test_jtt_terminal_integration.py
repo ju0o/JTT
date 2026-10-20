@@ -1,4 +1,4 @@
-"""JTT UI and two local PTY shells; no tmux, network, or agent CLI."""
+"""JTT UI, isolated PTY shells, and optional private-socket tmux; no agents."""
 
 from __future__ import annotations
 
@@ -8,9 +8,12 @@ from pathlib import Path
 import pty
 import pwd
 import select
+import shlex
 import shutil
 import signal
+import stat
 import struct
+import subprocess
 import tempfile
 import termios
 import time
@@ -152,6 +155,25 @@ def _wait_for_ui_text(ui: _UIProcess, expected: str, timeout: float = 5.0) -> No
         if expected in ui.text():
             return
     raise AssertionError("JTT curses UI did not render the expected terminal marker")
+
+
+def _wait_for_created_terminal(ui: _UIProcess, registry: TerminalRegistry,
+                               timeout: float = 8.0):
+    """Wait for both the exact-one registry row and successful RIGHT input lease.
+
+    The generic prefix footer also mentions Ctrl+] while merely awaiting a
+    prefix command, so that key label is not a creation/lease completion oracle.
+    """
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ui.pump()
+        sessions = registry.list_sessions()
+        if len(sessions) > 1:
+            raise AssertionError("prefix created more than one terminal")
+        if len(sessions) == 1 and "터미널 준비 완료" in ui.text():
+            return sessions[0]
+    raise AssertionError("prefix did not create one ready terminal and acquire RIGHT")
 
 
 def _enter_right_input(screen, state, binding) -> None:
@@ -337,11 +359,11 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
         assert registry.list_sessions() == ()  # UI startup is still read-only.
 
         ui.send(b"\x07n")
-        _wait_for_ui_text(ui, "Ctrl+]")  # The sole new shell acquired RIGHT input.
+        created = _wait_for_created_terminal(ui, registry)
         sessions = registry.list_sessions()
-        assert len(sessions) == 1
-        session_id = sessions[0].session_id
-        shell_pid = sessions[0].shell_pid
+        assert len(sessions) == 1 and sessions[0] == created
+        session_id = created.session_id
+        shell_pid = created.shell_pid
         marker = "JTT_PREFIX_N_" + uuid.uuid4().hex[:8]
         ui.send(("printf '%s\\n' '" + marker + "'\n").encode("ascii"))
         _wait_for_ui_text(ui, marker)
@@ -517,4 +539,140 @@ def test_vim_alternate_screen_unicode_keys_resize_and_shell_return(monkeypatch):
             client.close()
         if session_id is not None:
             registry.stop(session_id)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux fixture is unavailable")
+def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monkeypatch):
+    """Exercise a real nested tmux TUI only in a fresh JTT-owned PTY."""
+
+    if Path(pwd.getpwuid(os.getuid()).pw_shell).resolve() != Path("/bin/bash").resolve():
+        pytest.skip("fixture deliberately exercises the account's /bin/bash login shell")
+
+    tmux = shutil.which("tmux")
+    assert tmux is not None
+    root = Path(tempfile.mkdtemp(prefix="jtt-private-tmux-it-"))
+    root.chmod(0o700)
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    import pyte
+    pyte_root = Path(pyte.__file__).resolve().parent.parent
+    _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
+    socket_path = root / "tmux-test.sock"
+    assert not socket_path.exists()
+    registry = TerminalRegistry(root=root / "state" / "terminals")
+    client = None
+    session_id = None
+    shell_pid = None
+
+    def private_tmux(*args: str) -> subprocess.CompletedProcess[str]:
+        # -S always names the unique fixture socket; -f bypasses user tmux config.
+        return subprocess.run(
+            [tmux, "-S", str(socket_path), "-f", "/dev/null", *args],
+            env={
+                "PATH": os.defpath,
+                "HOME": str(root / "shell-home"),
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "TERM": "xterm",
+            },
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+
+    try:
+        client = registry.create("Private tmux fixture")
+        session_id = client.identity.session_id
+        shell_pid = client.identity.shell_pid
+        update = client.poll()
+        assert update.synced and update.screen is not None
+        assert client.acquire()
+
+        # The shell starts a new tmux server on a unique socket, then resumes
+        # and prints a marker after the tmux client detaches.
+        launch = (
+            f"tmux -S {shlex.quote(str(socket_path))} -f /dev/null "
+            "new-session -s jtt_fixture; printf '\\nJTT_TMUX_DETACHED_OK\\n'\n"
+        )
+        assert client.send(launch.encode("utf-8")) == len(launch.encode("utf-8"))
+        deadline = time.monotonic() + 5.0
+        listed = private_tmux("list-sessions")
+        while listed.returncode != 0 and time.monotonic() < deadline:
+            update = client.poll()
+            listed = private_tmux("list-sessions")
+            time.sleep(0.02)
+        assert listed.returncode == 0 and "jtt_fixture" in listed.stdout
+        assert socket_path.exists()
+        deadline = time.monotonic() + 5.0
+        attached = private_tmux("list-clients", "-F", "#{client_pid}")
+        while not attached.stdout.strip() and time.monotonic() < deadline:
+            update = client.poll()
+            attached = private_tmux("list-clients", "-F", "#{client_pid}")
+            time.sleep(0.02)
+        assert attached.returncode == 0 and attached.stdout.strip()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            update = client.poll()
+            if update.synced and not update.more:
+                break
+            time.sleep(0.02)
+        assert update.synced and not update.more, (
+            f"tmux initial redraw did not resynchronize: state={update.renderer_state}; "
+            f"output_tail={update.output[-800:]!r}"
+        )
+
+        inner_marker = "JTT_TMUX_INNER_OK"
+        command = f"printf '{inner_marker}\\n'\n".encode("ascii")
+        assert client.send(command) == len(command)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            update = client.poll()
+            if update.synced and inner_marker in _binding_text(update):
+                break
+            time.sleep(0.02)
+        assert inner_marker in _binding_text(update)
+
+        # tmux's default Ctrl+B prefix remains available to the nested program.
+        assert client.send(b"\x02d") == 2
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            update = client.poll()
+            if update.synced and "JTT_TMUX_DETACHED_OK" in _binding_text(update):
+                break
+            time.sleep(0.02)
+        assert "JTT_TMUX_DETACHED_OK" in _binding_text(update)
+        listed = private_tmux("list-sessions")
+        assert listed.returncode == 0 and "jtt_fixture" in listed.stdout
+
+        client.release()
+        assert [(row.session_id, row.shell_pid) for row in registry.list_sessions()] == [
+            (session_id, shell_pid)
+        ]
+
+        stopped = private_tmux("kill-server")
+        assert stopped.returncode == 0
+        deadline = time.monotonic() + 3.0
+        probe = private_tmux("list-sessions")
+        while probe.returncode == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+            probe = private_tmux("list-sessions")
+        assert probe.returncode != 0 and "no server running" in probe.stderr.lower()
+        # tmux may leave the unlinked server's filesystem socket node behind;
+        # TemporaryDirectory cleanup below removes this private fixture node.
+        if socket_path.exists():
+            assert stat.S_ISSOCK(socket_path.lstat().st_mode)
+    finally:
+        if client is not None:
+            client.close()
+        if socket_path.exists():
+            try:
+                private_tmux("kill-server")
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if session_id is not None:
+            try:
+                registry.stop(session_id)
+            except (OSError, RuntimeError, ValueError):
+                pass
         shutil.rmtree(root, ignore_errors=True)
