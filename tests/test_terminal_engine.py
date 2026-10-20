@@ -11,6 +11,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import time
 import zlib
 
@@ -106,6 +107,52 @@ def test_renderer_failure_prevents_registry_and_supervisor_creation(
     assert not root.parent.exists()
 
 
+def test_supervisor_early_exit_is_not_reported_as_stale_identity(tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.manager as manager
+
+    _safe_test_home(monkeypatch, tmp_path)
+    registry = TerminalRegistry(root=tmp_path / "jtt" / "terminals")
+    original_popen = manager.subprocess.Popen
+
+    def exit_worker(args, **kwargs):
+        if len(args) > 1 and str(args[1]) == str(manager.WORKER):
+            return original_popen(
+                [sys.executable, "-c", "raise SystemExit(23)"], **kwargs
+            )
+        return original_popen(args, **kwargs)
+
+    monkeypatch.setattr(manager.subprocess, "Popen", exit_worker)
+    with pytest.raises(TerminalError, match="exited during startup.*23"):
+        registry.create("early exit fixture")
+
+
+@pytest.mark.skipif(not renderer_available(), reason="worker identity test requires pyte")
+@pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash is not available")
+def test_live_supervisor_argv_mismatch_is_reported_separately(tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.manager as manager
+
+    _safe_test_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(manager, "SUPERVISOR_STARTUP_TIMEOUT", 0.3)
+    monkeypatch.setattr(manager, "_worker_identity_status",
+                        lambda *_args, **_kwargs: "argv_mismatch")
+    registry = TerminalRegistry(root=tmp_path / "jtt" / "terminals")
+    original_popen = manager.subprocess.Popen
+    worker_processes = []
+
+    def record_worker(args, **kwargs):
+        process = original_popen(args, **kwargs)
+        if len(args) > 1 and str(args[1]) == str(manager.WORKER):
+            worker_processes.append(process)
+        return process
+
+    monkeypatch.setattr(manager.subprocess, "Popen", record_worker)
+    with pytest.raises(TerminalError, match="argv identity could not be verified"):
+        registry.create("identity mismatch fixture")
+    assert len(worker_processes) == 1
+    assert worker_processes[0].poll() is not None
+    assert registry.list_sessions() == ()
+
+
 @pytest.mark.skipif(not renderer_available(), reason="live-shell preservation requires pyte")
 @pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash is not available")
 def test_renderer_preflight_does_not_hide_or_restart_existing_session(tmp_path, monkeypatch):
@@ -160,7 +207,6 @@ def test_create_interact_disconnect_reconnect_and_explicit_stop(tmp_path, monkey
     if account_shell != Path("/bin/bash").resolve():
         pytest.skip("test contract deliberately uses the account's /bin/bash login shell")
     home = _safe_test_home(monkeypatch, tmp_path)
-    # Keep the full session socket under sockaddr_un's platform path limit.
     root = tmp_path / "r"
     registry = TerminalRegistry(root=root)
 
@@ -180,8 +226,9 @@ def test_create_interact_disconnect_reconnect_and_explicit_stop(tmp_path, monkey
     session_dir = root / session_id
     assert stat.S_IMODE(session_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE((session_dir / "session.json").stat().st_mode) == 0o600
-    assert stat.S_IMODE((session_dir / "s").stat().st_mode) == 0o600
     metadata = json.loads((session_dir / "session.json").read_text())
+    socket_path = Path(metadata.get("socket_path", session_dir / "s"))
+    assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
     assert not {"environment", "env", "output", "transcript"}.intersection(metadata)
 
     initial = client.poll()
@@ -240,6 +287,54 @@ def test_create_interact_disconnect_reconnect_and_explicit_stop(tmp_path, monkey
         supervisor_pid, client.identity.supervisor_start, session_dir,
         session_id, client.identity.generation,
     )
+    assert not session_dir.exists()
+    assert registry.list_sessions() == ()
+
+
+@pytest.mark.skipif(not renderer_available(), reason="long-home socket test requires pyte")
+@pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash is not available")
+def test_long_jtt_home_keeps_socket_path_connectable_through_reconnect(tmp_path, monkeypatch):
+    """A long but valid JTT_HOME must not fail after spawning its supervisor."""
+
+    account_shell = Path(pwd.getpwuid(os.getuid()).pw_shell).resolve()
+    if account_shell != Path("/bin/bash").resolve():
+        pytest.skip("test contract deliberately uses the account's /bin/bash login shell")
+    _safe_test_home(monkeypatch, tmp_path)
+    root = tmp_path / ("j" * 70) / "terminals"
+    registry = TerminalRegistry(root=root)
+
+    client = registry.create("long JTT home")
+    session_id = client.identity.session_id
+    identity = client.identity
+    session_dir = root / session_id
+    assert len(os.fsencode(session_dir / "s")) > 107
+    metadata = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
+    socket_path = Path(metadata["socket_path"])
+    assert len(os.fsencode(socket_path)) <= 107
+    assert stat.S_IMODE(socket_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(socket_path.parent.parent.stat().st_mode) == 0o700
+    assert socket_path.exists()
+    assert stat.S_IMODE(socket_path.stat().st_mode) == 0o600
+    assert client.poll().synced
+    assert client.acquire()
+    marker = "JTT_LONG_HOME_INPUT_OK"
+    command = "printf '%s\\n'\n" % marker
+    client.send(command.encode("utf-8"))
+    assert marker in _screen_text(_wait_for_text(client, marker))
+
+    client.close()
+    reconnected = registry.connect(session_id)
+    try:
+        assert reconnected.identity.session_id == identity.session_id
+        assert reconnected.identity.generation == identity.generation
+        assert reconnected.identity.shell_pid == identity.shell_pid
+        assert reconnected.identity.supervisor_pid == identity.supervisor_pid
+        assert reconnected.poll().synced
+    finally:
+        reconnected.close()
+        registry.stop(session_id, expected_generation=identity.generation,
+                      expected_shell_pid=identity.shell_pid)
+    assert not socket_path.exists()
     assert not session_dir.exists()
     assert registry.list_sessions() == ()
 

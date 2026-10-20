@@ -43,9 +43,11 @@ from tmux_agent_tower.terminal.manager import (  # noqa: E402
     SOCKET_NAME,
     TerminalError,
     _atomic_metadata,
+    _ensure_private_root,
     _private_stat,
     _proc_start,
     _read_metadata,
+    _session_socket_path,
     _validate_shell,
 )
 
@@ -271,6 +273,7 @@ class PtyOwner:
                 or self.metadata.get("protocol") != PROTOCOL
                 or self.metadata.get("state") != "starting"):
             raise TerminalError("session launch identity mismatch")
+        self.socket_path = _session_socket_path(session_dir, self.metadata)
         shell_path, account_home = _validate_shell()
         if self.metadata.get("shell_path") != shell_path:
             raise TerminalError("account shell changed during terminal startup")
@@ -392,7 +395,9 @@ class PtyOwner:
             raise
 
     def _start_socket(self) -> None:
-        path = self.session_dir / SOCKET_NAME
+        path = self.socket_path
+        if path.parent != self.session_dir:
+            _ensure_private_root(path.parent)
         if os.path.lexists(path):
             raise TerminalError("session socket already exists")
         if len(os.fsencode(path)) > MAX_UNIX_SOCKET_PATH_BYTES:
@@ -906,7 +911,7 @@ class PtyOwner:
             os.close(self.master)
             self.master = None
         self.selector.close()
-        socket_path = self.session_dir / SOCKET_NAME
+        socket_path = self.socket_path
         try:
             if self.socket_owned and stat.S_ISSOCK(socket_path.lstat().st_mode):
                 socket_path.unlink()
