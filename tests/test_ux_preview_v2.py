@@ -124,6 +124,8 @@ def test_jtt_branding_footer_and_narrow_compact_layout(monkeypatch):
     assert "JTT — Ju0 Terminal Tower" in wide_frame
     assert "Ctrl+G 명령(4초)" in wide_frame
     assert "Ctrl+G x 종료" in wide_frame
+    assert "Ctrl+G d 분리" in wide_frame
+    assert "Q UI 분리" not in wide_frame
 
     narrow_state = ux_preview_v2._state(tower)
     narrow_state.update(runtime_mode="jtt", active_panel=2, jtt_notice="", jtt_prefix_pending=True,
@@ -140,6 +142,17 @@ def test_jtt_branding_footer_and_narrow_compact_layout(monkeypatch):
     ux_preview_v2.draw_preview_v2(narrow_screen, narrow_state)
     compact_frame = " ".join(text for _y, _x, text, _attr in narrow_screen.writes)
     assert "Ctrl+G x 종료" in compact_frame
+    assert "Q 분리" not in compact_frame
+
+
+@pytest.mark.parametrize("runtime_mode", ["fixture", "tower"])
+def test_legacy_and_fixture_navigation_quit_keys_keep_existing_exit_behavior(runtime_mode):
+    state = ux_preview_v2._state(ux_preview.make_preview_tower())
+    state["runtime_mode"] = runtime_mode
+    screen = _Screen()
+
+    for key in ("q", "Q", "\x1b"):
+        assert ux_preview_v2._handle_key(screen, state, key) is True
 
 
 def test_jtt_empty_workspace_uses_terminal_wording(monkeypatch):

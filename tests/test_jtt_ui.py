@@ -86,9 +86,9 @@ class FakeRegistry:
         self.stop_calls.append((session_id, expected))
 
 
-def _identity(session_id, pid, generation):
+def _identity(session_id, pid, generation, state="running", renderer_state="ready"):
     return TerminalIdentity(session_id, generation, 1000, "s1", pid, f"p{pid}",
-                             "/bin/bash", session_id, "running", renderer_state="ready")
+                             "/bin/bash", session_id, state, renderer_state=renderer_state)
 
 
 class FakeScreen:
@@ -335,9 +335,11 @@ def test_input_mode_bare_n_q_tab_are_forwarded_and_ctrl_bracket_releases(tmp_pat
 
     assert renderer._handle_key(screen, state, "n") is False
     assert renderer._handle_key(screen, state, "q") is False
+    assert renderer._handle_key(screen, state, "Q") is False
+    assert renderer._handle_key(screen, state, "\x1b") is False
     assert renderer._handle_key(screen, state, "\t") is False
     assert registry.created == 0
-    assert registry.clients["session-a"].sent == [b"n", b"q", b"\t"]
+    assert registry.clients["session-a"].sent == [b"n", b"q", b"Q", b"\x1b", b"\t"]
     assert renderer._handle_key(screen, state, "\x1d") is False
     assert not binding.input_mode
 
@@ -522,6 +524,163 @@ def test_prefix_x_binding_replacement_while_modal_is_open_fails_closed(tmp_path,
 
     assert registry.stop_calls == []
     assert "변경되어 종료를 차단" in state["jtt_notice"]
+
+
+def _exited_ready_state(tmp_path, *identities):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry(list(identities))
+    store.set_terminal_ids(store.DEFAULT_ID, [item.session_id for item in identities])
+    return jtt.build_state(store, registry), registry
+
+
+def _select_pane(state, index):
+    state["pane_index"] = index
+    row = state["panes"][index]
+    state["selected_target_id"] = str(row.get("target_id") or "")
+    state["selected_signature"] = renderer._pane_signature(row)
+
+
+def test_prefix_x_removes_only_selected_exited_card_reference_and_preserves_other_workspace(
+    tmp_path, monkeypatch,
+):
+    state, registry = _exited_ready_state(
+        tmp_path, _identity("session-a", 101, "gen-a", "exited"),
+        _identity("session-b", 202, "gen-b", "exited"),
+    )
+    _select_pane(state, 1)
+    other = state["jtt_store"].create_workspace("Other")
+    state["jtt_store"].set_terminal_ids(other["id"], ["session-b"])
+    captured = {}
+
+    def confirm(_screen, title, items, **kwargs):
+        captured.update(title=title, items=items, kwargs=kwargs)
+        return SimpleNamespace(cancelled=False, selected_key="remove")
+
+    monkeypatch.setattr(jtt, "run_list_picker", confirm)
+    assert _prefix(FakeScreen(), state, "x") is False
+
+    assert captured["title"] == "종료된 터미널 카드 제거"
+    assert captured["items"][0] == ("cancel", "취소")
+    assert captured["items"][1][0] == "remove"
+    assert "카드 참조만 제거" in captured["kwargs"]["footer_hint"]
+    workspaces = {item["id"]: item for item in state["jtt_store"].workspaces()}
+    assert workspaces[state["jtt_store"].DEFAULT_ID]["terminal_ids"] == ["session-a"]
+    assert workspaces[other["id"]]["terminal_ids"] == ["session-b"]
+    assert {item.session_id for item in registry.list_sessions()} == {"session-a", "session-b"}
+    assert registry.stop_calls == []
+    assert registry.clients["session-b"].closed is True
+
+
+def test_prefix_x_cancel_on_exited_card_keeps_workspace_and_session_unchanged(tmp_path, monkeypatch):
+    state, registry = _exited_ready_state(
+        tmp_path, _identity("session-a", 101, "gen-a", "exited"),
+    )
+    before = state["jtt_store"].workspaces()[0]["terminal_ids"]
+    monkeypatch.setattr(
+        jtt, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="cancel"),
+    )
+
+    assert _prefix(FakeScreen(), state, "x") is False
+
+    assert state["jtt_store"].workspaces()[0]["terminal_ids"] == before
+    assert [item.session_id for item in registry.list_sessions()] == ["session-a"]
+    assert registry.stop_calls == []
+    assert not registry.clients["session-a"].closed
+
+
+@pytest.mark.parametrize(
+    "mutation", ["selection", "registry_generation", "registry_pid", "binding", "membership"],
+)
+def test_prefix_x_exited_card_revalidates_after_modal(tmp_path, monkeypatch, mutation):
+    identities = [_identity("session-a", 101, "gen-a", "exited"),
+                  _identity("session-b", 202, "gen-b", "exited")]
+    state, registry = _exited_ready_state(tmp_path, *identities)
+    original_set_ids = state["jtt_store"].set_terminal_ids
+    store_writes_after_modal = []
+
+    def mutate_then_confirm(_screen, _title, _items, **_kwargs):
+        if mutation == "selection":
+            _select_pane(state, 1)
+        elif mutation == "registry_generation":
+            registry.identities = (_identity("session-a", 303, "replacement", "exited"),
+                                   identities[1])
+        elif mutation == "registry_pid":
+            registry.identities = (_identity("session-a", 303, "gen-a", "exited"),
+                                   identities[1])
+        elif mutation == "binding":
+            replacement = _identity("session-a", 101, "gen-a", "exited")
+            state["managed_terminals"]["session-a"] = jtt.ManagedTerminalBinding(
+                FakeClient(replacement), replacement,
+            )
+        elif mutation == "membership":
+            original_set_ids(state["workspace_id"], ["session-b"])
+            monkeypatch.setattr(
+                state["jtt_store"], "set_terminal_ids",
+                lambda *_args, **_kwargs: store_writes_after_modal.append(True),
+            )
+        return SimpleNamespace(cancelled=False, selected_key="remove")
+
+    monkeypatch.setattr(jtt, "run_list_picker", mutate_then_confirm)
+    assert _prefix(FakeScreen(), state, "x") is False
+
+    if mutation == "membership":
+        assert store_writes_after_modal == []
+        assert state["jtt_store"].workspaces()[0]["terminal_ids"] == ["session-b"]
+    else:
+        assert "변경되어 카드 제거를 차단" in state["jtt_notice"]
+        assert state["jtt_store"].workspaces()[0]["terminal_ids"] == ["session-a", "session-b"]
+    assert registry.stop_calls == []
+
+
+@pytest.mark.parametrize(
+    ("identity", "registry_override"),
+    [
+        (_identity("session-a", 101, "gen-a", "orphaned"), None),
+        (_identity("session-a", 101, "gen-a", "stopping"), None),
+        (_identity("session-a", 101, "gen-a", "exited", "parse_failed"), None),
+        (_identity("session-a", 101, "gen-a", "running", "parse_failed"), None),
+        (_identity("session-a", 101, "gen-a", "running"), "lookup_failure"),
+        (_identity("session-a", 101, "gen-a", "running"), "missing"),
+    ],
+    ids=["orphaned", "stopping", "exited-renderer-error", "running-renderer-error",
+         "lookup-failure", "missing-or-dead-supervisor"],
+)
+def test_prefix_x_never_offers_exited_card_cleanup_for_uncertain_states(
+    tmp_path, monkeypatch, identity, registry_override,
+):
+    state, registry = _exited_ready_state(tmp_path, identity)
+    if registry_override == "lookup_failure":
+        registry.list_sessions = lambda: (_ for _ in ()).throw(RuntimeError("fixture"))
+    elif registry_override == "missing":
+        registry.identities = ()
+    dialogs = []
+
+    def confirm(_screen, title, items, **_kwargs):
+        dialogs.append((title, items))
+        return SimpleNamespace(cancelled=False, selected_key="cancel")
+
+    monkeypatch.setattr(jtt, "run_list_picker", confirm)
+    assert _prefix(FakeScreen(), state, "x") is False
+
+    assert all(key != "remove" for _title, items in dialogs for key, _label in items)
+    assert registry.stop_calls == []
+    if identity.state in {"orphaned", "stopping", "exited"} or registry_override:
+        assert dialogs == []
+    else:
+        # The existing running-session stop confirmation may remain, but it is
+        # never presented as exited-card cleanup.
+        assert len(dialogs) == 1
+        assert dialogs[0][0] == "터미널 종료"
+
+
+def test_jtt_navigation_q_uppercase_q_and_escape_do_not_disconnect(tmp_path):
+    state, _registry = _stop_ready_state(tmp_path, _identity("session-a", 101, "gen-a"))
+    screen = FakeScreen()
+
+    for key in ("q", "Q", "\x1b"):
+        assert renderer._handle_key(screen, state, key) is False
+    assert state["jtt_prefix_pending"] is False
 
 
 @pytest.mark.parametrize(

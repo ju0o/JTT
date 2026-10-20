@@ -53,7 +53,10 @@ fixture fits the current bound, but arbitrary terminal contents are not
 claimed to fit every maximum-size viewport.
 
 Input mode is explicitly entered on the RIGHT. `Ctrl+]` returns to workspace
-navigation; `q` in navigation disconnects the UI without terminating sessions.
+navigation. In input mode, `q`, `Q`, and `Esc` are sent to the selected PTY when
+its lease is valid. In navigation, `q`, `Q`, and `Esc` do not close JTT. Use
+`Ctrl+G d` to disconnect the UI without terminating sessions. `Esc` closes an
+active dialog or cancels a pending prefix command.
 JTT reserves `Ctrl+G` as a global prefix, including while a terminal has input
 focus. Within 4 seconds, the next key selects a JTT command: `n` creates a
 terminal, `h`/`l` changes cards, `w` selects the workspace panel, `x` opens a
@@ -66,9 +69,12 @@ Ctrl+G must use the doubled sequence, and applications that require other
 unsupported terminal protocols remain outside the compatibility claim.
 
 `Ctrl+]` remains the direct input-mode escape and is consumed by JTT. `Ctrl+G d`
-and navigation-mode `q` disconnect only the UI and release its input lease;
-they do not terminate the shell. A terminal is stopped only through its
-explicit `터미널 종료` action. No AI executable, tmux command, SSH client,
+disconnects only the UI and releases its input lease; it does not terminate the
+shell. Navigation `q`, `Q`, and `Esc` keep JTT open. A running terminal is
+stopped only through its explicit, cancel-first `Ctrl+G x` action. A shell
+proven exited may be removed from the current workspace with that action; this
+removes only the workspace card reference and does not stop or unlink the
+session. No AI executable, tmux command, SSH client,
 clipboard action, login, or model request is started by JTT itself; commands
 typed into a terminal are ordinary user processes and inherit the current
 account's normal access.

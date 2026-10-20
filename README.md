@@ -21,12 +21,15 @@ create a shell. Use the explicit new-terminal action when one is wanted.
 
 JTT keys: within 4 seconds after `Ctrl+G`, `n` creates a terminal; `h`/`l`
 changes cards; `w` focuses the workspace panel; `x` opens a cancel-first
-confirmation to stop only the selected terminal; `d` detaches the UI while
-keeping terminals running; `?` shows help; `Esc` cancels a pending prefix. In terminal input
+confirmation to stop only the selected running terminal (for a proven-exited
+terminal it removes only that card reference from the current workspace); `d`
+detaches the UI while keeping terminals running; `?` shows help; `Esc` cancels a pending prefix. In terminal input
 mode with the selected terminal's valid input lease, `Ctrl+G Ctrl+G` sends one
 literal Ctrl+G byte to that terminal. In terminal input mode,
-`Ctrl+]` returns to navigation. Navigation `q` also detaches without stopping
-shells. See [JTT terminal support and safety](docs/JTT_TERMINAL_SUPPORT.md)
+`Ctrl+]` returns to navigation and `q`, `Q`, and `Esc` are sent to the PTY.
+In navigation, `q`, `Q`, and `Esc` do not close JTT; use `Ctrl+G d` to
+disconnect the UI while keeping shells running. `Esc` also closes an active
+dialog or cancels a pending prefix. See [JTT terminal support and safety](docs/JTT_TERMINAL_SUPPORT.md)
 for data locations, cleanup guidance, and VT compatibility limits.
 
 JTT is an interactive local terminal, not a security sandbox. Shells run as

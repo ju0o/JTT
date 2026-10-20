@@ -712,10 +712,10 @@ def _draw_jtt_footer(stdscr, state: dict, width: int, height: int) -> None:
     elif state.get("jtt_prefix_pending"):
         text = "JTT — Ju0 Terminal Tower · Ctrl+G 4초 내: n 새 · h/l 카드 · w 작업공간 · x 터미널 종료 · d UI 분리 · ? 도움 · Esc 취소 · Ctrl+G 전송"
     elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
-        text = "JTT — Ju0 Terminal Tower · Ctrl+] 탐색 복귀 · Ctrl+G 명령 대기(4초)"
+        text = "JTT — Ju0 Terminal Tower · Ctrl+] 탐색 복귀 · Ctrl+G 명령 대기(4초) · q/Q/Esc 터미널 입력"
     else:
-        text = "JTT — Ju0 Terminal Tower · Ctrl+G 명령(4초) · Tab/Shift+Tab 패널 · Enter 입력 · Q UI 분리 · Ctrl+G x 종료"
-    compact = "JTT · Ctrl+G(4초) · Tab 패널 · Enter 입력 · Q 분리 · Ctrl+G x 종료"
+        text = "JTT — Ju0 Terminal Tower · Ctrl+G 명령(4초) · Tab/Shift+Tab 패널 · Enter 입력 · Ctrl+G d 분리 · Ctrl+G x 종료 · q/Q/Esc 유지"
+    compact = "JTT · Ctrl+G(4초) · Tab · Enter · Ctrl+G d 분리 · Ctrl+G x 종료"
     # _regions() switches to the compact single-panel layout below 110 cols;
     # keep the footer equally compact so the prefixed stop command stays visible.
     if width < 110:
@@ -1650,6 +1650,12 @@ def _handle_key(stdscr, state: dict, key) -> bool:
         return False
 
     if key in ("q", "Q", "\x1b"):
+        # JTT deliberately disconnects only through its explicit global
+        # Ctrl+G d command. In navigation, q/Q/Esc are inert; while a managed
+        # terminal owns input, the binding above has already forwarded them.
+        # Keep the legacy Tower/fixture quit contract unchanged.
+        if state.get("runtime_mode") == "jtt":
+            return False
         return True
     if key == "\t":
         state["active_panel"] = (state["active_panel"] + 1) % 3

@@ -549,12 +549,12 @@ def _settings_menu(stdscr, state: dict) -> None:
     else:
         show_message_screen(
             stdscr, "JTT 키 안내",
-            ["탐색: Tab/Shift+Tab 패널 · Enter 입력 · Q 연결 해제",
+            ["탐색: Tab/Shift+Tab 패널 · Enter 입력 · q/Q/Esc는 JTT 유지",
              "Ctrl+G n: 새 터미널 · h/l: 카드 이동 · w: 작업공간",
              "Ctrl+G x: 선택 터미널 종료 (취소가 기본 선택)",
              "Ctrl+G d: UI 연결 해제 (셸 유지) · ?: 도움",
-             "Ctrl+G Esc: 취소 · Ctrl+G 두 번: 입력 중 Ctrl+G 전달",
-             "입력 중 bare n/q/Tab은 터미널로 전달됩니다.",
+             "Ctrl+G Esc: 접두 취소 · 대화상자 Esc: 닫기",
+             "입력 중 q/Q/Esc 및 bare n/Tab은 터미널로 전달됩니다.",
              "Ctrl+]는 입력 모드에서 탐색 복귀입니다."],
         )
 
@@ -622,9 +622,152 @@ def _capture_stop_target(state: dict) -> dict | None:
     }
 
 
+def _capture_exited_card_target(state: dict) -> dict | None:
+    """Capture an exactly identified, confirmed-exited card for reference removal.
+
+    This path never stops a terminal. It is intentionally stricter than the
+    normal running-terminal stop path: renderer/supervisor uncertainty or any
+    state other than an explicit registry ``exited`` state blocks cleanup.
+    """
+
+    row = renderer._selected_row(state)
+    if (not row or row.get("terminal_kind") != "tower_managed"
+            or str(row.get("terminal_shell_state") or "").lower() != "exited"
+            or str(row.get("terminal_view_state") or "") != "exited"
+            or str(row.get("terminal_renderer_state") or "") != "ready"):
+        return None
+    identity = row.get("managed_identity")
+    if not isinstance(identity, dict):
+        return None
+    session_id = str(identity.get("session_id") or "")
+    generation = str(identity.get("generation") or "")
+    try:
+        shell_pid = int(identity.get("shell_pid") or 0)
+        pane_index = int(state.get("pane_index", 0))
+    except (TypeError, ValueError):
+        return None
+    target_id = str(row.get("target_id") or "")
+    signature = renderer._pane_signature(row)
+    if (not session_id or not generation or shell_pid <= 0
+            or str(row.get("managed_id") or "") != session_id
+            or target_id != session_id
+            or str(state.get("selected_target_id") or "") != target_id
+            or state.get("selected_signature") != signature
+            or signature != ("jtt", session_id, generation, str(shell_pid))):
+        return None
+
+    binding = renderer._managed_binding(state)
+    if (binding is None or not binding.matches(row)
+            or binding.session_id != session_id
+            or binding.generation != generation or binding.shell_pid != shell_pid):
+        return None
+
+    workspace_id = str(state.get("workspace_id") or "")
+    try:
+        workspaces = state["jtt_store"].workspaces()
+        workspace_matches = [item for item in workspaces
+                             if str(item.get("id")) == workspace_id]
+        identities = [item for item in state["jtt_registry"].list_sessions()
+                      if str(getattr(item, "session_id", "")) == session_id]
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        return None
+    if len(workspace_matches) != 1 or len(identities) != 1:
+        return None
+    workspace = workspace_matches[0]
+    if session_id not in {str(item) for item in workspace.get("terminal_ids", ())}:
+        return None
+    registered = identities[0]
+    try:
+        registered_pid = int(getattr(registered, "shell_pid", -1))
+    except (TypeError, ValueError):
+        return None
+    if (str(getattr(registered, "generation", "")) != generation
+            or registered_pid != shell_pid
+            or str(getattr(registered, "state", "")).lower() != "exited"):
+        return None
+    return {
+        "session_id": session_id,
+        "generation": generation,
+        "shell_pid": shell_pid,
+        "workspace_id": workspace_id,
+        "pane_index": pane_index,
+        "target_id": target_id,
+        "signature": signature,
+        "binding": binding,
+        "display_name": str(row.get("display_name") or "터미널"),
+    }
+
+
+def _confirm_and_remove_exited_card(stdscr, state: dict) -> None:
+    """Remove only the selected exited session ID from the current workspace."""
+
+    target = _capture_exited_card_target(state)
+    if target is None:
+        state["jtt_notice"] = "종료 상태와 신원을 확인할 수 없어 카드 제거를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    confirm = run_list_picker(
+        stdscr,
+        "종료된 터미널 카드 제거",
+        [("cancel", "취소"), ("remove", f"{target['display_name']} 카드 제거")],
+        centered=True,
+        footer_hint="현재 작업공간의 카드 참조만 제거합니다 · 터미널 파일과 다른 작업공간은 유지됩니다.",
+    )
+    if confirm.cancelled or confirm.selected_key != "remove":
+        return
+
+    current = _capture_exited_card_target(state)
+    if (current is None
+            or current["session_id"] != target["session_id"]
+            or current["generation"] != target["generation"]
+            or current["shell_pid"] != target["shell_pid"]
+            or current["workspace_id"] != target["workspace_id"]
+            or current["pane_index"] != target["pane_index"]
+            or current["target_id"] != target["target_id"]
+            or current["signature"] != target["signature"]
+            or current["binding"] is not target["binding"]):
+        state["jtt_notice"] = "선택 터미널이 변경되어 카드 제거를 차단했습니다. 다시 확인하세요."
+        state["jtt_notice_until"] = 0.0
+        return
+
+    session_id = target["session_id"]
+    workspace_id = target["workspace_id"]
+    try:
+        clients = state.get("managed_terminals")
+        if (not isinstance(clients, dict)
+                or clients.get(session_id) is not target["binding"]):
+            raise WorkspaceStoreError("Terminal client binding changed")
+        workspaces = state["jtt_store"].workspaces()
+        workspace_matches = [item for item in workspaces
+                             if str(item.get("id")) == workspace_id]
+        if (len(workspace_matches) != 1
+                or session_id not in {str(item) for item in
+                                      workspace_matches[0].get("terminal_ids", ())}):
+            raise WorkspaceStoreError("Workspace membership changed")
+        workspace = workspace_matches[0]
+        state["jtt_store"].set_terminal_ids(
+            workspace_id,
+            [item for item in workspace["terminal_ids"] if str(item) != session_id],
+        )
+        binding = clients.pop(session_id, None)
+        if binding:
+            binding.close()  # Close this UI client only; never stop/unlink the session.
+        _refresh_workspaces(state, workspace_id)
+        state["jtt_notice"] = "종료된 터미널 카드를 현재 작업공간에서 제거했습니다."
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        state["jtt_notice"] = "카드를 제거하지 못했습니다. 작업공간 상태를 다시 확인하세요."
+    state["jtt_notice_until"] = 0.0
+
+
 def _confirm_and_stop_selected_terminal(stdscr, state: dict) -> None:
     """Stop only the exact selected session confirmed by the user; fail closed."""
 
+    selected = renderer._selected_row(state)
+    if (selected and selected.get("terminal_kind") == "tower_managed"
+            and (str(selected.get("terminal_shell_state") or "").lower() == "exited"
+                 or str(selected.get("terminal_view_state") or "") == "exited")):
+        _confirm_and_remove_exited_card(stdscr, state)
+        return
     target = _capture_stop_target(state)
     if target is None:
         state["jtt_notice"] = "선택 터미널 신원을 확인할 수 없어 종료를 차단했습니다."
@@ -764,8 +907,10 @@ def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
              "Ctrl+G h/l: 이전/다음 카드 (입력 권한 해제)",
              "Ctrl+G x: 선택 터미널 종료 (취소가 기본 선택)",
              "Ctrl+G w: 작업공간 패널", "Ctrl+G d: UI 연결 해제 (셸 유지)",
-             "Ctrl+G ?: 이 도움말", "Ctrl+G Esc: 접두 취소 · Ctrl+G 두 번: 입력 중 Ctrl+G 전송",
-             "입력 모드에서는 bare n/q/Tab을 터미널로 전달합니다.",
+             "종료된 셸은 Ctrl+G x로 현재 작업공간 카드 참조만 제거합니다.",
+             "탐색 q/Q/Esc는 JTT를 닫지 않으며 입력 중 q/Q/Esc는 터미널로 전달합니다.",
+             "Ctrl+G ?: 도움 · Ctrl+G Esc: 접두 취소 · 대화상자 Esc: 닫기",
+             "입력 중 bare n/Tab은 터미널로 전달 · Ctrl+G 두 번은 Ctrl+G 전송",
              "Ctrl+]는 입력 모드에서 탐색 복귀입니다."],
         )
         return False

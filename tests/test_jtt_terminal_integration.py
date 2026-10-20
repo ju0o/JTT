@@ -234,7 +234,7 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
             os.kill(pid, 0)
 
         # The actual curses UI enters RIGHT input mode, sends one harmless
-        # printf command through the selected card, then detaches without
+        # printf command through the selected card, then explicitly detaches without
         # stopping either shell. No tmux or user-agent path is involved.
         ui = _UIProcess(root, source_root, pyte_root)
         try:
@@ -246,7 +246,12 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
             _wait_for_ui_text(ui, right_marker)
             ui.send(b"\x1d")  # Return to navigation; release the input lease.
             _wait_for_ui_text(ui, "관찰 중")
-            ui.send(b"q")
+            # Bare navigation q is inert; follow it with a prefix help command
+            # so the real curses screen proves the UI stayed alive.
+            ui.send(b"q\x07?")
+            _wait_for_ui_text(ui, "JTT 키 안내")
+            ui.send(b"\x1b")  # Close the help dialog, not the JTT UI.
+            ui.send(b"\x07d")  # Only the explicit prefix command detaches.
             assert ui.exit() == 0
             assert b"\x1b[?1049l" in ui.raw
         finally:
@@ -259,12 +264,12 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 ui.pump()
-                if "터미널" in ui.text() and "Fixture A" in ui.text():
+                if all(marker in ui.text() for marker in ("터미널", "Fixture A", "Fixture B")):
                     break
             assert "터미널" in ui.text()
             assert "Fixture A" in ui.text()
             assert "Fixture B" in ui.text()
-            ui.send(b"q")
+            ui.send(b"\x07d")
             assert ui.exit() == 0
             assert b"\x1b[?1049l" in ui.raw
         finally:
@@ -281,7 +286,7 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_real_curses_launch_and_quit_does_not_autostart_a_shell(monkeypatch):
+def test_real_curses_launch_and_prefix_detach_does_not_autostart_a_shell(monkeypatch):
     root = Path(tempfile.mkdtemp(prefix="jtt-tty-"))
     root.chmod(0o700)
     source_root = Path(__file__).resolve().parents[1] / "src"
@@ -299,7 +304,7 @@ def test_real_curses_launch_and_quit_does_not_autostart_a_shell(monkeypatch):
         assert "작업공간" in ui.text()
         assert "터미널 배치" in ui.text()
         assert not (root / "state").exists()
-        ui.send(b"q")
+        ui.send(b"\x07d")
         assert ui.exit() == 0
         assert b"\x1b[?1049l" in ui.raw
         assert not (root / "state").exists()
@@ -350,7 +355,7 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
 
         ui.send(b"\x1d")
         _wait_for_ui_text(ui, "관찰 중")
-        ui.send(b"q")
+        ui.send(b"\x07d")
         assert ui.exit() == 0
         ui = None
         assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
@@ -376,14 +381,14 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
             (session_id, shell_pid)
         ]
 
-        # A further UI connection remains attached to the same PTY and q also
-        # disconnects without creating or terminating a shell.
+        # A further UI connection remains attached to the same PTY. Explicit
+        # prefix detach still does not create or terminate a shell.
         ui = _UIProcess(root, source_root, pyte_root)
         _wait_for_ui_text(ui, "JTT_PREFIX_N_")
         assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
             (session_id, shell_pid)
         ]
-        ui.send(b"q")
+        ui.send(b"\x07d")
         assert ui.exit() == 0
         ui = None
         assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
