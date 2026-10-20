@@ -7,16 +7,50 @@ JTT는 독립된 대화형 터미널을 관리하는 로컬 오픈소스 작업�
 직접 보고 조작합니다. 호스팅 서비스가 없으며 Agent 계정·프롬프트·모델 API를
 관리하지 않습니다.
 
-## 현재 JTT RC
+## JTT 설치와 실행
 
-이 저장소에는 이전 tmux Agent 관제 도구도 남아 있습니다. 독립 실행형 JTT는
-별도 `jtt` 명령이며, 기존 `tower` 명령과 동작은 변경하지 않습니다.
+이 저장소에는 이전 tmux Agent 관제 도구도 남아 있습니다. JTT는 별도
+`jtt` 명령이며, 기존 `tower` 명령과 업데이트 경로는 변경하지 않습니다.
 
-소스 체크아웃에서는 `./scripts/jtt-setup-dev`를 실행해 체크아웃 내부
-`.venv-jtt` 환경을 준비하고 의존성을 설치한 뒤 `./scripts/jtt-dev`를 실행하세요.
-환경 준비는 명시적 작업이며 설정된 Python 패키지 인덱스에 접속할 수 있습니다.
-JTT 시작 시 패키지를 자동 설치하지 않습니다. JTT를 열기만 해서는 셸이 생성되지
-않으며, 새 터미널 동작을 명시적으로 선택해야 합니다.
+### 개발 체크아웃
+
+JTT 소스 체크아웃에서 전용 Python 환경을 명시적으로 준비하고 개발 런처를
+설치합니다.
+
+```sh
+./scripts/jtt-setup-dev
+./scripts/jtt-install-dev
+jtt
+```
+
+런처는 `~/.local/bin/jtt`에만 설치합니다. 다른 `jtt` 명령이 있으면 거부하며,
+셸 시작 파일은 수정하지 않습니다. `~/.local/bin`이 PATH에 없다면 현재 셸에서만
+`export PATH="$HOME/.local/bin:$PATH"`를 실행하세요. 영구 설정은 직접 확인한 뒤
+수정해야 합니다. `jtt --version`에는 `DEV`가 표시되고 개발 체크아웃의
+`jtt update`는 거부됩니다. 기존 `scripts/jtt-dev`와 `scripts/jtt-setup-dev`도
+그대로 사용할 수 있습니다. 환경 준비는 명시적 작업이며 설정된 Python 패키지
+인덱스에 접속할 수 있지만, 일반 JTT 시작은 패키지를 설치하지 않습니다.
+
+### 공식 Release
+
+현재 JTT는 **Release HOLD** 상태입니다. Draft PR이나 소스 브랜치를 공식 설치본으로
+취급하지 마세요. JTT Release가 공개된 뒤 정확한 공개 태그의 깨끗한 체크아웃에서
+검증 부트스트랩을 실행합니다.
+
+```sh
+git clone --branch <공개된-JTT-태그> --depth 1 https://github.com/ju0o/tmux-agent-tower.git jtt-release
+cd jtt-release
+./scripts/jtt-install-release
+```
+
+설치기는 체크아웃이 공개 GitHub Release의 정확한 커밋인지 확인하고, 파일을 쓰기
+전에 사용자 확인을 받습니다. PATH에 이미 `jtt` 명령이 있으면 덮어쓰지 않습니다.
+기존 `tower` 런처, 셸 설정 파일, JTT 작업공간이나 실행 중인 세션도 변경하지
+않습니다. 업데이트·롤백 계약은 [`docs/JTT_UPDATING.ko.md`](docs/JTT_UPDATING.ko.md)를
+참고하세요. 현재 공식 설치나 Release 배포는 수행하지 않았습니다.
+
+JTT를 열기만 해서는 셸이 생성되지 않으며, 새 터미널 동작을 명시적으로 선택해야
+합니다.
 
 JTT 단축키: `Ctrl+G` 후 4초 안에 `n`은 새 터미널, `h`/`l`은 카드 이동, `w`는
 작업공간 패널, `x`는 실행 중인 선택 터미널의 종료 확인입니다. 이미 종료된
