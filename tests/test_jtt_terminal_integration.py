@@ -25,6 +25,7 @@ import pytest
 from tmux_agent_tower.state.jtt_workspaces import JTTWorkspaceStore
 from tmux_agent_tower.state.jtt_work_kits import JTTWorkKitStore
 from tmux_agent_tower.terminal import TerminalRegistry, renderer_available
+from tmux_agent_tower.terminal import manager as terminal_manager
 from tmux_agent_tower.ui import jtt
 from tmux_agent_tower.ui import ux_preview_v2 as renderer
 
@@ -461,6 +462,39 @@ def test_read_only_observe_keeps_two_pty_screens_distinct_and_does_not_take_leas
         for session_id in created:
             registry.stop(session_id)
         shutil.rmtree(root, ignore_errors=True)
+
+
+@pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash fixture requires /bin/bash")
+def test_supervisor_early_exit_does_not_persist_a_failed_workspace_card(monkeypatch, tmp_path):
+    """An explicit create failure leaves the isolated workspace reference-free."""
+    root = tmp_path / "isolated-jtt"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    _set_private_process_environment(monkeypatch, root, source_root)
+    store = JTTWorkspaceStore(root / "state")
+    registry = TerminalRegistry(root=root / "state" / "terminals")
+    state = jtt.build_state(store, registry)
+    original_popen = terminal_manager.subprocess.Popen
+    started = []
+
+    def exit_worker(args, **kwargs):
+        if len(args) > 1 and str(args[1]) == str(terminal_manager.WORKER):
+            process = original_popen(
+                [sys.executable, "-c", "raise SystemExit(23)"], **kwargs
+            )
+            started.append(process)
+            return process
+        return original_popen(args, **kwargs)
+
+    monkeypatch.setattr(terminal_manager.subprocess, "Popen", exit_worker)
+    jtt._create_terminal(_Screen(), state)
+
+    assert len(started) == 1 and started[0].poll() == 23
+    assert store.workspaces()[0]["terminal_ids"] == []
+    assert registry.list_sessions() == ()
+    assert "exited during startup" in state["jtt_notice"]
+    assert state["managed_terminals"] == {}
 
 
 @pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")

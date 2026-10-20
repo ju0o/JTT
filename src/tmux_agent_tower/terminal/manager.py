@@ -503,17 +503,39 @@ class TerminalRegistry:
                 if metadata.get("session_id") != entry.name or metadata.get("protocol") != PROTOCOL:
                     continue
                 ident = _identity(metadata)
-                supervisor_ok = _worker_is_same_process(
+                supervisor_status = _worker_identity_status(
                     ident.supervisor_pid, ident.supervisor_start, entry,
                     ident.session_id, ident.generation,
                 )
                 shell_ok = _proc_start(ident.shell_pid) == ident.shell_start
-                if not supervisor_ok:
-                    state = "orphaned" if shell_ok else "exited"
-                elif not shell_ok:
-                    state = "exited"
+                normal_exit_record = (
+                    ident.state == "exited"
+                    and (ident.exit_code is not None or ident.exit_signal is not None)
+                )
+                if supervisor_status in {"start_mismatch", "argv_mismatch"}:
+                    # A reused PID or changed argv is an identity conflict, not
+                    # evidence that the old shell exited. Never make it
+                    # eligible for a guessed stop/reconnect.
+                    state = "identity_mismatch"
+                elif supervisor_status != "verified":
+                    if shell_ok:
+                        state = "orphaned"
+                    elif normal_exit_record:
+                        state = "exited"
+                    else:
+                        # WSL shutdown/restart can remove both processes before
+                        # the supervisor writes a normal-exit record.
+                        state = "orphaned"
+                elif ident.state == "exited" and shell_ok:
+                    state = "identity_mismatch"
+                elif not shell_ok and ident.state != "exited":
+                    state = "identity_mismatch"
+                elif ident.state == "exited":
+                    state = "exited" if normal_exit_record else "identity_mismatch"
+                elif ident.state == "stopping":
+                    state = "stopping"
                 else:
-                    state = ident.state if ident.state in ("running", "stopping") else "exited"
+                    state = "running" if shell_ok else "identity_mismatch"
                 sessions.append(TerminalIdentity(
                     ident.session_id, ident.generation, ident.supervisor_pid,
                     ident.supervisor_start, ident.shell_pid, ident.shell_start,
@@ -524,6 +546,56 @@ class TerminalRegistry:
                 # A malformed or foreign entry must never be treated as a session.
                 continue
         return tuple(sorted(sessions, key=lambda item: item.session_id))
+
+    def inspect_reference(self, session_id: str) -> str:
+        """Classify a saved reference without starting, connecting, or deleting anything.
+
+        The result contains only a stable state label; malformed metadata and
+        process arguments are never surfaced to the UI or logs.
+        """
+        if not SESSION_ID_RE.fullmatch(str(session_id)):
+            return "identity_mismatch"
+        if not os.path.lexists(self.root):
+            return "not_found"
+        try:
+            _check_root_components(self.root, require_leaf=True)
+        except (OSError, TerminalError):
+            return "registry_unavailable"
+        session_dir = self.root / session_id
+        if not os.path.lexists(session_dir):
+            return "not_found"
+        try:
+            _private_stat(session_dir, directory=True)
+            metadata = _read_metadata(session_dir / SESSION_META)
+            if (metadata.get("protocol") != PROTOCOL
+                    or metadata.get("session_id") != session_id):
+                return "identity_mismatch"
+            identity = _identity(metadata)
+        except (OSError, TerminalError, TypeError, ValueError):
+            return "identity_mismatch"
+
+        worker_status = _worker_identity_status(
+            identity.supervisor_pid, identity.supervisor_start, session_dir,
+            identity.session_id, identity.generation,
+        )
+        shell_ok = _proc_start(identity.shell_pid) == identity.shell_start
+        if worker_status in {"start_mismatch", "argv_mismatch"}:
+            return "identity_mismatch"
+        normal_exit_record = (
+            identity.state == "exited"
+            and (identity.exit_code is not None or identity.exit_signal is not None)
+        )
+        if worker_status == "verified":
+            if identity.state == "exited":
+                return "exited" if normal_exit_record and not shell_ok else "identity_mismatch"
+            if not shell_ok:
+                return "identity_mismatch"
+            return identity.state if identity.state in {"running", "stopping"} else "orphaned"
+        if shell_ok:
+            return "orphaned"
+        if normal_exit_record:
+            return "exited"
+        return "orphaned"
 
     def create(self, name: Optional[str] = None) -> "TerminalClient":
         # Fail before creating the registry/session directory or spawning a

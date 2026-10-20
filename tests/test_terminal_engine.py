@@ -153,6 +153,94 @@ def test_live_supervisor_argv_mismatch_is_reported_separately(tmp_path, monkeypa
     assert registry.list_sessions() == ()
 
 
+@pytest.mark.parametrize(
+    ("worker_status", "shell_live", "metadata_state", "expected"),
+    [
+        ("argv_mismatch", True, "running", "identity_mismatch"),
+        ("start_mismatch", True, "running", "identity_mismatch"),
+        ("not_running", True, "running", "orphaned"),
+        ("unavailable", False, "running", "orphaned"),
+        ("not_running", False, "stopped", "orphaned"),
+        ("not_running", False, "exited", "exited"),
+    ],
+    ids=["argv-mismatch", "pid-reuse", "wsl-owner-gone-shell-live",
+         "wsl-owner-and-shell-gone-unconfirmed", "stopped-not-normal-exit",
+         "confirmed-normal-exit"],
+)
+def test_registry_distinguishes_owner_loss_identity_mismatch_and_confirmed_exit(
+    tmp_path, monkeypatch, worker_status, shell_live, metadata_state, expected,
+):
+    import tmux_agent_tower.terminal.manager as manager
+
+    root = tmp_path / "private-jtt" / "terminals"
+    manager._ensure_private_root(root)
+    session_id = "a" * 32
+    session_dir = root / session_id
+    session_dir.mkdir(mode=0o700)
+    manager._atomic_metadata(session_dir / manager.SESSION_META, {
+        "protocol": manager.PROTOCOL, "session_id": session_id,
+        "generation": "generation-a", "supervisor_pid": 123,
+        "supervisor_start": "supervisor-start", "shell_pid": 456,
+        "shell_start": "shell-start", "shell_path": "/bin/bash",
+        "name": "fixture", "state": metadata_state,
+        "exit_code": 0 if metadata_state == "exited" else None,
+        "exit_signal": None,
+    })
+    monkeypatch.setattr(manager, "_worker_identity_status",
+                        lambda *_args, **_kwargs: worker_status)
+    monkeypatch.setattr(
+        manager, "_proc_start",
+        lambda pid: ("shell-start" if pid == 456 and shell_live else
+                     "supervisor-start" if pid == 123 and worker_status == "verified" else None),
+    )
+
+    identity, = manager.TerminalRegistry(root).list_sessions()
+    assert identity.state == expected
+
+
+def test_registry_does_not_treat_exit_without_wait_status_as_normal(tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.manager as manager
+
+    root = tmp_path / "private-jtt" / "terminals"
+    manager._ensure_private_root(root)
+    session_id = "b" * 32
+    session_dir = root / session_id
+    session_dir.mkdir(mode=0o700)
+    manager._atomic_metadata(session_dir / manager.SESSION_META, {
+        "protocol": manager.PROTOCOL, "session_id": session_id,
+        "generation": "generation-b", "supervisor_pid": 123,
+        "supervisor_start": "supervisor-start", "shell_pid": 456,
+        "shell_start": "shell-start", "shell_path": "/bin/bash",
+        "name": "fixture", "state": "exited",
+        "exit_code": None, "exit_signal": None,
+    })
+    monkeypatch.setattr(manager, "_worker_identity_status", lambda *_args: "verified")
+    monkeypatch.setattr(manager, "_proc_start", lambda pid: {
+        123: "supervisor-start", 456: None,
+    }.get(pid))
+
+    identity, = manager.TerminalRegistry(root).list_sessions()
+    assert identity.state == "identity_mismatch"
+
+
+def test_registry_inspect_reference_does_not_conflate_missing_and_malformed(tmp_path):
+    import tmux_agent_tower.terminal.manager as manager
+
+    root = tmp_path / "private-jtt" / "terminals"
+    manager._ensure_private_root(root)
+    registry = manager.TerminalRegistry(root)
+    missing = "c" * 32
+    malformed = "d" * 32
+    bad_dir = root / malformed
+    bad_dir.mkdir(mode=0o700)
+    manager._atomic_metadata(bad_dir / manager.SESSION_META, {
+        "protocol": manager.PROTOCOL + 1, "session_id": malformed,
+    })
+
+    assert registry.inspect_reference(missing) == "not_found"
+    assert registry.inspect_reference(malformed) == "identity_mismatch"
+
+
 @pytest.mark.skipif(not renderer_available(), reason="live-shell preservation requires pyte")
 @pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash is not available")
 def test_renderer_preflight_does_not_hide_or_restart_existing_session(tmp_path, monkeypatch):
@@ -591,7 +679,9 @@ def test_supervisor_crash_makes_session_stale_and_shell_exits(tmp_path, monkeypa
         listed = registry.list_sessions()
         assert len(listed) == 1
         assert listed[0].session_id == session_id
-        assert listed[0].state == "exited"
+        # The worker was killed before it could persist an exit boundary, so
+        # process disappearance alone is not proof of a normal shell exit.
+        assert listed[0].state == "orphaned"
         with pytest.raises(TerminalError, match="supervisor identity is stale"):
             registry.connect(session_id)
     finally:

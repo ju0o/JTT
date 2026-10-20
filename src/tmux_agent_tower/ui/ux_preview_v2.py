@@ -420,6 +420,9 @@ def _status(row: dict) -> str:
             "renderer_error": "● 셸 실행 중 · 화면 렌더러 오류",
             "resyncing": "↻ 셸 실행 중 · 화면 재동기화",
             "supervisor_connection_failed": "! Supervisor 연결 실패",
+            "orphaned": "◇ Supervisor 종료 · 셸 상태 확인 필요",
+            "identity_mismatch": "! 세션 신원 불일치 · 입력 차단",
+            "stopping": "◇ 터미널 종료 확인 중",
             "session_unavailable": "? 세션 조회 불가",
             "exited": "× 셸 종료",
             "starting": "○ 시작 중",
@@ -442,9 +445,11 @@ def _status_attr(row: dict) -> int:
         if row.get("mini_live_state") == "synced" and row.get("mini_screen") is not None:
             return _color(_COLOR_WORKING, curses.A_DIM)
         view_state = str(row.get("terminal_view_state") or "unknown")
-        if view_state in {"exited", "supervisor_connection_failed", "renderer_error"}:
+        if view_state in {"exited", "supervisor_connection_failed", "renderer_error",
+                          "identity_mismatch"}:
             return _color(_COLOR_ERROR, curses.A_DIM)
-        if view_state in {"renderer_missing", "resyncing", "session_unavailable", "starting"}:
+        if view_state in {"renderer_missing", "resyncing", "session_unavailable", "starting",
+                          "orphaned", "stopping"}:
             return _color(_COLOR_WAITING, curses.A_DIM)
         return _color(_COLOR_WORKING, curses.A_DIM)
     status = str(row.get("status") or "UNKNOWN").upper()
@@ -795,6 +800,9 @@ def _draw_right(stdscr, rect, state: dict, active: bool) -> None:
                 "renderer_error": "셸 실행 중 · VT 렌더러 오류 · 입력 차단",
                 "resyncing": "화면 재동기화 중 · 입력 차단",
                 "supervisor_connection_failed": "Supervisor 연결 실패 · 입력 차단",
+                "orphaned": "Supervisor 종료 또는 WSL 재시작 가능성 · 셸 상태 미확정 · 입력 차단",
+                "identity_mismatch": "세션 신원 불일치 · 종료/입력 차단",
+                "stopping": "터미널 종료 확인 중 · 입력 차단",
                 "session_unavailable": "세션 조회 불가 · 입력 차단",
                 "exited": "셸 종료",
             }
@@ -937,7 +945,8 @@ def _draw_jtt_footer(stdscr, state: dict, width: int, height: int) -> None:
     elif state.get("jtt_prefix_pending"):
         create_hint = "n 차단" if state.get("work_kit_preview") is not None else "n 새"
         text = (f"JTT — Ju0 Terminal Tower · {prefix} {timeout} 내: {create_hint} · h/l 카드 · "
-                f"w 작업공간 · x 종료 · d 분리 · ? 도움 · Esc 취소 · {prefix} {prefix}/{escape} 전송")
+                f"r 재확인 · w 작업공간 · x 종료 · d 분리 · ? 도움 · Esc 취소 · "
+                f"{prefix} {prefix}/{escape} 전송")
     elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
         text = (f"JTT — Ju0 Terminal Tower · {escape} 탐색 복귀 · {prefix} 명령 대기({timeout}) · "
                 "q/Q/Esc 터미널 입력")
@@ -947,14 +956,15 @@ def _draw_jtt_footer(stdscr, state: dict, width: int, height: int) -> None:
                     "Tab/Shift+Tab 패널 · Enter 탐색")
         else:
             text = (f"JTT — Ju0 Terminal Tower · {prefix} 명령({timeout}) · Tab/Shift+Tab 패널 · "
-                    f"Enter 입력 · {prefix} d 분리 · {prefix} x 종료 · q/Q/Esc 유지")
-    compact = f"JTT · {prefix}({timeout}) · Tab · Enter · {prefix} d 분리 · {prefix} x 종료"
+                f"Enter 입력 · {prefix} r 재확인 · {prefix} d 분리 · {prefix} x 종료 · q/Q/Esc 유지")
+    compact = (f"JTT · {prefix}({timeout}) · Tab · Enter · {prefix} r 확인 · "
+               f"{prefix} x 종료 · {prefix} d 분리")
     # _regions() switches to the compact single-panel layout below 110 cols;
     # keep the footer equally compact so the prefixed stop command stays visible.
     if width < 110:
         if state.get("jtt_prefix_pending"):
             create_hint = "n 차단" if state.get("work_kit_preview") is not None else "n 새"
-            text = (f"JTT · {prefix} {timeout}: {create_hint} h/l 카드 w 작업 x 종료 d 분리 "
+            text = (f"JTT · {prefix} {timeout}: {create_hint} h/l 카드 r 확인 w 작업 x 종료 d 분리 "
                     f"? 도움 Esc 취소 {prefix} {prefix}/{escape} 전송")
         elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
             text = f"JTT · {escape} 탐색 · {prefix}({timeout}) 명령"
@@ -1005,7 +1015,7 @@ def _handle_jtt_prefix(stdscr, state: dict, key) -> tuple[bool, bool]:
             return True, False
         command = key.lower() if isinstance(key, str) and len(key) == 1 else None
         handler = state.get("jtt_prefix_handler")
-        if command in {"n", "h", "l", "w", "x", "d", "?"} and callable(handler):
+        if command in {"n", "h", "l", "w", "x", "d", "r", "?"} and callable(handler):
             return True, bool(handler(stdscr, state, command))
         state["jtt_notice"] = f"알 수 없는 {keybindings.prefix} 명령 · ? 도움"
         state["jtt_notice_until"] = 0.0
