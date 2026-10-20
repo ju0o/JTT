@@ -33,6 +33,9 @@ dialog or cancels a pending prefix. See [JTT terminal support and safety](docs/J
 for data locations, cleanup guidance, and VT compatibility limits. The default
 prefix/input escape (`Ctrl+G` / `Ctrl+]`) can be changed in the private JTT-only
 `keybindings.json`; the support guide documents its strict schema and key list.
+Work Kits are local templates rather than saved running terminals: selecting one
+only previews non-running cards and never starts a shell or command. See
+[JTT Work Kits](docs/JTT_WORK_KITS.md) for the local storage scope.
 
 JTT is an interactive local terminal, not a security sandbox. Shells run as
 the current user and can access that user's normal files and network. The

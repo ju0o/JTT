@@ -17,11 +17,21 @@ from ..state.jtt_keys import (
     JTTKeybindingsError,
     load_jtt_keybindings,
 )
+from ..state.jtt_work_kits import JTTWorkKitStore, WorkKitStoreError
 from ..state.jtt_workspaces import JTTWorkspaceStore, WorkspaceStoreError
 from ..terminal import TerminalRegistry
 from . import ux_preview_v2 as renderer
 from .render import display_width, truncate_to_width
-from .widgets import prompt_text, run_list_picker, safe_add, show_message_screen
+from .widgets import (
+    is_backspace,
+    is_enter,
+    is_escape,
+    prompt_text,
+    read_key,
+    run_list_picker,
+    safe_add,
+    show_message_screen,
+)
 
 
 class _JTTTerminationSignal(Exception):
@@ -484,6 +494,15 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
     clients = clients if clients is not None else {}
     keybindings = keybindings or load_jtt_keybindings(store.root)
     workspaces = store.workspaces()
+    work_kit_store = JTTWorkKitStore(store.root)
+    work_kit_error = False
+    try:
+        work_kits = work_kit_store.kits()
+    except WorkKitStoreError:
+        # Work Kits are optional templates; an invalid kit file must not block
+        # existing saved-workspace attachment or terminal operation.
+        work_kits = []
+        work_kit_error = True
     default = next((item for item in workspaces if item["id"] == store.DEFAULT_ID), workspaces[0])
     saved = [item for item in workspaces if item["id"] != store.DEFAULT_ID]
     choices = [{"kind": "workspace", "group": "windows", "scope": "jtt_workspace",
@@ -491,6 +510,7 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
     choices.extend({"kind": "workspace", "group": "saved", "scope": "jtt_workspace",
                     "id": item["id"], "label": item["name"], "terminal_ids": item["terminal_ids"]}
                    for item in saved)
+    choices.extend(_work_kit_choices(work_kits, unavailable=work_kit_error))
     choices.extend([
         {"kind": "action", "group": "actions", "id": "action:save", "label": "구성 저장",
          "dialog": "구성 저장"},
@@ -535,6 +555,10 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
         "managed_cards": rows_by_choice,
         "managed_terminals": clients,
         "jtt_store": store,
+        "jtt_work_kit_store": work_kit_store,
+        "jtt_work_kits": work_kits,
+        "jtt_work_kit_error": work_kit_error,
+        "work_kit_preview": None,
         "jtt_registry": registry,
         "jtt_keybindings": keybindings,
         "jtt_workspaces": workspaces,
@@ -545,6 +569,7 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
         "jtt_prefix_target": None,
         "jtt_pending_auto_acquire": None,
         "jtt_action_handler": _activate_jtt_action,
+        "jtt_work_kit_handler": _preview_work_kit,
         "jtt_center_action_handler": lambda stdscr, state, index: (
             _save_configuration(stdscr, state) if index == 0 else _create_terminal(stdscr, state)
         ),
@@ -555,8 +580,166 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
     return state
 
 
+def _work_kit_choices(work_kits: list[dict], *, unavailable: bool = False) -> list[dict]:
+    if unavailable:
+        return [{"kind": "info", "group": "work_kits", "id": "work-kit-unavailable",
+                 "label": "Work Kit 사용 불가 · 저장 데이터 오류"}]
+    choices = [{"kind": "work_kit", "group": "work_kits", "id": kit["id"],
+                "label": kit["name"], "description": kit["description"]}
+               for kit in work_kits]
+    choices.append({"kind": "action", "group": "work_kits", "id": "action:work-kit-create",
+                    "label": "＋ 새 Work Kit"})
+    return choices
+
+
+def _preview_work_kit(state: dict, choice: dict) -> None:
+    """Project one saved template into cards without resolving any processes."""
+    renderer._release_managed_input(state)
+    state["jtt_pending_auto_acquire"] = None
+    state["work_kit_preview"] = None
+    try:
+        matches = [kit for kit in state["jtt_work_kit_store"].kits()
+                   if kit["id"] == str(choice.get("id") or "")]
+    except WorkKitStoreError:
+        matches = []
+    if len(matches) != 1:
+        state["panes"] = []
+        state["pane_index"] = 0
+        state["selected_target_id"] = ""
+        state["selected_signature"] = None
+        state["jtt_notice"] = "Work Kit을 읽을 수 없습니다. 템플릿 미리보기를 중단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    kit = matches[0]
+    state["work_kit_preview"] = kit
+    state["workspace_id"] = "work-kit-preview:" + kit["id"]
+    state["workspace_name"] = kit["name"]
+    state["panes"] = [{
+        "kind": "work_kit_template",
+        "terminal_kind": "work_kit_template",
+        "template_id": terminal["id"],
+        "display_name": terminal["name"],
+        "agent": terminal["role"],
+        "status": "TEMPLATE",
+        "terminal_view_state": "not_running",
+        "terminal_preview": "템플릿 · 실행되지 않음",
+        "working_directory": terminal["working_directory"],
+        "live_lines": [],
+    } for terminal in kit["terminals"]]
+    state["pane_index"] = 0
+    state["selected_target_id"] = ""
+    state["selected_signature"] = None
+    state["card_scroll"] = 0
+    state["live_scroll"] = 0
+    state["center_actions_focused"] = False
+    state["custom_view"] = False
+    state["jtt_notice"] = "Work Kit 미리보기 · 터미널은 실행되지 않았습니다."
+    state["jtt_notice_until"] = 0.0
+
+
+def _refresh_work_kit_choices(state: dict, selected_id: str | None = None) -> None:
+    work_kits = state["jtt_work_kit_store"].kits()
+    choices = [item for item in state["choices"] if item.get("group") != "work_kits"]
+    insertion = next((index for index, item in enumerate(choices)
+                      if item.get("group") == "actions"), len(choices))
+    choices[insertion:insertion] = _work_kit_choices(work_kits)
+    state["choices"] = choices
+    state["jtt_work_kits"] = work_kits
+    state["jtt_work_kit_error"] = False
+    if selected_id:
+        index = next((i for i, item in enumerate(choices)
+                      if item.get("kind") == "work_kit" and item.get("id") == selected_id), None)
+        if index is not None:
+            state["nav_index"] = index
+            _preview_work_kit(state, choices[index])
+            state["active_panel"] = 1
+
+
+def _create_work_kit(stdscr, state: dict) -> None:
+    if state.get("jtt_work_kit_error"):
+        state["jtt_notice"] = "Work Kit 저장 데이터 오류로 생성을 막았습니다. 기존 파일은 변경하지 않았습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    name = prompt_text(stdscr, "Work Kit 이름: ")
+    if not name:
+        return
+    description = prompt_text(stdscr, "한 줄 설명 (선택): ")
+    if description is None:
+        return
+    count_text = prompt_text(
+        stdscr, "터미널 개수 (1–4): ",
+        context_lines=["Work Kit은 템플릿만 저장합니다. 셸이나 명령은 실행되지 않습니다."],
+    )
+    if count_text is None:
+        return
+    try:
+        count = int(count_text)
+        terminals = []
+        if count not in (1, 2, 3, 4):
+            raise ValueError
+        for index in range(count):
+            terminal_name = prompt_text(stdscr, f"터미널 {index + 1} 이름: ")
+            if not terminal_name:
+                return
+            role = prompt_text(stdscr, f"터미널 {index + 1} 역할: ")
+            if not role:
+                return
+            working_directory = _prompt_working_directory(
+                stdscr, f"터미널 {index + 1} 작업 폴더 (선택): "
+            )
+            if working_directory is None:
+                return
+            terminals.append({
+                "name": terminal_name,
+                "role": role,
+                "working_directory": working_directory or None,
+            })
+        kit = state["jtt_work_kit_store"].create_kit(name, description, terminals)
+        _refresh_work_kit_choices(state, kit["id"])
+    except (ValueError, WorkKitStoreError):
+        state["jtt_notice"] = "Work Kit 저장 상태를 확인할 수 없습니다 · 저장 데이터를 다시 확인하세요."
+        state["jtt_notice_until"] = 0.0
+
+
+def _prompt_working_directory(stdscr, label: str) -> str | None:
+    """Collect optional path text verbatim; never inspect or normalize it."""
+    height, width = stdscr.getmaxyx()
+    y = min(height - 2, 3)
+    chars = []
+    curses.curs_set(1)
+    stdscr.timeout(-1)
+    try:
+        while True:
+            stdscr.erase()
+            safe_add(stdscr, y, 0, label + "".join(chars), curses.A_BOLD)
+            cursor = display_width(label + "".join(chars))
+            try:
+                stdscr.move(y, min(max(0, width - 1), cursor))
+            except curses.error:
+                pass
+            stdscr.refresh()
+            key = read_key(stdscr)
+            if is_escape(key):
+                return None
+            if is_enter(key):
+                return "".join(chars)
+            if is_backspace(key):
+                if chars:
+                    chars.pop()
+                continue
+            if isinstance(key, str) and key.isprintable():
+                chars.append(key)
+    finally:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.timeout(200)
+
+
 def _attach_choice(state: dict, choice: dict) -> None:
     """Attach only the selected workspace's exact sessions to this UI client."""
+    state["work_kit_preview"] = None
     workspace_id = str(choice.get("id") or "")
     workspaces = state["jtt_store"].workspaces()
     workspace = next((item for item in workspaces if item["id"] == workspace_id), None)
@@ -606,6 +789,10 @@ def _refresh_workspaces(state: dict, selected_id: str | None = None) -> None:
 
 
 def _save_configuration(stdscr, state: dict) -> None:
+    if state.get("work_kit_preview") is not None:
+        state["jtt_notice"] = "Work Kit 미리보기에서는 작업공간 구성을 저장하지 않습니다."
+        state["jtt_notice_until"] = 0.0
+        return
     name = prompt_text(stdscr, "구성 이름: ")
     if not name:
         return
@@ -919,6 +1106,10 @@ def _confirm_and_stop_selected_terminal(stdscr, state: dict) -> None:
 
 
 def _create_terminal(stdscr, state: dict) -> None:
+    if state.get("work_kit_preview") is not None:
+        state["jtt_notice"] = "Work Kit 미리보기입니다. 셸을 만들지 않았습니다."
+        state["jtt_notice_until"] = 0.0
+        return
     renderer._release_managed_input(state)
     state["jtt_pending_auto_acquire"] = None
     session_id = ""
@@ -1008,9 +1199,12 @@ def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
         if state.get("jtt_terminal_mode_fatal"):
             return False
         keys = state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS)
+        create_help = (f"{keys.prefix} n: 새 터미널 (명시적 생성)"
+                       if state.get("work_kit_preview") is None
+                       else f"{keys.prefix} n: Work Kit 미리보기 중 생성 차단")
         show_message_screen(
             stdscr, "JTT 키 안내",
-            [f"{keys.prefix} n: 새 터미널 (명시적 생성)",
+            [create_help,
              f"{keys.prefix} h/l: 이전/다음 카드 (입력 권한 해제)",
              f"{keys.prefix} x: 선택 터미널 종료 (취소가 기본 선택)",
              f"{keys.prefix} w: 작업공간 패널", f"{keys.prefix} d: UI 연결 해제 (셸 유지)",
@@ -1026,7 +1220,9 @@ def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
 
 
 def _activate_jtt_action(stdscr, state: dict, choice: dict) -> None:
-    if choice.get("id") == "action:save":
+    if choice.get("id") == "action:work-kit-create":
+        _create_work_kit(stdscr, state)
+    elif choice.get("id") == "action:save":
         _save_configuration(stdscr, state)
     elif choice.get("id") == "action:settings":
         _settings_menu(stdscr, state)
