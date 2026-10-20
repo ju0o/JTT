@@ -354,7 +354,9 @@ def test_read_only_observe_keeps_two_pty_screens_distinct_and_does_not_take_leas
 
         # The original input owners remain able to write after observation.
         active[0].send(b"printf 'JTT_AFTER_OBSERVE\\n'\n")
-        assert "JTT_AFTER_OBSERVE" in _screen_text(_wait_for_text(active[0], "JTT_AFTER_OBSERVE"))
+        after_observe = jtt.ManagedTerminalBinding(active[0], active[0].identity)
+        _wait_for_marker(after_observe, "JTT_AFTER_OBSERVE")
+        assert "JTT_AFTER_OBSERVE" in _binding_text(after_observe)
     finally:
         for observer in observers:
             observer.close()
@@ -411,10 +413,11 @@ def test_real_curses_work_kit_creation_selects_template_without_starting_shells(
         _wait_for_ui_text(ui, "터미널 배치")
         assert registry.list_sessions() == ()
 
-        # A fresh store exposes the default workspace, its default folder and
-        # Window before the Work Kit create action in LEFT. Walk that real
-        # navigation order, then enter the create form.
-        ui.send(b"\x1bOB\x1bOB\x1bOB\n")  # Three application-mode downs, then Enter.
+        # A fresh store exposes the default workspace, default folder,
+        # default Window, then the Work Kit create action. Selecting a folder
+        # or Window moves focus to CENTER, so tab back to LEFT before each
+        # next selection. This follows the actual three-panel focus contract.
+        ui.send(b"\x1bOB\t\t\x1bOB\t\t\x1bOB\n")
         _wait_for_ui_text(ui, "Work Kit 이름:")
         ui.send("Integration Kit\nTemplate preview only\n1\nShell\nLocal command line\n\n".encode("utf-8"))
 
