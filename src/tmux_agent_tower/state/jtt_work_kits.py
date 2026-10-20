@@ -14,9 +14,21 @@ import stat
 from pathlib import Path
 from typing import Iterable
 
+from .jtt_store_lock import state_write_lock
+
 
 class WorkKitStoreError(RuntimeError):
     """Work Kit data is invalid or cannot be accessed safely."""
+
+
+class WorkKitStoreCommittedDurabilityError(WorkKitStoreError):
+    """A Work Kit replacement committed, but its directory sync failed."""
+
+    committed = True
+
+    def __init__(self, message: str, *, record_id: str | None = None):
+        super().__init__(message)
+        self.record_id = record_id
 
 
 _LAYOUT_BY_COUNT = {
@@ -100,60 +112,83 @@ class JTTWorkKitStore:
     def create_kit(self, name: str, description: str,
                    terminals: Iterable[dict]) -> dict:
         """Create a descriptive template; this method never starts terminals."""
-        existing = self.kits()
-        safe_name = " ".join(_text(name, "name", 80, one_line=True).split())
-        safe_description = _text(description, "description", 240, one_line=True,
-                                  allow_empty=True)
-        if any(item["name"].casefold() == safe_name.casefold() for item in existing):
-            raise WorkKitStoreError("A Work Kit with this name already exists")
-        specs = list(terminals)
-        layout = layout_for_terminal_count(len(specs))
-        normalized = []
-        names: set[str] = set()
-        used_template_ids = {
-            terminal["id"] for kit in existing for terminal in kit["terminals"]
-        }
-        for spec in specs:
-            if not isinstance(spec, dict) or set(spec) - {"name", "role", "working_directory"}:
-                raise WorkKitStoreError("Invalid Work Kit terminal template")
-            terminal_name = " ".join(
-                _text(spec.get("name"), "terminal name", 80, one_line=True).split()
-            )
-            role = " ".join(_text(spec.get("role"), "terminal role", 120,
-                                  one_line=True).split())
-            working_directory = spec.get("working_directory")
-            if working_directory is not None:
-                working_directory = _text(working_directory, "working directory", 1024,
-                                          one_line=True)
-            folded = terminal_name.casefold()
-            if folded in names:
-                raise WorkKitStoreError("Work Kit terminal names must be unique")
-            names.add(folded)
-            template_id = "template-" + secrets.token_hex(8)
-            while template_id in used_template_ids:
+        with state_write_lock(self.root, self._ensure_private_root, WorkKitStoreError):
+            existing = self.kits()
+            safe_name = " ".join(_text(name, "name", 80, one_line=True).split())
+            safe_description = _text(description, "description", 240, one_line=True,
+                                      allow_empty=True)
+            if any(item["name"].casefold() == safe_name.casefold() for item in existing):
+                raise WorkKitStoreError("A Work Kit with this name already exists")
+            specs = list(terminals)
+            layout = layout_for_terminal_count(len(specs))
+            normalized = []
+            names: set[str] = set()
+            used_template_ids = {
+                terminal["id"] for kit in existing for terminal in kit["terminals"]
+            }
+            for spec in specs:
+                if not isinstance(spec, dict) or set(spec) - {"name", "role", "working_directory"}:
+                    raise WorkKitStoreError("Invalid Work Kit terminal template")
+                terminal_name = " ".join(
+                    _text(spec.get("name"), "terminal name", 80, one_line=True).split()
+                )
+                role = " ".join(_text(spec.get("role"), "terminal role", 120,
+                                      one_line=True).split())
+                working_directory = spec.get("working_directory")
+                if working_directory is not None:
+                    working_directory = _text(working_directory, "working directory", 1024,
+                                              one_line=True)
+                folded = terminal_name.casefold()
+                if folded in names:
+                    raise WorkKitStoreError("Work Kit terminal names must be unique")
+                names.add(folded)
                 template_id = "template-" + secrets.token_hex(8)
-            used_template_ids.add(template_id)
-            normalized.append({
-                "id": template_id,
-                "name": terminal_name,
-                "role": role,
-                "working_directory": working_directory,
-            })
-        kit_id = "work-kit-" + secrets.token_hex(8)
-        used_kit_ids = {item["id"] for item in existing}
-        while kit_id in used_kit_ids:
+                while template_id in used_template_ids:
+                    template_id = "template-" + secrets.token_hex(8)
+                used_template_ids.add(template_id)
+                normalized.append({
+                    "id": template_id,
+                    "name": terminal_name,
+                    "role": role,
+                    "working_directory": working_directory,
+                })
             kit_id = "work-kit-" + secrets.token_hex(8)
-        kit = {
-            "id": kit_id,
-            "name": safe_name,
-            "description": safe_description,
-            "layout": layout,
-            "terminals": normalized,
-        }
-        # Use the same strict validator for objects written by this API.
-        self._validate_kit(kit)
-        self._write([*existing, kit])
-        return kit
+            used_kit_ids = {item["id"] for item in existing}
+            while kit_id in used_kit_ids:
+                kit_id = "work-kit-" + secrets.token_hex(8)
+            kit = {
+                "id": kit_id,
+                "name": safe_name,
+                "description": safe_description,
+                "layout": layout,
+                "terminals": normalized,
+            }
+            # Use the same strict validator for objects written by this API.
+            self._validate_kit(kit)
+            try:
+                self._write([*existing, kit])
+            except WorkKitStoreCommittedDurabilityError as exc:
+                raise WorkKitStoreCommittedDurabilityError(
+                    str(exc), record_id=kit["id"],
+                ) from exc
+            return kit
+
+    def delete_kit(self, kit_id: str, *, expected_snapshot: dict) -> dict:
+        """Delete one Work Kit only if its complete saved definition is unchanged."""
+        with state_write_lock(self.root, self._ensure_private_root, WorkKitStoreError):
+            kits = self.kits()
+            matches = [kit for kit in kits if kit["id"] == kit_id]
+            if len(matches) != 1:
+                raise WorkKitStoreError("Work Kit no longer exists")
+            current = matches[0]
+            try:
+                expected = self._validate_kit(expected_snapshot)
+            except WorkKitStoreError as exc:
+                raise WorkKitStoreError("Work Kit confirmation snapshot is invalid") from exc
+            if current != expected:
+                raise WorkKitStoreError("Work Kit changed before deletion")
+            self._write([kit for kit in kits if kit["id"] != kit_id])
+            return current
 
     def _validate_kit(self, value: object) -> dict:
         if not isinstance(value, dict) or set(value) != {
@@ -245,7 +280,7 @@ class JTTWorkKitStore:
                 raise
             if isinstance(exc, OSError):
                 if replaced:
-                    raise WorkKitStoreError(
+                    raise WorkKitStoreCommittedDurabilityError(
                         "Work Kit replacement completed but directory durability could not be confirmed"
                     ) from exc
                 raise WorkKitStoreError("Unable to write private Work Kit data") from exc
@@ -259,7 +294,10 @@ class JTTWorkKitStore:
             try:
                 info = current.lstat()
             except FileNotFoundError:
-                current.mkdir(mode=0o700)
+                try:
+                    current.mkdir(mode=0o700)
+                except FileExistsError:
+                    pass
                 info = current.lstat()
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
                 raise WorkKitStoreError("Unsafe JTT state directory")

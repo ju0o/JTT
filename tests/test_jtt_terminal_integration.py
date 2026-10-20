@@ -22,6 +22,7 @@ import uuid
 import pytest
 
 from tmux_agent_tower.state.jtt_workspaces import JTTWorkspaceStore
+from tmux_agent_tower.state.jtt_work_kits import JTTWorkKitStore
 from tmux_agent_tower.terminal import TerminalRegistry, renderer_available
 from tmux_agent_tower.ui import jtt
 from tmux_agent_tower.ui import ux_preview_v2 as renderer
@@ -332,6 +333,57 @@ def test_real_curses_launch_and_prefix_detach_does_not_autostart_a_shell(monkeyp
         assert not (root / "state").exists()
         ui.terminate()
         ui = None
+    finally:
+        if ui is not None:
+            ui.terminate()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_real_curses_work_kit_creation_selects_template_without_starting_shells(monkeypatch):
+    """Create and select a Work Kit through the actual curses PTY, not a mock UI."""
+    root = Path(tempfile.mkdtemp(prefix="jtt-work-kit-pty-"))
+    root.chmod(0o700)
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    import pyte
+    pyte_root = Path(pyte.__file__).resolve().parent.parent
+    _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
+    registry = TerminalRegistry(root=root / "state" / "terminals")
+    ui = None
+    try:
+        assert registry.list_sessions() == ()
+        ui = _UIProcess(root, source_root, pyte_root)
+        _wait_for_ui_text(ui, "터미널 배치")
+        assert registry.list_sessions() == ()
+
+        # With a fresh store the Work Kit create action follows the default
+        # workspace in LEFT. This enters the real text-prompt sequence.
+        ui.send(b"\x1bOB\n")  # xterm application-mode cursor-down, then Enter.
+        _wait_for_ui_text(ui, "Work Kit 이름:")
+        ui.send("Integration Kit\nTemplate preview only\n1\nShell\nLocal command line\n\n".encode("utf-8"))
+
+        _wait_for_ui_text(
+            ui, "Integration Kit Work Kit 저장 완료 · 터미널 1개 구성 · 아직 실행되지 않음",
+        )
+        # The newly created Kit is the selected LEFT entry and its saved
+        # template is visible as the selected CENTER card, not as a live PTY.
+        _wait_for_ui_text(ui, "▶ Integration Kit")
+        _wait_for_ui_text(ui, "▶ Shell")
+        _wait_for_ui_text(ui, "Local command line")
+        _wait_for_ui_text(ui, "터미널 · Shell")
+        _wait_for_ui_text(ui, "템플릿 · 셸/명령 미실행")
+        assert "실행 중인 터미널이 아닙니다." in ui.text()
+        assert "관찰 중" not in ui.text()
+        assert registry.list_sessions() == ()
+        kits = JTTWorkKitStore(root / "state").kits()
+        assert len(kits) == 1
+        assert kits[0]["name"] == "Integration Kit"
+        assert kits[0]["layout"] == "single"
+        assert not (root / "state" / "workspaces.json").exists()
+
+        ui.send(b"\x07d")
+        assert ui.exit() == 0
+        assert b"\x1b[?1049l" in ui.raw
+        assert registry.list_sessions() == ()
     finally:
         if ui is not None:
             ui.terminate()

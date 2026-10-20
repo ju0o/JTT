@@ -17,8 +17,16 @@ from ..state.jtt_keys import (
     JTTKeybindingsError,
     load_jtt_keybindings,
 )
-from ..state.jtt_work_kits import JTTWorkKitStore, WorkKitStoreError
-from ..state.jtt_workspaces import JTTWorkspaceStore, WorkspaceStoreError
+from ..state.jtt_work_kits import (
+    JTTWorkKitStore,
+    WorkKitStoreCommittedDurabilityError,
+    WorkKitStoreError,
+)
+from ..state.jtt_workspaces import (
+    JTTWorkspaceStore,
+    WorkspaceStoreCommittedDurabilityError,
+    WorkspaceStoreError,
+)
 from ..terminal import TerminalRegistry
 from . import ux_preview_v2 as renderer
 from .render import display_width, truncate_to_width
@@ -662,15 +670,21 @@ def _create_work_kit(stdscr, state: dict) -> None:
         return
     name = prompt_text(stdscr, "Work Kit 이름: ")
     if not name:
+        state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
+        state["jtt_notice_until"] = 0.0
         return
     description = prompt_text(stdscr, "한 줄 설명 (선택): ")
     if description is None:
+        state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
+        state["jtt_notice_until"] = 0.0
         return
     count_text = prompt_text(
         stdscr, "터미널 개수 (1–4): ",
         context_lines=["Work Kit은 템플릿만 저장합니다. 셸이나 명령은 실행되지 않습니다."],
     )
     if count_text is None:
+        state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
+        state["jtt_notice_until"] = 0.0
         return
     try:
         count = int(count_text)
@@ -680,14 +694,20 @@ def _create_work_kit(stdscr, state: dict) -> None:
         for index in range(count):
             terminal_name = prompt_text(stdscr, f"터미널 {index + 1} 이름: ")
             if not terminal_name:
+                state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
+                state["jtt_notice_until"] = 0.0
                 return
             role = prompt_text(stdscr, f"터미널 {index + 1} 역할: ")
             if not role:
+                state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
+                state["jtt_notice_until"] = 0.0
                 return
             working_directory = _prompt_working_directory(
                 stdscr, f"터미널 {index + 1} 작업 폴더 (선택): "
             )
             if working_directory is None:
+                state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
+                state["jtt_notice_until"] = 0.0
                 return
             terminals.append({
                 "name": terminal_name,
@@ -696,6 +716,18 @@ def _create_work_kit(stdscr, state: dict) -> None:
             })
         kit = state["jtt_work_kit_store"].create_kit(name, description, terminals)
         _refresh_work_kit_choices(state, kit["id"])
+        terminal_count = len(kit["terminals"])
+        state["jtt_notice"] = (
+            f"{kit['name']} Work Kit 저장 완료 · 터미널 {terminal_count}개 구성 · 아직 실행되지 않음"
+        )
+        state["jtt_notice_until"] = 0.0
+    except WorkKitStoreCommittedDurabilityError as exc:
+        _refresh_work_kit_choices(state, exc.record_id)
+        state["jtt_notice"] = (
+            f"Work Kit 저장 완료 · 터미널 {len(terminals)}개 구성 · "
+            "디렉터리 동기화 확인 필요 · 아직 실행되지 않음"
+        )
+        state["jtt_notice_until"] = 0.0
     except (ValueError, WorkKitStoreError):
         state["jtt_notice"] = "Work Kit 저장 상태를 확인할 수 없습니다 · 저장 데이터를 다시 확인하세요."
         state["jtt_notice_until"] = 0.0
@@ -807,14 +839,332 @@ def _save_configuration(stdscr, state: dict) -> None:
         )
         state["jtt_notice"] = f"{saved['name']} 구성을 저장했습니다."
         _refresh_workspaces(state, saved["id"])
+    except WorkspaceStoreCommittedDurabilityError as exc:
+        _refresh_workspaces(state, exc.record_id)
+        state["jtt_notice"] = f"{name} 구성 저장 반영됨 · 디렉터리 동기화 확인 필요"
     except WorkspaceStoreError:
         state["jtt_notice"] = "구성을 안전하게 저장하지 못했습니다."
 
 
+def _selected_choice(state: dict) -> dict | None:
+    choices = state.get("choices") or ()
+    index = int(state.get("nav_index", -1))
+    return choices[index] if 0 <= index < len(choices) else None
+
+
+def _capture_workspace_delete_target(state: dict) -> dict | None:
+    if state.get("work_kit_preview") is not None:
+        return None
+    choice = _selected_choice(state)
+    workspace_id = str(state.get("workspace_id") or "")
+    if (workspace_id == JTTWorkspaceStore.DEFAULT_ID or not choice
+            or choice.get("kind") != "workspace" or str(choice.get("id") or "") != workspace_id):
+        return None
+    try:
+        matches = [item for item in state["jtt_store"].workspaces()
+                   if str(item.get("id") or "") == workspace_id]
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        return None
+    if len(matches) != 1 or not matches[0].get("saved"):
+        return None
+    return {"workspace": dict(matches[0]),
+            "workspace_id": workspace_id,
+            "pane_index": int(state.get("pane_index", 0)),
+            "selected_target_id": str(state.get("selected_target_id") or ""),
+            "selected_signature": state.get("selected_signature")}
+
+
+def _capture_work_kit_delete_target(state: dict) -> dict | None:
+    preview = state.get("work_kit_preview")
+    choice = _selected_choice(state)
+    if (state.get("jtt_work_kit_error") or not isinstance(preview, dict) or not choice
+            or choice.get("kind") != "work_kit" or str(choice.get("id") or "") != preview.get("id")):
+        return None
+    try:
+        matches = [item for item in state["jtt_work_kit_store"].kits()
+                   if item["id"] == preview["id"]]
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkKitStoreError):
+        return None
+    if len(matches) != 1 or matches[0] != preview:
+        return None
+    return {"kit": matches[0], "pane_index": int(state.get("pane_index", 0)),
+            "selected_target_id": str(state.get("selected_target_id") or "")}
+
+
+def _capture_card_reference_target(state: dict) -> dict | None:
+    """Capture an uncertain or explicitly exited card for reference-only cleanup."""
+    row = renderer._selected_row(state)
+    if not row or row.get("terminal_kind") != "tower_managed":
+        return None
+    shell_state = str(row.get("terminal_shell_state") or "unknown").lower()
+    view_state = str(row.get("terminal_view_state") or "")
+    renderer_state = str(row.get("terminal_renderer_state") or "unknown")
+    confirmed_exited = (shell_state in {"exited", "dead", "stopped"}
+                        and view_state == "exited" and renderer_state == "ready")
+    uncertain = (shell_state not in {"running", "active", "exited", "dead", "stopped"}
+                 or view_state != "running_ready" or renderer_state != "ready"
+                 or bool(row.get("stale")) or bool(row.get("_live_stale")))
+    if not (confirmed_exited or uncertain):
+        return None
+
+    identity = row.get("managed_identity")
+    if not isinstance(identity, dict):
+        return None
+    session_id = str(identity.get("session_id") or "")
+    generation = str(identity.get("generation") or "")
+    has_shell_pid = "shell_pid" in identity
+    try:
+        pane_index = int(state.get("pane_index", 0))
+    except (TypeError, ValueError):
+        return None
+    signature = renderer._pane_signature(row)
+    if (not session_id or str(row.get("managed_id") or "") != session_id
+            or str(row.get("target_id") or "") != session_id
+            or str(state.get("selected_target_id") or "") != session_id):
+        return None
+
+    workspace_id = str(state.get("workspace_id") or "")
+    try:
+        workspaces = state["jtt_store"].workspaces()
+        workspace_matches = [item for item in workspaces if item["id"] == workspace_id]
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        return None
+    if (len(workspace_matches) != 1
+            or session_id not in workspace_matches[0]["terminal_ids"]):
+        return None
+
+    if not generation and not has_shell_pid:
+        if (set(identity) != {"session_id"} or signature is not None
+                or state.get("selected_signature") is not None
+                or shell_state != "unknown"
+                or view_state not in {"session_unavailable", "supervisor_connection_failed"}
+                or not row.get("stale") or not row.get("_live_stale")):
+            return None
+        try:
+            identities = state["jtt_registry"].list_sessions()
+            registry_state = "not_found"
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError):
+            identities = ()
+            registry_state = "lookup_unavailable"
+        if any(str(getattr(item, "session_id", "")) == session_id for item in identities):
+            return None
+        binding = (state.get("managed_terminals") or {}).get(session_id)
+        if (binding is not None
+                and str(getattr(binding, "session_id", "")) != session_id):
+            return None
+        return {
+            "session_id": session_id, "generation": "", "shell_pid": 0,
+            "workspace_id": workspace_id, "workspace_snapshot": dict(workspace_matches[0]),
+            "pane_index": pane_index, "target_id": session_id, "signature": None,
+            "binding": binding, "registry_state": registry_state,
+            "classification": "uncertain", "display_name": str(row.get("display_name") or "터미널"),
+            "sparse_identity": True,
+        }
+
+    if not generation or not has_shell_pid:
+        return None
+    try:
+        shell_pid = int(identity.get("shell_pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    if (shell_pid <= 0 or state.get("selected_signature") != signature
+            or signature != ("jtt", session_id, generation, str(shell_pid))):
+        return None
+    try:
+        identities = [item for item in state["jtt_registry"].list_sessions()
+                      if str(getattr(item, "session_id", "")) == session_id]
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError):
+        return None
+    if len(identities) != 1:
+        return None
+    registered = identities[0]
+    try:
+        registered_pid = int(getattr(registered, "shell_pid", -1))
+    except (TypeError, ValueError):
+        return None
+    registry_state = str(getattr(registered, "state", "unknown")).lower()
+    if (str(getattr(registered, "generation", "")) != generation
+            or registered_pid != shell_pid):
+        return None
+    if confirmed_exited and registry_state not in {"exited", "dead", "stopped"}:
+        confirmed_exited = False
+        uncertain = True
+    binding = (state.get("managed_terminals") or {}).get(session_id)
+    if binding is not None:
+        try:
+            binding_pid = int(getattr(binding, "shell_pid", -1))
+        except (TypeError, ValueError):
+            return None
+        if (str(getattr(binding, "session_id", "")) != session_id
+                or str(getattr(binding, "generation", "")) != generation
+                or binding_pid != shell_pid):
+            return None
+    return {
+        "session_id": session_id, "generation": generation, "shell_pid": shell_pid,
+        "workspace_id": workspace_id, "workspace_snapshot": dict(workspace_matches[0]),
+        "pane_index": pane_index, "target_id": session_id, "signature": signature,
+        "binding": binding, "registry_state": registry_state,
+        "classification": "exited" if confirmed_exited else "uncertain",
+        "display_name": str(row.get("display_name") or "터미널"),
+    }
+
+
+def _same_card_reference_target(first: dict | None, second: dict | None) -> bool:
+    if first is None or second is None:
+        return False
+    fields = ("session_id", "generation", "shell_pid", "workspace_id", "workspace_snapshot",
+              "pane_index", "target_id", "signature", "registry_state", "classification",
+              "sparse_identity")
+    return all(first.get(field) == second.get(field) for field in fields) and first.get("binding") is second.get("binding")
+
+
+def _remove_card_reference(stdscr, state: dict, *, confirmed_exited: bool = False) -> None:
+    target = _capture_card_reference_target(state)
+    if target is None or (confirmed_exited and target["classification"] != "exited"):
+        state["jtt_notice"] = "카드 신원을 확인할 수 없어 참조 정리를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    if target["classification"] == "exited":
+        title = "종료된 터미널 카드 제거"
+        label = f"{target['display_name']} 카드 제거"
+    else:
+        title = "터미널 카드 참조 정리"
+        label = f"{target['display_name']} 카드 정리"
+    confirm = run_list_picker(
+        stdscr, title, [("cancel", "취소"), ("remove", label)], centered=True,
+        footer_hint=("취소가 기본 선택입니다 · 현재 작업공간 카드 참조만 제거합니다. "
+                     "셸·PTY·Supervisor는 종료하지 않습니다."),
+        preamble=(
+            ["세션 생존 여부는 확인되지 않았습니다.",
+             "다른 작업공간 참조는 유지됩니다. 마지막 참조는 기본/복구 작업공간으로 보관합니다."]
+            if target["classification"] == "uncertain" else
+            ["다른 작업공간 참조는 유지됩니다. 마지막 참조는 기본/복구 작업공간으로 보관합니다."]
+        ),
+    )
+    if confirm.cancelled or confirm.selected_key != "remove":
+        return
+
+    current = _capture_card_reference_target(state)
+    if not _same_card_reference_target(target, current):
+        state["jtt_notice"] = "선택 또는 세션 신원이 변경되어 카드 제거를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    clients = state.get("managed_terminals")
+    if not isinstance(clients, dict) or clients.get(target["session_id"]) is not target["binding"]:
+        state["jtt_notice"] = "터미널 연결 상태가 변경되어 카드 제거를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    try:
+        state["jtt_store"].remove_terminal_reference(
+            target["workspace_id"], target["session_id"],
+            expected_snapshot=target["workspace_snapshot"],
+        )
+        _finish_card_reference_removal(state, target)
+        state["jtt_notice"] = "카드 참조만 제거했습니다 · 셸과 Supervisor는 종료하지 않았습니다."
+    except WorkspaceStoreCommittedDurabilityError:
+        _finish_card_reference_removal(state, target)
+        state["jtt_notice"] = (
+            "카드 참조 정리 반영됨 · 실행 상태는 바뀌지 않음 · 디렉터리 동기화 확인 필요"
+        )
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        state["jtt_notice"] = "카드를 안전하게 정리하지 못했습니다. 작업공간 상태를 다시 확인하세요."
+    state["jtt_notice_until"] = 0.0
+
+
+def _finish_card_reference_removal(state: dict, target: dict) -> None:
+    clients = state["managed_terminals"]
+    binding = clients.pop(target["session_id"], None)
+    if binding is not None:
+        binding.close()  # Detach this UI client only; the PTY and supervisor remain.
+    _refresh_workspaces(state, target["workspace_id"])
+
+
+def _confirm_and_delete_workspace(stdscr, state: dict) -> None:
+    target = _capture_workspace_delete_target(state)
+    if target is None:
+        state["jtt_notice"] = "저장 작업공간을 확인할 수 없어 삭제를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    confirm = run_list_picker(
+        stdscr, "저장 작업공간 삭제",
+        [("cancel", "취소"),
+         ("delete", f"{target['workspace']['name']} 삭제 · 포함 터미널 "
+                    f"{len(target['workspace']['terminal_ids'])}개")],
+        centered=True, footer_hint="취소가 기본 선택입니다 · 셸은 종료하지 않습니다.",
+        preamble=["이 작업공간만 삭제합니다. 마지막 터미널 참조는 내 작업공간으로 이동합니다."],
+    )
+    if confirm.cancelled or confirm.selected_key != "delete":
+        return
+    current = _capture_workspace_delete_target(state)
+    if current != target:
+        state["jtt_notice"] = "선택 작업공간이 변경되어 삭제를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    try:
+        state["jtt_store"].delete_workspace(
+            target["workspace_id"], expected_snapshot=target["workspace"],
+        )
+        _refresh_workspaces(state, JTTWorkspaceStore.DEFAULT_ID)
+        state["jtt_notice"] = "작업공간을 삭제했습니다 · 셸은 유지되고 마지막 참조는 내 작업공간으로 이동했습니다."
+    except WorkspaceStoreCommittedDurabilityError:
+        _refresh_workspaces(state, JTTWorkspaceStore.DEFAULT_ID)
+        state["jtt_notice"] = (
+            "작업공간 삭제 반영됨 · 마지막 참조는 내 작업공간으로 이동 · "
+            "디렉터리 동기화 확인 필요"
+        )
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        state["jtt_notice"] = "작업공간을 안전하게 삭제하지 못했습니다. 상태를 다시 확인하세요."
+    state["jtt_notice_until"] = 0.0
+
+
+def _confirm_and_delete_work_kit(stdscr, state: dict) -> None:
+    target = _capture_work_kit_delete_target(state)
+    if target is None:
+        state["jtt_notice"] = "Work Kit을 확인할 수 없어 삭제를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    kit = target["kit"]
+    confirm = run_list_picker(
+        stdscr, "Work Kit 삭제",
+        [("cancel", "취소"), ("delete", f"{kit['name']} 삭제")],
+        centered=True, footer_hint="취소가 기본 선택입니다 · 실행 중인 터미널은 변경하지 않습니다.",
+        preamble=["선택한 템플릿 정의만 삭제합니다 · 작업공간과 셸은 변경하지 않습니다."],
+    )
+    if confirm.cancelled or confirm.selected_key != "delete":
+        return
+    current = _capture_work_kit_delete_target(state)
+    if current != target:
+        state["jtt_notice"] = "선택 Work Kit이 변경되어 삭제를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    try:
+        state["jtt_work_kit_store"].delete_kit(kit["id"], expected_snapshot=kit)
+        _refresh_workspaces(state, JTTWorkspaceStore.DEFAULT_ID)
+        state["jtt_notice"] = "Work Kit 템플릿만 삭제했습니다 · 터미널과 작업공간은 변경하지 않았습니다."
+    except WorkKitStoreCommittedDurabilityError:
+        _refresh_workspaces(state, JTTWorkspaceStore.DEFAULT_ID)
+        state["jtt_notice"] = "Work Kit 삭제 반영됨 · 디렉터리 동기화 확인 필요"
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkKitStoreError):
+        state["jtt_notice"] = "Work Kit을 안전하게 삭제하지 못했습니다. 템플릿 상태를 다시 확인하세요."
+    state["jtt_notice_until"] = 0.0
+
+
 def _settings_menu(stdscr, state: dict) -> None:
+    actions = [("new", "새 작업공간"), ("help", "키 안내")]
+    if state.get("work_kit_preview") is not None:
+        if _capture_work_kit_delete_target(state) is not None:
+            actions.append(("delete_kit", "선택한 Work Kit 삭제"))
+    else:
+        if _capture_workspace_delete_target(state) is not None:
+            actions.append(("delete_workspace", "선택한 저장 작업공간 삭제"))
+        row = renderer._selected_row(state)
+        if row and row.get("terminal_kind") == "tower_managed":
+            if _capture_card_reference_target(state) is not None:
+                actions.append(("cleanup_card", "선택한 터미널 카드 참조 정리"))
+            if _capture_stop_target(state) is not None:
+                actions.append(("stop", "선택한 터미널 종료"))
     result = run_list_picker(
-        stdscr, "설정 · 메뉴", [("new", "새 작업공간"), ("help", "키 안내"),
-                                ("stop", "선택한 터미널 종료")],
+        stdscr, "설정 · 메뉴", actions,
         centered=True, footer_hint="↑↓ 이동 · Enter 선택 · Esc 취소",
     )
     if result.cancelled or result.selected_key is None:
@@ -827,10 +1177,19 @@ def _settings_menu(stdscr, state: dict) -> None:
             item = state["jtt_store"].create_workspace(name)
             _refresh_workspaces(state, item["id"])
             state["jtt_notice"] = "새 빈 작업공간을 만들었습니다."
+        except WorkspaceStoreCommittedDurabilityError as exc:
+            _refresh_workspaces(state, exc.record_id)
+            state["jtt_notice"] = f"{name} 작업공간 생성 반영됨 · 디렉터리 동기화 확인 필요"
         except WorkspaceStoreError:
             state["jtt_notice"] = "작업공간을 안전하게 저장하지 못했습니다."
     elif result.selected_key == "stop":
         _confirm_and_stop_selected_terminal(stdscr, state)
+    elif result.selected_key == "delete_workspace":
+        _confirm_and_delete_workspace(stdscr, state)
+    elif result.selected_key == "delete_kit":
+        _confirm_and_delete_work_kit(stdscr, state)
+    elif result.selected_key == "cleanup_card":
+        _remove_card_reference(stdscr, state)
     else:
         keys = state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS)
         show_message_screen(
@@ -910,140 +1269,13 @@ def _capture_stop_target(state: dict) -> dict | None:
 
 
 def _capture_exited_card_target(state: dict) -> dict | None:
-    """Capture an exactly identified, confirmed-exited card for reference removal.
-
-    This path never stops a terminal. It is intentionally stricter than the
-    normal running-terminal stop path: renderer/supervisor uncertainty or any
-    state other than an explicit registry ``exited`` state blocks cleanup.
-    """
-
-    row = renderer._selected_row(state)
-    if (not row or row.get("terminal_kind") != "tower_managed"
-            or str(row.get("terminal_shell_state") or "").lower() != "exited"
-            or str(row.get("terminal_view_state") or "") != "exited"
-            or str(row.get("terminal_renderer_state") or "") != "ready"):
-        return None
-    identity = row.get("managed_identity")
-    if not isinstance(identity, dict):
-        return None
-    session_id = str(identity.get("session_id") or "")
-    generation = str(identity.get("generation") or "")
-    try:
-        shell_pid = int(identity.get("shell_pid") or 0)
-        pane_index = int(state.get("pane_index", 0))
-    except (TypeError, ValueError):
-        return None
-    target_id = str(row.get("target_id") or "")
-    signature = renderer._pane_signature(row)
-    if (not session_id or not generation or shell_pid <= 0
-            or str(row.get("managed_id") or "") != session_id
-            or target_id != session_id
-            or str(state.get("selected_target_id") or "") != target_id
-            or state.get("selected_signature") != signature
-            or signature != ("jtt", session_id, generation, str(shell_pid))):
-        return None
-
-    binding = renderer._managed_binding(state)
-    if (binding is None or not binding.matches(row)
-            or binding.session_id != session_id
-            or binding.generation != generation or binding.shell_pid != shell_pid):
-        return None
-
-    workspace_id = str(state.get("workspace_id") or "")
-    try:
-        workspaces = state["jtt_store"].workspaces()
-        workspace_matches = [item for item in workspaces
-                             if str(item.get("id")) == workspace_id]
-        identities = [item for item in state["jtt_registry"].list_sessions()
-                      if str(getattr(item, "session_id", "")) == session_id]
-    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
-        return None
-    if len(workspace_matches) != 1 or len(identities) != 1:
-        return None
-    workspace = workspace_matches[0]
-    if session_id not in {str(item) for item in workspace.get("terminal_ids", ())}:
-        return None
-    registered = identities[0]
-    try:
-        registered_pid = int(getattr(registered, "shell_pid", -1))
-    except (TypeError, ValueError):
-        return None
-    if (str(getattr(registered, "generation", "")) != generation
-            or registered_pid != shell_pid
-            or str(getattr(registered, "state", "")).lower() != "exited"):
-        return None
-    return {
-        "session_id": session_id,
-        "generation": generation,
-        "shell_pid": shell_pid,
-        "workspace_id": workspace_id,
-        "pane_index": pane_index,
-        "target_id": target_id,
-        "signature": signature,
-        "binding": binding,
-        "display_name": str(row.get("display_name") or "터미널"),
-    }
+    target = _capture_card_reference_target(state)
+    return target if target and target["classification"] == "exited" else None
 
 
 def _confirm_and_remove_exited_card(stdscr, state: dict) -> None:
-    """Remove only the selected exited session ID from the current workspace."""
-
-    target = _capture_exited_card_target(state)
-    if target is None:
-        state["jtt_notice"] = "종료 상태와 신원을 확인할 수 없어 카드 제거를 차단했습니다."
-        state["jtt_notice_until"] = 0.0
-        return
-    confirm = run_list_picker(
-        stdscr,
-        "종료된 터미널 카드 제거",
-        [("cancel", "취소"), ("remove", f"{target['display_name']} 카드 제거")],
-        centered=True,
-        footer_hint="현재 작업공간의 카드 참조만 제거합니다 · 터미널 파일과 다른 작업공간은 유지됩니다.",
-    )
-    if confirm.cancelled or confirm.selected_key != "remove":
-        return
-
-    current = _capture_exited_card_target(state)
-    if (current is None
-            or current["session_id"] != target["session_id"]
-            or current["generation"] != target["generation"]
-            or current["shell_pid"] != target["shell_pid"]
-            or current["workspace_id"] != target["workspace_id"]
-            or current["pane_index"] != target["pane_index"]
-            or current["target_id"] != target["target_id"]
-            or current["signature"] != target["signature"]
-            or current["binding"] is not target["binding"]):
-        state["jtt_notice"] = "선택 터미널이 변경되어 카드 제거를 차단했습니다. 다시 확인하세요."
-        state["jtt_notice_until"] = 0.0
-        return
-
-    session_id = target["session_id"]
-    workspace_id = target["workspace_id"]
-    try:
-        clients = state.get("managed_terminals")
-        if (not isinstance(clients, dict)
-                or clients.get(session_id) is not target["binding"]):
-            raise WorkspaceStoreError("Terminal client binding changed")
-        workspaces = state["jtt_store"].workspaces()
-        workspace_matches = [item for item in workspaces
-                             if str(item.get("id")) == workspace_id]
-        if (len(workspace_matches) != 1
-                or session_id not in {str(item) for item in
-                                      workspace_matches[0].get("terminal_ids", ())}):
-            raise WorkspaceStoreError("Workspace membership changed")
-        workspace = workspace_matches[0]
-        state["jtt_store"].set_terminal_ids(
-            workspace_id,
-            [item for item in workspace["terminal_ids"] if str(item) != session_id],
-        )
-        binding = clients.pop(session_id, None)
-        if binding:
-            binding.close()  # Close this UI client only; never stop/unlink the session.
-        _refresh_workspaces(state, workspace_id)
-        state["jtt_notice"] = "종료된 터미널 카드를 현재 작업공간에서 제거했습니다."
-    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
-        state["jtt_notice"] = "카드를 제거하지 못했습니다. 작업공간 상태를 다시 확인하세요."
-    state["jtt_notice_until"] = 0.0
+    """Remove a confirmed-exited card through the recoverable ref-only path."""
+    _remove_card_reference(stdscr, state, confirmed_exited=True)
 
 
 def _confirm_and_stop_selected_terminal(stdscr, state: dict) -> None:
@@ -1098,13 +1330,22 @@ def _confirm_and_stop_selected_terminal(stdscr, state: dict) -> None:
             workspace_id,
             [item for item in workspace["terminal_ids"] if str(item) != session_id],
         )
+    except WorkspaceStoreCommittedDurabilityError:
+        binding = state["managed_terminals"].pop(session_id, None)
+        if binding:
+            binding.close()
+        _refresh_workspaces(state, workspace_id)
+        state["jtt_notice"] = (
+            "선택 터미널 종료 및 카드 제거 반영됨 · 디렉터리 동기화 확인 필요"
+        )
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        state["jtt_notice"] = "선택한 터미널을 종료하지 못했습니다. 작업 상태는 다시 확인하세요."
+    else:
         binding = state["managed_terminals"].pop(session_id, None)
         if binding:
             binding.close()
         _refresh_workspaces(state, workspace_id)
         state["jtt_notice"] = "선택한 터미널을 종료했습니다."
-    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
-        state["jtt_notice"] = "선택한 터미널을 종료하지 못했습니다. 작업 상태는 다시 확인하세요."
     state["jtt_notice_until"] = 0.0
 
 
@@ -1127,18 +1368,13 @@ def _create_terminal(stdscr, state: dict) -> None:
         workspace_id = state["workspace_id"]
         workspace = next(item for item in state["jtt_store"].workspaces() if item["id"] == workspace_id)
         state["jtt_store"].set_terminal_ids(workspace_id, [*workspace["terminal_ids"], session_id])
-        _refresh_workspaces(state, workspace_id)
-        state["pane_index"] = max(0, len(state["panes"]) - 1)
-        state["active_panel"] = 2
-        state["center_actions_focused"] = False
-        state["selected_target_id"] = str(state["panes"][state["pane_index"]].get("target_id") or "")
-        state["selected_signature"] = renderer._pane_signature(state["panes"][state["pane_index"]])
-        state["jtt_pending_auto_acquire"] = {
-            "session_id": session_id,
-            "deadline": time.monotonic() + 2.5,
-        }
-        state["jtt_notice"] = "새 로컬 셸 생성 · 화면과 입력 준비 확인 중"
+    except WorkspaceStoreCommittedDurabilityError:
+        _select_created_terminal(state, session_id)
+        state["jtt_notice"] = (
+            "새 로컬 셸 및 작업공간 카드 반영됨 · 디렉터리 동기화 확인 필요"
+        )
         state["jtt_notice_until"] = 0.0
+        return
     except (OSError, RuntimeError, ValueError, WorkspaceStoreError) as exc:
         if session_id:
             try:
@@ -1155,6 +1391,30 @@ def _create_terminal(stdscr, state: dict) -> None:
         state["jtt_notice"] = (detail[:120] if detail else
                                 "새 터미널을 만들지 못했습니다. 기존 작업은 변경되지 않았습니다.")
         state["jtt_notice_until"] = 0.0
+        return
+
+    _select_created_terminal(state, session_id)
+    state["jtt_notice"] = "새 로컬 셸 생성 · 화면과 입력 준비 확인 중"
+    state["jtt_notice_until"] = 0.0
+
+
+def _select_created_terminal(state: dict, session_id: str) -> None:
+    workspace_id = state["workspace_id"]
+    _refresh_workspaces(state, workspace_id)
+    pane_index = next((index for index, row in enumerate(state["panes"])
+                       if str(row.get("managed_id") or "") == session_id), None)
+    if pane_index is None:
+        raise WorkspaceStoreError("Created terminal reference is unavailable")
+    state["pane_index"] = pane_index
+    state["active_panel"] = 2
+    state["center_actions_focused"] = False
+    row = state["panes"][pane_index]
+    state["selected_target_id"] = str(row.get("target_id") or "")
+    state["selected_signature"] = renderer._pane_signature(row)
+    state["jtt_pending_auto_acquire"] = {
+        "session_id": session_id,
+        "deadline": time.monotonic() + 2.5,
+    }
 
 
 def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
