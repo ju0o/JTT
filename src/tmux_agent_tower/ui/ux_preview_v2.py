@@ -337,16 +337,20 @@ def _put(stdscr, y: int, x: int, width: int, text: str, attr: int = 0) -> None:
     safe_add(stdscr, y, x, truncate_to_width(text, width), attr)
 
 
-def _draw_box(stdscr, rect, title: str, active: bool = False) -> tuple[int, int, int, int]:
+def _draw_box(stdscr, rect, title: str, active: bool = False, *, unicode: bool = False) -> tuple[int, int, int, int]:
     x, y, width, height = rect
     if width < 4 or height < 3:
         return x + 1, y + 1, max(0, width - 2), max(0, height - 2)
     edge_attr = (_color(_COLOR_ACTIVE) | curses.A_BOLD) if active else curses.A_DIM
-    _put(stdscr, y, x, width, "+" + "-" * (width - 2) + "+", edge_attr)
-    _put(stdscr, y + height - 1, x, width, "+" + "-" * (width - 2) + "+", edge_attr)
+    top_left, horizontal, top_right, vertical, bottom_left, bottom_right = (
+        ("┌", "─", "┐", "│", "└", "┘") if unicode else ("+", "-", "+", "|", "+", "+")
+    )
+    _put(stdscr, y, x, width, top_left + horizontal * (width - 2) + top_right, edge_attr)
+    _put(stdscr, y + height - 1, x, width,
+         bottom_left + horizontal * (width - 2) + bottom_right, edge_attr)
     for row in range(y + 1, y + height - 1):
-        _put(stdscr, row, x, 1, "|", edge_attr)
-        _put(stdscr, row, x + width - 1, 1, "|", edge_attr)
+        _put(stdscr, row, x, 1, vertical, edge_attr)
+        _put(stdscr, row, x + width - 1, 1, vertical, edge_attr)
     title_attr = (_color(_COLOR_ACTIVE) | curses.A_BOLD) if active else curses.A_BOLD
     safe_add(stdscr, y, x + 2, " " + truncate_to_width(title, max(1, width - 5)) + " ", title_attr)
     return x + 1, y + 1, width - 2, height - 2
@@ -356,10 +360,10 @@ def _status(row: dict) -> str:
     if row.get("terminal_kind") == "tower_managed":
         view_state = str(row.get("terminal_view_state") or "unknown")
         return {
-            "running_ready": "● 터미널 실행 중",
-            "renderer_missing": "● 셸 실행 중 · 렌더러 없음",
-            "renderer_error": "● 셸 실행 중 · 렌더러 오류",
-            "resyncing": "↻ 화면 재동기화 중",
+            "running_ready": "● 셸 실행 중 · 화면 준비됨",
+            "renderer_missing": "● 셸 실행 중 · 화면 렌더러 없음",
+            "renderer_error": "● 셸 실행 중 · 화면 렌더러 오류",
+            "resyncing": "↻ 셸 실행 중 · 화면 재동기화",
             "supervisor_connection_failed": "! Supervisor 연결 실패",
             "session_unavailable": "? 세션 조회 불가",
             "exited": "× 셸 종료",
@@ -395,7 +399,8 @@ def _append_hit(state: dict, rect, kind: str, index: int = -1) -> None:
 
 
 def _draw_left(stdscr, rect, state: dict, active: bool) -> None:
-    ix, iy, iw, ih = _draw_box(stdscr, rect, "내 작업공간", active)
+    unicode = state.get("runtime_mode") == "jtt"
+    ix, iy, iw, ih = _draw_box(stdscr, rect, "내 작업공간", active, unicode=unicode)
     choices = state["choices"]
     windows = [(i, item) for i, item in enumerate(choices)
                if item.get("group") == "windows" and item.get("kind") == "workspace"]
@@ -422,23 +427,26 @@ def _draw_left(stdscr, rect, state: dict, active: bool) -> None:
     windows_rect = (ix, cursor, iw, windows_height)
     _draw_choice_group(stdscr, windows_rect,
                        "작업공간" if state.get("runtime_mode") == "jtt" else "Windows",
-                       windows, state, active)
+                       windows, state, active, unicode=unicode)
     cursor += windows_height + gap
     if remote:
         remote_rect = (ix, cursor, iw, remote_height)
-        _draw_choice_group(stdscr, remote_rect, "원격 연결", remote, state, active)
+        _draw_choice_group(stdscr, remote_rect, "원격 연결", remote, state, active, unicode=unicode)
         cursor += remote_height + gap
     saved_rect = (ix, cursor, iw, saved_height)
-    _draw_choice_group(stdscr, saved_rect, "저장한 작업", saved, state, active)
+    _draw_choice_group(stdscr, saved_rect, "저장한 작업", saved, state, active, unicode=unicode)
     cursor += saved_height + gap
     for index, item in actions:
         action_rect = (ix, cursor, iw, action_height)
-        _draw_action_choice(stdscr, action_rect, index, item, state, active)
+        _draw_action_choice(stdscr, action_rect, index, item, state, active, unicode=unicode)
         cursor += action_height + gap
 
 
-def _draw_choice_group(stdscr, rect, title, items, state, active):
-    ix, iy, iw, ih = _draw_box(stdscr, rect, title, active and any(i == state["nav_index"] for i, _ in items))
+def _draw_choice_group(stdscr, rect, title, items, state, active, *, unicode=False):
+    ix, iy, iw, ih = _draw_box(
+        stdscr, rect, title, active and any(i == state["nav_index"] for i, _ in items),
+        unicode=unicode,
+    )
     visible = max(0, min(len(items), ih))
     group = next((item.get("group") for _choice_index, item in items), title)
     selected_position = next((position for position, (choice_index, _item) in enumerate(items)
@@ -466,11 +474,11 @@ def _draw_choice_group(stdscr, rect, title, items, state, active):
             _append_hit(state, (ix, line_y, iw, 1), "left", choice_index)
 
 
-def _draw_action_choice(stdscr, rect, choice_index, item, state, active):
+def _draw_action_choice(stdscr, rect, choice_index, item, state, active, *, unicode=False):
     x, y, width, height = rect
     selected = choice_index == state["nav_index"]
     if height >= 3:
-        _draw_box(stdscr, rect, "", active and selected)
+        _draw_box(stdscr, rect, "", active and selected, unicode=unicode)
         label_y = y + height // 2
     else:
         label_y = y
@@ -482,14 +490,18 @@ def _draw_action_choice(stdscr, rect, choice_index, item, state, active):
     _append_hit(state, rect, "left", choice_index)
 
 
-def _draw_card(stdscr, rect, row: dict, selected: bool) -> None:
+def _draw_card(stdscr, rect, row: dict, selected: bool, *, unicode: bool = False) -> None:
     index, x, y, width, height = rect
     attr = (_color(_COLOR_SELECTED) | curses.A_BOLD) if selected else curses.A_DIM
-    _put(stdscr, y, x, width, "+" + "-" * max(0, width - 2) + "+", attr)
+    top_left, horizontal, top_right, vertical, bottom_left, bottom_right = (
+        ("┌", "─", "┐", "│", "└", "┘") if unicode else ("+", "-", "+", "|", "+", "+")
+    )
+    _put(stdscr, y, x, width, top_left + horizontal * max(0, width - 2) + top_right, attr)
     for line_y in range(y + 1, y + height - 1):
-        _put(stdscr, line_y, x, 1, "|", attr)
-        _put(stdscr, line_y, x + width - 1, 1, "|", attr)
-    _put(stdscr, y + height - 1, x, width, "+" + "-" * max(0, width - 2) + "+", attr)
+        _put(stdscr, line_y, x, 1, vertical, attr)
+        _put(stdscr, line_y, x + width - 1, 1, vertical, attr)
+    _put(stdscr, y + height - 1, x, width,
+         bottom_left + horizontal * max(0, width - 2) + bottom_right, attr)
     name = str(row.get("display_name") or row.get("task_name") or "Pane")
     marker = "▶ " if selected else "  "
     _put(stdscr, y + 1, x + 1, width - 2, marker + name,
@@ -510,19 +522,22 @@ def _draw_card(stdscr, rect, row: dict, selected: bool) -> None:
 
 def _draw_center(stdscr, rect, state: dict, active: bool) -> None:
     center_title = "터미널 배치" if state.get("runtime_mode") == "jtt" else "Pane 배치"
-    inner = _draw_box(stdscr, rect, center_title, active)
+    unicode = state.get("runtime_mode") == "jtt"
+    inner = _draw_box(stdscr, rect, center_title, active, unicode=unicode)
     ix, iy, iw, ih = inner
     workspace_name = state.get("workspace_name") or "Windows"
     _put(stdscr, iy, ix + 1, max(1, iw - 2), workspace_name, curses.A_BOLD)
     panes = state["panes"]
     if not panes:
-        _put(stdscr, iy + 2, ix + 1, max(0, iw - 2), "Pane 없음", curses.A_DIM)
+        empty = ("이 작업공간에 터미널 없음 · Ctrl+G n 새 터미널"
+                 if unicode else "Pane 없음")
+        _put(stdscr, iy + 2, ix + 1, max(0, iw - 2), empty, curses.A_DIM)
     else:
         card_area = (ix + 1, iy + 2, max(1, iw - 2), max(1, ih - 5))
         cards = card_rectangles(len(panes), card_area, scroll_row=state["card_scroll"])
         for item in cards:
             pane_index, x, y, width, height = item
-            _draw_card(stdscr, item, panes[pane_index], pane_index == state["pane_index"])
+            _draw_card(stdscr, item, panes[pane_index], pane_index == state["pane_index"], unicode=unicode)
             _append_hit(state, (x, y, width, height), "pane", pane_index)
     _draw_center_actions(stdscr, (ix + 1, iy + ih - 1, max(1, iw - 2), 1), state)
 
@@ -575,7 +590,8 @@ def _draw_right(stdscr, rect, state: dict, active: bool) -> None:
     row = panes[state["pane_index"]] if panes else None
     pane_name = str((row or {}).get("display_name") or (row or {}).get("pane_id") or "LIVE")
     right_title = "터미널" if state.get("runtime_mode") == "jtt" else "LIVE"
-    inner = _draw_box(stdscr, rect, f"{right_title} · {pane_name}", active)
+    unicode = state.get("runtime_mode") == "jtt"
+    inner = _draw_box(stdscr, rect, f"{right_title} · {pane_name}", active, unicode=unicode)
     if row and row.get("terminal_kind") == "tower_managed":
         binding = _managed_binding(state)
         if binding is not None:
@@ -624,7 +640,8 @@ def _draw_dialog(stdscr, state):
     box_height = min(7, max(5, height - 2))
     x = max(0, (width - box_width) // 2)
     y = max(0, (height - box_height) // 2)
-    inner = _draw_box(stdscr, (x, y, box_width, box_height), dialog["title"], True)
+    inner = _draw_box(stdscr, (x, y, box_width, box_height), dialog["title"], True,
+                      unicode=state.get("runtime_mode") == "jtt")
     ix, iy, iw, ih = inner
     body = dialog.get("body") or ""
     if body and ih > 1:
@@ -663,7 +680,7 @@ def draw_preview_v2(stdscr, state: dict) -> None:
         pass
 
 
-_JTT_PREFIX_TIMEOUT = 1.5
+_JTT_PREFIX_TIMEOUT = 4.0
 
 
 def _is_ctrl_g(key) -> bool:
@@ -691,19 +708,21 @@ def _draw_jtt_footer(stdscr, state: dict, width: int, height: int) -> None:
     if notice and not state.get("jtt_notice_until"):
         state["jtt_notice_until"] = now + 2.0
     if notice and now < float(state.get("jtt_notice_until") or 0.0):
-        text = notice
+        text = f"JTT — Ju0 Terminal Tower · {notice}"
     elif state.get("jtt_prefix_pending"):
-        text = "Ctrl+G → n 새 터미널 · h/l 이동 · w 작업공간 · d 종료 · ? 도움 · Esc 취소 · Ctrl+G 전송"
+        text = "JTT — Ju0 Terminal Tower · Ctrl+G 4초 내: n 새 · h/l 카드 · w 작업공간 · x 터미널 종료 · d UI 분리 · ? 도움 · Esc 취소 · Ctrl+G 전송"
     elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
-        text = "Ctrl+] 탐색 복귀 · Ctrl+G 명령"
+        text = "JTT — Ju0 Terminal Tower · Ctrl+] 탐색 복귀 · Ctrl+G 명령 대기(4초)"
     else:
-        text = "Ctrl+G 명령 · Tab/Shift+Tab 패널 · Enter 입력 · Q 종료"
-    compact = "Ctrl+G 명령 · Enter 입력 · Q 종료"
-    if width < 100:
+        text = "JTT — Ju0 Terminal Tower · Ctrl+G 명령(4초) · Tab/Shift+Tab 패널 · Enter 입력 · Q UI 분리 · Ctrl+G x 종료"
+    compact = "JTT · Ctrl+G(4초) · Tab 패널 · Enter 입력 · Q 분리 · Ctrl+G x 종료"
+    # _regions() switches to the compact single-panel layout below 110 cols;
+    # keep the footer equally compact so the prefixed stop command stays visible.
+    if width < 110:
         if state.get("jtt_prefix_pending"):
-            text = "Ctrl+G: n 새터미널 h/l 이동 w 작업공간 d 종료 ? 도움 Esc 취소"
+            text = "JTT · Ctrl+G 4초: n 새 h/l 카드 w 작업 x 종료 d 분리 ? 도움 Esc 취소"
         elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
-            text = "Ctrl+] 탐색 · Ctrl+G 명령"
+            text = "JTT · Ctrl+] 탐색 · Ctrl+G(4초) 명령"
         elif not notice or now >= float(state.get("jtt_notice_until") or 0.0):
             text = compact
     _put(stdscr, height - 1, 1, max(1, width - 2), text, curses.A_DIM)
@@ -735,7 +754,7 @@ def _handle_jtt_prefix(stdscr, state: dict, key) -> tuple[bool, bool]:
             return True, False
         command = key.lower() if isinstance(key, str) and len(key) == 1 else None
         handler = state.get("jtt_prefix_handler")
-        if command in {"n", "h", "l", "w", "d", "?"} and callable(handler):
+        if command in {"n", "h", "l", "w", "x", "d", "?"} and callable(handler):
             return True, bool(handler(stdscr, state, command))
         state["jtt_notice"] = "알 수 없는 Ctrl+G 명령 · ? 도움"
         state["jtt_notice_until"] = 0.0

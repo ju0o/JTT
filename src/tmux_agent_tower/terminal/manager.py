@@ -576,11 +576,37 @@ class TerminalRegistry:
             raise TerminalError("terminal socket path is too long for this platform")
         return TerminalClient(session_dir, identity)
 
-    def stop(self, session_id: str) -> None:
+    def stop(
+        self,
+        session_id: str,
+        *,
+        expected_generation: Optional[str] = None,
+        expected_shell_pid: Optional[int] = None,
+    ) -> None:
+        """Stop one session, optionally requiring the UI-captured identity.
+
+        The second validation is deliberately performed on the connected
+        client's identity as well as on the registry snapshot. This prevents a
+        stale card from stopping a replacement session that reused its opaque
+        session id while a confirmation dialog was open.
+        """
+
         session_dir, metadata = _validate_identity(self.root, session_id)
         ident = _identity(metadata)
+        if (expected_generation is not None
+                and ident.generation != str(expected_generation)):
+            raise TerminalError("terminal identity changed before stop")
+        if (expected_shell_pid is not None
+                and ident.shell_pid != int(expected_shell_pid)):
+            raise TerminalError("terminal identity changed before stop")
         client = self.connect(session_id)
         try:
+            if (expected_generation is not None
+                    and client.identity.generation != str(expected_generation)):
+                raise TerminalError("terminal identity changed before stop")
+            if (expected_shell_pid is not None
+                    and client.identity.shell_pid != int(expected_shell_pid)):
+                raise TerminalError("terminal identity changed before stop")
             client._request("stop")
         finally:
             client.close()

@@ -55,9 +55,10 @@ claimed to fit every maximum-size viewport.
 Input mode is explicitly entered on the RIGHT. `Ctrl+]` returns to workspace
 navigation; `q` in navigation disconnects the UI without terminating sessions.
 JTT reserves `Ctrl+G` as a global prefix, including while a terminal has input
-focus. Within 1.5 seconds, the next key selects a JTT command: `n` creates a
-terminal, `h`/`l` changes cards, `w` selects the workspace panel, `d` detaches
-the UI, and `?` opens help. `Esc` cancels the prefix. Only in RIGHT input mode
+focus. Within 4 seconds, the next key selects a JTT command: `n` creates a
+terminal, `h`/`l` changes cards, `w` selects the workspace panel, `x` opens a
+cancel-first confirmation to stop only the selected terminal, `d` detaches the
+UI, and `?` opens help. `Esc` cancels the prefix. Only in RIGHT input mode
 with a valid lease, `Ctrl+G Ctrl+G` sends one literal Ctrl+G byte to the selected
 PTY; the prefix byte itself is never sent.
 An unknown prefix command is consumed. Consequently, an application that needs

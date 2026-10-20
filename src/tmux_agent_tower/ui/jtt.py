@@ -545,41 +545,137 @@ def _settings_menu(stdscr, state: dict) -> None:
         except WorkspaceStoreError:
             state["jtt_notice"] = "작업공간을 안전하게 저장하지 못했습니다."
     elif result.selected_key == "stop":
-        row = renderer._selected_row(state)
-        if not row or row.get("stale"):
-            state["jtt_notice"] = "종료할 연결된 터미널이 없습니다."
-            return
-        confirm = run_list_picker(
-            stdscr, "터미널 종료", [("stop", f"{row.get('display_name')} 종료"), ("cancel", "취소")],
-            centered=True, footer_hint="종료는 해당 셸 프로세스를 끝냅니다.",
-        )
-        if not confirm.cancelled and confirm.selected_key == "stop":
-            session_id = str(row.get("managed_id") or "")
-            try:
-                state["jtt_registry"].stop(session_id)
-                workspace = next(item for item in state["jtt_store"].workspaces()
-                                 if item["id"] == state["workspace_id"])
-                state["jtt_store"].set_terminal_ids(
-                    state["workspace_id"],
-                    [item for item in workspace["terminal_ids"] if item != session_id],
-                )
-                binding = state["managed_terminals"].pop(session_id, None)
-                if binding:
-                    binding.close()
-                _refresh_workspaces(state, state["workspace_id"])
-                state["jtt_notice"] = "선택한 터미널을 종료했습니다."
-            except (OSError, RuntimeError, ValueError, WorkspaceStoreError):
-                state["jtt_notice"] = "선택한 터미널을 종료하지 못했습니다."
+        _confirm_and_stop_selected_terminal(stdscr, state)
     else:
         show_message_screen(
             stdscr, "JTT 키 안내",
             ["탐색: Tab/Shift+Tab 패널 · Enter 입력 · Q 연결 해제",
              "Ctrl+G n: 새 터미널 · h/l: 카드 이동 · w: 작업공간",
+             "Ctrl+G x: 선택 터미널 종료 (취소가 기본 선택)",
              "Ctrl+G d: UI 연결 해제 (셸 유지) · ?: 도움",
              "Ctrl+G Esc: 취소 · Ctrl+G 두 번: 입력 중 Ctrl+G 전달",
              "입력 중 bare n/q/Tab은 터미널로 전달됩니다.",
              "Ctrl+]는 입력 모드에서 탐색 복귀입니다."],
         )
+
+
+def _capture_stop_target(state: dict) -> dict | None:
+    """Capture a selected JTT session only when card, binding, store and registry agree."""
+
+    row = renderer._selected_row(state)
+    if (not row or row.get("terminal_kind") != "tower_managed"
+            or row.get("stale") or str(row.get("terminal_shell_state") or "running") != "running"):
+        return None
+    identity = row.get("managed_identity")
+    if not isinstance(identity, dict):
+        return None
+    session_id = str(identity.get("session_id") or "")
+    generation = str(identity.get("generation") or "")
+    try:
+        shell_pid = int(identity.get("shell_pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    signature = renderer._pane_signature(row)
+    target_id = str(row.get("target_id") or "")
+    if (not session_id or not generation or shell_pid <= 0
+            or str(row.get("managed_id") or "") != session_id
+            or target_id != session_id
+            or str(state.get("selected_target_id") or "") != target_id
+            or state.get("selected_signature") != signature
+            or signature != ("jtt", session_id, generation, str(shell_pid))):
+        return None
+    binding = renderer._managed_binding(state)
+    if (binding is None or not binding.matches(row)
+            or binding.session_id != session_id
+            or binding.generation != generation or binding.shell_pid != shell_pid):
+        return None
+    workspace_id = str(state.get("workspace_id") or "")
+    try:
+        workspaces = state["jtt_store"].workspaces()
+        workspace = next((item for item in workspaces if str(item.get("id")) == workspace_id), None)
+        identities = [item for item in state["jtt_registry"].list_sessions()
+                      if str(getattr(item, "session_id", "")) == session_id]
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        return None
+    if (workspace is None or session_id not in {str(item) for item in workspace.get("terminal_ids", ())}
+            or len(identities) != 1):
+        return None
+    registered = identities[0]
+    try:
+        registered_pid = int(getattr(registered, "shell_pid", -1))
+    except (TypeError, ValueError):
+        return None
+    if (str(getattr(registered, "generation", "")) != generation
+            or registered_pid != shell_pid
+            or str(getattr(registered, "state", "")).lower() != "running"):
+        return None
+    return {
+        "session_id": session_id,
+        "generation": generation,
+        "shell_pid": shell_pid,
+        "workspace_id": workspace_id,
+        "pane_index": int(state.get("pane_index", 0)),
+        "target_id": target_id,
+        "signature": signature,
+        "binding": binding,
+        "display_name": str(row.get("display_name") or "터미널"),
+    }
+
+
+def _confirm_and_stop_selected_terminal(stdscr, state: dict) -> None:
+    """Stop only the exact selected session confirmed by the user; fail closed."""
+
+    target = _capture_stop_target(state)
+    if target is None:
+        state["jtt_notice"] = "선택 터미널 신원을 확인할 수 없어 종료를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    confirm = run_list_picker(
+        stdscr,
+        "터미널 종료",
+        [("cancel", "취소"), ("stop", f"{target['display_name']} 종료")],
+        centered=True,
+        footer_hint="취소가 기본 선택입니다 · 종료하면 해당 셸과 자식 프로세스가 끝납니다.",
+    )
+    if confirm.cancelled or confirm.selected_key != "stop":
+        return
+
+    current = _capture_stop_target(state)
+    if (current is None
+            or current["session_id"] != target["session_id"]
+            or current["generation"] != target["generation"]
+            or current["shell_pid"] != target["shell_pid"]
+            or current["workspace_id"] != target["workspace_id"]
+            or current["pane_index"] != target["pane_index"]
+            or current["target_id"] != target["target_id"]
+            or current["signature"] != target["signature"]
+            or current["binding"] is not target["binding"]):
+        state["jtt_notice"] = "선택 터미널이 변경되어 종료를 차단했습니다. 다시 선택하고 확인하세요."
+        state["jtt_notice_until"] = 0.0
+        return
+
+    session_id = target["session_id"]
+    workspace_id = target["workspace_id"]
+    try:
+        state["jtt_registry"].stop(
+            session_id,
+            expected_generation=target["generation"],
+            expected_shell_pid=target["shell_pid"],
+        )
+        workspace = next(item for item in state["jtt_store"].workspaces()
+                         if str(item["id"]) == workspace_id)
+        state["jtt_store"].set_terminal_ids(
+            workspace_id,
+            [item for item in workspace["terminal_ids"] if str(item) != session_id],
+        )
+        binding = state["managed_terminals"].pop(session_id, None)
+        if binding:
+            binding.close()
+        _refresh_workspaces(state, workspace_id)
+        state["jtt_notice"] = "선택한 터미널을 종료했습니다."
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        state["jtt_notice"] = "선택한 터미널을 종료하지 못했습니다. 작업 상태는 다시 확인하세요."
+    state["jtt_notice_until"] = 0.0
 
 
 def _create_terminal(stdscr, state: dict) -> None:
@@ -653,6 +749,9 @@ def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
         state["jtt_notice"] = "작업공간 탐색"
         state["jtt_notice_until"] = 0.0
         return False
+    if command == "x":
+        _confirm_and_stop_selected_terminal(stdscr, state)
+        return False
     if command == "d":
         renderer._release_managed_input(state)
         state["jtt_pending_auto_acquire"] = None
@@ -663,6 +762,7 @@ def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
             stdscr, "JTT 키 안내",
             ["Ctrl+G n: 새 터미널 (명시적 생성)",
              "Ctrl+G h/l: 이전/다음 카드 (입력 권한 해제)",
+             "Ctrl+G x: 선택 터미널 종료 (취소가 기본 선택)",
              "Ctrl+G w: 작업공간 패널", "Ctrl+G d: UI 연결 해제 (셸 유지)",
              "Ctrl+G ?: 이 도움말", "Ctrl+G Esc: 접두 취소 · Ctrl+G 두 번: 입력 중 Ctrl+G 전송",
              "입력 모드에서는 bare n/q/Tab을 터미널로 전달합니다.",

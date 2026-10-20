@@ -19,9 +19,10 @@ checkout-local `.venv-jtt` and install dependencies, then run
 package index; JTT startup does not install packages. Opening JTT does not
 create a shell. Use the explicit new-terminal action when one is wanted.
 
-JTT keys: `Ctrl+G` then `n` creates a terminal; `h`/`l` changes cards; `w`
-focuses the workspace panel; `d` detaches the UI while keeping terminals
-running; `?` shows help; `Esc` cancels a pending prefix. In terminal input
+JTT keys: within 4 seconds after `Ctrl+G`, `n` creates a terminal; `h`/`l`
+changes cards; `w` focuses the workspace panel; `x` opens a cancel-first
+confirmation to stop only the selected terminal; `d` detaches the UI while
+keeping terminals running; `?` shows help; `Esc` cancels a pending prefix. In terminal input
 mode with the selected terminal's valid input lease, `Ctrl+G Ctrl+G` sends one
 literal Ctrl+G byte to that terminal. In terminal input mode,
 `Ctrl+]` returns to navigation. Navigation `q` also detaches without stopping

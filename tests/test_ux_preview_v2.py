@@ -94,6 +94,99 @@ def test_wide_preview_draws_block_navigation_cards_and_single_live(monkeypatch):
     assert "실제 사용자 작업이나 Agent 대화가 아닙니다." not in frame
 
 
+def test_jtt_panels_and_cards_use_unicode_borders_while_legacy_stays_ascii(monkeypatch):
+    monkeypatch.setattr(ux_preview_v2.curses, "doupdate", lambda: None)
+    tower = ux_preview.make_preview_tower()
+    jtt_state = ux_preview_v2._state(tower)
+    jtt_state["runtime_mode"] = "jtt"
+    jtt_screen = _Screen()
+    ux_preview_v2.draw_preview_v2(jtt_screen, jtt_state)
+    jtt_frame = " ".join(text for _y, _x, text, _attr in jtt_screen.writes)
+    assert all(glyph in jtt_frame for glyph in ("┌", "─", "┐", "│", "└", "┘"))
+
+    legacy_state = ux_preview_v2._state(tower)
+    legacy_state["runtime_mode"] = "tower"
+    legacy_screen = _Screen()
+    ux_preview_v2.draw_preview_v2(legacy_screen, legacy_state)
+    legacy_frame = " ".join(text for _y, _x, text, _attr in legacy_screen.writes)
+    assert "+" in legacy_frame and "-" in legacy_frame
+    assert not any(glyph in legacy_frame for glyph in ("┌", "─", "┐", "│", "└", "┘"))
+
+
+def test_jtt_branding_footer_and_narrow_compact_layout(monkeypatch):
+    monkeypatch.setattr(ux_preview_v2.curses, "doupdate", lambda: None)
+    tower = ux_preview.make_preview_tower()
+    wide_state = ux_preview_v2._state(tower)
+    wide_state.update(runtime_mode="jtt", jtt_notice="", jtt_prefix_pending=False)
+    wide_screen = _Screen(44, 160)
+    ux_preview_v2.draw_preview_v2(wide_screen, wide_state)
+    wide_frame = " ".join(text for _y, _x, text, _attr in wide_screen.writes)
+    assert "JTT — Ju0 Terminal Tower" in wide_frame
+    assert "Ctrl+G 명령(4초)" in wide_frame
+    assert "Ctrl+G x 종료" in wide_frame
+
+    narrow_state = ux_preview_v2._state(tower)
+    narrow_state.update(runtime_mode="jtt", active_panel=2, jtt_notice="", jtt_prefix_pending=True,
+                        jtt_prefix_deadline=time.monotonic() + 4.0)
+    narrow_screen = _Screen(24, 80)
+    ux_preview_v2.draw_preview_v2(narrow_screen, narrow_state)
+    narrow_frame = " ".join(text for _y, _x, text, _attr in narrow_screen.writes)
+    assert "JTT" in narrow_frame
+    assert "Ctrl+G 4초" in narrow_frame
+    assert "x 종료" in narrow_frame  # Prefix is explicitly active in this footer.
+    assert all(0 <= y < 24 and 0 <= x < 80 for y, x, _text, _attr in narrow_screen.writes)
+
+    narrow_state["jtt_prefix_pending"] = False
+    ux_preview_v2.draw_preview_v2(narrow_screen, narrow_state)
+    compact_frame = " ".join(text for _y, _x, text, _attr in narrow_screen.writes)
+    assert "Ctrl+G x 종료" in compact_frame
+
+
+def test_jtt_empty_workspace_uses_terminal_wording(monkeypatch):
+    monkeypatch.setattr(ux_preview_v2.curses, "doupdate", lambda: None)
+    state = ux_preview_v2._state(ux_preview.make_preview_tower())
+    state.update(runtime_mode="jtt", active_panel=1, panes=[])
+    screen = _Screen(44, 160)
+    ux_preview_v2.draw_preview_v2(screen, state)
+    frame = " ".join(text for _y, _x, text, _attr in screen.writes)
+    assert "이 작업공간에 터미널 없음" in frame
+    assert "Pane 없음" not in frame
+
+
+@pytest.mark.parametrize("width", [100, 109])
+def test_jtt_narrow_layout_widths_keep_compact_stop_footer(monkeypatch, width):
+    monkeypatch.setattr(ux_preview_v2.curses, "doupdate", lambda: None)
+    state = ux_preview_v2._state(ux_preview.make_preview_tower())
+    state.update(runtime_mode="jtt", active_panel=2, jtt_notice="", jtt_prefix_pending=False)
+    screen = _Screen(24, width)
+
+    ux_preview_v2.draw_preview_v2(screen, state)
+
+    frame = " ".join(text for _y, _x, text, _attr in screen.writes)
+    assert "Ctrl+G(4초)" in frame
+    assert "Ctrl+G x 종료" in frame
+    assert all(0 <= y < 24 and 0 <= x < width for y, x, _text, _attr in screen.writes)
+
+
+@pytest.mark.parametrize("width", [100, 109])
+def test_jtt_narrow_prefix_and_notice_footer_states_are_preserved(monkeypatch, width):
+    monkeypatch.setattr(ux_preview_v2.curses, "doupdate", lambda: None)
+    state = ux_preview_v2._state(ux_preview.make_preview_tower())
+    state.update(runtime_mode="jtt", active_panel=2, jtt_notice="", jtt_prefix_pending=True,
+                 jtt_prefix_deadline=time.monotonic() + 4.0)
+    screen = _Screen(24, width)
+
+    ux_preview_v2.draw_preview_v2(screen, state)
+    prefix_frame = " ".join(text for _y, _x, text, _attr in screen.writes)
+    assert "Ctrl+G 4초" in prefix_frame
+    assert "x 종료" in prefix_frame
+
+    state.update(jtt_prefix_pending=False, jtt_notice="대상 확인 필요", jtt_notice_until=0.0)
+    ux_preview_v2.draw_preview_v2(screen, state)
+    notice_frame = " ".join(text for _y, _x, text, _attr in screen.writes)
+    assert "JTT — Ju0 Terminal Tower · 대상 확인 필요" in notice_frame
+
+
 @pytest.mark.parametrize("active_panel", [0, 1, 2])
 def test_narrow_preview_draws_one_tabbed_panel_without_clipping(monkeypatch, active_panel):
     tower = ux_preview.make_preview_tower()

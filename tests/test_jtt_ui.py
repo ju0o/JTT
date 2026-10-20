@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
 import curses
 from types import SimpleNamespace
-import time
+
+import pytest
 
 from tmux_agent_tower.state.jtt_workspaces import JTTWorkspaceStore
 from tmux_agent_tower.terminal import TerminalIdentity
@@ -64,6 +65,7 @@ class FakeRegistry:
         self.clients = {item.session_id: FakeClient(item) for item in self.identities}
         self.created = 0
         self.connected = []
+        self.stop_calls = []
 
     def list_sessions(self):
         return self.identities
@@ -79,6 +81,9 @@ class FakeRegistry:
         self.identities = (*self.identities, identity)
         self.clients[session_id] = FakeClient(identity)
         return self.clients[session_id]
+
+    def stop(self, session_id, **expected):
+        self.stop_calls.append((session_id, expected))
 
 
 def _identity(session_id, pid, generation):
@@ -401,6 +406,7 @@ def test_prefix_w_releases_input_and_help_lists_prefix_commands(tmp_path, monkey
     assert shown["title"] == "JTT 키 안내"
     assert any("Ctrl+G n" in line for line in shown["lines"])
     assert any("Ctrl+G h/l" in line for line in shown["lines"])
+    assert any("Ctrl+G x" in line for line in shown["lines"])
     assert any("Ctrl+]" in line for line in shown["lines"])
 
 
@@ -414,12 +420,201 @@ def test_prefix_cancel_timeout_and_detach_are_one_shot(tmp_path):
     assert renderer._handle_key(screen, state, "\x1b") is False
     assert not state["jtt_prefix_pending"]
     assert registry.created == 0
-
-    assert renderer._handle_key(screen, state, "\x07") is False
-    state["jtt_prefix_deadline"] = time.monotonic() - 1
-    assert renderer._handle_key(screen, state, "n") is False
-    assert registry.created == 0
-    assert not state["jtt_prefix_pending"]
-
     assert _prefix(screen, state, "d") is True
     assert registry.created == 0
+
+
+def _stop_ready_state(tmp_path, *identities):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry(list(identities))
+    store.set_terminal_ids(store.DEFAULT_ID, [item.session_id for item in identities])
+    state = jtt.build_state(store, registry)
+    return state, registry
+
+
+def test_prefix_x_stops_only_exact_confirmed_terminal_and_cancel_is_default(tmp_path, monkeypatch):
+    identities = [_identity("session-a", 101, "gen-a"),
+                  _identity("session-b", 202, "gen-b")]
+    state, registry = _stop_ready_state(tmp_path, *identities)
+    state["pane_index"] = 1
+    state["selected_target_id"] = "session-b"
+    state["selected_signature"] = renderer._pane_signature(state["panes"][1])
+    captured = {}
+
+    def confirm(_screen, title, items, **kwargs):
+        captured.update(title=title, items=items, kwargs=kwargs)
+        return SimpleNamespace(cancelled=False, selected_key="stop")
+
+    monkeypatch.setattr(jtt, "run_list_picker", confirm)
+    screen = FakeScreen()
+    assert _prefix(screen, state, "x") is False
+
+    assert captured["title"] == "터미널 종료"
+    assert captured["items"][0] == ("cancel", "취소")
+    assert captured["items"][1][0] == "stop"
+    assert "취소가 기본 선택" in captured["kwargs"]["footer_hint"]
+    assert registry.stop_calls == [(
+        "session-b", {"expected_generation": "gen-b", "expected_shell_pid": 202}
+    )]
+    workspace = state["jtt_store"].workspaces()[0]
+    assert workspace["terminal_ids"] == ["session-a"]
+    assert "session-b" not in state["managed_terminals"]
+
+
+def test_prefix_x_cancel_does_not_stop_or_change_workspace(tmp_path, monkeypatch):
+    state, registry = _stop_ready_state(tmp_path, _identity("session-a", 101, "gen-a"))
+    monkeypatch.setattr(
+        jtt, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=True, selected_key=None),
+    )
+    before = state["jtt_store"].workspaces()[0]["terminal_ids"]
+
+    assert _prefix(FakeScreen(), state, "x") is False
+
+    assert registry.stop_calls == []
+    assert state["jtt_store"].workspaces()[0]["terminal_ids"] == before
+
+
+def test_prefix_x_selection_change_while_confirmation_is_open_fails_closed(tmp_path, monkeypatch):
+    identities = [_identity("session-a", 101, "gen-a"),
+                  _identity("session-b", 202, "gen-b")]
+    state, registry = _stop_ready_state(tmp_path, *identities)
+
+    def change_selection_then_confirm(_screen, _title, _items, **_kwargs):
+        state["pane_index"] = 1
+        state["selected_target_id"] = "session-b"
+        state["selected_signature"] = renderer._pane_signature(state["panes"][1])
+        return SimpleNamespace(cancelled=False, selected_key="stop")
+
+    monkeypatch.setattr(jtt, "run_list_picker", change_selection_then_confirm)
+    assert _prefix(FakeScreen(), state, "x") is False
+
+    assert registry.stop_calls == []
+    assert "변경되어 종료를 차단" in state["jtt_notice"]
+
+
+def test_prefix_x_registry_identity_change_while_modal_is_open_fails_closed(tmp_path, monkeypatch):
+    original = _identity("session-a", 101, "gen-a")
+    state, registry = _stop_ready_state(tmp_path, original)
+
+    def replace_registry_identity_then_confirm(_screen, _title, _items, **_kwargs):
+        registry.identities = (_identity("session-a", 303, "gen-replacement"),)
+        return SimpleNamespace(cancelled=False, selected_key="stop")
+
+    monkeypatch.setattr(jtt, "run_list_picker", replace_registry_identity_then_confirm)
+    assert _prefix(FakeScreen(), state, "x") is False
+
+    assert registry.stop_calls == []
+    assert "변경되어 종료를 차단" in state["jtt_notice"]
+
+
+def test_prefix_x_binding_replacement_while_modal_is_open_fails_closed(tmp_path, monkeypatch):
+    identity = _identity("session-a", 101, "gen-a")
+    state, registry = _stop_ready_state(tmp_path, identity)
+
+    def replace_binding_then_confirm(_screen, _title, _items, **_kwargs):
+        client = FakeClient(identity)
+        state["managed_terminals"]["session-a"] = jtt.ManagedTerminalBinding(client, identity)
+        return SimpleNamespace(cancelled=False, selected_key="stop")
+
+    monkeypatch.setattr(jtt, "run_list_picker", replace_binding_then_confirm)
+    assert _prefix(FakeScreen(), state, "x") is False
+
+    assert registry.stop_calls == []
+    assert "변경되어 종료를 차단" in state["jtt_notice"]
+
+
+@pytest.mark.parametrize(
+    ("expected_generation", "expected_shell_pid"),
+    [("old-generation", 456), ("current-generation", 999)],
+)
+def test_registry_stop_checks_expected_identity_before_request(
+    tmp_path, monkeypatch, expected_generation, expected_shell_pid,
+):
+    from tmux_agent_tower.terminal import manager
+
+    registry = manager.TerminalRegistry(tmp_path / "sessions")
+    metadata = {
+        "session_id": "a" * 32,
+        "generation": "current-generation",
+        "supervisor_pid": 123,
+        "supervisor_start": "sup-start",
+        "shell_pid": 456,
+        "shell_start": "shell-start",
+        "shell_path": "/bin/bash",
+        "name": "Fixture",
+        "state": "running",
+    }
+    monkeypatch.setattr(manager, "_validate_identity", lambda _root, _session: (tmp_path, metadata))
+    connected = []
+    monkeypatch.setattr(registry, "connect", lambda session: connected.append(session))
+
+    with pytest.raises(manager.TerminalError, match="identity changed"):
+        registry.stop("a" * 32, expected_generation=expected_generation,
+                      expected_shell_pid=expected_shell_pid)
+
+    assert connected == []
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        {"generation": "replacement-generation", "shell_pid": 456},
+        {"generation": "current-generation", "shell_pid": 789},
+    ],
+)
+def test_registry_stop_rechecks_connected_client_before_stop_request(
+    tmp_path, monkeypatch, replacement,
+):
+    from tmux_agent_tower.terminal import manager
+
+    registry = manager.TerminalRegistry(tmp_path / "sessions")
+    metadata = {
+        "session_id": "b" * 32,
+        "generation": "current-generation",
+        "supervisor_pid": 123,
+        "supervisor_start": "sup-start",
+        "shell_pid": 456,
+        "shell_start": "shell-start",
+        "shell_path": "/bin/bash",
+        "name": "Fixture",
+        "state": "running",
+    }
+    monkeypatch.setattr(manager, "_validate_identity", lambda _root, _session: (tmp_path, metadata))
+    requested = []
+    closed = []
+    client = SimpleNamespace(
+        identity=SimpleNamespace(**replacement),
+        _request=lambda operation: requested.append(operation),
+        close=lambda: closed.append(True),
+    )
+    monkeypatch.setattr(registry, "connect", lambda _session: client)
+
+    with pytest.raises(manager.TerminalError, match="identity changed"):
+        registry.stop("b" * 32, expected_generation="current-generation", expected_shell_pid=456)
+
+    assert requested == []
+    assert closed == [True]
+
+
+def test_prefix_deadline_is_four_seconds_and_boundary_is_fail_closed(tmp_path, monkeypatch):
+    clock = [50.0]
+    monkeypatch.setattr(renderer.time, "monotonic", lambda: clock[0])
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([])
+    state = jtt.build_state(store, registry)
+    screen = FakeScreen()
+
+    assert renderer._handle_key(screen, state, "\x07") is False
+    assert state["jtt_prefix_deadline"] == 54.0
+    clock[0] = 53.999
+    assert renderer._handle_key(screen, state, "n") is False
+    assert registry.created == 1
+
+    second = jtt.build_state(JTTWorkspaceStore(tmp_path / "jtt-second"), FakeRegistry([]))
+    second_registry = second["jtt_registry"]
+    assert renderer._handle_key(screen, second, "\x07") is False
+    clock[0] = 58.0
+    assert renderer._handle_key(screen, second, "n") is False
+    assert second_registry.created == 0
+    assert not second["jtt_prefix_pending"]
