@@ -677,6 +677,96 @@ def test_new_window_action_creates_empty_metadata_only_and_preserves_terminal_id
     assert state["active_panel"] == 0
 
 
+@pytest.mark.parametrize("workspace_kind", ["default", "saved"])
+def test_work_kit_window_return_restores_workspace_for_navigation_and_creation(
+        tmp_path, monkeypatch, workspace_kind):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    default = store.workspaces()[0]
+    saved = None
+    if workspace_kind == "saved":
+        saved = store.create_workspace("Saved workspace")
+    workspace = saved or default
+    prefix = "saved" if saved else "default"
+    terminal_ids = [f"session-{prefix}-one", f"session-{prefix}-two"]
+    store.set_terminal_ids(workspace["id"], terminal_ids)
+    layouts = jtt.JTTLayoutStore(store.root)
+    second = layouts.create_window(workspace["id"], "folder-default", "Second")
+    registry = FakeRegistry([
+        _identity(terminal_ids[0], 101, f"{prefix}-one"),
+        _identity(terminal_ids[1], 202, f"{prefix}-two"),
+    ])
+    kits = JTTWorkKitStore(store.root)
+    kit = kits.create_kit("Preview only", "", [
+        {"name": "Shell", "role": "Local", "working_directory": None},
+    ])
+    workspaces_before = store.path.read_bytes()
+    kits_before = kits.path.read_bytes()
+    identities_before = tuple(
+        (item.session_id, item.generation, item.shell_pid) for item in registry.list_sessions()
+    )
+    state = jtt.build_state(store, registry)
+
+    if saved is not None:
+        jtt._attach_choice(state, {"kind": "workspace", "id": saved["id"]})
+    jtt._preview_work_kit(state, {"kind": "work_kit", "id": kit["id"]})
+    assert state["workspace_id"] == f"work-kit-preview:{kit['id']}"
+
+    first_window = next(index for index, choice in enumerate(state["choices"])
+                        if choice.get("kind") == "logical_window"
+                        and choice.get("workspace_id") == workspace["id"]
+                        and choice.get("window_id") == "window-default")
+    renderer._set_choice(state, first_window)
+    assert state["workspace_id"] == workspace["id"]
+    assert state["selected_window_id"] == "window-default"
+    assert state["active_panel"] == 0
+
+    second_window = next(index for index, choice in enumerate(state["choices"])
+                         if choice.get("kind") == "logical_window"
+                         and choice.get("workspace_id") == workspace["id"]
+                         and choice.get("window_id") == second["id"])
+    screen = FakeScreen()
+    assert renderer._handle_key(screen, state, curses.KEY_DOWN) is False
+    assert state["nav_index"] == second_window
+    assert state["workspace_id"] == workspace["id"]
+    assert state["selected_window_id"] == second["id"]
+    assert state["window_refs"] == ()
+    assert state["panes"] == []
+    assert state["active_panel"] == 0
+    assert renderer._handle_key(screen, state, curses.KEY_UP) is False
+    assert state["selected_window_id"] == "window-default"
+    assert renderer._handle_key(screen, state, curses.KEY_DOWN) is False
+    assert state["selected_window_id"] == second["id"]
+
+    prompts = []
+
+    def prompt(_screen, label, **kwargs):
+        prompts.append((label, kwargs.get("initial")))
+        return "Third"
+
+    monkeypatch.setattr(jtt, "prompt_text", prompt)
+    create_index = next(index for index, choice in enumerate(state["choices"])
+                        if choice.get("id") == "action:new-window")
+    state["nav_index"] = create_index
+    assert renderer._handle_key(FakeScreen(), state, "\n") is False
+
+    actual_layout = layouts.layout(workspace["id"], terminal_ids)
+    created = next(item for item in actual_layout["windows"] if item["name"] == "Third")
+    assert created["terminal_ids"] == []
+    assert state["workspace_id"] == workspace["id"]
+    assert state["selected_window_id"] == created["id"]
+    assert state["panes"] == []
+    assert prompts == [("새 Window 이름: ", "Window 2")]
+    assert store.path.read_bytes() == workspaces_before
+    assert kits.path.read_bytes() == kits_before
+    if saved is not None:
+        default_layout = layouts.layout(default["id"], default["terminal_ids"])
+        assert [item["id"] for item in default_layout["windows"]] == ["window-default"]
+    assert tuple((item.session_id, item.generation, item.shell_pid)
+                 for item in registry.list_sessions()) == identities_before
+    assert registry.created == 0
+    assert registry.stop_calls == []
+
+
 def test_archive_left_action_opens_unified_saved_configuration_and_work_kit_menu(
         tmp_path, monkeypatch):
     store = JTTWorkspaceStore(tmp_path / "jtt")

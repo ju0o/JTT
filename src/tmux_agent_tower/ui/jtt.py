@@ -1228,6 +1228,10 @@ def _attach_layout_choice(state: dict, choice: dict) -> None:
     ids = list(window["terminal_ids"])
     selected_choice_id = str(choice.get("id") or "")
 
+    # The validated choice points back to the canonical workspace. A Work Kit
+    # preview temporarily replaces state["workspace_id"] with a template ID;
+    # restore the real ID before subsequent Window navigation or creation.
+    state["workspace_id"] = str(workspace["id"])
     _replace_workspace_layout_choices(state, workspace, layout,
                                       selected_choice_id=selected_choice_id)
     state["work_kit_preview"] = None
