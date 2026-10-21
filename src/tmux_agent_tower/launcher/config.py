@@ -19,7 +19,9 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
-CONFIG_FILE = Path.home() / ".config" / "tmux-agent-tower" / "config.toml"
+from ..paths import CONFIG_DIR
+
+CONFIG_FILE = CONFIG_DIR / "config.toml"
 
 # Label used throughout the UI/adapters -> the config key a user would write
 # in [agents] to override its launch command.

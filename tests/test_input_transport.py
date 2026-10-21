@@ -125,6 +125,77 @@ def test_send_prompt_to_pane_never_doubles_enter(monkeypatch):
     assert enters[0][0][-1] == "Enter"
 
 
+def test_control_room_text_submission_revalidates_after_paste_and_never_retries(monkeypatch):
+    row = {"kind": "pane", "key": "%7", "pane_id": "%7", "auto_agent": "Codex",
+           "auto_agent_source": "process", "agent_process_alive": True, "transport": "local"}
+    allowed = actions.FocusTargetValidation(actions.FocusTargetStatus.ALLOWED, "%7", ("identity",))
+    stale = actions.FocusTargetValidation(actions.FocusTargetStatus.STALE, "%7", ())
+    checks = iter((allowed, stale))
+    calls = []
+    monkeypatch.setattr(actions, "validate_focus_target", lambda *_a: next(checks))
+    monkeypatch.setattr(actions, "send_text", lambda pane, text: calls.append(("paste", pane, text)) or True)
+    monkeypatch.setattr(actions, "submit_input", lambda *args: calls.append(("enter", *args)) or True)
+
+    result = actions.submit_user_text_once(object(), row, "user authored text")
+
+    assert result.status is actions.TextSubmissionStatus.PASTED_NOT_SUBMITTED
+    assert result.stage == "before_submit"
+    assert calls == [("paste", "%7", "user authored text")]
+
+
+def test_control_room_text_submission_sends_one_paste_and_one_enter(monkeypatch):
+    row = {"kind": "pane", "key": "%7", "pane_id": "%7", "auto_agent": "Claude",
+           "auto_agent_source": "process", "agent_process_alive": True, "transport": "local"}
+    allowed = actions.FocusTargetValidation(actions.FocusTargetStatus.ALLOWED, "%7", ("same",))
+    checks, calls = [], []
+    monkeypatch.setattr(actions, "validate_focus_target", lambda *_a: checks.append(True) or allowed)
+    monkeypatch.setattr(actions, "send_text", lambda pane, text: calls.append(("paste", pane, text)) or True)
+    monkeypatch.setattr(actions, "submit_input", lambda *args: calls.append(("enter", *args)) or True)
+
+    result = actions.submit_user_text_once(object(), row, "one request")
+
+    assert result.status is actions.TextSubmissionStatus.SUBMITTED
+    assert result.validation.identity == ("same",)
+    assert calls == [("paste", "%7", "one request"), ("enter", "%7", "Enter")]
+    assert len(checks) == 2
+
+
+def test_control_room_text_submission_blocks_remote_and_unknown_agent(monkeypatch):
+    calls = []
+    monkeypatch.setattr(actions, "validate_focus_target",
+                        lambda *_a: calls.append("validate") or actions.FocusTargetValidation(
+                            actions.FocusTargetStatus.REMOTE_UNSUPPORTED, "%7"))
+    monkeypatch.setattr(actions, "send_text", lambda *_a: calls.append("paste") or True)
+    monkeypatch.setattr(actions, "submit_input", lambda *_a: calls.append("enter") or True)
+
+    peer = {"kind": "pane", "key": "%7", "pane_id": "%7", "auto_agent": "OpenCode",
+            "remote": True, "transport": "remote_tmux"}
+    unknown = {"kind": "pane", "key": "%8", "pane_id": "%8", "auto_agent": "Shell",
+               "auto_agent_source": "process", "agent_process_alive": True, "transport": "local"}
+    ssh_client = {"kind": "pane", "key": "%9", "pane_id": "%9", "auto_agent": "Claude",
+                  "auto_agent_source": "process", "agent_process_alive": True, "transport": "ssh"}
+    assert actions.submit_user_text_once(object(), peer, "hello").status is actions.TextSubmissionStatus.REFUSED
+    assert actions.submit_user_text_once(object(), unknown, "hello").status is actions.TextSubmissionStatus.REFUSED
+    assert actions.submit_user_text_once(object(), ssh_client, "hello").status is actions.TextSubmissionStatus.REFUSED
+    assert calls == []
+
+
+def test_control_room_text_submission_rejects_multiline_or_control_text_without_io(monkeypatch):
+    calls = []
+    monkeypatch.setattr(actions, "validate_focus_target", lambda *_a: calls.append("validate"))
+    monkeypatch.setattr(actions, "send_text", lambda *_a: calls.append("paste"))
+    monkeypatch.setattr(actions, "submit_input", lambda *_a: calls.append("enter"))
+    row = {"kind": "pane", "key": "%7", "pane_id": "%7", "auto_agent": "Codex",
+           "auto_agent_source": "process", "agent_process_alive": True, "transport": "local"}
+
+    for value in ("first\nsecond", "first\tsecond", "first\x1bsecond"):
+        result = actions.submit_user_text_once(object(), row, value)
+        assert result.status is actions.TextSubmissionStatus.REFUSED
+        assert result.stage == "invalid_text"
+
+    assert calls == []
+
+
 def _prompt_flow(monkeypatch, screens, agent_cmd="codex"):
     """Drive send_prompt with a scripted sequence of screens."""
 

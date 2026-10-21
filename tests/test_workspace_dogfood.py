@@ -6,7 +6,10 @@ that window.
 
 import os
 import re
+import shutil
+import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -31,19 +34,53 @@ from workspace_fixture import make_three_level_git_workspace
 
 
 def _tmux(*args):
-    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False)
+    return subprocess.run(
+        ["tmux", *args], capture_output=True, text=True, check=False, env=os.environ.copy()
+    )
+
+
+def _private_tmux_socket(socket_root: Path) -> Path:
+    sockets = list(socket_root.glob("tmux-*/default"))
+    assert len(sockets) == 1, sockets
+    assert stat.S_ISSOCK(sockets[0].stat().st_mode), sockets[0]
+    return sockets[0]
+
+
+@pytest.fixture
+def isolated_tmux(monkeypatch, request):
+    socket_root = Path(tempfile.mkdtemp(prefix="tower-tmux-", dir="/tmp"))
+
+    def cleanup():
+        sockets = list(socket_root.glob("tmux-*/default"))
+        assert len(sockets) <= 1, sockets
+        if sockets:
+            assert stat.S_ISSOCK(sockets[0].stat().st_mode), sockets[0]
+            stopped = subprocess.run(
+                ["tmux", "-S", str(sockets[0]), "kill-server"],
+                capture_output=True, text=True, check=False, env=os.environ.copy(),
+            )
+            if stopped.returncode != 0:
+                assert stopped.stderr == f"no server running on {sockets[0]}\n", stopped.stderr
+                sockets[0].unlink()
+        assert not list(socket_root.glob("tmux-*/default")), "isolated tmux socket still exists"
+        shutil.rmtree(socket_root)
+
+    request.addfinalizer(cleanup)
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    monkeypatch.setenv("TMUX_TMPDIR", str(socket_root))
+    assert "TMUX" not in os.environ
+    assert "TMUX_PANE" not in os.environ
+    assert os.environ["TMUX_TMPDIR"] == str(socket_root)
+    assert not list(socket_root.glob("tmux-*/default"))
+    return socket_root
 
 
 def _have_tmux():
     return _tmux("-V").returncode == 0
 
-
-def _session_windows(session: str) -> str:
-    return _tmux("list-windows", "-t", session, "-F", "#{window_id}").stdout
-
-
 @pytest.mark.skipif(not _have_tmux(), reason="tmux is not installed")
-def test_local_tree_and_direct_path_create_in_an_isolated_session(tmp_path):
+def test_local_tree_and_direct_path_create_in_an_isolated_session(tmp_path, isolated_tmux):
     _tree_root, group, repo = make_three_level_git_workspace(tmp_path)
     parent = list_local_children(str(group))
     match = [child for child in parent.children if child.path == str(repo)]
@@ -57,12 +94,15 @@ def test_local_tree_and_direct_path_create_in_an_isolated_session(tmp_path):
     assert discovered
     assert all(entry.path != direct.entry.path for entry in discovered)
 
-    user_before = _session_windows("0")
+    assert "TMUX" not in os.environ and "TMUX_PANE" not in os.environ
+    assert os.environ["TMUX_TMPDIR"] == str(isolated_tmux)
+    assert not list(isolated_tmux.glob("tmux-*/default"))
     session = f"tower-browser-{os.getpid()}"
-    created = _tmux("new-session", "-d", "-s", session, "-n", "tower")
+    created = _tmux("-f", "/dev/null", "new-session", "-d", "-s", session, "-n", "tower")
     assert created.returncode == 0, created.stderr
-    tower_window = _tmux("display-message", "-p", "-t", session, "#{window_id}").stdout.strip()
     try:
+        socket_path = _private_tmux_socket(isolated_tmux)
+        tower_window = _tmux("display-message", "-p", "-t", session, "#{window_id}").stdout.strip()
         results = launch_workspaces(
             session=session,
             state_dir=tmp_path / "state",
@@ -73,6 +113,7 @@ def test_local_tree_and_direct_path_create_in_an_isolated_session(tmp_path):
             agents_cfg=default_agent_commands(),
         )
         assert results[0].ok
+        assert _private_tmux_socket(isolated_tmux) == socket_path
         windows = _tmux(
             "list-panes", "-s", "-t", session,
             "-F", "#{window_id}\t#{pane_id}\t#{pane_current_path}",
@@ -102,8 +143,8 @@ def test_local_tree_and_direct_path_create_in_an_isolated_session(tmp_path):
         again = _tmux("list-panes", "-s", "-t", session, "-F", "#{pane_current_path}").stdout
         assert direct.entry.path in again.splitlines()
     finally:
-        _tmux("kill-session", "-t", session)
-    assert _session_windows("0") == user_before
+        killed = _tmux("kill-session", "-t", session)
+        assert killed.returncode == 0, killed.stderr
 
 
 def _remote_target() -> str:
@@ -214,7 +255,7 @@ def _select(tree: FolderTree, name: str):
 
 
 @pytest.mark.skipif(not _have_tmux(), reason="tmux is not installed")
-def test_local_tree_three_levels_then_new_window(tmp_path):
+def test_local_tree_three_levels_then_new_window(tmp_path, isolated_tmux):
     tree_root, _group, _repo = make_three_level_git_workspace(tmp_path)
     tree = FolderTree("workstation-a", ProjectEntry(tree_root.name, str(tree_root), False))
     _expand(tree, tree.root.path)
@@ -228,12 +269,15 @@ def test_local_tree_three_levels_then_new_window(tmp_path):
     assert chosen.path == str(_repo)
     assert "group" in [row.node.name for row in tree.visible_rows()]
 
-    user_before = _session_windows("0")
+    assert "TMUX" not in os.environ and "TMUX_PANE" not in os.environ
+    assert os.environ["TMUX_TMPDIR"] == str(isolated_tmux)
+    assert not list(isolated_tmux.glob("tmux-*/default"))
     session = f"tower-tree-{os.getpid()}"
-    created = _tmux("new-session", "-d", "-s", session, "-n", "tower")
+    created = _tmux("-f", "/dev/null", "new-session", "-d", "-s", session, "-n", "tower")
     assert created.returncode == 0, created.stderr
-    starter = set(_tmux("list-windows", "-t", session, "-F", "#{window_id}").stdout.split())
     try:
+        socket_path = _private_tmux_socket(isolated_tmux)
+        starter = set(_tmux("list-windows", "-t", session, "-F", "#{window_id}").stdout.split())
         results = launch_workspaces(
             session=session,
             state_dir=tmp_path / "state",
@@ -244,6 +288,7 @@ def test_local_tree_three_levels_then_new_window(tmp_path):
             agents_cfg=default_agent_commands(),
         )
         assert results[0].ok
+        assert _private_tmux_socket(isolated_tmux) == socket_path
         listed = _tmux("list-panes", "-s", "-t", session, "-F", "#{window_id}\t#{pane_id}\t#{pane_current_path}").stdout
         match = [
             line for line in listed.splitlines()
@@ -256,8 +301,8 @@ def test_local_tree_three_levels_then_new_window(tmp_path):
         assert bound["project_path"] == chosen.path
         assert bound["agent"] == "Shell"
     finally:
-        _tmux("kill-session", "-t", session)
-    assert _session_windows("0") == user_before
+        killed = _tmux("kill-session", "-t", session)
+        assert killed.returncode == 0, killed.stderr
 
 
 def _remote_workstation_tree_path() -> str:

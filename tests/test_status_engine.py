@@ -9,6 +9,7 @@ from tmux_agent_tower.detection.status import (
     STATUS_UNKNOWN,
     STATUS_DEAD,
 )
+from tmux_agent_tower.ui import render
 
 
 def _ctx(lines, title="", command="codex"):
@@ -251,6 +252,24 @@ def test_old_working_history_yields_to_current_idle_fixtures(fixture_lines):
         ctx = _ctx(lines, command=command)
         assert adapter.classify(ctx).status == STATUS_IDLE, command
         assert StatusEngine().evaluate(command, False, adapter, ctx) == STATUS_IDLE
+
+
+def test_agent_specific_current_work_and_input_waiting_labels(fixture_lines):
+    cases = (
+        ("codex", "codex-working.txt", "codex-idle.txt"),
+        ("claude", "claude-working.txt", "claude-idle.txt"),
+        ("cursor-agent", "cursor-working-spinner.txt", "cursor-idle-followup.txt"),
+        ("opencode", "opencode-working.txt", "opencode-idle.txt"),
+        ("grok", "grok-working.txt", "grok-idle.txt"),
+    )
+    for command, working_fixture, idle_fixture in cases:
+        adapter = resolve_adapter(command, "")
+        working = _ctx(fixture_lines(working_fixture), command=command)
+        idle = _ctx(fixture_lines(idle_fixture), command=command)
+        assert StatusEngine().evaluate(command + "-working", False, adapter, working) == STATUS_WORKING
+        assert render.execution_badge(STATUS_WORKING, agent_process_alive=True)[1] == "state.working"
+        assert StatusEngine().evaluate(command + "-idle", False, adapter, idle) == STATUS_IDLE
+        assert render.execution_badge(STATUS_IDLE, agent_process_alive=True)[1] == "state.input_waiting"
 
 
 def test_recognized_attention_is_idle_execution_on_all_current_prompt_fixtures(fixture_lines):

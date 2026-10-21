@@ -44,7 +44,7 @@ tower = "tmux_agent_tower.main:cli"
 where = ["src"]
 
 [tool.setuptools.package-data]
-tmux_agent_tower = ["resources/harnesses/*.md"]
+tmux_agent_tower = ["resources/harnesses/*.md", "remote/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

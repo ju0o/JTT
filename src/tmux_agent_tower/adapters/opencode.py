@@ -162,7 +162,7 @@ class OpenCodeAdapter(AgentAdapter):
 
     def extract_result(self, ctx: PaneContext) -> Optional[ResultCandidate]:
         lines = list(ctx.lines)
-        if not _IDLE_HINT_RE.search(ctx.tail(8)):
+        if self.classify(ctx).status != "IDLE":
             return None
         marks = _done_marks(lines)
         if not marks:

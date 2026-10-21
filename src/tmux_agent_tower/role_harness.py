@@ -9,8 +9,9 @@ from importlib.resources import files
 from pathlib import Path
 
 from .state.overrides import ROLE_IDS
+from .paths import CONFIG_DIR
 
-DEFAULT_HARNESS_DIR = Path.home() / ".config" / "tmux-agent-tower" / "harnesses"
+DEFAULT_HARNESS_DIR = CONFIG_DIR / "harnesses"
 MAX_HARNESS_BYTES = 64 * 1024
 
 

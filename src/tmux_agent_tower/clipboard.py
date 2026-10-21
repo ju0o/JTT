@@ -529,9 +529,9 @@ def _read_process(argv: List[str]) -> Optional[str]:
 
 
 def normalize_newlines(text: str) -> str:
-    """Turn CRLF and a lone CR into LF. Every other character stays."""
+    """Normalize CRLF to LF; preserve lone CR and every other character."""
 
-    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return (text or "").replace("\r\n", "\n")
 
 
 def _decode_powershell_stdout(data: bytes) -> Optional[str]:
@@ -817,6 +817,7 @@ def copy_text(
     verify: Optional[Callable[[str, str], bool]] = None,
     read_buffer: Optional[Callable[[str], Optional[bytes]]] = None,
     allow_buffer_fallback: bool = True,
+    diagnostic_callback: Optional[Callable[[str, str, int, str], bool]] = None,
 ) -> CopyOutcome:
     """Copy ``text`` to one destination.
 
@@ -836,6 +837,14 @@ def copy_text(
     platform = system or sys.platform
     body = plain_clipboard_text(text)
     data = body.encode("utf-8")
+
+    def before_write(kind: str, tool: str) -> bool:
+        if diagnostic_callback is None:
+            return True
+        try:
+            return diagnostic_callback(kind, tool, len(data), hashlib.sha256(data).hexdigest()) is not False
+        except Exception:
+            return False
 
     def accepted(tool: str) -> bool:
         if verify is not None:
@@ -874,10 +883,10 @@ def copy_text(
         if remember(name) != data:
             drop(name)
             return CopyOutcome(False, False, "none", False, ambiguous)
-        code = runner(
-            ["tmux", "load-buffer", "-w", "-b", name, "-t", client_tty, "-"],
-            data,
-        )
+        if not before_write("current_terminal", "tmux-osc52"):
+            drop(name)
+            return CopyOutcome(False, False, "none", False, ambiguous)
+        code = runner(["tmux", "load-buffer", "-w", "-b", name, "-t", client_tty, "-"], data)
         drop(name)
         if code != 0:
             return keep_buffer()
@@ -890,6 +899,8 @@ def copy_text(
         if tool:
             path = _find_executable(finder, tool) or tool
             _audit("host", data)
+            if not before_write("local_host", os.path.basename(path)):
+                return CopyOutcome(False, False, tool, False, False)
             wrote = runner(_argv(tool, path), _payload(tool, body)) == 0
             if wrote and accepted(tool):
                 return CopyOutcome(True, False, tool, False, False)
@@ -911,6 +922,8 @@ def copy_text(
             if bridge_port is None or not bridge_token or len(data) > 48 * 1024:
                 return CopyOutcome(False, False, "none", False, ambiguous)
             _audit("terminal", data)
+            if not before_write("current_terminal", "clipboard-bridge"):
+                return CopyOutcome(False, False, "none", False, ambiguous)
             if _post_clipboard_bridge(bridge_port, bridge_token, data):
                 return CopyOutcome(True, False, "terminal", False, ambiguous)
             # The bridge may have accepted the request before a response was

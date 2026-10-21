@@ -27,11 +27,19 @@ from ..detection.result import ResultTracker, pane_result_identity, shared_resul
 from ..detection.status import StatusEngine, STATUS_DEAD
 from ..i18n import t
 from ..launcher.config import AGENT_LAUNCH_ORDER, load_config
+from ..paths import (
+    APP_HOME_ISOLATED,
+    CONFIG_DIR as APP_CONFIG_DIR,
+    STATE_DIR as APP_STATE_DIR,
+    configured_path,
+)
 from .. import notify
 from ..remote.collector import fetch_remote, HOST_STATUS_ONLINE
 from ..state.bindings import ProjectBindingStore
 from ..state.folders import FolderStore, window_ref
 from ..state.overrides import ROLE_IDS, OverrideStore
+from ..state.projects import ProjectStore
+from ..state.control_screens import ControlScreenStore
 from ..state.work_groups import WorkGroupStore
 from ..detection.project import git_project_name
 from ..state.visits import VisitStore
@@ -46,6 +54,9 @@ from .widgets import is_ctrl_c, is_enter, is_escape, matches_letter, prompt_text
 
 REFRESH_SECONDS = 2.0
 REMOTE_REFRESH_SECONDS = 6.0
+PANE_TITLE_SYNC_INTERVAL_SECONDS = 15.0
+PANE_TITLE_SYNC_CONFLICT_WINDOW_SECONDS = 120.0
+PANE_TITLE_SYNC_MAX_CONFLICTS = 3
 CAPTURE_LINES = 30
 USER_WORK_VIEW = "user_work"
 TERMINAL_STRUCTURE_VIEW = "terminal_structure"
@@ -55,10 +66,37 @@ def _target_id(host: str, session_id: str, pane_id: str, pane_pid: str) -> str:
     identity = "\0".join((host or "", session_id or "", pane_id or "", pane_pid or ""))
     return hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()
 
-STATE_DIR = Path.home() / ".cache" / "tmux-agent-tower"
-CONFIG_DIR = Path.home() / ".config" / "tmux-agent-tower"
-HOST_FILE = CONFIG_DIR / "host"
-REMOTE_HOSTS_FILE = CONFIG_DIR / "remote-hosts.txt"
+
+def _confirmed_agent_exit(
+    previous: Dict,
+    *,
+    pane_dead: bool,
+    via_ssh: bool,
+    process_alive: bool,
+    detected_agent: bool,
+    auto_source: str,
+) -> bool:
+    """Keep an Agent exit visible only across the same local Pane identity.
+
+    This is a presentation hint, not a Result completion signal. It requires
+    a previously process-confirmed Agent and a current local shell process;
+    SSH panes and uncertain screen-only identity stay unverified.
+    """
+
+    if pane_dead or via_ssh or process_alive or detected_agent or auto_source != "process":
+        return False
+    if previous.get("agent_process_ended"):
+        return True
+    if str(previous.get("auto_agent") or "").casefold() in {"", "shell", "unknown", "터미널"}:
+        return False
+    return bool(previous.get("agent_process_alive"))
+
+STATE_DIR = APP_STATE_DIR
+CONFIG_DIR = APP_CONFIG_DIR
+HOST_FILE = configured_path("TMUX_AGENT_TOWER_HOST_FILE", CONFIG_DIR / "host")
+REMOTE_HOSTS_FILE = configured_path(
+    "TMUX_AGENT_TOWER_REMOTE_HOSTS_FILE", CONFIG_DIR / "remote-hosts.txt",
+)
 
 STATUS_SYMBOL = render.STATUS_SYMBOL
 STATUS_ORDER = render.STATUS_ORDER
@@ -307,7 +345,7 @@ def navigator_rows(panes: List[Dict], collapsed: Optional[set] = None) -> List[D
     return out
 
 
-def zero_state_rows() -> List[Dict]:
+def zero_state_rows(*, include_projects: bool = False) -> List[Dict]:
     """What to show when Tower has no working pane yet."""
 
     title = t("zero.title")
@@ -315,7 +353,7 @@ def zero_state_rows() -> List[Dict]:
         ("task", t("zero.task")),
         ("saved", t("zero.saved")),
         ("template", t("zero.template")),
-    )
+    ) + ((("projects", t("project_manage.title")),) if include_projects else ())
     return [
         {
             "kind": "zero",
@@ -335,6 +373,7 @@ class Tower:
     def __init__(self, session: str, own_pane_id: str = "", status_engine: Optional[StatusEngine] = None, results: Optional[ResultTracker] = None):
         self.session = session
         self.own_pane_id = own_pane_id
+        self.discover_all_sessions = APP_HOME_ISOLATED
         self.local_host = local_host_label()
         self.access_context = None
         self.remote_hosts = load_remote_hosts()
@@ -345,6 +384,8 @@ class Tower:
         self.bindings = ProjectBindingStore(STATE_DIR / "project-bindings.json")
         self.work_groups = WorkGroupStore(STATE_DIR / "work-groups.json")
         self.folders = FolderStore(STATE_DIR / "folders.json")
+        self.projects = ProjectStore(STATE_DIR / "projects.json")
+        self.control_screens = ControlScreenStore(STATE_DIR / "control-screens.json")
         self.window_assets: List[Dict] = []
         # The TUI owns one engine for its lifetime. Remote passes the
         # server's engine in so hysteresis survives across HTTP polls.
@@ -370,7 +411,10 @@ class Tower:
         self.view_mode = USER_WORK_VIEW      # terminal structure is an explicit secondary view
         self.collapsed: set = set()          # window row keys hidden in the UI only
         self.collapsed_work_groups: set = set()
-        self.collapsed_other = False
+        # Incidental shells discovered from tmux stay out of the way. This is
+        # presentation state for this Tower run; saved folders are untouched.
+        self.collapsed_other = True
+        self.collapsed_agents = False
         self.notice = ""
         self.selected = 0                    # index into visible_rows
         self.last_refresh = 0.0
@@ -381,6 +425,8 @@ class Tower:
         self._refresh_ready = None
         self._refresh_snapshot = None
         self.remote_state = None
+        self._last_title_sync_scan = 0.0
+        self._title_sync_last_applied: Dict[Tuple[str, str, str], float] = {}
 
     # -- data ---------------------------------------------------------
 
@@ -391,7 +437,14 @@ class Tower:
         """
 
         activity_text = None
-        if self.config["show_activity"] and not dead:
+        # Activity summaries can remain in scrollback after a turn ends.
+        # Require both the status engine and the adapter's current-widget
+        # classifier to say WORKING; a screen-change hold or old
+        # "Working/Edited/Explored" text alone is not enough.
+        if (
+            self.config["show_activity"] and not dead and status == "WORKING"
+            and adapter.classify(ctx).status == "WORKING"
+        ):
             activity = adapter.extract_activity(ctx)
             # Low-confidence guesses are computed (testable at the adapter
             # level) but never shown -- a plausible-sounding wrong answer
@@ -515,9 +568,16 @@ class Tower:
         return openssh_hostname(token)
 
     def _local_rows(self) -> List[Dict]:
-        panes = discovery.list_panes(self.session, self.own_pane_id, CAPTURE_LINES)
+        panes = discovery.list_panes(
+            self.session, self.own_pane_id, CAPTURE_LINES,
+            all_sessions=self.discover_all_sessions,
+        )
         out = []
         no_name = t("project.no_name")
+        previous_agents = {
+            (str(row.get("session") or ""), str(row.get("pane_id") or ""), str(row.get("pane_pid") or "")): row
+            for row in self.rows if row.get("pane_id") and not row.get("remote")
+        }
 
         for pane in panes:
             adapter = resolve_adapter(
@@ -588,6 +648,19 @@ class Tower:
                 pane["pane_id"], pane["dead"], adapter, ctx,
                 runtime_identity=pane.get("pane_pid") or None,
             )
+            detected_agent = str(auto_name or "").strip().casefold() not in {
+                "", "shell", "unknown", "터미널",
+            }
+            agent_process_alive = bool(
+                not pane["dead"] and auto_source == "process" and detected_agent
+            )
+            previous_agent = previous_agents.get((str(session_name), str(key), str(pane_pid)), {})
+            agent_process_ended = _confirmed_agent_exit(
+                previous_agent,
+                pane_dead=bool(pane["dead"]), via_ssh=via_ssh,
+                process_alive=agent_process_alive, detected_agent=detected_agent,
+                auto_source=auto_source,
+            )
             project = identity["project"]
             agent = identity["agent"]
             auto_project = identity["auto_project"]
@@ -634,7 +707,12 @@ class Tower:
                     "project_source": identity["project_source"],
                     "auto_project_source": identity["auto_project_source"],
                     "agent": agent,
+                    "agent_process_alive": agent_process_alive,
+                    "agent_process_ended": agent_process_ended,
+                    "agent_status_unverified": bool(detected_agent and not agent_process_alive),
                     "auto_agent": identity["auto_agent"],
+                    "auto_detected_agent": auto_name,
+                    "result_adapter": adapter.name,
                     "agent_source": identity["agent_source"],
                     "auto_agent_source": identity["auto_agent_source"],
                     "tower_runtime": bool(pane.get("tower_runtime") or identity["tower_runtime"]),
@@ -749,6 +827,14 @@ class Tower:
                     session=pane.get("session") or "",
                     pane_pid=pane.get("pane_pid") or "",
                 )
+                detected_agent = str(identity.get("auto_agent") or "").strip().casefold() not in {
+                    "", "shell", "unknown", "터미널",
+                }
+                agent_process_alive = bool(
+                    not pane["dead"]
+                    and identity.get("auto_agent_source") == "process"
+                    and detected_agent
+                )
                 project = identity["project"]
                 agent = identity["agent"]
                 auto_project = identity["auto_project"]
@@ -787,7 +873,11 @@ class Tower:
                         "project_source": identity["project_source"],
                         "auto_project_source": identity["auto_project_source"],
                         "agent": agent,
+                        "agent_process_alive": agent_process_alive,
+                        "agent_status_unverified": bool(detected_agent and not agent_process_alive),
                         "auto_agent": identity["auto_agent"],
+                        "auto_detected_agent": identity["auto_agent"],
+                        "result_adapter": adapter.name,
                         "agent_source": identity["agent_source"],
                         "auto_agent_source": identity["auto_agent_source"],
                         "tower_runtime": identity["tower_runtime"],
@@ -840,7 +930,7 @@ class Tower:
 
         now = time.monotonic()
         self.access_context = observe_access_client()[0].access_context
-        windows = discovery.list_windows(self.session)
+        windows = discovery.list_windows(self.session, all_sessions=self.discover_all_sessions)
         own_window_id = discovery.window_for_pane(self.own_pane_id)
         for window in windows:
             window["tmux_host"] = self.local_host
@@ -871,6 +961,10 @@ class Tower:
         task_rows = [row for row in self.rows if row.get("pane_id") and not row.get("tower_runtime")]
         live_windows = folder_tree.visible_windows(live_windows.values(), self.rows, own_window_id)
         self.window_assets = folder_tree.infer_window_assets(live_windows, task_rows, self.local_host)
+        for asset in self.window_assets:
+            saved_name = self.folders.window(str(asset.get("window_ref") or "")).get("display_name")
+            if saved_name:
+                asset["display_name"] = saved_name
         groups = self.work_groups.all()
         group_by_target = {target: group for group in groups for target in group["member_target_ids"]}
         for row in self.rows:
@@ -905,6 +999,7 @@ class Tower:
         snapshot = copy.copy(self)
         for name in ("status_engine", "notifier", "visits", "overrides", "bindings", "work_groups", "folders", "_host_registry"):
             setattr(snapshot, name, copy.deepcopy(getattr(self, name)))
+        snapshot.projects = ProjectStore(self.projects.path)
         snapshot.results = (
             ResultTracker(self.results.state_path)
             if self.results is not None and self.results.state_path is not None
@@ -977,14 +1072,22 @@ class Tower:
         if previous_key is None and self.visible_rows and 0 <= self.selected < len(self.visible_rows):
             previous_key = self.visible_rows[self.selected]["key"]
 
-        filtered = [r for r in self.rows if render.row_matches_filter(r, self.filter_text)]
+        hidden_window_refs = self.projects.hidden_refs()
+        display_rows = [r for r in self.rows
+                        if str(r.get("window_ref") or "") not in hidden_window_refs]
+        display_windows = self.window_assets
+        filtered = [r for r in display_rows if render.row_matches_filter(r, self.filter_text)]
 
-        panes = [r for r in self.rows if r.get("pane_id")]
+        panes = [r for r in display_rows if r.get("pane_id")]
         work_panes = [r for r in panes if not r.get("tower_runtime")]
         groups = self.work_groups.all()
+        visible_targets = {str(row.get("target_id") or "") for row in work_panes}
+        visible_groups = [group for group in groups if any(
+            str(target) in visible_targets for target in group.get("member_target_ids") or ()
+        )]
         if (not self.filter_text and self.view_mode != TERMINAL_STRUCTURE_VIEW
-                and not work_panes and not groups and not self.folders.all()):
-            self.visible_rows = zero_state_rows()
+                and not work_panes and not visible_groups and not self.folders.all()):
+            self.visible_rows = zero_state_rows(include_projects=bool(self.projects.all()))
         elif self.view_mode == TERMINAL_STRUCTURE_VIEW:
             self.visible_rows = navigator_rows(filtered, set() if self.filter_text else self.collapsed)
         else:
@@ -993,7 +1096,10 @@ class Tower:
                 self.visible_rows = render.sort_by_attention(matching)
             else:
                 self.visible_rows = folder_tree.build_rows(
-                    self.folders, self.window_assets, work_panes, self.filter_text, self.collapsed_other
+                    self.folders, display_windows, work_panes, self.filter_text,
+                    self.collapsed_other, self.collapsed_agents,
+                    flatten_single_pane_windows=True,
+                    hidden_window_refs=hidden_window_refs,
                 )
 
         if not self.visible_rows:
@@ -1043,13 +1149,11 @@ class Tower:
             ]
             return
 
-        visual = [{"type": "header", "host": t("list.title")}]
-        clustered = None
+        # The home title is already pinned above the list. Keep saved
+        # folders/groups as flat section rows instead of repeating a
+        # project/tree header above their tasks.
+        visual = []
         for idx, row in enumerate(self.visible_rows):
-            project = row.get("_project_cluster")
-            if project and project != clustered:
-                visual.append({"type": "header", "host": str(project), "level": "project"})
-            clustered = project
             visual.append({"type": "data", "row": row, "row_index": idx})
         self.visual = visual
 
@@ -1087,6 +1191,8 @@ class Tower:
     def toggle_folder(self, folder_id: str) -> None:
         if folder_id == "__unfiled__":
             self.collapsed_other = not self.collapsed_other
+        elif folder_id == "__agents__":
+            self.collapsed_agents = not self.collapsed_agents
         else:
             try:
                 self.folders.toggle_folder(folder_id)
@@ -1123,7 +1229,10 @@ class Tower:
             self._apply_filter(row.get("key"))
             return
         if row.get("kind") == "other_section":
-            self.collapsed_other = True
+            if row.get("folder_id") == "__agents__":
+                self.collapsed_agents = True
+            else:
+                self.collapsed_other = True
             self._apply_filter(row.get("key"))
             return
         if row.get("kind") == "work_group":
@@ -1133,6 +1242,13 @@ class Tower:
         if row.get("kind") == "window_asset":
             try:
                 self.folders.update_window(row["window_ref"], collapsed=True)
+            except (KeyError, OSError, ValueError):
+                self.notice = t("folder.save_failed")
+            self._apply_filter(row.get("key"))
+            return
+        if row.get("kind") == "pane" and row.get("tree_window_ref"):
+            try:
+                self.folders.update_window(row["tree_window_ref"], collapsed=True)
             except (KeyError, OSError, ValueError):
                 self.notice = t("folder.save_failed")
             self._apply_filter(row.get("key"))
@@ -1162,7 +1278,10 @@ class Tower:
             self._apply_filter(row.get("key"))
             return
         if row.get("kind") == "other_section":
-            self.collapsed_other = False
+            if row.get("folder_id") == "__agents__":
+                self.collapsed_agents = False
+            else:
+                self.collapsed_other = False
             self._apply_filter(row.get("key"))
             return
         if row.get("kind") == "window_asset":
@@ -1221,7 +1340,7 @@ class Tower:
         return None
 
     def rename_selected(self, stdscr) -> None:
-        """Rename the selected Tower work item without changing tmux names."""
+        """Rename a task in Tower; local tmux title sync is an explicit opt-in."""
 
         if not self.visible_rows:
             return
@@ -1254,27 +1373,225 @@ class Tower:
             self.load()
             return
         if row.get("kind") == "window":
-            pane_id = row.get("rename_pane_id")
-            row = next((pane for pane in self.rows if pane.get("pane_id") == pane_id), {})
+            window = row
+            pane_id = window.get("rename_pane_id")
+            row = next((
+                pane for pane in self.rows
+                if pane.get("pane_id") == pane_id
+                and str(pane.get("session") or "") == str(window.get("session") or "")
+                and bool(pane.get("remote")) == bool(window.get("remote"))
+                and (not window.get("window_id") or pane.get("window_id") == window.get("window_id"))
+            ), {})
         if row.get("offline") or not row.get("pane_id"):
             return
 
         key = row["key"]
         session = str(row.get("session") or "")
         pane_pid = str(row.get("pane_pid") or "")
+        if not key or not session or not pane_pid:
+            self.notice = t("rename.stale")
+            return
         current = row.get("display_name") or row.get("task_name") or row.get("project") or ""
+        suggested = row.get("suggested_name") or current or "-"
+        is_remote = not self._supports_local_pane_title_sync(row)
         name = prompt_text(
             stdscr,
-            t("prompt.rename"),
+            t("rename.prompt"),
             initial=current,
-            context_lines=[f'{t("edit.auto_label")}: {row.get("suggested_name") or current or "-"}'],
+            context_lines=[
+                t("rename.current", name=current or "-"),
+                t("rename.auto", name=suggested),
+                t("rename.default_scope"),
+                t("rename.remote_scope") if is_remote else t("rename.local_scope"),
+            ],
         )
-        if name is not None:
-            if name.strip():
-                self.overrides.set_task_name(key, name.strip(), session, pane_pid)
+        if name is None:
+            return
+
+        cleaned_name = name.strip()
+        sync_state = self.overrides.get_task_title_sync(key, session, pane_pid)
+        if not cleaned_name:
+            if sync_state["enabled"] and not is_remote and not self._restore_managed_pane_title(row, sync_state):
+                self.notice = t("rename.auto_restore_failed")
+                self.load()
+                return
+            self.overrides.clear_field(key, "task_name", session, pane_pid)
+            self.notice = t("rename.auto_restored")
+            self.load()
+            return
+
+        sync_selected = False
+        if not is_remote:
+            pick = run_list_picker(
+                stdscr,
+                t("rename.scope_title"),
+                [("sync", t("rename.sync_option"))],
+                multi=True,
+                checked={"sync"} if sync_state["enabled"] else set(),
+                footer_hint=t("rename.scope_hint"),
+                preamble=[
+                    t("rename.current", name=cleaned_name),
+                    t("rename.auto", name=suggested),
+                    t("rename.default_scope"),
+                ],
+            )
+            if pick.cancelled:
+                return
+            sync_selected = "sync" in pick.selected_keys
+
+        self.overrides.set_task_name(key, cleaned_name, session, pane_pid)
+        if sync_selected:
+            ok, _reason = self._sync_one_pane_title(row, cleaned_name, time.monotonic(), initial=True)
+            if ok:
+                self.notice = t("rename.changed_both")
             else:
-                self.overrides.clear_field(key, "task_name", session, pane_pid)
+                self.overrides.set_task_title_sync(
+                    key, session, pane_pid, enabled=False, blocked=False, conflicts=0,
+                )
+                self.notice = t("rename.display_only")
+        else:
+            self.overrides.set_task_title_sync(
+                key, session, pane_pid, enabled=False, blocked=False, conflicts=0,
+            )
+            self.notice = t("rename.changed_tower")
         self.load()
+
+    def _restore_managed_pane_title(self, row: Dict, sync_state: Dict[str, object]) -> bool:
+        """On explicit auto-reset, restore only a title Tower still owns."""
+
+        if not self._supports_local_pane_title_sync(row) or not sync_state.get("last_title"):
+            return True
+        from ..tmux import structure
+
+        session = str(row.get("session") or "")
+        pane_id = str(row.get("pane_id") or "")
+        pane_pid = str(row.get("pane_pid") or "")
+        live = structure.pane_title_identity(session, pane_id)
+        if not live or live["pane_pid"] != pane_pid:
+            return True
+        if live["pane_title"] != sync_state.get("last_title"):
+            # An Agent or user already changed the title; do not overwrite it.
+            return True
+        result = structure.rename_pane(
+            session,
+            pane_id,
+            str(sync_state.get("original_title") or ""),
+            expected_pane_pid=pane_pid,
+            allow_empty=True,
+        )
+        return result.ok
+
+    def _sync_one_pane_title(
+        self, row: Dict, task_name: str, now: float, *, initial: bool = False,
+    ) -> Tuple[bool, str]:
+        """Set only this local pane's title after a fresh session/id/pid check."""
+
+        if not self._supports_local_pane_title_sync(row):
+            return False, "unsupported"
+        key = str(row.get("key") or "")
+        session = str(row.get("session") or "")
+        pane_id = str(row.get("pane_id") or "")
+        pane_pid = str(row.get("pane_pid") or "").strip()
+        if not key or not session or not pane_pid:
+            return False, "stale"
+
+        from ..tmux import structure
+
+        cleaned_title = structure.clean_name(task_name, limit=80)
+        if not cleaned_title or cleaned_title != task_name:
+            return False, "bad_title"
+        live = structure.pane_title_identity(session, pane_id)
+        if not live or live["pane_pid"] != pane_pid:
+            return False, "stale"
+
+        state = self.overrides.get_task_title_sync(key, session, pane_pid)
+        previous_last = str(state.get("last_title") or "")
+        original_title = (
+            str(state.get("original_title") or "")
+            if previous_last and live["pane_title"] == previous_last
+            else live["pane_title"]
+        )
+        attempt_key = (key, session, pane_pid)
+
+        if live["pane_title"] != cleaned_title and not initial:
+            last_attempt = self._title_sync_last_applied.get(attempt_key)
+            conflict_count = int(state.get("conflicts") or 0)
+            if (last_attempt is not None and now - last_attempt <= PANE_TITLE_SYNC_CONFLICT_WINDOW_SECONDS) or (
+                last_attempt is None and conflict_count > 0
+            ):
+                conflict_count += 1
+                if conflict_count >= PANE_TITLE_SYNC_MAX_CONFLICTS:
+                    self.overrides.set_task_title_sync(
+                        key, session, pane_pid, enabled=False, blocked=True,
+                        conflicts=conflict_count,
+                    )
+                    self._title_sync_last_applied.pop(attempt_key, None)
+                    self.notice = t("rename.title_sync_conflict")
+                    return False, "conflict"
+            else:
+                conflict_count = 0
+        else:
+            conflict_count = 0
+
+        result = structure.rename_pane(
+            session, pane_id, cleaned_title, expected_pane_pid=pane_pid,
+        )
+        if not result.ok:
+            return False, result.detail or "rename_failed"
+        self.overrides.set_task_title_sync(
+            key, session, pane_pid, enabled=True, blocked=False,
+            conflicts=conflict_count, original_title=original_title, last_title=cleaned_title,
+        )
+        if live["pane_title"] != cleaned_title:
+            self._title_sync_last_applied[attempt_key] = now
+        else:
+            self._title_sync_last_applied.pop(attempt_key, None)
+        return True, "changed" if live["pane_title"] != cleaned_title else "unchanged"
+
+    def sync_opted_in_pane_titles(self, now: Optional[float] = None) -> bool:
+        """Rate-limited reconciliation; at most one pane title write per scan."""
+
+        now = time.monotonic() if now is None else now
+        if now - self._last_title_sync_scan < PANE_TITLE_SYNC_INTERVAL_SECONDS:
+            return False
+        self._last_title_sync_scan = now
+        for row in self.rows:
+            if row.get("kind") != "pane" or not self._supports_local_pane_title_sync(row):
+                continue
+            key = str(row.get("key") or "")
+            session = str(row.get("session") or "")
+            pane_pid = str(row.get("pane_pid") or "").strip()
+            if not self.overrides.get_task_title_sync(key, session, pane_pid).get("enabled"):
+                continue
+            task_name = self.overrides.get_task_name(key, session, pane_pid)
+            if self.overrides.get_task_name_origin(key, session, pane_pid) != "user" or not task_name:
+                self.overrides.set_task_title_sync(
+                    key, session, pane_pid, enabled=False, blocked=False, conflicts=0,
+                )
+                continue
+            before_notice = self.notice
+            ok, _reason = self._sync_one_pane_title(row, str(task_name), now)
+            if not ok:
+                if _reason != "conflict":
+                    self.overrides.set_task_title_sync(
+                        key, session, pane_pid, enabled=False, blocked=False, conflicts=0,
+                    )
+                    self.notice = t("rename.display_only")
+                return self.notice != before_notice
+            if _reason != "unchanged":
+                return False
+        return False
+
+    def _supports_local_pane_title_sync(self, row: Dict) -> bool:
+        """Only a locally observed tmux pane may receive physical title writes."""
+
+        if APP_HOME_ISOLATED:
+            return False
+        if row.get("remote") or row.get("transport") == "ssh" or row.get("offline") or row.get("placeholder"):
+            return False
+        tmux_host = str(row.get("tmux_host") or "").strip().casefold()
+        local_host = str(self.local_host or "").strip().casefold()
+        return not tmux_host or not local_host or tmux_host == local_host
 
     def edit_selected(self, stdscr) -> None:
         """Edit task identity first; keep terminal labels under More."""
@@ -1479,7 +1796,7 @@ def _build_detail_fields(tower: Tower, row: Dict, advanced: bool = False) -> Lis
             (t("group.members"), str(row.get("member_count") or 0)),
             (t("detail.status"), row.get("summary") or t("group.empty")),
         ]
-    symbol, key = render.execution_badge(row.get("status") or "")
+    symbol, key = render.execution_badge_for_row(row)
     status_text = _badge_text(symbol, key)
     duration = _duration_text(tower, row)
     if duration:
@@ -1535,53 +1852,134 @@ def _build_detail_fields(tower: Tower, row: Dict, advanced: bool = False) -> Lis
     return fields
 
 
-def _build_selected_summary(tower: Tower, row: Dict) -> List[str]:
-    """Short, user-facing summary for the default Work view."""
-    if row.get("kind") in {"folder", "other_section"}:
-        return [row.get("display_name") or "", row.get("summary") or t("group.empty")]
-    if row.get("kind") == "window_asset":
-        return [
-            row.get("display_name") or t("folder.terminal"),
-            t("folder.window_tasks").format(n=len(row.get("task_target_ids") or [])),
-            row.get("summary") or t("group.empty"),
-        ]
-    if row.get("kind") == "work_group":
-        return [
-            row.get("display_name") or "",
-            t("group.member_count").format(n=row.get("member_count") or 0),
-            row.get("summary") or t("group.empty"),
-        ]
+def _enter_blocked_reason(row: Optional[Dict]) -> str:
+    """Localization key for why a selected row cannot be opened with Enter."""
 
-    project = _project_text(row)
-    name = row.get("display_name") or row.get("task_name") or project or t("task.terminal")
-    role = t(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
-    agent = row.get("agent") or t("task.terminal")
-    identity = [label for label in (role, agent) if label]
-    if role and role.casefold() in str(name).casefold():
-        identity.remove(role)
-    badges = " · ".join(_badge_text(symbol, key) for symbol, key in render.detail_badges(row))
-    duration = _duration_text(tower, row)
-    if duration and row.get("status") == "WORKING":
-        badges = f"{badges} · {duration}"
-    execution_host = row.get("execution_host") or row.get("host") or ""
-    details = []
-    if project:
-        details.append(f'{t("detail.project")} {project}')
-    if execution_host and execution_host.casefold() not in {"unknown", t("state.unknown").casefold()}:
-        details.append(f'{t("detail.execution_host")} {execution_host}')
-    identity_line = " · ".join(identity + ([badges] if badges else []))
-    return [str(name), identity_line] + ([" · ".join(details)] if details else [])
+    if not row:
+        return "enter.no_selection"
+    if row.get("offline") or row.get("placeholder"):
+        return "enter.offline"
+    if row.get("kind") == "work_group_stale" or row.get("stale"):
+        return "enter.stale"
+    if row.get("kind") == "window" and row.get("remote"):
+        return "enter.remote_readonly"
+    if row.get("kind") == "window" and not row.get("window_id"):
+        return "enter.window_missing"
+    return "enter.unavailable"
+
+
+def _selected_enter_hint(row: Optional[Dict]) -> str:
+    if row and row.get("kind") == "pane" and row.get("status") == "UNKNOWN" and not row.get("offline"):
+        return t("hint.enter_check_status")
+    intent = enter_intent(row)
+    return {
+        "toggle": t("hint.enter_expand"),
+        "group": t("hint.enter_expand"),
+        "control": t("hint.enter_conversation"),
+        "window": t("hint.enter_window"),
+        "zero": t("hint.enter_start"),
+        "ignore": t("hint.enter_unavailable"),
+    }.get(intent, t("hint.enter_unavailable"))
+
+
+def _help_lines() -> List[str]:
+    return [
+        t("help.navigation"), t("help.actions"), t("help.saved"),
+        t("help.results"), t("help.copy_safety"), t("help.copy_safety_block"),
+        t("help.remote"), t("help.remote_limits"), t("help.manage"),
+        t("help.detail"), t("help.detail_advanced"), t("help.detail_reject"),
+        t("help.troubleshoot"), t("help.advanced"),
+        t("help.start"), t("help.existing"), t("help.destinations"), t("help.exit"),
+    ]
+
+
+def _home_selected_row(tower: Tower) -> Optional[Dict]:
+    if not tower.visible_rows or not 0 <= tower.selected < len(tower.visible_rows):
+        return None
+    return tower.visible_rows[tower.selected]
+
+
+def _home_selection_lines(tower: Tower, width: int) -> List[str]:
+    """Compact selected-item context for the wide home side panel."""
+
+    row = _home_selected_row(tower)
+    if not row:
+        return []
+
+    available = max(0, width - 4)
+    name = (
+        row.get("display_name") or row.get("task_name") or row.get("project")
+        or row.get("folder_name") or t("task.terminal")
+    )
+    lines = [render.truncate_to_width(t("home.selected_task", name=name), available)]
+    kind = row.get("kind")
+
+    if kind in {"pane", "work_group_stale"}:
+        role = t(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
+        agent = str(row.get("agent") or t("task.terminal")).strip()
+        if role and role.casefold() not in str(name).casefold():
+            agent = f"{role} · {agent}"
+
+        agent_line = t("home.agent", agent=agent)
+        host = str(row.get("execution_host") or row.get("host") or "").strip()
+        if host.casefold() in {"unknown", t("state.unknown").casefold()}:
+            host = ""
+        lines.append(render.truncate_to_width(agent_line, available))
+        if host:
+            lines.append(render.truncate_to_width(
+                t("home.execution_host", host=host), available
+            ))
+
+        _symbol, primary_key = render.primary_badge(row)
+        statuses = [t(primary_key)]
+        if not row.get("offline"):
+            _symbol, execution_key = render.execution_badge_for_row(row)
+            execution_status = t(execution_key)
+            if execution_status not in statuses:
+                statuses.append(execution_status)
+        lines.append(render.truncate_to_width(
+            t("home.status", status=" · ".join(statuses)), available
+        ))
+    elif kind == "work_group":
+        lines.append(render.truncate_to_width(
+            t("group.member_count").format(n=row.get("member_count") or 0), available
+        ))
+    elif kind == "window_asset":
+        lines.append(render.truncate_to_width(
+            t("home.task_count", count=len(row.get("task_target_ids") or [])), available
+        ))
+    elif kind in {"folder", "other_section"}:
+        lines.append(render.truncate_to_width(
+            t("home.folder_contents", count=len(row.get("window_refs") or [])), available
+        ))
+
+    return lines
+
+
+def _home_key_lines(tower: Tower, width: int) -> List[str]:
+    row = tower.visible_rows[tower.selected] if tower.visible_rows and 0 <= tower.selected < len(tower.visible_rows) else None
+    enter_hint = _selected_enter_hint(row)
+    keys = [t("hint.move_compact"), enter_hint]
+    if row and row.get("kind") == "pane":
+        keys.append(t("hint.result"))
+    if row and row.get("kind") == "zero":
+        keys.append(t("hint.create_compact"))
+    first = "   ".join(keys)
+    view_hint = (
+        t("hint.user_work_view_compact")
+        if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW
+        else t("hint.advanced_compact")
+    )
+    second = "   ".join((
+        t("hint.rename_compact"), t("hint.actions_compact"),
+        t("hint.attention_compact"), view_hint, t("hint.help_compact"),
+    ))
+    available = max(1, width - 4)
+    return [render.truncate_to_width(first, available), render.truncate_to_width(second, available)]
 
 
 def _home_footer_lines(tower: Tower, width: int) -> List[str]:
-    keys = [
-        t("hint.move"), t("hint.open"), t("hint.actions"), t("hint.create"),
-        t("hint.saved"), t("hint.live"), t("hint.settings"), t("hint.filter"),
-        t("hint.result"), t("hint.back"), t("hint.help"),
-    ]
-    if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW:
-        keys.insert(0, t("hint.user_work_view"))
-    return render.wrap_items(keys, max(1, width - 4))
+    return _home_key_lines(tower, width)
 
 
 def _location_fields(row: Dict) -> List[Tuple[str, str]]:
@@ -1601,11 +1999,10 @@ def _location_fields(row: Dict) -> List[Tuple[str, str]]:
     return fields
 
 
-def _build_physical_lines(tower: Tower, narrow: bool) -> List[Dict]:
+def _build_physical_lines(tower: Tower, narrow: bool, show_home_context: bool = False) -> List[Dict]:
     """Flattens ``tower.visual`` (header/data items) into one entry per
-    *physical* terminal line, since narrow rows can show project, task name,
-    and agent/status separately -- viewport scrolling paginates over this
-    list, not over ``visual``.
+    *physical* terminal line, since narrow rows show agent/status below the
+    task title -- viewport scrolling paginates over this list, not visual.
     """
 
     physical: List[Dict] = []
@@ -1619,9 +2016,13 @@ def _build_physical_lines(tower: Tower, narrow: bool) -> List[Dict]:
         row_index = item["row_index"]
         physical.append({"kind": "primary", "row": row, "row_index": row_index})
 
-        if narrow and row.get("kind") in {"folder", "other_section", "window_asset"}:
+        if (narrow and row.get("kind") in {"folder", "other_section", "window_asset"}
+                and row.get("collapsed")):
             physical.append({"kind": "group_summary", "row": row, "row_index": row_index})
-        elif narrow and row.get("kind") in {"pane", "work_group_stale"}:
+        elif (show_home_context and row_index == tower.selected
+              and row.get("kind") in {"folder", "other_section", "window_asset", "work_group"}):
+            physical.append({"kind": "selected_context", "row": row, "row_index": row_index})
+        elif (narrow or show_home_context) and row.get("kind") in {"pane", "work_group_stale"}:
             physical.append({"kind": "agent_status", "row": row, "row_index": row_index})
         elif not narrow and row.get("activity_text"):
             physical.append({"kind": "activity", "row": row, "row_index": row_index})
@@ -1635,49 +2036,82 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
     height, width = stdscr.getmaxyx()
     narrow = render.use_narrow_layout(width)
 
-    # -- row 0: title + per-host mini summaries (right-aligned) ---------
+    # -- row 0: title + concise work-state counts (right-aligned) --------
 
-    title = t("app.title")
+    title = t("home.title")
     if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW:
         title = f'{title} · {t("nav.terminal_structure")}'
     safe_add(stdscr, 0, 2, title, curses.A_BOLD)
     from .remote_menu import badge_text
 
     view_mode = getattr(tower, "view_mode", USER_WORK_VIEW)
+    wide_home = view_mode == USER_WORK_VIEW and render.use_home_side_panel(width, height)
+    list_width = render.home_list_width(width) if wide_home else width
+    side_x = list_width + 3
+    side_width = max(0, width - side_x - 2)
+    side_lines = _home_selection_lines(tower, side_width + 4) if wide_home else []
     badge = badge_text(remote_state) if view_mode == TERMINAL_STRUCTURE_VIEW else ""
     badge_x = 2 + render.display_width(title) + 3
     if badge:
         safe_add(stdscr, 0, badge_x, badge, curses.A_DIM)
 
-    host_line = render.format_watch_header(render.watch_counts(tower.visible_rows), t)
-    if host_line and not narrow:
-        min_x = badge_x + render.display_width(badge) + (2 if badge else 0)
-        x = max(min_x, width - render.display_width(host_line) - 2)
-        if x + render.display_width(host_line) < width:
-            safe_add(stdscr, 0, x, host_line, curses.A_BOLD)
+    counts = render.watch_counts(tower.visible_rows)
+    watch_items = [
+        f"{symbol} {t(key)} {counts.get(name, 0)}"
+        for name, symbol, key in render.WATCH_HEADER
+        if counts.get(name, 0) > 0
+    ]
+    watch_text = "   ".join(watch_items)
+    min_watch_x = badge_x + render.display_width(badge) + (2 if badge else 0)
+    watch_x = width - render.display_width(watch_text) - 2
+    watch_lines: List[str] = []
+    if watch_text and watch_x >= min_watch_x:
+        safe_add(stdscr, 0, watch_x, watch_text, curses.A_BOLD)
+    elif watch_items:
+        watch_lines = render.wrap_items(watch_items, max(1, width - 4))
 
     # -- row 1: access and copy context ----------------------------------
     context = getattr(tower, "access_context", None)
     if context:
         preference = load_preference()
+        client = str(context.display_name or "").strip()
         if preference == COPY_AUTO:
             destination = (
                 context.display_name
                 if context.clipboard_capability in {"host", "bridge"}
                 else t("access.unknown_destination")
             )
-            access_line = t("access.copy_auto", client=context.display_name, destination=destination)
+            same_displayed_computer = bool(
+                client and str(destination).strip()
+                and client.casefold() == str(destination).strip().casefold()
+            )
+            access_line = (
+                t("access.copy_auto_same_computer")
+                if same_displayed_computer
+                else t("access.copy_auto", client=context.display_name, destination=destination)
+            )
         else:
             destination = {
                 LOCAL_HOST: context.display_name,
                 CURRENT_TERMINAL: t("access.terminal"),
                 TMUX_BUFFER: t("access.tower_buffer"),
             }.get(preference, t("access.unknown_destination"))
-            access_line = t("access.copy_manual", client=context.display_name, destination=destination)
+            same_displayed_computer = bool(
+                client and str(destination).strip()
+                and client.casefold() == str(destination).strip().casefold()
+            )
+            access_line = (
+                t("access.copy_manual_same_computer")
+                if same_displayed_computer
+                else t("access.copy_manual", client=context.display_name, destination=destination)
+            )
     else:
         access_line = t("access.unknown_context")
     safe_add(stdscr, 1, 2, render.truncate_to_width(access_line, max(0, width - 4)), curses.A_DIM)
     start_y = 2
+    for index, line in enumerate(watch_lines):
+        safe_add(stdscr, start_y + index, 2, line, curses.A_BOLD)
+    start_y += len(watch_lines)
 
     if tower.visible_rows and all(row.get("kind") == "zero" for row in tower.visible_rows):
         safe_add(stdscr, start_y, 2, t("zero.title"), curses.A_BOLD)
@@ -1689,32 +2123,29 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
     # -- selected-item detail, immediately below the work list -----------
 
     detail_lines: List[str] = []
-    if (render.should_show_detail_panel(height) and tower.visible_rows
+    if (view_mode == TERMINAL_STRUCTURE_VIEW and render.should_show_detail_panel(height) and tower.visible_rows
             and tower.visible_rows[tower.selected].get("kind") != "zero"):
         selected_row = tower.visible_rows[tower.selected]
-        if getattr(tower, "view_mode", USER_WORK_VIEW) == TERMINAL_STRUCTURE_VIEW:
-            detail_fields = _build_detail_fields(tower, selected_row, advanced=True)
-        else:
-            detail_fields = []
-        detail_lines = (
-            render.format_detail_panel(detail_fields)
-            if detail_fields
-            else _build_selected_summary(tower, selected_row)
-        )
+        detail_fields = _build_detail_fields(tower, selected_row, advanced=True)
+        detail_lines = render.format_detail_panel(detail_fields) if detail_fields else []
 
     detail_block = (1 + 1 + len(detail_lines)) if detail_lines else 0
     max_rows = max(0, footer_y - start_y - detail_block)
 
     if not tower.visible_rows:
         msg = t("wizard.no_matches") if tower.filter_text else t("empty.no_panes")
-        safe_add(stdscr, start_y, 2, msg)
+        if start_y < footer_y:
+            safe_add(stdscr, start_y, 2, msg)
+        if tower.notice:
+            safe_add(stdscr, footer_y, 2, render.truncate_to_width(tower.notice, max(0, width - 4)), curses.A_BOLD)
         for index, line in enumerate(footer_lines):
-            safe_add(stdscr, footer_y + index, 2, line, curses.A_DIM)
+            safe_add(stdscr, footer_y + index + (1 if tower.notice else 0), 2, line, curses.A_NORMAL)
         stdscr.noutrefresh()
         curses.doupdate()
         return
 
-    physical = _build_physical_lines(tower, narrow)
+    show_home_context = view_mode == USER_WORK_VIEW and not wide_home
+    physical = _build_physical_lines(tower, narrow, show_home_context=show_home_context)
 
     selected_phys_index = 0
     for i, p in enumerate(physical):
@@ -1732,6 +2163,8 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
         y = start_y + offset
 
         if p["kind"] == "header":
+            if view_mode == USER_WORK_VIEW and p.get("level") == "host" and p.get("host") == t("list.title"):
+                continue
             if p.get("level") == "window":
                 # A window is a divider above its panes, not a row.
                 label = f'  ┄ {p["host"]} '
@@ -1745,37 +2178,49 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
         is_selected = p["row_index"] == tower.selected
 
         user_view = view_mode == USER_WORK_VIEW
-        base_attr = (curses.A_BOLD if is_selected else 0) if user_view else curses.A_REVERSE
+        base_attr = (
+            (curses.A_REVERSE | curses.A_BOLD) if is_selected else 0
+        ) if user_view else curses.A_REVERSE
         if not user_view and is_selected and curses.has_colors():
             base_attr = curses.color_pair(6) | curses.A_BOLD
 
-        if is_selected and not user_view:
-            safe_add(stdscr, y, 0, " " * max(1, width - 1), base_attr)
+        if is_selected:
+            safe_add(stdscr, y, 0, " " * max(1, list_width - 1), base_attr)
 
         if p["kind"] == "primary":
-            parts = render.list_row_parts(row, width, t, _duration_text(tower, row))
-            prefix = ("› " if is_selected else "  ") + (parts["guide"] or "") if user_view else (parts["guide"] or " ")
+            duration = "" if user_view else _duration_text(tower, row)
+            parts = render.list_row_parts(row, list_width, t, duration)
+            if (user_view and row.get("kind") in {"folder", "other_section", "window_asset"}
+                    and not row.get("collapsed")):
+                parts["badge"] = ""
+            if user_view:
+                prefix = "▶ " if is_selected else "  "
+                if row.get("kind") in {"folder", "other_section", "window_asset", "work_group"}:
+                    prefix += ("▸ " if row.get("collapsed") else "▾ ")
+            else:
+                prefix = parts["guide"] or " "
             project_text = parts["project"] if row.get("kind") != "zero" else _project_text(row)
             if parts.get("task") and (narrow or row.get("kind") != "work_group"):
                 project_text = f'{project_text} · {parts["task"]}'
-            state_text = parts["badge"]
-            agent_text = parts["agent"]
+            show_row_identity = not user_view or (wide_home and not is_selected)
+            state_text = parts["badge"] if show_row_identity else ""
+            agent_text = parts["agent"] if show_row_identity else ""
             state_width = render.display_width(state_text)
             prefix_width = render.display_width(prefix)
             state_reserve = state_width + 2 if state_text else 0
             agent_reserve = render.display_width(agent_text) + 2 if agent_text else 0
-            project_budget = max(8, width - prefix_width - state_reserve - agent_reserve - 4)
+            project_budget = max(8, list_width - prefix_width - state_reserve - agent_reserve - 4)
             text = render.truncate_to_width(project_text, project_budget)
 
             safe_add(stdscr, y, 0, prefix, base_attr if is_selected else (
-                curses.A_BOLD if row.get("kind") in {"folder", "other_section", "window_asset"} else 0
+                curses.A_BOLD if row.get("kind") in {"folder", "other_section", "window_asset", "work_group"} else 0
             ))
             safe_add(stdscr, y, prefix_width, text, base_attr)
 
             if agent_text:
                 agent_x = prefix_width + render.display_width(text) + 2
                 safe_add(stdscr, y, agent_x, agent_text, base_attr)
-            state_x = width - state_width - 2
+            state_x = list_width - state_width - 2
             if state_text and state_x > prefix_width + 1:
                 if row.get("kind") in {"window", "folder", "other_section", "window_asset", "work_group"}:
                     status_attr_here = base_attr if is_selected else curses.A_DIM
@@ -1785,24 +2230,48 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
 
         elif p["kind"] == "activity":
             attr = base_attr if is_selected else curses.A_DIM
-            indent = render.display_width(row.get("guide") or "") or 4
+            indent = 2 if user_view else (render.display_width(row.get("guide") or "") or 4)
             safe_add(stdscr, y, indent, row["activity_text"], attr)
 
         elif p["kind"] == "agent_status":
             _symbol, key = render.primary_badge(row)
-            state = f'{_symbol} {t(key)}'
-            duration = _duration_text(tower, row)
+            primary_status = t(key)
+            statuses = [f'{_symbol} {primary_status}']
+            if user_view and not row.get("offline"):
+                _exec_symbol, execution_key = render.execution_badge_for_row(row)
+                execution = t(execution_key)
+                if execution != primary_status and execution not in statuses:
+                    statuses.append(execution)
+            state = " · ".join(statuses)
+            duration = "" if user_view else _duration_text(tower, row)
             if duration:
                 state += " · " + duration
             role = t(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
-            line = render.agent_status_line(row.get("agent") or "-", state, role=role)
-            indent = render.display_width(row.get("guide") or "") + 2
+            host = str(row.get("execution_host") or row.get("host") or "").strip() if user_view else ""
+            if host.casefold() in {"unknown", t("state.unknown").casefold()}:
+                host = ""
+            line = render.agent_status_line(
+                row.get("agent") or "-", state, role=role, host=host,
+                max_width=max(1, list_width - 4),
+            )
+            indent = 2 if user_view else render.display_width(row.get("guide") or "") + 2
             safe_add(stdscr, y, indent, line, base_attr if is_selected else curses.A_DIM)
 
+        elif p["kind"] == "selected_context":
+            context_lines = _home_selection_lines(tower, list_width)
+            if len(context_lines) > 1:
+                safe_add(stdscr, y, 2, context_lines[1], base_attr if is_selected else curses.A_DIM)
+
         elif p["kind"] == "group_summary":
-            indent = render.display_width(row.get("guide") or "") + 2
+            indent = 2 if user_view else render.display_width(row.get("guide") or "") + 2
             summary = row.get("summary_compact") if narrow else row.get("summary")
             safe_add(stdscr, y, indent, summary or t("group.empty"), base_attr if is_selected else curses.A_DIM)
+
+    if wide_home and visible_physical:
+        safe_add(stdscr, start_y, list_width, "│", curses.A_DIM)
+        safe_add(stdscr, start_y, side_x, t("home.summary"), curses.A_BOLD)
+        for index, line in enumerate(side_lines[:max(0, footer_y - start_y - 1)]):
+            safe_add(stdscr, start_y + index + 1, side_x, line, curses.A_DIM)
 
     # -- detail panel ------------------------------------------------------
 
@@ -1816,7 +2285,7 @@ def draw(stdscr, tower: Tower, remote_state: str = "stopped") -> None:
     if tower.notice:
         safe_add(stdscr, footer_y, 2, render.truncate_to_width(tower.notice, max(0, width - 4)), curses.A_BOLD)
     for index, line in enumerate(footer_lines):
-        safe_add(stdscr, footer_y + index + (1 if tower.notice else 0), 2, line, curses.A_DIM)
+        safe_add(stdscr, footer_y + index + (1 if tower.notice else 0), 2, line, curses.A_NORMAL)
 
     stdscr.noutrefresh()
     curses.doupdate()
@@ -1897,6 +2366,22 @@ def _open_selected_row(stdscr, tower) -> None:
         from .structure_menu import run_zero_action
 
         run_zero_action(stdscr, tower, row.get("action") or "")
+    elif intent == "ignore" and row:
+        tower.notice = t(_enter_blocked_reason(row))
+
+
+def _show_selected_result_copy(stdscr, tower) -> None:
+    row = tower.visible_rows[tower.selected] if tower.visible_rows else None
+    from .widgets import show_message_screen
+
+    if not row or row.get("kind") != "pane" or not row.get("key"):
+        show_message_screen(stdscr, t("nav.copy_result"), [t("control.copy_requires_pane")])
+        return
+
+    from .control_view import _copy_result
+
+    message = _copy_result(tower, row["key"], stdscr)
+    show_message_screen(stdscr, t("detail.result"), [message or t("control.no_result")])
 
 
 def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
@@ -1919,6 +2404,10 @@ def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
             remote_state = tower.remote_state or remote_state
             needs_draw = True
         now = time.monotonic()
+
+        sync_titles = getattr(tower, "sync_opted_in_pane_titles", None)
+        if callable(sync_titles) and sync_titles(now):
+            needs_draw = True
 
         if now - tower.last_refresh >= REFRESH_SECONDS:
             _request_background_refresh(tower)
@@ -2008,13 +2497,7 @@ def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
             continue
 
         if matches_letter(key, "y"):
-            row = tower.visible_rows[tower.selected] if tower.visible_rows else None
-            if row and row.get("kind") == "pane" and row.get("key"):
-                from .control_view import _copy_result
-                from .widgets import show_message_screen
-
-                message = _copy_result(tower, row["key"], stdscr)
-                show_message_screen(stdscr, t("detail.result"), [message or t("control.no_result")])
+            _show_selected_result_copy(stdscr, tower)
             draw(stdscr, tower, remote_state=remote_state)
             continue
 
@@ -2033,38 +2516,14 @@ def _run_loop(stdscr, session: str, own_pane_id: str) -> None:
         if key == "?":
             from .widgets import show_message_screen
 
-            show_message_screen(stdscr, t("help.title"), [
-                t("help.navigation"), t("help.actions"), t("help.saved"),
-                t("help.results"), t("help.start"), t("help.destinations"), t("help.exit"),
-            ])
+            show_message_screen(stdscr, t("help.title"), _help_lines(), paginate=True)
             draw(stdscr, tower, remote_state=remote_state)
             continue
 
         if matches_letter(key, "l"):
-            row = tower.visible_rows[tower.selected] if tower.visible_rows else None
-            if row and row.get("kind") in {"folder", "other_section"}:
-                from .live_view import open_folder_live_view
+            from .control_room import open_control_room
 
-                open_folder_live_view(stdscr, tower, row)
-            elif row and row.get("kind") == "work_group":
-                from .live_view import open_group_live_view
-
-                store = getattr(tower, "work_groups", None)
-                group = next((item for item in store.all()
-                              if item.get("group_id") == row.get("group_id")), row) if store else row
-                open_group_live_view(stdscr, tower, group)
-            elif row and row.get("kind") == "window_asset":
-                from .live_view import open_window_live_view
-
-                open_window_live_view(stdscr, tower, row.get("window_ref") or "")
-            elif row and row.get("kind") == "pane" and row.get("key"):
-                from .live_view import open_live_view
-
-                open_live_view(stdscr, tower, row["key"])
-            else:
-                from .live_view import open_live_view
-
-                open_live_view(stdscr, tower)
+            open_control_room(stdscr, tower)
             _request_background_refresh(tower)
             draw(stdscr, tower, remote_state=remote_state)
             continue

@@ -27,7 +27,11 @@ from typing import Dict, Optional
 
 ROLE_IDS = ("orchestrator", "planner", "builder", "reviewer", "qa", "dogfood", "e2e")
 FIELDS = ("project", "task_name", "agent", "title", "execution_host", "role")
-_KEPT = FIELDS + ("task_name_origin", "session", "pane_pid")
+_TITLE_SYNC_FIELDS = (
+    "task_title_sync_enabled", "task_title_sync_conflicts", "task_title_sync_blocked",
+    "task_title_sync_original_title", "task_title_sync_last_title",
+)
+_KEPT = FIELDS + ("task_name_origin", "session", "pane_pid") + _TITLE_SYNC_FIELDS
 
 
 class OverrideStore:
@@ -150,6 +154,57 @@ class OverrideStore:
         self._cache = data
         self._save()
 
+    def get_task_title_sync(self, key: str, session: str, pane_pid: str) -> Dict[str, object]:
+        entry = self._load().get(str(key))
+        if not entry or not self._matches(entry, session, pane_pid):
+            return {"enabled": False, "blocked": False, "conflicts": 0, "original_title": "", "last_title": ""}
+        try:
+            conflicts = max(0, int(entry.get("task_title_sync_conflicts") or 0))
+        except (TypeError, ValueError):
+            conflicts = 0
+        blocked = entry.get("task_title_sync_blocked") == "1"
+        return {
+            "enabled": entry.get("task_title_sync_enabled") == "1" and not blocked,
+            "blocked": blocked,
+            "conflicts": conflicts,
+            "original_title": entry.get("task_title_sync_original_title") or "",
+            "last_title": entry.get("task_title_sync_last_title") or "",
+        }
+
+    def set_task_title_sync(
+        self,
+        key: str,
+        session: str,
+        pane_pid: str,
+        *,
+        enabled: Optional[bool] = None,
+        blocked: Optional[bool] = None,
+        conflicts: Optional[int] = None,
+        original_title: Optional[str] = None,
+        last_title: Optional[str] = None,
+    ) -> bool:
+        """Update opt-in title syncing only on the exact bound pane identity."""
+
+        data = self._load()
+        entry = data.get(str(key))
+        if not entry or not self._matches(entry, session, pane_pid) or not entry.get("task_name"):
+            return False
+        entry = dict(entry)
+        if enabled is not None:
+            entry["task_title_sync_enabled"] = "1" if enabled else "0"
+        if blocked is not None:
+            entry["task_title_sync_blocked"] = "1" if blocked else "0"
+        if conflicts is not None:
+            entry["task_title_sync_conflicts"] = str(max(0, conflicts))
+        if original_title is not None:
+            entry["task_title_sync_original_title"] = original_title
+        if last_title is not None:
+            entry["task_title_sync_last_title"] = last_title
+        data[str(key)] = entry
+        self._cache = data
+        self._save()
+        return True
+
     def get_agent(self, key: str, session: str = "", pane_pid: str = "") -> Optional[str]:
         return self._get_field(key, "agent", session, pane_pid)
 
@@ -221,6 +276,8 @@ class OverrideStore:
         entry.pop(field, None)
         if field == "task_name":
             entry.pop("task_name_origin", None)
+            for sync_field in _TITLE_SYNC_FIELDS:
+                entry.pop(sync_field, None)
         leftover = {k: v for k, v in entry.items() if k in FIELDS}
         if leftover:
             data[str(key)] = entry

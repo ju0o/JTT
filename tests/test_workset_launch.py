@@ -1,13 +1,20 @@
 import json
+import os
 import shutil
+import stat
 import subprocess
+import tempfile
+import time
 import uuid
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
-from tmux_agent_tower.launcher.spawn import SpawnTarget, spawn_local
-from tmux_agent_tower.launcher.workset_launch import WorksetLaunchError, launch_workset
+from tmux_agent_tower.launcher.spawn import SpawnResult, SpawnTarget, spawn_local
+from tmux_agent_tower.launcher.workset_launch import (
+    WorksetLaunchError, _rollback_message, launch_workset,
+)
 from tmux_agent_tower.state.worksets import WorkMember, WorksetStore, new_workset
 from tmux_agent_tower.ui.tower import Tower
 
@@ -16,7 +23,16 @@ pytestmark = pytest.mark.skipif(not shutil.which("tmux"), reason="tmux is not in
 
 
 def _tmux(*args):
+    assert "TMUX" not in os.environ and "TMUX_PANE" not in os.environ
+    assert os.environ.get("TMUX_TMPDIR", "").startswith("/tmp/tower-workset-")
     return subprocess.run(["tmux", *args], check=True, text=True, capture_output=True).stdout.strip()
+
+
+def _private_tmux_socket(socket_dir):
+    sockets = list(socket_dir.glob("tmux-*/default"))
+    assert len(sockets) == 1, sockets
+    assert stat.S_ISSOCK(sockets[0].stat().st_mode), sockets[0]
+    return sockets[0]
 
 
 def _window_geometry(window_id):
@@ -27,11 +43,12 @@ def _window_geometry(window_id):
 
 @pytest.fixture
 def isolated_tower(tmp_path, monkeypatch):
-    socket_dir = tmp_path / "tmux-socket"
-    socket_dir.mkdir()
-    monkeypatch.setenv("TMUX_TMPDIR", str(socket_dir))
+    socket_dir = Path(tempfile.mkdtemp(prefix="tower-workset-", dir="/tmp"))
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
+    monkeypatch.setenv("TMUX_TMPDIR", str(socket_dir))
+    assert "TMUX" not in os.environ and "TMUX_PANE" not in os.environ
+    assert not list(socket_dir.glob("tmux-*/default"))
     from tmux_agent_tower.ui import tower as tower_module
 
     state_dir = tmp_path / "state"
@@ -41,15 +58,87 @@ def isolated_tower(tmp_path, monkeypatch):
     monkeypatch.setattr(tower_module, "HOST_FILE", config_dir / "host")
     monkeypatch.setattr(tower_module, "REMOTE_HOSTS_FILE", config_dir / "remote-hosts.txt")
     session = "workset-" + uuid.uuid4().hex[:8]
-    _tmux("new-session", "-d", "-x", "160", "-y", "60", "-s", session, "sleep 600")
-    base = _tmux("list-panes", "-t", session, "-F", "#{pane_id} #{pane_pid}").split()
-    tower = Tower(session, own_pane_id=base[0])
-    yield tower, state_dir, base
-    _tmux("kill-server")
+    server_pid = None
+    try:
+        _tmux("-f", "/dev/null", "new-session", "-d", "-x", "160", "-y", "60", "-s", session, "sleep 600")
+        socket_path = _private_tmux_socket(socket_dir)
+        assert socket_path.parent.parent == socket_dir
+        server = subprocess.run(
+            ["tmux", "-S", str(socket_path), "display-message", "-p", "#{pid}"],
+            capture_output=True, text=True, check=False,
+        )
+        assert server.returncode == 0 and server.stdout.strip().isdecimal(), server.stderr
+        server_pid = int(server.stdout.strip())
+        base = _tmux("list-panes", "-t", session, "-F", "#{pane_id} #{pane_pid}").split()
+        tower = Tower(session, own_pane_id=base[0])
+        yield tower, state_dir, base
+    finally:
+        sockets = list(socket_dir.glob("tmux-*/default"))
+        assert len(sockets) <= 1, sockets
+        if sockets:
+            socket_path = sockets[0]
+            assert stat.S_ISSOCK(socket_path.stat().st_mode), socket_path
+            assert socket_path.parent.parent == socket_dir
+            if server_pid is None:
+                server = subprocess.run(
+                    ["tmux", "-S", str(socket_path), "display-message", "-p", "#{pid}"],
+                    capture_output=True, text=True, check=False,
+                )
+                if server.returncode == 0 and server.stdout.strip().isdecimal():
+                    server_pid = int(server.stdout.strip())
+            subprocess.run(
+                ["tmux", "-S", str(socket_path), "kill-server"],
+                capture_output=True, text=True, check=False,
+            )
+            for _ in range(50):
+                probe = subprocess.run(
+                    ["tmux", "-S", str(socket_path), "list-sessions"],
+                    capture_output=True, text=True, check=False,
+                )
+                if probe.returncode != 0:
+                    assert server_pid is not None, "could not identify isolated tmux server"
+                    try:
+                        os.kill(server_pid, 0)
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        time.sleep(0.1)
+                        continue
+                    socket_path.unlink(missing_ok=True)
+                    assert not socket_path.exists()
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("isolated tmux server did not stop")
+        assert not list(socket_dir.glob("tmux-*/default"))
+        shutil.rmtree(socket_dir)
 
 
 def _agents():
     return {name: "sleep 600" for name in ("Codex", "Claude", "Cursor", "OpenCode", "Shell")}
+
+
+@pytest.mark.parametrize(("returncode", "cleaned"), [(0, True), (1, False)])
+def test_remote_rollback_report_matches_cleanup_result(monkeypatch, returncode, cleaned):
+    from types import SimpleNamespace
+
+    from tmux_agent_tower.launcher import workset_launch
+
+    target = SpawnTarget("/project", "project", "Shell")
+    result = SpawnResult(target, True, "", window_id="@123")
+    calls = []
+    monkeypatch.setattr(workset_launch.subprocess, "run", lambda *args, **_kwargs:
+                        calls.append(args[0]) or SimpleNamespace(returncode=returncode))
+
+    message = _rollback_message(object(), [([result], "test-asus")], "시작 실패")
+
+    if cleaned:
+        assert "이번 실행을 정리했습니다." in message
+        assert "새 작업이 남아 있을 수 있습니다." not in message
+    else:
+        assert "이번 실행을 정리했습니다." not in message
+        assert "새 작업이 남아 있을 수 있습니다." in message
+    assert calls == [["ssh", "-o", "BatchMode=yes", "test-asus", "tmux kill-window -t @123"]]
 
 
 def test_launch_resolves_new_pane_after_its_process_id_changes(tmp_path, isolated_tower, monkeypatch):

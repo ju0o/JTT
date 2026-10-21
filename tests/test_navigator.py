@@ -157,6 +157,8 @@ def test_renamed_window_keeps_its_id():
 
 
 def test_enter_prefers_pane_id_over_window_index(monkeypatch):
+    from types import SimpleNamespace
+
     calls = []
 
     def fake(args, capture=True, timeout=3.0):
@@ -167,6 +169,10 @@ def test_enter_prefers_pane_id_over_window_index(monkeypatch):
 
     monkeypatch.setattr(navigation.capture, "run_tmux", fake)
     monkeypatch.setattr(navigation.capture, "pane_exists", lambda pane_id: pane_id == "%44")
+    monkeypatch.setattr(
+        navigation.subprocess, "run",
+        lambda args, **_kwargs: calls.append(args[1:]) or SimpleNamespace(returncode=0),
+    )
 
     # The row still says window 9. The move must not target 9.
     assert navigation.open_pane("0", "9", "%44") is True
@@ -177,6 +183,8 @@ def test_enter_prefers_pane_id_over_window_index(monkeypatch):
 
 
 def test_moved_pane_still_uses_its_id(monkeypatch):
+    from types import SimpleNamespace
+
     calls = []
 
     def fake(args, capture=True, timeout=3.0):
@@ -187,6 +195,10 @@ def test_moved_pane_still_uses_its_id(monkeypatch):
 
     monkeypatch.setattr(navigation.capture, "run_tmux", fake)
     monkeypatch.setattr(navigation.capture, "pane_exists", lambda pane_id: True)
+    monkeypatch.setattr(
+        navigation.subprocess, "run",
+        lambda args, **_kwargs: calls.append(args[1:]) or SimpleNamespace(returncode=0),
+    )
     assert navigation.focus_local_pane("0", "%33") is True
     assert calls[1] == ["select-window", "-t", "%33"]
     assert calls[2] == ["select-pane", "-t", "%33"]
@@ -200,7 +212,37 @@ def test_stale_pane_does_not_move(monkeypatch):
     assert not any(call[0] in ("select-window", "select-pane", "send-keys") for call in calls)
 
 
+def test_focus_reports_tmux_selection_failure(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(navigation, "_panes_in_session", lambda _session: {"%33"})
+    monkeypatch.setattr(navigation.capture, "pane_exists", lambda _pane_id: True)
+    for failed_command in ("select-window", "select-pane"):
+        calls = []
+
+        def run(args, *, stdin, stdout, stderr, timeout, check):
+            calls.append(args[1])
+            return SimpleNamespace(returncode=1 if args[1] == failed_command else 0)
+
+        monkeypatch.setattr(navigation.subprocess, "run", run)
+        assert navigation.focus_local_pane("0", "%33") is False
+        assert calls == (["select-window"] if failed_command == "select-window" else ["select-window", "select-pane"])
+
+
+def test_focus_handles_tmux_selection_error(monkeypatch):
+    monkeypatch.setattr(navigation, "_panes_in_session", lambda _session: {"%33"})
+    monkeypatch.setattr(navigation.capture, "pane_exists", lambda _pane_id: True)
+
+    def fail(*_args, **_kwargs):
+        raise OSError("tmux unavailable")
+
+    monkeypatch.setattr(navigation.subprocess, "run", fail)
+    assert navigation.focus_local_pane("0", "%33") is False
+
+
 def test_window_enter_goes_to_that_windows_active_pane(monkeypatch):
+    from types import SimpleNamespace
+
     calls = []
 
     def fake(args, capture=True, timeout=3.0):
@@ -213,6 +255,10 @@ def test_window_enter_goes_to_that_windows_active_pane(monkeypatch):
 
     monkeypatch.setattr(navigation.capture, "run_tmux", fake)
     monkeypatch.setattr(navigation.capture, "pane_exists", lambda pane_id: True)
+    monkeypatch.setattr(
+        navigation.subprocess, "run",
+        lambda args, **_kwargs: calls.append(args[1:]) or SimpleNamespace(returncode=0),
+    )
     assert navigation.focus_window("0", "1") is True
     assert ["select-window", "-t", "%52"] in calls
     assert ["select-pane", "-t", "%52"] in calls
@@ -252,15 +298,64 @@ def test_project_list_is_the_default_and_attention_does_not_reorder_it(tmp_path,
     tower.rows = [waiting, idle]
     _apply_user_work_view(tower)
     assert [row["pane_id"] for row in tower.visible_rows if row.get("kind") == "pane"] == ["%6", "%7"]
-    assert [row["kind"] for row in tower.visible_rows] == [
-        "other_section", "window_asset", "pane", "window_asset", "pane",
-    ]
+    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "pane", "pane"]
+    assert tower.visible_rows[0]["display_name"] == "자동으로 찾은 작업"
 
     tower.toggle_attention()
     assert [row["kind"] for row in tower.visible_rows] == ["pane", "pane"]
     assert [row["key"] for row in tower.visible_rows] == ["%6", "%7"]
     tower.toggle_attention()
     assert [row["pane_id"] for row in tower.visible_rows if row.get("kind") == "pane"] == ["%6", "%7"]
+
+
+def test_home_prioritizes_agent_work_and_collapses_discovered_shells_by_default(tmp_path, monkeypatch):
+    from tmux_agent_tower.ui import tower as tower_module
+
+    monkeypatch.setattr(tower_module, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(tower_module, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(tower_module, "HOST_FILE", tmp_path / "config" / "host")
+    monkeypatch.setattr(tower_module, "REMOTE_HOSTS_FILE", tmp_path / "config" / "remote-hosts.txt")
+    tower = tower_module.Tower("0")
+    agent = _pane("%agent", "0", "Agent", window_id="@agent", project="Agent task", agent="OpenCode")
+    shell = _pane("%shell", "1", "Shell", window_id="@shell", project="Terminal", agent="Shell")
+    tower.rows = [agent, shell]
+    _apply_user_work_view(tower)
+
+    sections = [row for row in tower.visible_rows if row.get("kind") == "other_section"]
+    assert [row["display_name"] for row in sections] == [
+        "자동으로 찾은 작업", "기타 터미널 · 자동 발견",
+    ]
+    assert sections[0]["collapsed"] is False
+    assert sections[1]["collapsed"] is True
+    assert "%agent" in [row.get("pane_id") for row in tower.visible_rows]
+    assert "%shell" not in [row.get("pane_id") for row in tower.visible_rows]
+
+    tower.selected = tower.visible_rows.index(sections[1])
+    tower.toggle_folder("__unfiled__")
+    assert "%shell" in [row.get("pane_id") for row in tower.visible_rows]
+
+
+def test_enter_reports_why_a_selected_remote_window_cannot_open(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tmux_agent_tower.i18n import t
+    from tmux_agent_tower.ui import tower as tower_module
+
+    row = {"kind": "window", "remote": True, "window_id": "", "key": "remote"}
+    tower = SimpleNamespace(visible_rows=[row], selected=0, notice="")
+    tower_module._open_selected_row(None, tower)
+    assert tower.notice == t("enter.remote_readonly")
+
+
+def test_selected_item_enter_hint_explains_expand_open_and_disabled_actions():
+    from tmux_agent_tower.i18n import ko
+    from tmux_agent_tower.ui.tower import _selected_enter_hint
+
+    assert _selected_enter_hint({"kind": "folder"}) == ko.STRINGS["hint.enter_expand"]
+    assert _selected_enter_hint({"kind": "window_asset"}) == ko.STRINGS["hint.enter_expand"]
+    assert _selected_enter_hint({"kind": "pane", "pane_id": "%1"}) == ko.STRINGS["hint.enter_conversation"]
+    assert _selected_enter_hint({"kind": "window", "window_id": "@1"}) == ko.STRINGS["hint.enter_window"]
+    assert _selected_enter_hint({"kind": "window", "remote": True}) == ko.STRINGS["hint.enter_unavailable"]
 
 
 def test_home_visually_clusters_legacy_ungrouped_tasks_by_project(tmp_path, monkeypatch):
@@ -278,11 +373,10 @@ def test_home_visually_clusters_legacy_ungrouped_tasks_by_project(tmp_path, monk
     tower.rows = [first, second]
     _apply_user_work_view(tower)
 
-    assert [row["kind"] for row in tower.visible_rows] == [
-        "other_section", "window_asset", "pane", "window_asset", "pane",
-    ]
-    assert [row["display_name"] for row in tower.visible_rows if row["kind"] == "window_asset"] == [
-        "old-window-a", "old-window-b",
+    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "pane", "pane"]
+    panes = [row for row in tower.visible_rows if row.get("kind") == "pane"]
+    assert [(row["display_name"], row["window_name"]) for row in panes] == [
+        ("PM", "old-window-a"), ("구현", "old-window-b"),
     ]
     assert all(row.get("kind") != "work_group" for row in tower.visible_rows)
 
@@ -325,7 +419,7 @@ def test_remote_only_default_uses_user_work_rows_and_physical_tree_is_explicit(t
 
     assert tower.view_mode == tower_module.USER_WORK_VIEW
     _apply_user_work_view(tower)
-    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "window_asset", "pane"]
+    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "pane"]
 
     tower.toggle_navigator()
     assert tower.view_mode == tower_module.TERMINAL_STRUCTURE_VIEW
@@ -333,7 +427,7 @@ def test_remote_only_default_uses_user_work_rows_and_physical_tree_is_explicit(t
 
     tower.toggle_navigator()
     assert tower.view_mode == tower_module.USER_WORK_VIEW
-    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "window_asset", "pane"]
+    assert [row["kind"] for row in tower.visible_rows] == ["other_section", "pane"]
 
 
 def test_collapse_hides_children_and_search_keeps_the_window(tmp_path, monkeypatch):
@@ -391,7 +485,7 @@ def test_collapse_hides_children_and_search_keeps_the_window(tmp_path, monkeypat
     )
     assert narrow["agent"] == ""
     assert narrow["project"] == "로그인 수정"
-    assert narrow["task"] == "쥬포탈"
+    assert narrow["task"] == ""
     assert "3m" not in narrow["badge"]
     assert render.agent_status_line("Cursor", "● 작업 중") == "Cursor  ● 작업 중"
     assert "%2" not in "".join(narrow.values())
@@ -399,7 +493,7 @@ def test_collapse_hides_children_and_search_keeps_the_window(tmp_path, monkeypat
     assert "%2" not in "".join(wide.values())
     assert wide["agent"] == "Cursor"
     assert wide["project"] == "로그인 수정"
-    assert wide["task"] == "쥬포탈"
+    assert wide["task"] == ""
     assert "3m" in wide["badge"]
     assert render.display_width("쥬포탈") == 6
     assert render.display_width("├─ ") == render.display_width("└─ ")
@@ -556,6 +650,8 @@ def test_search_clear_keeps_fold_and_attention_uses_work_list(tmp_path, monkeypa
 
 
 def test_rename_action_on_window_renames_active_tower_work_item(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
     from tmux_agent_tower.ui import tower as tower_module
 
     tower = _fold_tower(tmp_path, monkeypatch)
@@ -569,6 +665,10 @@ def test_rename_action_on_window_renames_active_tower_work_item(tmp_path, monkey
     tower._apply_filter()
     tower.selected = next(i for i, row in enumerate(tower.visible_rows) if row["kind"] == "window")
     monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "new-task")
+    monkeypatch.setattr(
+        tower_module, "run_list_picker",
+        lambda *args, **kwargs: SimpleNamespace(cancelled=False, selected_keys=set()),
+    )
     monkeypatch.setattr(tower, "load", lambda: None)
 
     tower.rename_selected(None)
@@ -581,6 +681,8 @@ def test_rename_action_on_window_renames_active_tower_work_item(tmp_path, monkey
 
 
 def test_rename_action_on_pane_changes_only_tower_work_name(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
     from tmux_agent_tower.ui import tower as tower_module
 
     tower = _fold_tower(tmp_path, monkeypatch)
@@ -591,12 +693,134 @@ def test_rename_action_on_pane_changes_only_tower_work_name(tmp_path, monkeypatc
     _apply_user_work_view(tower)
     tower.selected = next(i for i, row in enumerate(tower.visible_rows) if row.get("kind") == "pane")
     monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "new-name")
+    monkeypatch.setattr(
+        tower_module, "run_list_picker",
+        lambda *args, **kwargs: SimpleNamespace(cancelled=False, selected_keys=set()),
+    )
     monkeypatch.setattr(tower, "load", lambda: None)
 
     tower.rename_selected(None)
 
     assert tower.overrides.get_task_name("%52", "0", "5252") == "new-name"
     assert tower.overrides.get_project("%52", "0", "5252") is None
+
+
+def test_rename_opt_in_syncs_only_the_selected_local_pane(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.tmux import structure
+
+    tower = _fold_tower(tmp_path, monkeypatch)
+    pane = _pane("%53", "0", "terminal", window_id="@5", project="old-name")
+    pane.update(pane_pid="5353", tmux_host=tower.local_host, transport="local")
+    tower.rows = [pane]
+    tower.visible_rows = [pane]
+    monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "new-name")
+    seen = {}
+    monkeypatch.setattr(
+        tower_module, "run_list_picker",
+        lambda *args, **kwargs: seen.update(checked=kwargs["checked"], preamble=kwargs["preamble"])
+        or SimpleNamespace(cancelled=False, selected_keys={"sync"}),
+    )
+    monkeypatch.setattr(
+        structure, "pane_title_identity",
+        lambda session, pane_id: {"session": session, "pane_id": pane_id, "pane_pid": "5353", "pane_title": "Agent title"},
+    )
+    title_writes = []
+    monkeypatch.setattr(
+        structure, "rename_pane",
+        lambda session, pane_id, title, **kwargs: title_writes.append((session, pane_id, title, kwargs))
+        or structure.StructureResult(True, pane_id=pane_id),
+    )
+    monkeypatch.setattr(tower, "load", lambda: None)
+
+    tower.rename_selected(None)
+
+    assert seen["checked"] == set()
+    assert title_writes == [("0", "%53", "new-name", {"expected_pane_pid": "5353"})]
+    assert tower.overrides.get_task_name("%53", "0", "5353") == "new-name"
+    assert tower.overrides.get_task_title_sync("%53", "0", "5353")["enabled"] is True
+    assert tower.notice == "Tower 이름과 tmux 화면 제목을 변경했습니다."
+
+
+def test_remote_ssh_task_never_offers_or_applies_tmux_title_sync(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.tmux import structure
+
+    tower = _fold_tower(tmp_path, monkeypatch)
+    pane = _pane("%54", "0", "ssh", window_id="@5", project="remote-task")
+    pane.update(pane_pid="5454", transport="ssh", execution_host="ASUS", tmux_host=tower.local_host)
+    tower.rows = [pane]
+    tower.visible_rows = [pane]
+    seen = {}
+    monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "ASUS 작업")
+    monkeypatch.setattr(
+        tower_module, "run_list_picker",
+        lambda *args, **kwargs: seen.update(items=kwargs.get("items"))
+        or SimpleNamespace(cancelled=False, selected_keys={"sync"}),
+    )
+    monkeypatch.setattr(
+        structure, "pane_title_identity",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("remote title control attempted")),
+    )
+    monkeypatch.setattr(tower, "load", lambda: None)
+
+    tower.rename_selected(None)
+
+    assert seen == {}
+    assert tower.overrides.get_task_name("%54", "0", "5454") == "ASUS 작업"
+    assert tower.notice == "Tower 작업 이름을 변경했습니다."
+
+
+def test_reset_task_name_returns_to_auto_detection(tmp_path, monkeypatch):
+    from tmux_agent_tower.ui import tower as tower_module
+
+    tower = _fold_tower(tmp_path, monkeypatch)
+    pane = _pane("%55", "0", "terminal", window_id="@5", project="detected-name")
+    pane.update(pane_pid="5555", task_name="custom-name", display_name="custom-name", suggested_name="detected-name")
+    tower.rows = [pane]
+    tower.visible_rows = [pane]
+    tower.overrides.set_task_name("%55", "custom-name", "0", "5555")
+    monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "")
+    monkeypatch.setattr(tower, "load", lambda: None)
+
+    tower.rename_selected(None)
+
+    assert tower.overrides.get_task_name("%55", "0", "5555") is None
+    assert tower.notice == "자동 감지한 작업 이름으로 복원했습니다."
+
+
+def test_reset_does_not_overwrite_an_agent_changed_pane_title(tmp_path, monkeypatch):
+    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.tmux import structure
+
+    tower = _fold_tower(tmp_path, monkeypatch)
+    pane = _pane("%56", "0", "terminal", window_id="@5", project="detected-name")
+    pane.update(pane_pid="5656", task_name="custom-name", display_name="custom-name", suggested_name="detected-name")
+    tower.rows = [pane]
+    tower.visible_rows = [pane]
+    tower.overrides.set_task_name("%56", "custom-name", "0", "5656")
+    tower.overrides.set_task_title_sync(
+        "%56", "0", "5656", enabled=True, original_title="Original", last_title="custom-name",
+    )
+    monkeypatch.setattr(tower_module, "prompt_text", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        structure, "pane_title_identity",
+        lambda *args: {"session": "0", "pane_id": "%56", "pane_pid": "5656", "pane_title": "Agent title"},
+    )
+    monkeypatch.setattr(
+        structure, "rename_pane",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Agent title must be preserved")),
+    )
+    monkeypatch.setattr(tower, "load", lambda: None)
+
+    tower.rename_selected(None)
+
+    assert tower.overrides.get_task_name("%56", "0", "5656") is None
+    assert tower.notice == "자동 감지한 작업 이름으로 복원했습니다."
 
 
 def test_edit_menu_uses_task_facing_actions_and_hides_terminal_names(tmp_path, monkeypatch):

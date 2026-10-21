@@ -17,6 +17,7 @@ class World:
         self.names = {}
         self.layouts = {}
         self.titles = {}
+        self.pids = {}
         self.current = ""
         self.calls = []
         self._w = 1
@@ -31,6 +32,7 @@ class World:
         self.windows[window_id] = [pane_id]
         self.names[window_id] = name
         self.layouts[window_id] = "single"
+        self.pids[pane_id] = str(1000 + self._p - 1)
         if not self.current:
             self.current = window_id
         return window_id, pane_id
@@ -56,7 +58,14 @@ class World:
         if cmd == "list-windows":
             return self._result("\n".join(self.windows))
         if cmd == "list-panes" and "-s" in args:
+            if "-t" in args and args[args.index("-t") + 1] != "0":
+                return self._result("", 1)
             panes = [pane for panes in self.windows.values() for pane in panes]
+            if "\t" in args[-1]:
+                return self._result("\n".join(
+                    "\t".join((pane, self.pids[pane], "0", self.titles.get(pane, "")))
+                    for pane in panes
+                ))
             return self._result("\n".join(panes))
         if cmd == "list-panes":
             window_id = args[args.index("-t") + 1]
@@ -66,6 +75,8 @@ class World:
             if target.startswith("%"):
                 for wid, panes in self.windows.items():
                     if target in panes:
+                        if "\t" in args[-1]:
+                            return self._result("\t".join((target, self.pids[target], "0", self.titles.get(target, ""))))
                         return self._result(wid)
                 return self._result("", 1)
             if target.startswith("@"):
@@ -81,6 +92,7 @@ class World:
             self.windows[window_id] = [pane_id]
             self.names[window_id] = name
             self.layouts[window_id] = "single"
+            self.pids[pane_id] = str(1000 + self._p - 1)
             return self._result(f"{window_id}\t{pane_id}")
         if cmd == "split-window":
             assert "-d" in args
@@ -90,6 +102,7 @@ class World:
             pane_id = f"%{self._p}"
             self._p += 1
             self.windows[window_id].append(pane_id)
+            self.pids[pane_id] = str(1000 + self._p - 1)
             return self._result(f"{window_id}\t{pane_id}")
         if cmd == "move-pane":
             assert "-d" in args
@@ -262,6 +275,26 @@ def test_rename_window_and_pane_keep_ids(monkeypatch):
     title_call = next(call for call in world.calls if call[0] == "select-pane")
     assert "-d" not in title_call
     assert title_call[title_call.index("-t") + 1] == pane_id
+
+
+def test_pane_title_rename_checks_exact_session_and_process_before_writing(monkeypatch):
+    world = _bind(monkeypatch)
+    _window_id, target = world.add("target")
+    _other_window, other = world.add("other")
+
+    assert structure.rename_pane("0", target, "Task name", expected_pane_pid=world.pids[target]).ok
+    assert world.titles[target] == "Task name"
+    assert world.titles.get(other, "") == ""
+
+    before = len([call for call in world.calls if call[0] == "select-pane"])
+    stale = structure.rename_pane("0", target, "Wrong process", expected_pane_pid="999999")
+    wrong_session = structure.rename_pane("other-session", target, "Wrong session", expected_pane_pid=world.pids[target])
+
+    assert stale.detail == "stale"
+    assert wrong_session.detail == "not_found"
+    assert len([call for call in world.calls if call[0] == "select-pane"]) == before
+    assert world.titles[target] == "Task name"
+    assert world.titles.get(other, "") == ""
 
 
 def test_close_exact_pane_and_protect_tower(monkeypatch):

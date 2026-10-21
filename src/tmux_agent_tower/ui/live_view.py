@@ -9,7 +9,7 @@ from ..control.actions import get_pane_screen
 from ..i18n import t
 from ..state.worksets import LAYOUTS
 from .perf_trace import draw as trace_draw
-from .render import display_width, truncate_to_width, use_narrow_layout
+from .render import display_width, execution_badge_for_row, truncate_to_width, use_narrow_layout
 from .widgets import is_escape, read_key, run_list_picker, safe_add
 
 REFRESH_SECONDS = 0.7
@@ -122,7 +122,9 @@ def open_folder_live_view(stdscr, tower, folder: dict) -> None:
     tasks = [row for row in tower.rows if row.get("pane_id") and not row.get("tower_runtime")]
     workspace = tower.folders.workspace(tower.window_assets, tasks)
     if folder.get("kind") == "other_section":
-        windows = workspace["unfiled_windows"]
+        refs = set(folder.get("window_refs") or ())
+        windows = [window for window in workspace["unfiled_windows"]
+                   if not refs or window.get("window_ref") in refs]
     else:
         item = next((value for value in workspace["folders"]
                      if value["folder_id"] == folder.get("folder_id")), None)
@@ -400,10 +402,7 @@ def _apply_refresh(tower) -> bool:
 
 
 def _execution(row: dict):
-    status = row.get("status")
-    labels = {"WORKING": ("●", "status.WORKING"), "WAITING": ("!", "status.WAITING"),
-              "IDLE": ("○", "status.IDLE"), "DEAD": ("×", "status.DEAD")}
-    mark, key = labels.get(status, ("?", "status.UNKNOWN"))
+    mark, key = execution_badge_for_row(row)
     return mark, t(key)
 
 

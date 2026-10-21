@@ -13,8 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .overrides import ROLE_IDS
+from ..paths import CONFIG_DIR
 
-WORKSET_FILE = Path.home() / ".config" / "tmux-agent-tower" / "worksets.json"
+WORKSET_FILE = CONFIG_DIR / "worksets.json"
 VERSION = 1
 MAX_BYTES = 1024 * 1024
 LAYOUTS = ("focus", "split-2", "grid-4", "main-plus-side")

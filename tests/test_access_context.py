@@ -55,12 +55,12 @@ def test_platform_uses_the_only_wayland_socket_without_requiring_tmux_env(monkey
         server.bind(str(tmp_path / "wayland-0"))
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        assert platform_name({"XDG_RUNTIME_DIR": str(tmp_path)}) == "linux-wayland"
+        assert platform_name({"XDG_RUNTIME_DIR": str(tmp_path), "TOWER_UNAME": "Linux testhost"}) == "linux-wayland"
     finally:
         server.close()
 
 
-def test_platform_uses_the_only_wayland_socket_without_requiring_tmux_env(monkeypatch, tmp_path):
+def test_platform_prioritizes_wsl_over_wayland_socket(tmp_path):
     import socket
 
     from tmux_agent_tower.access_context import platform_name
@@ -68,9 +68,10 @@ def test_platform_uses_the_only_wayland_socket_without_requiring_tmux_env(monkey
     server = socket.socket(socket.AF_UNIX)
     try:
         server.bind(str(tmp_path / "wayland-0"))
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
-        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        assert platform_name({"XDG_RUNTIME_DIR": str(tmp_path)}) == "linux-wayland"
+        assert platform_name({
+            "XDG_RUNTIME_DIR": str(tmp_path),
+            "TOWER_UNAME": "microsoft-standard-WSL2",
+        }) == "windows-wsl"
     finally:
         server.close()
 

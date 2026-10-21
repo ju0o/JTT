@@ -279,6 +279,50 @@ Ctrl+Y copies Result, Ctrl+S shows it, Ctrl+E edits names, Ctrl+G focuses the
 pane, Ctrl+N rejects only a measured rejection, Ctrl+X closes where allowed,
 and Esc returns to the list.
 
+## Confirmed Agent focus handoff
+
+Control Room remains an observation screen until the user chooses `Agent
+direct control` and confirms the named task, Agent, computer, and Window. Tower
+does not relay arbitrary keys: after the handoff, the selected local tmux Pane
+and tmux handle keyboard input. A MainPC SSH Client Pane can be eligible only
+when its live process-tree destination matches the observed SSH target; an
+ASUS `remote_tmux` peer is not a local handoff target.
+
+The handoff rechecks the Tower target ID, Host, Session name and ID, Window ID,
+Pane ID/PID, transport, and SSH target against a fresh read-only tmux/process
+snapshot immediately before focusing. Because focusing uses separate
+`select-window` and `select-pane` commands, tmux cannot make identity check and
+selection atomic. The checks reduce but do not eliminate the race. Identity
+change or uncertain command completion stops the sequence; if the Window was
+already selected, Tower reports a partial handoff and does not attempt an
+automatic rollback or another target. Tower itself is not terminated. Return
+is manual through the user's existing tmux navigation; Tower promises no
+fixed prefix or one-key return. Its existing snapshot refresh continues, and
+a disappeared/reused Pane is shown as stale rather than inheriting old LIVE
+output.
+
+## Isolated local UX sidecars
+
+For an explicitly isolated local UI run, `TMUX_AGENT_TOWER_HOME` redirects
+Tower-owned config, cache, saved projects/screens, result metadata, remote
+service metadata, and update data beneath a separate absolute directory. The
+process `HOME` is not changed, so OpenSSH continues to use the existing user's
+SSH profile and authentication-agent socket. Optional
+`TMUX_AGENT_TOWER_REMOTE_HOSTS_FILE` and `TMUX_AGENT_TOWER_HOST_FILE` point to
+existing read-only Tower host profiles; Tower only reads these files.
+
+This does not isolate tmux session options. Tower registration is
+session-scoped and last-write-wins, so a sidecar must run in its own tmux
+session on the existing tmux server; using the same session can replace the
+active Tower registration. Isolated mode refuses Tower's tmux key-binding
+install/restore actions and physical Pane-title synchronization. For useful
+read-only discovery from that separate session, isolated mode lists panes and
+windows server-wide (`tmux list-panes -a` / `list-windows -a`) while excluding
+only its own Pane; normal Tower runs remain scoped to their own session. Keep
+its config absent/defaulted so Remote autostart stays off. This mode alone
+does not authorize creating that session, launching the TUI, connecting to
+remote hosts, or handing focus to an Agent.
+
 `send_prompt` sends one initial Enter. Only Cursor can receive one more,
 after a fresh capture shows the prompt head as the first nonblank text
 below the current `Add a follow-up` composer. A prompt echo above that
@@ -344,8 +388,10 @@ a visible turn boundary is partial, even when its body is long; Y recovers
 bounded history and refuses to route text unless the adapter can identify
 the complete turn. User prompts, prior turns, tool rows, and UI chrome are
 excluded by the adapter. If completeness cannot be established, the UI says
-"최신 결과 전체를 찾지 못했습니다" and writes nothing. Current live
-screen copy is separate: open details, press `Ctrl+I`, then `Ctrl+L`.
+"최신 결과 전체를 찾지 못했습니다" and writes nothing. Recent terminal
+output copy is separate: open details, press `Ctrl+I`, then `Ctrl+L`. It copies
+up to the last 60 captured lines and reports when earlier output was omitted;
+it does not claim to be a complete Agent Result.
 
 Configured remote tmux hosts are read-only `remote_tmux` result providers.
 Each target is identified by provider endpoint, tmux session ID, pane ID, and
@@ -376,6 +422,21 @@ One Y writes one primary destination. The notice names that destination and
 confirms a complete result.
 A Codex trust chooser appearing after the last `Worked for` marker
 invalidates that older screen candidate; recovery returns no new Result.
+Codex completion markers inside fenced or indented Markdown code are ignored,
+and an elapsed-time line must be followed by the exact idle prompt. An earlier
+turn boundary also requires Codex model and shortcut status chrome before the
+next prompt. Unknown status text between a prior completion and a later prompt
+is ambiguous too; it cannot be treated as harmless UI. A prompt-shaped line
+without that structure cannot reset the turn. A result without an unambiguous
+current user-turn start remains incomplete, including a capture that may begin inside
+code. History is bounded to 800 lines and 256 KiB;
+`OUTPUT_RANGE_EXCEEDED` is used only when capture or that bound proves rows
+were discarded. Other uncertain boundaries report an incomplete/unknown
+reason. Remote provider failures preserve their distinct reason codes.
+The pane menu's Diagnostics view reads the current row and in-memory copy
+metadata only; it does not extract a Result or update ResultTracker/SQLite.
+It shows provider, completeness, failure, and clipboard-stage metadata without
+showing prompt or Result text.
 The TUI and Phone Remote share ready/read metadata in the local SQLite
 store; only a current pane extraction can supply the body after restart.
 The stored fields and stale-pane rules are documented in
@@ -396,6 +457,13 @@ asks the user to choose. A stale client choice is discarded. Each copy writes
 to one destination only, and successful native clipboard writes are verified
 by reading back the content. Phone copy uses the browser clipboard and does
 not depend on PC settings.
+
+For native text Clipboard readback, only LF and CRLF line endings are treated
+as equivalent. Readback verification still compares the complete normalized
+text, preserving all other characters, whitespace, Markdown, and final
+newlines. `READBACK_VERIFIED` therefore does not mean the original UTF-8 bytes
+are identical: `EXACT_BYTE_MATCH` and `NORMALIZED_TEXT_MATCH` are distinct
+checks. A tmux-buffer fallback is not a verified computer Clipboard write.
 
 The selected destination is configurable in Settings. The user-facing labels
 are "자동으로 선택 (추천)", "이 컴퓨터", "현재 접속한 터미널", and

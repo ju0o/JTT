@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import Tuple
 
 from .plan import LaunchPlan, WorkspaceRef, validate_launch_plan
+from ..paths import CONFIG_DIR
 
-PRESET_FILE = Path.home() / ".config" / "tmux-agent-tower" / "workspace-presets.json"
+PRESET_FILE = CONFIG_DIR / "workspace-presets.json"
 _VERSION = 1
 
 

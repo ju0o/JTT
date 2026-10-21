@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 from . import capture
+from ..paths import APP_HOME_ISOLATED, CONFIG_DIR
 
 BEGIN = "# >>> tmux-agent-tower smart-w >>>"
 END = "# <<< tmux-agent-tower smart-w <<<"
@@ -62,7 +63,7 @@ def config_path() -> Path:
 
 
 def state_path() -> Path:
-    return Path.home() / ".config" / "tmux-agent-tower" / STATE_NAME
+    return CONFIG_DIR / STATE_NAME
 
 
 def parse_w_command(list_keys_output: str) -> str:
@@ -408,6 +409,8 @@ def query_tmux_default_w() -> str:
 
 
 def install_for_user() -> str:
+    if APP_HOME_ISOLATED:
+        raise RuntimeError("tmux key bindings are unavailable in isolated Tower mode")
     default = query_tmux_default_w()
     live = query_w_line(["tmux"])
     configured = query_configured_w(config_path())
@@ -424,6 +427,8 @@ def install_for_user() -> str:
 
 
 def restore_for_user() -> str:
+    if APP_HOME_ISOLATED:
+        raise RuntimeError("tmux key bindings are unavailable in isolated Tower mode")
     return restore_smart_w(
         config_path(),
         state_path(),

@@ -15,13 +15,19 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import List, Optional, Tuple
 
 from ..adapters.base import ResultCandidate
+from ..detection import identity as identity_detection
+from ..detection import process as process_detection
 from ..state.overrides import FIELDS as OVERRIDE_FIELDS, ROLE_IDS
 from ..detection.result import pane_result_identity
 from ..detection.providers import ResultProvider, ResultTarget, normalize_candidate
+from ..detection.sshdest import find_ssh_client, host_from_destination
+from ..paths import APP_HOME_ISOLATED
 from ..tmux import capture as tmux_capture
+from ..tmux import navigation as tmux_navigation
 from ..tmux.navigation import focus_local_pane
 
 MAX_PROMPT_CHARS = 32000
@@ -34,6 +40,256 @@ MAX_IDENTITY_CHARS = 80
 RECOVERY_LINES = 800
 RECOVERY_BYTES = 256 * 1024
 LONG_PROMPT_CONFIRM_CHARS = 2000
+
+
+class FocusTargetStatus(str, Enum):
+    """Point-in-time outcome of validating a possible local focus target."""
+
+    ALLOWED = "ALLOWED"
+    STALE = "STALE"
+    REMOTE_UNSUPPORTED = "REMOTE_UNSUPPORTED"
+    AMBIGUOUS = "AMBIGUOUS"
+    SELF_TARGET = "SELF_TARGET"
+    NOT_FOUND = "NOT_FOUND"
+    UNVERIFIED = "UNVERIFIED"
+
+
+class FocusHandoffStatus(str, Enum):
+    """Outcome of a confirmed local tmux focus handoff."""
+
+    FOCUSED = "FOCUSED"
+    REFUSED = "REFUSED"
+    FAILED = "FAILED"
+    PARTIAL = "PARTIAL"
+
+
+class TextSubmissionStatus(str, Enum):
+    """One explicit user-text attempt into a freshly checked local Pane."""
+
+    SUBMITTED = "SUBMITTED"
+    PASTED_NOT_SUBMITTED = "PASTED_NOT_SUBMITTED"
+    REFUSED = "REFUSED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class FocusTargetValidation:
+    """Read-only eligibility result; never a token that authorizes later focus."""
+
+    status: FocusTargetStatus
+    pane_id: str = ""
+    identity: tuple = ()
+
+    @property
+    def allowed(self) -> bool:
+        return self.status is FocusTargetStatus.ALLOWED
+
+
+@dataclass(frozen=True)
+class FocusHandoffResult:
+    """A focus operation outcome, including the last identity check and step."""
+
+    status: FocusHandoffStatus
+    validation: FocusTargetValidation
+    stage: str = ""
+
+
+@dataclass(frozen=True)
+class TextSubmissionResult:
+    status: TextSubmissionStatus
+    validation: FocusTargetValidation
+    stage: str = ""
+
+
+_FOCUS_IDENTITY_FIELDS = (
+    "target_id", "tmux_host", "session", "session_id", "window_id",
+    "pane_id", "pane_pid", "transport", "transport_target",
+)
+
+
+def _focus_target_id(host: str, session: str, pane_id: str, pane_pid: str) -> str:
+    """Match Tower's stable target-id recipe using observed physical fields."""
+
+    identity = "\0".join((host or "", session or "", pane_id or "", pane_pid or ""))
+    return hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()
+
+
+def validate_focus_target(tower, row: dict, expected_agent: str = "") -> FocusTargetValidation:
+    """Validate a row against the current local tmux/process snapshots.
+
+    This is deliberately read-only. ``ALLOWED`` is a point-in-time result,
+    not permission to use a previously validated identity later: a future
+    focus handoff must call this again immediately before selecting a pane.
+    """
+
+    if not isinstance(row, dict) or row.get("kind") != "pane":
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED)
+    if row.get("remote") or row.get("transport") == "remote_tmux":
+        return FocusTargetValidation(FocusTargetStatus.REMOTE_UNSUPPORTED)
+
+    pane_id = str(row.get("pane_id") or row.get("key") or "")
+    if not _LOCAL_PANE_KEY_RE.fullmatch(pane_id) or row.get("key") != pane_id:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    own_pane_id = str(getattr(tower, "own_pane_id", "") or "")
+    if not own_pane_id:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    if pane_id == own_pane_id or row.get("tower_runtime"):
+        return FocusTargetValidation(FocusTargetStatus.SELF_TARGET, pane_id)
+
+    local_host = str(getattr(tower, "local_host", "") or "").strip()
+    row_host = str(row.get("tmux_host") or "").strip()
+    if not local_host or not row_host:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    if row_host.casefold() != local_host.casefold():
+        return FocusTargetValidation(FocusTargetStatus.REMOTE_UNSUPPORTED, pane_id)
+
+    # Empty transport_target is valid only for a local pane; all other
+    # identity fields must be present and strings before comparison.
+    if any(not isinstance(row.get(field), str) for field in _FOCUS_IDENTITY_FIELDS):
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    session = row.get("session", "")
+    session_id = row.get("session_id", "")
+    window_id = row.get("window_id", "")
+    pane_pid = row.get("pane_pid", "")
+    transport = row.get("transport", "")
+    transport_target = row.get("transport_target", "").strip()
+    if (
+        not row.get("target_id") or not session or not session_id
+        or not session_id.startswith("$") or not window_id.startswith("@")
+        or not pane_pid.isdecimal()
+    ):
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    if transport not in {"local", "ssh"}:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    if (transport == "local" and transport_target) or (transport == "ssh" and not transport_target):
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+
+    current_rows = getattr(tower, "rows", None)
+    if not isinstance(current_rows, (list, tuple)):
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    same_key = [
+        candidate for candidate in current_rows
+        if isinstance(candidate, dict)
+        and not candidate.get("placeholder")
+        and str(candidate.get("pane_id") or candidate.get("key") or "") == pane_id
+    ]
+    local_key_rows = [
+        candidate for candidate in same_key
+        if not candidate.get("remote")
+        and str(candidate.get("tmux_host") or "").strip().casefold() == local_host.casefold()
+    ]
+    if len(local_key_rows) > 1:
+        return FocusTargetValidation(FocusTargetStatus.AMBIGUOUS, pane_id)
+    expected_identity = tuple(row.get(field) for field in _FOCUS_IDENTITY_FIELDS)
+    matches = [
+        candidate for candidate in local_key_rows
+        if tuple(candidate.get(field) for field in _FOCUS_IDENTITY_FIELDS) == expected_identity
+    ]
+    if len(matches) > 1:
+        return FocusTargetValidation(FocusTargetStatus.AMBIGUOUS, pane_id)
+    if not matches:
+        return FocusTargetValidation(
+            FocusTargetStatus.STALE if same_key else FocusTargetStatus.NOT_FOUND,
+            pane_id,
+        )
+    if _focus_target_id(local_host, session, pane_id, pane_pid) != row.get("target_id"):
+        return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+
+    observed = tmux_navigation.read_local_pane_identities()
+    if observed is None:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    physical = [identity for identity in observed if identity.pane_id == pane_id]
+    if not physical:
+        return FocusTargetValidation(FocusTargetStatus.NOT_FOUND, pane_id)
+    if len(physical) > 1:
+        return FocusTargetValidation(FocusTargetStatus.AMBIGUOUS, pane_id)
+    actual = physical[0]
+    if actual.pane_dead != "0":
+        return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+    actual_tuple = (
+        actual.session, actual.session_id, actual.window_id,
+        actual.pane_id, actual.pane_pid,
+    )
+    expected_physical = (session, session_id, window_id, pane_id, pane_pid)
+    if actual_tuple != expected_physical:
+        return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+    if _focus_target_id(local_host, actual.session, actual.pane_id, actual.pane_pid) != row.get("target_id"):
+        return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+
+    processes = process_detection.process_snapshot()
+    if not processes:
+        return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+    pane_process = processes.get(pane_pid)
+    if not pane_process or not pane_process.get("ppid"):
+        return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+    cmdline_map = {str(pid): str(info.get("args") or "") for pid, info in processes.items()}
+    ppid_map = {str(pid): str(info.get("ppid") or "") for pid, info in processes.items()}
+    if expected_agent:
+        # Only local Agent processes can be verified from this host's process
+        # table. An SSH client's live connection does not prove that an Agent
+        # still owns the remote terminal rather than a remote shell.
+        if transport != "local":
+            return FocusTargetValidation(FocusTargetStatus.REMOTE_UNSUPPORTED, pane_id)
+        _agent_pid, agent_args = identity_detection._deepest_agent(
+            pane_pid, cmdline_map, ppid_map,
+        )
+        observed_agent = identity_detection.agent_name_from_args(agent_args) or ""
+        if observed_agent.casefold() != str(expected_agent).strip().casefold():
+            return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+    actual_target, ssh_stale = find_ssh_client(pane_pid, cmdline_map, ppid_map)
+    if transport == "local":
+        if ssh_stale:
+            return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+        if actual_target:
+            return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+    else:
+        expected_target = host_from_destination(transport_target).casefold()
+        observed_target = host_from_destination(actual_target).casefold()
+        if ssh_stale:
+            return FocusTargetValidation(FocusTargetStatus.UNVERIFIED, pane_id)
+        if not expected_target or not observed_target or expected_target != observed_target:
+            return FocusTargetValidation(FocusTargetStatus.STALE, pane_id)
+
+    return FocusTargetValidation(
+        FocusTargetStatus.ALLOWED,
+        pane_id,
+        expected_identity,
+    )
+
+
+def handoff_focus_target(tower, row: dict) -> FocusHandoffResult:
+    """Revalidate and focus one explicitly confirmed local Pane.
+
+    No arbitrary key or prompt is forwarded. The operation revalidates before
+    selecting the Window, again before selecting the Pane, and after the last
+    selection. tmux cannot atomically compare identity and select, so a race
+    remains; any intermediate mismatch stops the sequence without attempting
+    an automatic rollback or another target.
+    """
+
+    validation = validate_focus_target(tower, row)
+    if not validation.allowed:
+        return FocusHandoffResult(FocusHandoffStatus.REFUSED, validation, "before_focus")
+
+    window_step = tmux_navigation.select_window_for_pane(validation.pane_id)
+    if window_step is False:
+        return FocusHandoffResult(FocusHandoffStatus.FAILED, validation, "select_window")
+    if window_step is None:
+        return FocusHandoffResult(FocusHandoffStatus.PARTIAL, validation, "select_window_uncertain")
+
+    validation = validate_focus_target(tower, row)
+    if not validation.allowed:
+        return FocusHandoffResult(FocusHandoffStatus.PARTIAL, validation, "after_select_window")
+
+    pane_step = tmux_navigation.select_pane_for_pane(validation.pane_id)
+    if pane_step is not True:
+        return FocusHandoffResult(FocusHandoffStatus.PARTIAL, validation, "select_pane")
+
+    validation = validate_focus_target(tower, row)
+    if not validation.allowed:
+        return FocusHandoffResult(FocusHandoffStatus.PARTIAL, validation, "after_select_pane")
+
+    return FocusHandoffResult(FocusHandoffStatus.FOCUSED, validation, "complete")
 
 _ANSI_RE = re.compile(
     r"\x1b\[[0-?]*[ -/]*[@-~]"
@@ -143,14 +399,14 @@ def get_pane_screen(
     *,
     expected_pane_pid: str = "",
 ) -> Tuple[bool, str, dict]:
-    """Recent visible text of one local pane. ``capture-pane`` only."""
+    """Recent terminal output of one local pane. ``capture-pane`` only."""
 
     ok, reason, pane_id = find_screen_target(session, pane_key, own_pane_id)
     if not ok or not pane_id:
         return False, reason or "not_found", {}
     if expected_pane_pid and not _pane_matches_live_identity(session, pane_id, expected_pane_pid):
         return False, "stale", {}
-    raw = tmux_capture.capture_pane(pane_id, lines=MAX_SCREEN_LINES)
+    raw = tmux_capture.capture_pane(pane_id, lines=MAX_SCREEN_LINES + 1)
     if expected_pane_pid and not _pane_matches_live_identity(session, pane_id, expected_pane_pid):
         return False, "stale", {}
     return True, "", build_screen_payload(pane_key, raw)
@@ -184,18 +440,11 @@ def apply_identity_edit(tower, pane_key: str, body: dict) -> Tuple[bool, str]:
         return False, "stale"
 
     task_name_edited = "task_name" in body
-    if (
+    preserve_auto_task_name = (
         row.get("name_origin") == "auto"
         and not task_name_edited
         and any(field in body for field in ("project", "agent", "title"))
-    ):
-        tower.overrides.set_task_name(
-            pane_key,
-            row.get("display_name") or row.get("task_name") or "",
-            session,
-            pane_pid,
-            origin="auto",
-        )
+    )
 
     touched = False
     for field in OVERRIDE_FIELDS:
@@ -211,13 +460,32 @@ def apply_identity_edit(tower, pane_key: str, body: dict) -> Tuple[bool, str]:
             return False, f"invalid_{field}"
         if field == "role" and cleaned not in ROLE_IDS:
             return False, "invalid_role"
+        if field == "title" and APP_HOME_ISOLATED and not row.get("remote") and row.get("transport") != "ssh":
+            return False, "title_sync_unavailable"
+        if field == "title" and not row.get("remote") and row.get("transport") != "ssh":
+            from ..tmux import structure
+
+            result = structure.rename_pane(
+                session,
+                str(row.get("pane_id") or ""),
+                cleaned,
+                expected_pane_pid=pane_pid,
+            )
+            if not result.ok:
+                return False, "stale" if result.detail in {"stale", "not_found"} else "title_update_failed"
         getattr(tower.overrides, f"set_{field}")(pane_key, cleaned, session, pane_pid)
         touched = True
-        if field == "title" and not row.get("remote"):
-            tmux_capture.run_tmux(["select-pane", "-t", row["pane_id"], "-T", cleaned], capture=False)
 
     if not touched:
         return False, "bad_request"
+    if preserve_auto_task_name:
+        tower.overrides.set_task_name(
+            pane_key,
+            row.get("display_name") or row.get("task_name") or "",
+            session,
+            pane_pid,
+            origin="auto",
+        )
     if (
         "role" in body
         and row.get("name_origin") == "auto"
@@ -365,6 +633,43 @@ def submit_input(pane_id: str, key: str = "Enter") -> bool:
         return False
 
 
+def submit_user_text_once(tower, row: dict, text: str) -> TextSubmissionResult:
+    """Paste and submit one user-authored line after two identity checks.
+
+    This does not relay arbitrary keyboard events. Validation is repeated
+    after paste and before the single Enter; a changed target is never retried.
+    A race between tmux validation and tmux's paste/send operation remains.
+    """
+
+    if (not isinstance(text, str) or not text.strip() or len(text) > MAX_PROMPT_CHARS
+            or any(ord(character) < 0x20 or ord(character) == 0x7f for character in text)):
+        return TextSubmissionResult(
+            TextSubmissionStatus.REFUSED,
+            FocusTargetValidation(FocusTargetStatus.UNVERIFIED), "invalid_text",
+        )
+    detected_name = str(row.get("auto_agent") or "").strip()
+    detected = detected_name.casefold()
+    if (detected not in {"codex", "claude", "opencode"}
+            or row.get("auto_agent_source") != "process"
+            or row.get("agent_process_alive") is not True
+            or row.get("transport") != "local"):
+        return TextSubmissionResult(
+            TextSubmissionStatus.REFUSED,
+            FocusTargetValidation(FocusTargetStatus.UNVERIFIED), "agent_not_supported",
+        )
+    first = validate_focus_target(tower, row, detected_name)
+    if not first.allowed:
+        return TextSubmissionResult(TextSubmissionStatus.REFUSED, first, "before_paste")
+    if not send_text(first.pane_id, text):
+        return TextSubmissionResult(TextSubmissionStatus.FAILED, first, "paste")
+    second = validate_focus_target(tower, row, detected_name)
+    if not second.allowed or second.identity != first.identity:
+        return TextSubmissionResult(TextSubmissionStatus.PASTED_NOT_SUBMITTED, second, "before_submit")
+    if not submit_input(first.pane_id, "Enter"):
+        return TextSubmissionResult(TextSubmissionStatus.PASTED_NOT_SUBMITTED, second, "submit")
+    return TextSubmissionResult(TextSubmissionStatus.SUBMITTED, second, "complete")
+
+
 def send_prompt_to_pane(pane_id: str, text: str, submit_key: str = "Enter") -> bool:
     """Paste once, then one submit key."""
 
@@ -501,7 +806,9 @@ def focus_pane(session: str, pane_key: str, own_pane_id: str = "") -> Tuple[bool
     return True, ""
 
 
-def get_result(tower, pane_key: str) -> Tuple[bool, str, dict]:
+def get_result(
+    tower, pane_key: str, *, expected_pane_pid: Optional[str] = None,
+) -> Tuple[bool, str, dict]:
     """Result state and, when ready or read, the extracted body.
 
     A fresh Tower process has an empty tracker. Y and S then read a
@@ -511,11 +818,30 @@ def get_result(tower, pane_key: str) -> Tuple[bool, str, dict]:
     row = find_row(tower, pane_key)
     if row is None or row.get("placeholder"):
         return False, "not_found", {}
+    if expected_pane_pid is not None and not row.get("remote"):
+        row_pid = str(row.get("pane_pid") or "")
+        if (
+            not expected_pane_pid or not row_pid or row_pid != expected_pane_pid
+            or not _pane_matches_live_identity(
+                getattr(tower, "session", "") or "", str(row.get("pane_id") or ""), expected_pane_pid,
+            )
+        ):
+            return False, "stale", {"reason_code": "UNKNOWN"}
     target = ResultTarget.from_row(row)
     if row.get("remote"):
         provider = _RecoveryProvider(lambda target: _recover_remote_result(target.remote_provider_row()))
         candidate = provider.get_latest_complete_result(target)
         return True, "", _candidate_payload(candidate) if candidate else provider.observation
+    screen_fallback_reason = ""
+    if target.transport == "ssh" and (target.agent == "OpenCode" or row.get("result_adapter") == "OpenCode"):
+        if row.get("result_adapter") not in (None, "", "OpenCode"):
+            return True, "", _remote_opencode_failure("AGENT_UNBOUND")
+        session_probe = _get_ssh_opencode_result(tower, row, target, pane_key, expected_pane_pid)
+        screen_fallback_reason = str(session_probe[2].get("reason_code") or "")
+        if screen_fallback_reason != "OPENCODE_PLUGIN_NOT_INSTALLED":
+            return session_probe
+        # Only an explicitly absent binding enables the existing screen adapter;
+        # invalid, stale, or changed bindings stay fail-closed.
     if target.transport == "ssh" and target.agent == "Grok":
         from ..detection.sshdest import ssh_connection_for_pane
 
@@ -565,13 +891,17 @@ def get_result(tower, pane_key: str) -> Tuple[bool, str, dict]:
     provider = _RecoveryProvider(
         lambda resolved: _recover_result(
             tower, resolved.tower_pane_id or pane_key, tracker, identity, source=source,
+            expected_pane_pid=expected_pane_pid or target.tower_pane_pid,
         )
     )
     candidate = provider.get_latest_complete_result(target)
     recovered = provider.observation
     if candidate is not None:
-        return True, "", _candidate_payload(candidate, recovered.get("state") or "ready")
-    if row.get("status") != "WORKING" and (
+        payload = _candidate_payload(candidate, recovered.get("state") or "ready")
+        if screen_fallback_reason and payload.get("source") == "ssh_visible_history":
+            payload["fallback_reason_code"] = screen_fallback_reason
+        return True, "", payload
+    if not screen_fallback_reason and row.get("status") != "WORKING" and (
         recovered is None or (not recovered.get("complete") and not recovered.get("working"))
     ):
         remote_target = ResultTarget.from_row(row)
@@ -580,12 +910,15 @@ def get_result(tower, pane_key: str) -> Tuple[bool, str, dict]:
         )
         remote_candidate = remote_provider.get_latest_complete_result(remote_target)
         if remote_candidate is not None:
-            return True, "", _candidate_payload(remote_candidate, remote_provider.observation.get("state") or "ready")
+            payload = _candidate_payload(remote_candidate, remote_provider.observation.get("state") or "ready")
+            return True, "", payload
     if recovered is None:
         snap = tracker.snapshot(pane_key, identity=identity)
         if row.get("status") == "WORKING" or not snap.complete:
             return True, "", _empty_incomplete(snap)
         return True, "", _payload(snap)
+    if screen_fallback_reason and isinstance(recovered, dict):
+        recovered = {**recovered, "fallback_reason_code": screen_fallback_reason}
     return True, "", recovered
 
 
@@ -727,6 +1060,98 @@ def _remote_grok_failure(source: str) -> dict:
     }
 
 
+def _remote_opencode_failure(source: str) -> dict:
+    return {
+        "state": "none", "text": "", "fingerprint": "", "generated_at": 0.0,
+        "complete": False, "turn_complete": False, "body_complete": False,
+        "source": source, "reason_code": source,
+    }
+
+
+def _recover_ssh_opencode_result(row: dict) -> dict:
+    """Probe a pane-bound OpenCode TUI and fail closed if its active session is unknown."""
+
+    from ..remote.opencode import fetch_remote_opencode_result
+
+    endpoint = str(row.get("result_provider_endpoint") or "")
+    connection = tuple(row.get("ssh_connection") or ())
+    if (
+        row.get("result_provider_type") != "remote_opencode" or not endpoint
+        or not str(row.get("ssh_client_pid") or "").isdecimal() or len(connection) != 4
+    ):
+        return _remote_opencode_failure("REMOTE_PROVIDER_UNBOUND")
+    requested = {
+        "ssh_client_pid": str(row["ssh_client_pid"]),
+        "client_ip": connection[0], "client_port": connection[1],
+        "server_ip": connection[2], "server_port": connection[3],
+    }
+    result = fetch_remote_opencode_result(endpoint, requested)
+    if not isinstance(result, dict):
+        return _remote_opencode_failure("REMOTE_PROVIDER_UNAVAILABLE")
+    status = str(result.get("status") or "UNKNOWN")
+    if status != "ok":
+        if status == "REMOTE_RESULT_INCOMPLETE":
+            reason_code = str(result.get("reason_code") or status)
+            if reason_code not in {"REMOTE_RESULT_INCOMPLETE", "SESSION_BINDING_CHANGED", "OUTPUT_RANGE_EXCEEDED"}:
+                reason_code = "REMOTE_RESULT_INCOMPLETE"
+            return _remote_opencode_failure(reason_code)
+        if status == "AGENT_SESSION_UNBOUND" and result.get("session_binding") == "TUI_BINDING_ABSENT":
+            return _remote_opencode_failure("OPENCODE_PLUGIN_NOT_INSTALLED")
+        if status == "AGENT_SESSION_UNBOUND" and result.get("session_binding") == "TUI_BINDING_INVALID":
+            return _remote_opencode_failure("OPENCODE_BINDING_INVALID")
+        if status == "AGENT_SESSION_UNBOUND" and result.get("session_binding") == "NO_ACTIVE_SESSION":
+            return _remote_opencode_failure("OPENCODE_NO_ACTIVE_SESSION")
+        if status not in {
+            "AGENT_SESSION_UNBOUND", "REMOTE_PROVIDER_UNBOUND", "REMOTE_PROVIDER_UNAVAILABLE",
+            "REMOTE_PROVIDER_TIMEOUT", "REMOTE_RESULT_INCOMPLETE", "OUTPUT_RANGE_EXCEEDED",
+        }:
+            status = "UNKNOWN"
+        return _remote_opencode_failure(status)
+    if result.get("ssh_connection") != list(connection):
+        return _remote_opencode_failure("REMOTE_PROVIDER_UNBOUND")
+    session_id = str(result.get("session_id") or "")
+    user_id = str(result.get("user_id") or "")
+    message_id = str(result.get("message_id") or "")
+    remote_session_pid = str(result.get("remote_session_pid") or "")
+    remote_sshd_pid = str(result.get("remote_sshd_pid") or "")
+    opencode_pid = str(result.get("opencode_pid") or "")
+    text = result.get("text")
+    if (
+        not re.fullmatch(r"ses_[A-Za-z0-9_-]{8,128}", session_id)
+        or not user_id.startswith("msg_") or not message_id.startswith("msg_")
+        or not all(value.isdecimal() for value in (remote_session_pid, remote_sshd_pid, opencode_pid))
+        or result.get("turn_complete") is not True or result.get("body_complete") is not True
+        or not isinstance(text, str) or not text
+    ):
+        return _remote_opencode_failure("REMOTE_RESULT_INCOMPLETE")
+    body = text.encode("utf-8", "strict")
+    native_hash = hashlib.sha256(body).hexdigest()
+    if (
+        isinstance(result.get("native_length"), bool)
+        or not isinstance(result.get("native_length"), int)
+        or len(text) != result.get("native_length")
+        or len(body) != result.get("native_utf8_bytes")
+        or native_hash != result.get("native_sha256")
+    ):
+        return _remote_opencode_failure("REMOTE_RESULT_INCOMPLETE")
+    turn_identity = ":".join((
+        str(row["ssh_client_pid"]), *connection, remote_session_pid, remote_sshd_pid,
+        opencode_pid, session_id, user_id, message_id, native_hash,
+    ))
+    now = time.time()
+    return {
+        "state": "ready", "text": text, "fingerprint": native_hash,
+        "generated_at": now, "complete": True, "turn_complete": True, "body_complete": True,
+        "source": "remote_opencode", "turn_identity": turn_identity, "timestamp": now, "confidence": "high",
+        "remote_session_pid": remote_session_pid, "remote_sshd_pid": remote_sshd_pid,
+        "opencode_pid": opencode_pid, "session_id": session_id, "user_id": user_id, "message_id": message_id,
+        "native_length": len(text), "native_utf8_bytes": len(body), "native_sha256": native_hash,
+        "local_ssh_pid": str(row["ssh_client_pid"]), "ssh_connection": connection,
+        "ssh_local_socket": tuple(row.get("ssh_local_socket") or ()),
+        "ssh_connection_mode": str(row.get("ssh_connection_mode") or "direct"),
+    }
+
+
 def _recover_ssh_grok_result(row: dict) -> dict:
     """Read the newest complete Grok export from this exact SSH socket."""
 
@@ -749,7 +1174,7 @@ def _recover_ssh_grok_result(row: dict) -> dict:
     result = fetch_remote_grok_result(endpoint, requested)
     if not isinstance(result, dict):
         return _remote_grok_failure("REMOTE_PROVIDER_UNAVAILABLE")
-    status = str(result.get("status") or "REMOTE_PROVIDER_UNBOUND")
+    status = str(result.get("status") or "UNKNOWN")
     if status != "ok":
         return _remote_grok_failure(status)
     if result.get("ssh_connection") != list(connection):
@@ -820,7 +1245,9 @@ def _recover_registered_remote_result(row: dict) -> Optional[dict]:
     return _recover_remote_result(provider_row)
 
 
-def _recover_result(tower, pane_key: str, tracker, identity=None, *, source: str = "local_tmux") -> Optional[dict]:
+def _recover_result(
+    tower, pane_key: str, tracker, identity=None, *, source: str = "local_tmux", expected_pane_pid: str = "",
+) -> Optional[dict]:
     """Newest finished body in bounded history, using the screen adapter.
 
     ``None`` means this pane's screen was not read. A working turn and a
@@ -835,14 +1262,19 @@ def _recover_result(tower, pane_key: str, tracker, identity=None, *, source: str
     )
     if not ok or not pane_id:
         return None
+    session = getattr(tower, "session", "") or ""
+    if expected_pane_pid and not _pane_matches_live_identity(session, pane_id, expected_pane_pid):
+        return {"state": "none", "text": "", "complete": False, "reason_code": "UNKNOWN"}
     found = pane_title_and_command(pane_id)
     if found is None:
         return None
     title, command = found
     watermark = tracker.turn_start_watermark(pane_key, identity) if tracker is not None else None
     capture_lines = RECOVERY_LINES
+    history_position = tmux_capture.pane_history_position(pane_id)
+    watermark_scoped = False
     if watermark is not None:
-        current = tmux_capture.pane_history_position(pane_id)
+        current = history_position
         start_size, start_limit = watermark
         if (
             current is not None
@@ -851,11 +1283,20 @@ def _recover_result(tower, pane_key: str, tracker, identity=None, *, source: str
             and start_size <= current[0] < current[1]
         ):
             capture_lines = min(RECOVERY_LINES, max(0, current[0] - start_size))
-    lines = _bounded_history(tmux_capture.capture_pane(
+            watermark_scoped = True
+    raw_lines = tmux_capture.capture_pane(
         pane_id, lines=capture_lines, join_wrapped=True,
-    ))
+    )
+    if expected_pane_pid and not _pane_matches_live_identity(session, pane_id, expected_pane_pid):
+        return {"state": "none", "text": "", "complete": False, "reason_code": "UNKNOWN"}
+    lines, range_exceeded = _bounded_history_with_truncation(raw_lines)
+    if not watermark_scoped and history_position is not None:
+        range_exceeded = range_exceeded or history_position[0] > capture_lines
     if not lines:
-        return {"state": "none", "text": "", "fingerprint": "", "generated_at": 0.0, "complete": False}
+        return {
+            "state": "none", "text": "", "fingerprint": "", "generated_at": 0.0,
+            "complete": False, "reason_code": "OUTPUT_RANGE_EXCEEDED" if range_exceeded else "UNKNOWN",
+        }
     from ..adapters.base import PaneContext
     from ..detection.topology import resolve_runtime
 
@@ -867,11 +1308,17 @@ def _recover_result(tower, pane_key: str, tracker, identity=None, *, source: str
         snap = tracker.observe(pane_key, "WORKING", None, identity=identity)
         return {
             "state": snap.state, "text": "", "fingerprint": snap.fingerprint,
-            "generated_at": snap.generated_at, "complete": False,
+            "generated_at": snap.generated_at, "complete": False, "reason_code": "TURN_NOT_COMPLETE",
         }
     candidate = adapter.extract_result(ctx)
     if candidate is None or not candidate.text:
-        return {"state": "none", "text": "", "fingerprint": "", "generated_at": 0.0, "complete": False}
+        reason_code = "OUTPUT_RANGE_EXCEEDED" if range_exceeded else "UNKNOWN"
+        if getattr(adapter, "name", "") == "Shell":
+            reason_code = "AGENT_UNSUPPORTED"
+        return {
+            "state": "none", "text": "", "fingerprint": "", "generated_at": 0.0,
+            "complete": False, "reason_code": reason_code,
+        }
     snap = tracker.observe(
         pane_key, "IDLE", candidate, identity=identity, full_recovery=candidate.complete,
     )
@@ -883,6 +1330,11 @@ def _recover_result(tower, pane_key: str, tracker, identity=None, *, source: str
             "generated_at": snap.generated_at, "complete": False,
             "turn_complete": candidate.turn_complete,
             "body_complete": candidate.body_complete,
+            "reason_code": (
+                "OUTPUT_RANGE_EXCEEDED" if range_exceeded else
+                "SOURCE_PARTIAL" if candidate.turn_complete and not candidate.body_complete else
+                "TURN_NOT_COMPLETE"
+            ),
         }
     turn_identity = hashlib.sha256(
         json.dumps(identity or {}, sort_keys=True, default=str).encode("utf-8")
@@ -897,10 +1349,19 @@ def _recover_result(tower, pane_key: str, tracker, identity=None, *, source: str
 def _bounded_history(lines: List[str]) -> List[str]:
     """Keep the newest lines, and stop if the bytes exceed the cap."""
 
-    kept = list(lines)[-RECOVERY_LINES:]
+    return _bounded_history_with_truncation(lines)[0]
+
+
+def _bounded_history_with_truncation(lines: List[str]) -> Tuple[List[str], bool]:
+    """Return bounded history and whether this function actually discarded rows."""
+
+    kept = list(lines)
+    truncated = len(kept) > RECOVERY_LINES
+    kept = kept[-RECOVERY_LINES:]
     while kept and len("\n".join(kept).encode("utf-8", "replace")) > RECOVERY_BYTES:
         kept.pop(0)
-    return kept
+        truncated = True
+    return kept, truncated
 
 
 _SAFE_ATTENTION_KEY = re.compile(r"^[0-9yn]$")
@@ -938,6 +1399,71 @@ def send_attention_key(pane_id: str, key: str) -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _get_ssh_opencode_result(tower, row: dict, target: ResultTarget, pane_key: str, expected_pane_pid):
+    failure = _remote_opencode_failure("REMOTE_PROVIDER_UNBOUND")
+    pane_id = target.tower_pane_id
+    pane_pid = target.tower_pane_pid
+    session = str(row.get("session") or "")
+    host = target.transport_target
+    interaction = row.get("interaction")
+    if (
+        row.get("status") != "IDLE" or row.get("attention") not in (None, "", "none")
+        or (interaction and (not isinstance(interaction, dict) or interaction.get("type") not in (None, "none")))
+    ):
+        return True, "", _remote_opencode_failure("TURN_NOT_COMPLETE")
+    if (
+        pane_id != pane_key or not _LOCAL_PANE_KEY_RE.fullmatch(pane_id or "")
+        or not pane_pid.isdecimal() or (expected_pane_pid and pane_pid != expected_pane_pid)
+        or not session or not host
+        or not _pane_matches_live_identity(session, pane_id, pane_pid)
+    ):
+        return True, "", failure
+    live = pane_title_and_command(pane_id)
+    if not live or live[1].casefold() not in {"ssh", "ssh.exe"}:
+        return True, "", failure
+    pane_title = live[0]
+
+    from ..detection.sshdest import ssh_connection_for_pane
+
+    connection = ssh_connection_for_pane(pane_pid, host)
+    if connection is None:
+        return True, "", failure
+    target = replace(
+        target, provider_type="remote_opencode", provider_endpoint=host, title=pane_title,
+        ssh_client_pid=connection["ssh_client_pid"],
+        ssh_connection=(
+            connection["client_ip"], connection["client_port"],
+            connection["server_ip"], connection["server_port"],
+        ),
+        ssh_local_socket=tuple(connection.get("local_socket") or ()),
+        ssh_connection_mode=str(connection.get("connection_mode") or "direct"),
+    )
+    provider = _RecoveryProvider(
+        lambda resolved: _recover_ssh_opencode_result(resolved.remote_provider_row())
+    )
+    candidate = provider.get_latest_complete_result(target)
+
+    # The title is a stability check only; session identity comes from the fresh TUI route binding.
+    live_after = pane_title_and_command(pane_id)
+    connection_after = ssh_connection_for_pane(pane_pid, host)
+    if (
+        not _pane_matches_live_identity(session, pane_id, pane_pid)
+        or live_after != live or not connection_after
+        or connection_after.get("ssh_client_pid") != connection["ssh_client_pid"]
+        or tuple(connection_after.get(key) for key in ("client_ip", "client_port", "server_ip", "server_port")) != target.ssh_connection
+        or tuple(connection_after.get("local_socket") or ()) != target.ssh_local_socket
+    ):
+        return True, "", _remote_opencode_failure("REMOTE_PROVIDER_UNBOUND")
+    if candidate is None:
+        return True, "", provider.observation or _remote_opencode_failure("REMOTE_RESULT_INCOMPLETE")
+    payload = _candidate_payload(candidate, provider.observation.get("state") or "ready")
+    payload.update({key: value for key, value in provider.observation.items() if key.startswith("remote_") or key in {
+        "opencode_pid", "session_id", "user_id", "message_id", "native_length", "native_utf8_bytes",
+        "native_sha256", "local_ssh_pid", "ssh_connection", "ssh_local_socket", "ssh_connection_mode",
+    }})
+    return True, "", payload
 
 
 def respond_interaction(tower, pane_key: str, key: str) -> Tuple[bool, str]:

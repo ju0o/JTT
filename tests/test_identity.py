@@ -116,3 +116,9 @@ def test_phone_detail_has_a_sense_line_and_home_cards_do_not():
     html = webui.PAGE_HTML
     assert 'id="d-sense"' in html
     assert "override→" in html
+
+
+def test_cline_cli_is_identified_without_a_result_adapter():
+    name, source = identify_agent("cline", "", "/usr/local/bin/cline")
+    assert (name, source) == ("Cline", "process")
+    assert resolve_adapter("cline", "", "/usr/local/bin/cline").name == "Shell"

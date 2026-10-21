@@ -1,5 +1,5 @@
 from tmux_agent_tower.adapters import resolve_adapter
-from tmux_agent_tower.adapters.base import PaneContext
+from tmux_agent_tower.adapters.base import Activity, PaneContext
 from tmux_agent_tower.adapters.shell import ShellAdapter
 
 
@@ -132,3 +132,31 @@ def test_shell_never_has_activity():
     adapter = ShellAdapter()
     ctx = PaneContext(title="", command="bash", lines=("user@host:~$ ls", "file1  file2"))
     assert adapter.extract_activity(ctx) is None
+
+
+def test_stale_activity_is_hidden_without_current_working_status():
+    from types import SimpleNamespace
+
+    from tmux_agent_tower.ui.tower import Tower
+
+    class Adapter:
+        def __init__(self, status):
+            self.status = status
+
+        def classify(self, _ctx):
+            return SimpleNamespace(status=self.status)
+
+        def extract_activity(self, _ctx):
+            return Activity("Edited src/main.py", "medium")
+
+    tower = SimpleNamespace(
+        config={"show_activity": True, "show_status_duration": False},
+        status_engine=SimpleNamespace(duration_seconds=lambda _key: 0.0),
+    )
+    context = PaneContext(title="", command="opencode", lines=("old activity",))
+
+    assert Tower._activity_and_duration(tower, "%1", Adapter("IDLE"), context, "IDLE", False) == (None, 0.0)
+    assert Tower._activity_and_duration(tower, "%1", Adapter(None), context, "WORKING", False) == (None, 0.0)
+    assert Tower._activity_and_duration(tower, "%1", Adapter("WORKING"), context, "WORKING", False) == (
+        "Edited src/main.py", 0.0,
+    )

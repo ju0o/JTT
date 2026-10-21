@@ -119,7 +119,7 @@ def test_task_menu_separates_result_and_screen_copy(monkeypatch):
     from types import SimpleNamespace
     from tmux_agent_tower.ui import control_view
 
-    row = {"kind": "pane", "key": "%9", "pane_id": "%9", "target_id": "target-9", "project": "Tower"}
+    row = {"kind": "pane", "key": "%9", "pane_id": "%9", "pane_pid": "123", "target_id": "target-9", "project": "Tower"}
     tower = SimpleNamespace(work_groups=SimpleNamespace(membership=lambda: {}))
     picks = iter(("cancel", "more", "screen_copy"))
     menus = []
@@ -130,7 +130,11 @@ def test_task_menu_separates_result_and_screen_copy(monkeypatch):
 
     copied = []
     monkeypatch.setattr(structure_menu, "run_list_picker", pick)
-    monkeypatch.setattr(control_view, "_copy_screen", lambda *_args: copied.append(True) or "화면을 복사했습니다")
+    monkeypatch.setattr(
+        control_view,
+        "_copy_screen",
+        lambda *_args, **kwargs: copied.append(kwargs.get("expected_pane_pid")) or "화면을 복사했습니다",
+    )
     monkeypatch.setattr(structure_menu, "show_message_screen", lambda *_args: None)
 
     # First inspect the ordinary task actions, then route More → current screen copy.
@@ -141,7 +145,32 @@ def test_task_menu_separates_result_and_screen_copy(monkeypatch):
         "control", "result", "copy", "edit", "move", "layout", "more", "cancel"
     ]
     assert ("screen_copy", structure_menu.t("nav.copy_screen")) in menus[2]
-    assert copied == [True]
+    assert copied == ["123"]
+
+
+def test_task_menu_routes_to_read_only_diagnostics(monkeypatch):
+    from types import SimpleNamespace
+    from tmux_agent_tower.ui import control_view
+
+    row = {"kind": "pane", "key": "%9", "pane_id": "%9", "pane_pid": "123", "project": "Tower"}
+    tower = SimpleNamespace(work_groups=SimpleNamespace(membership=lambda: {}))
+    picks = iter(("more", "diagnostics"))
+    menus = []
+    shown = []
+    monkeypatch.setattr(
+        structure_menu, "run_list_picker",
+        lambda _s, _t, items, **_kwargs: menus.append(items) or PickResult(selected_key=next(picks)),
+    )
+    monkeypatch.setattr(control_view, "pane_diagnostic_lines", lambda _tower, selected: [selected["pane_id"], "SAFE METADATA"])
+    monkeypatch.setattr(
+        structure_menu, "show_message_screen",
+        lambda _s, title, lines: shown.append((title, lines)),
+    )
+
+    structure_menu.open_pane_menu(None, tower, row)
+
+    assert ("diagnostics", structure_menu.t("nav.diagnostics")) in menus[1]
+    assert shown == [(structure_menu.t("diagnostics.title"), ["%9", "SAFE METADATA"])]
 
 
 def test_remote_quick_start_binds_auto_name_to_exact_namespaced_identity(tmp_path, monkeypatch):

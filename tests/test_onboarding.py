@@ -127,9 +127,25 @@ def test_agent_picker_shows_install_state_and_never_falls_back(monkeypatch):
 
 
 def test_help_and_saved_work_explain_actions_without_internal_terms(monkeypatch):
-    assert "Y 최신 결과 전체 복사" in ko.STRINGS["help.results"]
-    assert "G 실제 터미널" in ko.STRINGS["help.results"]
+    from tmux_agent_tower.ui.render import display_width
+
+    assert "목록 Y" in ko.STRINGS["help.results"]
+    assert "상세 Ctrl+Y" in ko.STRINGS["help.results"]
+    assert "Ctrl+S" in ko.STRINGS["help.results"]
+    assert "복사하지 않습니다" in ko.STRINGS["help.copy_safety_block"]
+    assert "상태 확인 가능" in ko.STRINGS["help.remote"]
+    assert "문제 해결" in ko.STRINGS["help.troubleshoot"]
+    help_keys = (
+        "help.navigation", "help.actions", "help.saved", "help.results", "help.copy_safety",
+        "help.copy_safety_block", "help.remote", "help.remote_limits", "help.manage",
+        "help.detail", "help.detail_advanced", "help.detail_reject", "help.troubleshoot",
+        "help.advanced", "help.start", "help.existing", "help.destinations", "help.exit",
+    )
+    assert all(display_width(ko.STRINGS[key]) <= 56 for key in help_keys)
     assert "새 작업" in ko.STRINGS["help.start"]
+    assert "기존 작업" in ko.STRINGS["help.existing"]
+    assert "기존 작업" in ko.STRINGS["hint.home_help"]
+    assert "새 작업" in ko.STRINGS["hint.home_help"]
     assert "복사" in ko.STRINGS["help.destinations"]
 
     captured = {}

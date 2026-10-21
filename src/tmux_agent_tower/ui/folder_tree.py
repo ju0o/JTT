@@ -52,14 +52,27 @@ def visible_windows(windows: Iterable[dict], rows: Iterable[dict], own_window_id
 
 
 def build_rows(store: FolderStore, windows: Iterable[dict], tasks: Iterable[dict],
-               filter_text: str = "", collapsed_other: bool = False) -> List[dict]:
+               filter_text: str = "", collapsed_other: bool = False,
+               collapsed_agents: bool = False,
+               flatten_single_pane_windows: bool = False,
+               hidden_window_refs: Iterable[str] = ()) -> List[dict]:
     windows = list(windows)
+    hidden_window_refs = set(hidden_window_refs or ())
     tasks = [row for row in tasks if row.get("pane_id")]
     workspace = store.workspace(windows, tasks)
+    workspace["unfiled_windows"] = [
+        window for window in workspace["unfiled_windows"]
+        if window["window_ref"] not in hidden_window_refs
+    ]
+    for folder in workspace["folders"]:
+        folder["windows"] = [window for window in folder["windows"]
+                             if window["window_ref"] not in hidden_window_refs]
+        folder["summary_counts"] = aggregate_window_list(folder["windows"])
     source_by_ref = {str(row.get("window_ref") or window_ref(row)): row for row in windows}
     task_by_ref = {
         str(row.get("target_id") or row.get("key")): row for row in tasks
-        if row.get("target_id") or row.get("key")
+        if (row.get("target_id") or row.get("key"))
+        and str(row.get("window_ref") or "") not in hidden_window_refs
     }
     query = filter_text.casefold().strip()
     out: List[dict] = []
@@ -88,6 +101,17 @@ def build_rows(store: FolderStore, windows: Iterable[dict], tasks: Iterable[dict
             "folder_id": window.get("folder_id"), "guide": guide,
             "remote": bool(source.get("remote")), "host": source.get("host") or "",
         }
+        if flatten_single_pane_windows and len(members) == 1 and not row["collapsed"]:
+            # The default work list needs the task, not a second selectable
+            # heading for its one-pane window. Keep the window reference on
+            # the pane so collapsing still targets only this saved window.
+            task = dict(members[0])
+            task["kind"] = "pane"
+            task["window_ref"] = window["window_ref"]
+            task["guide"] = guide
+            task["tree_window_ref"] = window["window_ref"]
+            out.append(task)
+            return True
         out.append(row)
         if row["collapsed"] and not query:
             return True
@@ -98,6 +122,49 @@ def build_rows(store: FolderStore, windows: Iterable[dict], tasks: Iterable[dict
             task["guide"] = guide + ("   └─ " if index == len(members) - 1 else "   ├─ ")
             out.append(task)
         return True
+
+    unfiled = workspace["unfiled_windows"]
+    agent_windows = []
+    other_windows = []
+
+    def is_agent_task(task: dict) -> bool:
+        adapter = str(task.get("result_adapter") or "").strip().casefold()
+        if adapter:
+            return adapter != "shell"
+        return str(task.get("agent") or "").strip().casefold() not in {"", "shell", "unknown", "터미널"}
+
+    for window in unfiled:
+        members = [task_by_ref[target] for target in window.get("task_target_ids", []) if target in task_by_ref]
+        if any(is_agent_task(task) for task in members):
+            agent_windows.append(window)
+        else:
+            other_windows.append(window)
+
+    def append_discovered_section(section_id: str, label: str, source_windows: List[dict], collapsed: bool) -> None:
+        section_match = bool(query and query in label.casefold())
+        matched = [window for window in source_windows
+                   if (not query or section_match or query in window["display_name"].casefold()
+                       or filtered_tasks(window, False))]
+        if not matched:
+            return
+        counts = aggregate_window_list(matched)
+        is_collapsed = collapsed and not query
+        out.append({
+            "key": "folder:" + section_id, "kind": "other_section", "folder_id": section_id,
+            "display_name": label, "summary_counts": counts,
+            "summary": summary_text(counts), "summary_compact": compact_summary(counts),
+            "collapsed": is_collapsed, "guide": "▶ " if is_collapsed else "▼ ",
+            "window_refs": [window["window_ref"] for window in source_windows],
+        })
+        if is_collapsed:
+            return
+        for index, window in enumerate(matched):
+            branch = "   " + ("└─ " if index == len(matched) - 1 else "├─ ")
+            append_window(window, branch, section_match)
+
+    # Unfiled Agent work remains visible and comes before saved folders so
+    # the first screen favors work over incidental terminal panes.
+    append_discovered_section("__agents__", t("folder.agent_work"), agent_windows, collapsed_agents)
 
     for folder in workspace["folders"]:
         name = folder["display_name"]
@@ -130,25 +197,7 @@ def build_rows(store: FolderStore, windows: Iterable[dict], tasks: Iterable[dict
             branch = "   " + ("└─ " if index == len(matched_windows) - 1 else "├─ ")
             append_window(window, branch, folder_match)
 
-    unfiled = workspace["unfiled_windows"]
-    other_match = bool(query and query in t("folder.other").casefold())
-    matched_unfiled = [window for window in unfiled
-                       if (not query or other_match or query in window["display_name"].casefold()
-                           or filtered_tasks(window, False))]
-    if matched_unfiled:
-        counts = aggregate_window_list(matched_unfiled)
-        collapsed = collapsed_other and not query
-        out.append({
-            "key": "folder:__unfiled__", "kind": "other_section", "folder_id": "__unfiled__",
-            "display_name": t("folder.other"), "summary_counts": counts,
-            "summary": summary_text(counts), "summary_compact": compact_summary(counts),
-            "collapsed": collapsed, "guide": "▶ " if collapsed else "▼ ",
-            "window_refs": [window["window_ref"] for window in unfiled],
-        })
-        if not collapsed:
-            for index, window in enumerate(matched_unfiled):
-                branch = "   " + ("└─ " if index == len(matched_unfiled) - 1 else "├─ ")
-                append_window(window, branch)
+    append_discovered_section("__unfiled__", t("folder.other"), other_windows, collapsed_other)
     return out
 
 

@@ -20,11 +20,12 @@ from pathlib import Path
 from typing import Optional
 
 from . import ko, en
+from ..paths import CONFIG_DIR
 
 _CATALOGS = {"ko": ko.STRINGS, "en": en.STRINGS}
 _DEFAULT_LANGUAGE = "ko"
 
-CONFIG_FILE = Path.home() / ".config" / "tmux-agent-tower" / "config.toml"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
 
 _LANGUAGE_LINE_RE = re.compile(r'^\s*language\s*=\s*"?([A-Za-z]{2})"?\s*$')
 

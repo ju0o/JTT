@@ -335,10 +335,12 @@ def aggregate(members: Iterable[dict]) -> Dict[str, int]:
             counts["error"] += 1
         elif row.get("attention") in {"approval_required", "input_required"} or row.get("status") == "WAITING":
             counts["attention"] += 1
-        elif row.get("status") == "WORKING":
+        elif row.get("status") == "WORKING" and not row.get("agent_process_ended"):
             counts["working"] += 1
         elif row.get("result_state") == "ready":
             counts["result"] += 1
+        elif row.get("agent_process_ended"):
+            counts["unavailable"] += 1
         elif row.get("status") == "IDLE":
             counts["idle"] += 1
         elif row.get("status") in {"DEAD", "UNKNOWN"}:

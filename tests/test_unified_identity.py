@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from tmux_agent_tower.i18n import t
 from tmux_agent_tower.server import httpapi, webui
+from tmux_agent_tower.control import actions as actions_module
 from tmux_agent_tower.control.actions import apply_identity_edit
 from tmux_agent_tower.state.bindings import ProjectBindingStore
 from tmux_agent_tower.state.overrides import OverrideStore
@@ -9,9 +10,9 @@ from tmux_agent_tower.ui import control_view, render
 from tmux_agent_tower.ui.tower import Tower
 
 
-def _identity(tower, *, project="ExampleProject", command="codex", session="0", pane_pid="123"):
+def _identity(tower, *, project="ExampleProject", command="codex", title="", session="0", pane_pid="123"):
     return tower._identity(
-        "%1", command, "", command, (), project, project, "workstation-b", "(이름 없음)",
+        "%1", command, title, command, (), project, project, "workstation-b", "(이름 없음)",
         session=session, pane_pid=pane_pid,
     )
 
@@ -66,13 +67,47 @@ def test_auto_role_name_tracks_role_and_legacy_name_is_a_user_name(tmp_path):
 
     tower.overrides.set_task_name("%1", "기능 구현", "0", "123")
     tower.overrides.set_role("%1", "qa", "0", "123")
-    identity = _identity(tower, project="Tower", command="claude")
+    identity = _identity(
+        tower, project="Tower", command="claude", title="Agent changed title | AnotherProject",
+    )
     assert identity["display_name"] == "기능 구현"
     assert identity["name_origin"] == "user"
 
     reopened = OverrideStore(tmp_path / "overrides.json")
     assert reopened.get_task_name("%1", "0", "123") == "기능 구현"
     assert reopened.get_task_name_origin("%1", "0", "123") == "user"
+    restarted = Tower.__new__(Tower)
+    restarted.overrides = reopened
+    assert _identity(
+        restarted, project="AnotherProject", command="opencode", title="Agent changed it | Project",
+    )["display_name"] == "기능 구현"
+
+
+def test_agent_exit_label_requires_same_local_pane_and_confirmed_agent_to_shell_transition():
+    from tmux_agent_tower.ui.tower import _confirmed_agent_exit
+
+    previous = {"auto_agent": "Codex", "agent_process_alive": True}
+    assert _confirmed_agent_exit(
+        previous, pane_dead=False, via_ssh=False, process_alive=False,
+        detected_agent=False, auto_source="process",
+    )
+    assert _confirmed_agent_exit(
+        {"auto_agent": "Shell", "agent_process_ended": True},
+        pane_dead=False, via_ssh=False, process_alive=False,
+        detected_agent=False, auto_source="process",
+    )
+    assert not _confirmed_agent_exit(
+        previous, pane_dead=False, via_ssh=True, process_alive=False,
+        detected_agent=False, auto_source="process",
+    )
+    assert not _confirmed_agent_exit(
+        previous, pane_dead=False, via_ssh=False, process_alive=True,
+        detected_agent=True, auto_source="process",
+    )
+    assert not _confirmed_agent_exit(
+        previous, pane_dead=False, via_ssh=False, process_alive=False,
+        detected_agent=False, auto_source="ui",
+    )
 
 
 def test_tower_runtime_identity_is_detected_without_window_name_matching(tmp_path):
@@ -125,19 +160,20 @@ def test_default_task_details_hide_tmux_names_and_ids():
     assert labels == ["작업 이름", "프로젝트", "에이전트", "역할", "상태", "확인할 일", "결과", "실행 위치"]
 
 
-def test_default_selected_summary_omits_empty_project_and_role():
+def test_default_home_summary_omits_empty_project_role_and_unknown_host():
     from tmux_agent_tower.ui import tower as tower_module
 
-    lines = tower_module._build_selected_summary(
-        SimpleNamespace(config={"show_status_duration": False}),
-        {
-            "display_name": "터미널", "project": "(이름 없음)", "agent": "Shell",
-            "role": None, "status": "IDLE", "attention": "none", "result_state": "none",
-            "execution_host": "UNKNOWN",
-        },
+    row = {
+        "kind": "pane", "display_name": "터미널", "project": "(이름 없음)",
+        "agent": "Shell", "role": None, "status": "IDLE", "attention": "none",
+        "result_state": "none", "execution_host": "UNKNOWN",
+    }
+    lines = tower_module._home_selection_lines(
+        SimpleNamespace(visible_rows=[row], selected=0), 80
     )
-    assert lines == ["터미널", "Shell · ○ 대기"]
+    assert lines == ["선택한 작업: 터미널", "에이전트: Shell", "상태: 대기 중"]
     assert not any("이름 없음" in line or "역할 없음" in line for line in lines)
+    assert not any("실행 위치 UNKNOWN" in line for line in lines)
 
 
 def test_project_rebind_changes_path_and_preserves_result_provider(tmp_path):
@@ -232,6 +268,32 @@ def test_agent_edit_preserves_auto_name_and_role_edit_recomputes_it(tmp_path):
     assert overrides.get_task_name_origin("%1", "0", "123") == "auto"
 
 
+def test_isolated_identity_edit_refuses_physical_pane_title_write(tmp_path, monkeypatch):
+    overrides = OverrideStore(tmp_path / "overrides.json")
+
+    class FakeTower:
+        def __init__(self):
+            self.overrides = overrides
+            self.rows = [{
+                "key": "%1", "session": "0", "pane_id": "%1", "pane_pid": "123",
+                "remote": False, "transport": "local",
+            }]
+
+        def load(self):
+            return None
+
+    monkeypatch.setattr(actions_module, "APP_HOME_ISOLATED", True)
+    monkeypatch.setattr(
+        "tmux_agent_tower.tmux.structure.rename_pane",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not rename a user Pane")),
+    )
+
+    assert apply_identity_edit(FakeTower(), "%1", {"title": "sidecar title"}) == (
+        False, "title_sync_unavailable",
+    )
+    assert overrides.get_title("%1", "0", "123") is None
+
+
 def test_status_and_phone_use_the_same_task_identity():
     tower = SimpleNamespace(
         load=lambda: None,
@@ -282,6 +344,6 @@ def test_conversation_header_uses_identity_and_keeps_location_friendly(monkeypat
     )
     by_line = dict(seen)
     assert "ExampleProject · 구현" in by_line[0]
-    assert by_line[1] == "Codex · 구현"
-    assert by_line[2] == "실행 위치: workstation-b"
+    assert by_line[1] == "Codex · 구현 · 실행 위치 workstation-b"
+    assert by_line[2] == "상태: ● 작업 중"
     assert not any("Pane" in text or "Window" in text for _line, text in seen)

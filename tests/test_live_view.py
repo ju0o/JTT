@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import unicodedata
 
 import curses
 import pytest
@@ -56,6 +57,23 @@ class Screen:
 
     def get_wch(self):
         return next(self.keys)
+
+    def frame_lines(self):
+        """Return a plain-text terminal frame from fake curses writes."""
+        height, width = self.size
+        cells = [[" "] * width for _ in range(height)]
+        for y, x, text, _attr in self.writes:
+            if not 0 <= y < height:
+                continue
+            column = x
+            for char in text:
+                char_width = 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+                if 0 <= column < width:
+                    cells[y][column] = char
+                if char_width == 2 and 0 <= column + 1 < width:
+                    cells[y][column + 1] = ""
+                column += char_width
+        return ["".join(line).rstrip() for line in cells]
 
 
 def test_layout_slots_and_sequential_selection_preserve_slot_order(monkeypatch):
@@ -248,13 +266,58 @@ def test_empty_start_choices_do_not_look_like_a_selected_task(monkeypatch):
     tower_module.draw(screen, tower)
 
     text = " ".join(item[2] for item in screen.writes)
+    assert "내 AI 작업" in text
     assert "아직 실행 중인 작업이 없습니다." in text
     assert "AI 작업을 한곳에서 보고" in text
     assert "현재 접속 위치를 확인할 수 없습니다" in text
-    assert "Enter 열기" in text
+    assert "Enter 시작" in text
     assert "+ 새 작업" in text
     assert "Ctrl+b" not in text
     assert "작업 이름" not in text
+
+
+@pytest.mark.parametrize("width", [60, 80, 100, 120])
+def test_home_footer_keeps_primary_hints_within_two_lines(width):
+    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.ui.render import display_width
+
+    tower = SimpleNamespace(
+        visible_rows=[{"kind": "pane", "pane_id": "%7", "key": "%7"}],
+        selected=0,
+        view_mode=tower_module.USER_WORK_VIEW,
+    )
+    key_lines = tower_module._home_key_lines(tower, width)
+    lines = tower_module._home_footer_lines(tower, width)
+    rendered = " ".join(key_lines)
+
+    assert len(key_lines) == 2
+    assert lines == key_lines
+    assert all(display_width(line) <= width - 4 for line in lines)
+    for hint in ("↑↓ 선택", "Enter 대화 열기", "Y 최신 답변 복사", "Space 메뉴", "E 이름", "A 확인 필요", "V 구조", "? 도움말"):
+        assert hint in rendered
+    assert "+ 새 작업" not in rendered
+
+
+@pytest.mark.parametrize("width", [60, 80, 100, 120])
+@pytest.mark.parametrize("kind", ["folder", "work_group"])
+def test_home_footer_hides_copy_for_expandable_rows(width, kind):
+    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.ui.render import display_width
+
+    tower = SimpleNamespace(
+        visible_rows=[{"kind": kind, "key": f"{kind}:selected"}],
+        selected=0,
+        view_mode=tower_module.USER_WORK_VIEW,
+    )
+    key_lines = tower_module._home_key_lines(tower, width)
+    lines = tower_module._home_footer_lines(tower, width)
+    rendered = " ".join(key_lines)
+
+    assert len(key_lines) == 2
+    assert lines == key_lines
+    assert all(display_width(line) <= width - 4 for line in lines)
+    assert "Enter 펼치기/접기" in rendered
+    assert "Y" not in rendered
 
 
 def test_default_home_draws_user_identity_without_physical_inspector_or_legacy_wall(monkeypatch):
@@ -289,20 +352,213 @@ def test_default_home_draws_user_identity_without_physical_inspector_or_legacy_w
     text = " ".join(item[2] for item in screen.writes)
 
     assert "SamplePortal 개선" in text and "API 확인" in text
-    assert "구현 · Codex" in text
-    assert any(item[2].startswith("› ") for item in screen.writes)
-    assert not any(item[2] == " " * 99 for item in screen.writes)
-    assert "실행 위치 workstation-a" in text
+    assert "Codex · 구현" in text
+    selected_marker = next(item for item in screen.writes if item[2].startswith("▶ "))
+    assert selected_marker[3] & curses.A_REVERSE
+    assert any(item[2] == " " * 99 and item[3] & curses.A_REVERSE for item in screen.writes)
+    assert "workstation-a" in text
     assert "새 결과" in text
     for internal in ("Pane ID", "Window ID", "Session", "%42", "@4", "A 우선순위", "M 휴대폰", "Ctrl+b w"):
         assert internal not in text
-    for key in ("Enter 열기", "Space 메뉴", "+ 새 작업", "S 저장한 구성", "L 실시간 보기", "/ 찾기·명령", "Y 결과 복사", "Esc 뒤로", "? 도움말"):
+    for key in ("Enter 대화 열기", "Space 메뉴", "Y 최신 답변 복사", "E 이름", "A 확인 필요", "V 구조", "? 도움말"):
         assert key in text
+    assert "+ 새 작업" not in text
 
 
-def test_tower_v_opens_navigator_and_l_opens_live_view(monkeypatch):
-    from tmux_agent_tower.server import service
+@pytest.mark.parametrize("height,width", [(18, 60), (24, 80), (40, 100), (40, 120)])
+@pytest.mark.parametrize("variant", ["working", "new_result", "remote_unknown"])
+def test_home_selection_and_footer_stay_visible_in_fake_viewports(monkeypatch, height, width, variant):
     from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.ui.render import display_width
+
+    values = {
+        "display_name": "한국어 제목이 길어도 선택한 작업과 다음 행동을 알아보기 위한 점검",
+        "duration_seconds": 10,
+    }
+    if variant == "working":
+        values.update(status="WORKING", result_state="none", execution_host="DESKTOP-UU9DD3I")
+    elif variant == "new_result":
+        values.update(status="WORKING", result_state="ready", execution_host="DESKTOP-UU9DD3I")
+    else:
+        values.update(
+            status="UNKNOWN", result_state="none", remote=True,
+            transport="ssh", execution_host="asus-workstation.example.test",
+        )
+    row = _row("%7", **values)
+    tower = SimpleNamespace(
+        visible_rows=[row], selected=0,
+        visual=[{"type": "data", "row": row, "row_index": 0}],
+        access_context=SimpleNamespace(display_name="DESKTOP-UU9DD3I", clipboard_capability="host"),
+        filter_text="", notice="", config={"show_status_duration": True},
+        view_mode=tower_module.USER_WORK_VIEW,
+    )
+    screen = Screen(height=height, width=width)
+    monkeypatch.setattr(tower_module, "load_preference", lambda: tower_module.COPY_AUTO)
+    monkeypatch.setattr(tower_module.curses, "has_colors", lambda: False)
+    monkeypatch.setattr(tower_module.curses, "doupdate", lambda: None)
+
+    tower_module.draw(screen, tower)
+
+    footer_lines = tower_module._home_footer_lines(tower, width)
+    footer_y = height - len(footer_lines)
+    frame = screen.frame_lines()
+    text = "\n".join(frame)
+    selected_y = next(item[0] for item in screen.writes if item[2] == "▶ ")
+    assert frame[selected_y].startswith("▶ 한국어 제목")
+    assert display_width(frame[selected_y]) <= width
+    assert "Codex" in text
+    if width >= 100 and variant != "remote_unknown":
+        assert "DESKTOP-UU9DD3I" in text
+    assert any(item[2].startswith("▶ ") and item[3] & curses.A_REVERSE for item in screen.writes)
+    assert "현재 컴퓨터에서 자동 복사" in text
+    assert "10초" not in text  # this is status-observation duration, not agent runtime
+    assert len(footer_lines) == 2
+    assert all(0 <= item[0] < height for item in screen.writes)
+    assert all(display_width(line) <= width - 4 for line in footer_lines)
+    for offset, line in enumerate(footer_lines):
+        assert any(item[0] == footer_y + offset and item[1] == 2 and item[2] == line for item in screen.writes)
+
+    if variant == "working":
+        assert "작업 중" in text
+        assert text.count("DESKTOP-UU9DD3I") == 1
+        assert "Y 최신 답변 복사" in text
+        assert any(item[0] == 0 and "작업 중 1" in item[2] for item in screen.writes)
+    elif variant == "new_result":
+        assert "새 결과" in text and "작업 중" in text
+        assert "Y 최신 답변 복사" in text
+        assert any(item[0] == 0 and "새 결과 1" in item[2] for item in screen.writes)
+    else:
+        assert "상태 확인 필요" in text
+        assert "Enter 상태 확인" in text
+        assert "Y 최신 답변 복사" in text
+
+    if width >= 110 and height >= 30:
+        assert "선택 작업 요약" in text
+        assert "선택한 작업:" in text
+        assert "에이전트:" in text
+        assert "실행 위치" in text
+    else:
+        assert "선택 작업 요약" not in text
+        assert "에이전트:" not in text
+        assert "실행 위치" not in text
+
+
+@pytest.mark.parametrize("height,width", [(18, 60), (24, 80), (40, 100), (40, 120)])
+def test_user_title_is_single_list_heading_across_fake_viewports(monkeypatch, height, width):
+    from tmux_agent_tower.ui import tower as tower_module
+
+    row = _row(
+        "%41", display_name="Projects Briping", task_name="Projects Briping",
+        name_origin="user", project="Tmux Agent Tower", work_group_name="RC handoff",
+        status="IDLE", agent_process_alive=True, target_id="target-41",
+    )
+    tower = SimpleNamespace(
+        visible_rows=[row], selected=0,
+        visual=[{"type": "header", "host": "내 AI 작업"}, {"type": "data", "row": row, "row_index": 0}],
+        access_context=None, filter_text="", notice="", config={"show_status_duration": False},
+        view_mode=tower_module.USER_WORK_VIEW,
+    )
+    screen = Screen(height=height, width=width)
+    monkeypatch.setattr(tower_module.curses, "has_colors", lambda: False)
+    monkeypatch.setattr(tower_module.curses, "doupdate", lambda: None)
+
+    tower_module.draw(screen, tower)
+
+    selected_y = next(item[0] for item in screen.writes if item[2] == "▶ ")
+    selected_line = " ".join(item[2] for item in screen.writes if item[0] == selected_y)
+    assert "Projects Briping" in selected_line
+    assert "Tmux Agent Tower" not in selected_line
+    assert "RC handoff" not in selected_line
+    assert row["key"] == "%41" and row["target_id"] == "target-41"
+
+
+def test_user_home_visual_is_flat_without_changing_pane_selection_identity():
+    from tmux_agent_tower.ui import tower as tower_module
+
+    pane = _row(
+        "%41", display_name="내 작업", project="자동 프로젝트명",
+        target_id="target-41", pane_id="%41", window_id="@4",
+    )
+    tower = SimpleNamespace(
+        view_mode=tower_module.USER_WORK_VIEW,
+        attention_mode=False,
+        visible_rows=[pane],
+    )
+
+    tower_module.Tower._build_visual(tower)
+
+    assert tower.visual == [{"type": "data", "row": pane, "row_index": 0}]
+    assert tower.visual[0]["row"]["key"] == "%41"
+    assert tower.visual[0]["row"]["target_id"] == "target-41"
+    assert tower.visual[0]["row"]["window_id"] == "@4"
+
+
+def test_draw_renders_cached_home_rows_without_network_or_subprocess(monkeypatch):
+    import subprocess
+    from tmux_agent_tower.ui import tower as tower_module
+
+    row = _row("%41", display_name="작업", target_id="target-41", result_state="ready")
+    tower = SimpleNamespace(
+        visible_rows=[row], selected=0,
+        visual=[{"type": "data", "row": row, "row_index": 0}],
+        access_context=None, filter_text="", notice="", config={},
+        view_mode=tower_module.USER_WORK_VIEW,
+    )
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("draw must only render the already-collected Tower snapshot")
+
+    monkeypatch.setattr(subprocess, "run", unexpected)
+    monkeypatch.setattr(tower_module.discovery, "list_panes", unexpected)
+    monkeypatch.setattr(tower_module, "fetch_remote", unexpected)
+    monkeypatch.setattr(tower_module, "load_preference", lambda: tower_module.COPY_AUTO)
+    monkeypatch.setattr(tower_module.curses, "has_colors", lambda: False)
+    monkeypatch.setattr(tower_module.curses, "doupdate", lambda: None)
+
+    screen = Screen(height=40, width=120)
+    tower_module.draw(screen, tower)
+
+    frame = "\n".join(screen.frame_lines())
+    assert "작업" in frame
+    assert "선택 작업 요약" in frame
+
+
+@pytest.mark.parametrize("height,width", [(18, 60), (24, 80), (40, 100), (40, 120)])
+def test_expanded_folder_hides_duplicate_counts_and_copy_hint(monkeypatch, height, width):
+    from tmux_agent_tower.ui import tower as tower_module
+
+    folder = {
+        "kind": "folder", "key": "folder:work", "display_name": "내 업무",
+        "collapsed": False, "guide": "▼ ", "window_refs": ["@1"],
+        "summary": "● 1 작업 중", "summary_compact": "●1",
+        "summary_counts": {"working": 1},
+    }
+    task = _row("%9", display_name="로그인 수정", status="WORKING")
+    tower = SimpleNamespace(
+        visible_rows=[folder, task], selected=0,
+        visual=[
+            {"type": "data", "row": folder, "row_index": 0},
+            {"type": "data", "row": task, "row_index": 1},
+        ], access_context=None, filter_text="", notice="", config={},
+        view_mode=tower_module.USER_WORK_VIEW,
+    )
+    screen = Screen(height=height, width=width)
+    monkeypatch.setattr(tower_module.curses, "has_colors", lambda: False)
+    monkeypatch.setattr(tower_module.curses, "doupdate", lambda: None)
+
+    tower_module.draw(screen, tower)
+    text = "\n".join(item[2] for item in screen.writes)
+
+    assert "내 업무" in text
+    assert "연결된 작업 공간 1개" in text
+    assert "● 1 작업 중" not in text
+    assert "Enter 펼치기/접기" in text
+    assert "Y 최신 답변 복사" not in text
+
+
+def test_tower_v_opens_navigator_and_l_opens_quiet_control_room(monkeypatch):
+    from tmux_agent_tower.server import service
+    from tmux_agent_tower.ui import control_room, tower as tower_module
 
     class FakeTower:
         session = "isolated-test"
@@ -330,20 +586,20 @@ def test_tower_v_opens_navigator_and_l_opens_live_view(monkeypatch):
     monkeypatch.setattr(tower_module, "draw", lambda _screen, current, **_kwargs: events.append(("draw", current.navigator_mode)))
     monkeypatch.setattr(tower_module, "_remote_state", lambda: "stopped")
     monkeypatch.setattr(service, "maybe_autostart", lambda **_kwargs: None)
-    monkeypatch.setattr(live_view, "open_live_view", lambda _screen, current, selected_key=None: events.append(("live", current.navigator_mode, selected_key)))
+    monkeypatch.setattr(control_room, "open_control_room", lambda _screen, current: events.append(("control_room", current.navigator_mode)))
 
     tower_module._run_loop(screen, "isolated-test", "")
 
     assert events[0] == ("draw", False)
     assert ("draw", True) in events
-    assert ("live", True, "%7") in events
+    assert ("control_room", True) in events
     assert tower.navigator_mode is True
     assert tower.loaded == 2
 
 
-def test_live_on_selected_group_opens_group_view(monkeypatch):
+def test_control_room_entry_is_independent_of_selected_group_type(monkeypatch):
     from tmux_agent_tower.server import service
-    from tmux_agent_tower.ui import tower as tower_module
+    from tmux_agent_tower.ui import control_room, tower as tower_module
 
     group = {"kind": "work_group", "group_id": "g1", "display_name": "ExampleProject"}
 
@@ -365,16 +621,16 @@ def test_live_on_selected_group_opens_group_view(monkeypatch):
     monkeypatch.setattr(tower_module, "draw", lambda *_a, **_k: None)
     monkeypatch.setattr(tower_module, "_remote_state", lambda: "stopped")
     monkeypatch.setattr(service, "maybe_autostart", lambda **_k: None)
-    monkeypatch.setattr(live_view, "open_group_live_view", lambda _s, _t, row: opened.append(row))
+    monkeypatch.setattr(control_room, "open_control_room", lambda _s, current: opened.append(current))
 
     tower_module._run_loop(Screen(), "isolated-test", "")
 
-    assert opened == [group]
+    assert opened == [tower]
 
 
 def test_primary_navigation_and_result_keys_route_to_existing_flows(monkeypatch):
     from tmux_agent_tower.server import service
-    from tmux_agent_tower.ui import control_view, settings_menu, structure_menu, tower as tower_module, worksets
+    from tmux_agent_tower.ui import control_room, control_view, settings_menu, structure_menu, tower as tower_module, worksets
     from tmux_agent_tower.ui.widgets import show_message_screen
 
     pane = _row("%7")
@@ -391,6 +647,7 @@ def test_primary_navigation_and_result_keys_route_to_existing_flows(monkeypatch)
 
     tower = FakeTower()
     events = []
+    shown_messages = []
     keys = iter(("s", "l", "c", "?", "y", "g", "n", "w", "\x03"))
     monkeypatch.setattr(tower_module, "Tower", lambda *_a, **_k: tower)
     monkeypatch.setattr(tower_module, "REFRESH_SECONDS", 10**9)
@@ -400,15 +657,19 @@ def test_primary_navigation_and_result_keys_route_to_existing_flows(monkeypatch)
     monkeypatch.setattr(service, "maybe_autostart", lambda **_k: None)
     monkeypatch.setattr(worksets, "open_saved_collection", lambda *_a: events.append("saved"))
     monkeypatch.setattr(structure_menu, "open_create_hub", lambda *_a: events.append("create"))
-    monkeypatch.setattr(live_view, "open_live_view", lambda *_a: events.append("live"))
+    monkeypatch.setattr(control_room, "open_control_room", lambda *_a: events.append("live"))
     monkeypatch.setattr(settings_menu, "open_settings", lambda *_a: events.append("settings"))
     monkeypatch.setattr(control_view, "_copy_result", lambda *_a: events.append("copy") or "복사했습니다")
     monkeypatch.setattr(control_view, "_go", lambda *_a: events.append("terminal") or t("control.focused"))
-    monkeypatch.setattr("tmux_agent_tower.ui.widgets.show_message_screen", lambda *_a, **_k: events.append("message"))
+    monkeypatch.setattr(
+        "tmux_agent_tower.ui.widgets.show_message_screen",
+        lambda *args, **kwargs: (events.append("message"), shown_messages.append((args, kwargs))),
+    )
 
     tower_module._run_loop(Screen(), "isolated-test", "")
 
     assert events == ["saved", "live", "settings", "message", "copy", "message", "terminal", "create", "create"]
+    assert shown_messages[0][1] == {"paginate": True}
 
 
 def test_focus_side_by_side_and_grid_draw_selected_order(monkeypatch):

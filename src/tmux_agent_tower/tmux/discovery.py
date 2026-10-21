@@ -42,9 +42,13 @@ _WINDOW_FORMAT = FIELD_SEP.join(
 )
 
 
-def list_windows(session: str) -> List[Dict]:
-    """Read the window assets in one Tower session, including empty windows."""
-    output = capture.run_tmux(["list-windows", "-t", session, "-F", _WINDOW_FORMAT]) if session else ""
+def list_windows(session: str, *, all_sessions: bool = False) -> List[Dict]:
+    """Read window assets in one session, or server-wide for an isolated sidecar."""
+    if all_sessions:
+        args = ["list-windows", "-a", "-F", _WINDOW_FORMAT]
+    else:
+        args = ["list-windows", "-t", session, "-F", _WINDOW_FORMAT] if session else []
+    output = capture.run_tmux(args) if args else ""
     rows = []
     for line in (output or "").splitlines():
         parts = line.replace(r"\037", FIELD_SEP).split(FIELD_SEP)
@@ -93,7 +97,9 @@ def _has_tower_process(pane_pid: str, cmdline_map: Dict[str, str], ppid_map: Dic
     return False
 
 
-def list_panes(session: str, exclude_pane_id: str = "", capture_lines: int = 30) -> List[Dict]:
+def list_panes(
+    session: str, exclude_pane_id: str = "", capture_lines: int = 30, *, all_sessions: bool = False,
+) -> List[Dict]:
     """Return one dict per pane, excluding Tower's own pane (by pane_id).
 
     Deliberately NOT a window-name match: a window's name is just text
@@ -107,7 +113,11 @@ def list_panes(session: str, exclude_pane_id: str = "", capture_lines: int = 30)
     bad line can't take down the whole refresh.
     """
 
-    output = capture.run_tmux(["list-panes", "-s", "-t", session, "-F", _PANE_FORMAT])
+    if all_sessions:
+        args = ["list-panes", "-a", "-F", _PANE_FORMAT]
+    else:
+        args = ["list-panes", "-s", "-t", session, "-F", _PANE_FORMAT]
+    output = capture.run_tmux(args)
 
     if not output:
         return []

@@ -347,7 +347,7 @@ def test_conversation_header_includes_group_without_changing_member_identity(mon
         "host": "workstation-b", "attention": "none", "activity_text": "", "remote": False, "interaction": {},
     }, "", False)
     assert "ExampleProject · 구현" in dict(seen)[0]
-    assert dict(seen)[1] == "ExampleProject · V2 고도화 › 구현 · Codex"
+    assert dict(seen)[1] == "ExampleProject · V2 고도화 › Codex · 구현 · 실행 위치 workstation-b"
 
 
 def test_group_menu_creation_role_sorts_and_removal_keeps_task(tmp_path, monkeypatch):

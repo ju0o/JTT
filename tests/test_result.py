@@ -5,6 +5,7 @@ from pathlib import Path
 import pty
 import socket
 import sqlite3
+import stat
 import termios
 
 import pytest
@@ -83,6 +84,266 @@ def test_codex_result_drops_the_tool_diff_and_keeps_a_code_block():
     assert "이해가 안됨" not in result.text
     assert "작전판으로 정리" in result.text
     assert "print('tower')" in result.text
+
+
+def test_codex_completion_words_inside_fences_do_not_truncate_2751_byte_answer():
+    prefix = ["```text", *(["A" * 29] * 65), "B" * 80, "Worked for 5s", "Worked for 6s"]
+    suffix = ["```", *(["C" * 29] * 21), "D" * 50]
+    body = prefix + suffix
+    body_text = "\n".join(body)
+    assert len(body) == 92
+    assert len(body_text.encode("utf-8")) == 2751
+    assert len("\n".join(suffix).encode("utf-8")) == 684
+
+    history = ["› synthetic request", *body, "Worked for 1s", "› Ask Codex to do anything"]
+    candidate = CodexAdapter().extract_result(PaneContext("", "codex", tuple(history)))
+
+    assert candidate is not None and candidate.complete
+    assert candidate.body_complete is True and candidate.turn_complete is True
+    assert candidate.text == body_text
+
+
+def test_codex_result_without_a_start_boundary_stays_partial():
+    history = ["visible suffix only", "Worked for 1s", "› Ask Codex to do anything"]
+    candidate = CodexAdapter().extract_result(PaneContext("", "codex", tuple(history)))
+
+    assert candidate is not None
+    assert candidate.turn_complete is True
+    assert candidate.body_complete is False
+    assert candidate.complete is False
+
+
+def test_codex_indented_worked_for_line_stays_in_complete_answer():
+    history = [
+        "› synthetic request",
+        "    Worked for 5s",
+        "actual answer",
+        "Worked for 1s",
+        "› Ask Codex to do anything",
+    ]
+
+    candidate = CodexAdapter().extract_result(PaneContext("", "codex", tuple(history)))
+
+    assert candidate is not None and candidate.complete
+    assert candidate.text == "    Worked for 5s\nactual answer"
+
+
+def test_codex_capture_starting_inside_code_fails_closed_without_turn_start():
+    history = [
+        "    code continuation",
+        "Worked for 5s",
+        "more code continuation",
+        "```",
+        "another code block",
+        "```",
+        "actual answer",
+        "Worked for 1s",
+        "› Ask Codex to do anything",
+    ]
+
+    candidate = CodexAdapter().extract_result(PaneContext("", "codex", tuple(history)))
+
+    assert candidate is None or not candidate.complete
+
+
+def test_codex_fenced_worked_for_and_prompt_text_stay_inside_the_answer():
+    history = [
+        "› synthetic request",
+        "```text",
+        "Worked for 5s",
+        "› Ask Codex to do anything",
+        "actual code continuation",
+        "```",
+        "actual answer",
+        "Worked for 1s",
+        "› Ask Codex to do anything",
+    ]
+
+    candidate = CodexAdapter().extract_result(PaneContext("", "codex", tuple(history)))
+
+    assert candidate is not None and candidate.complete
+    assert candidate.text == "\n".join(history[1:6] + ["actual answer"])
+
+
+def test_codex_terminal_example_prompt_is_not_a_completion_or_turn_start():
+    body = [
+        "답변 첫 문단 - 반드시 포함되어야 함",
+        "예시 CLI 로그:",
+        "Worked for 5s",
+        "› example next command",
+        "예시 로그 아래의 설명",
+        "정상적인 답변 마지막 문단",
+    ]
+    history = ["› 실제 사용자 요청", *body, "Worked for 1s", "› Ask Codex to do anything"]
+
+    candidate = CodexAdapter().extract_result(PaneContext("", "codex", tuple(history)))
+
+    assert candidate is not None and candidate.complete
+    assert candidate.text == "\n".join(body)
+
+
+def test_codex_mid_answer_capture_with_example_prompt_stays_partial():
+    history = [
+        "예시 CLI 로그:",
+        "Worked for 5s",
+        "› example next command",
+        "예시 로그 아래의 설명",
+        "정상적인 답변 마지막 문단",
+        "Worked for 1s",
+        "› Ask Codex to do anything",
+    ]
+
+    candidate = CodexAdapter().extract_result(PaneContext("", "codex", tuple(history)))
+
+    assert candidate is None or candidate.complete is False
+
+
+def test_codex_exact_footer_example_is_ambiguous_and_stays_partial():
+    history = [
+        "› actual user request",
+        "Answer before the terminal example.",
+        "Worked for 5s",
+        "› Ask Codex to do anything",
+        "› example next command",
+        "Answer after the terminal example.",
+        "Worked for 1s",
+        "› Ask Codex to do anything",
+    ]
+
+    candidate = CodexAdapter().extract_result(PaneContext("", "codex", tuple(history)))
+
+    assert candidate is not None
+    assert candidate.complete is False
+    assert candidate.body_complete is False
+
+
+def test_codex_unknown_status_after_prior_completion_is_ambiguous():
+    history = [
+        "› first user question",
+        "FIRST TURN ANSWER",
+        "Worked for 5s",
+        "› Ask Codex to do anything",
+        "Updated status: context 62%",
+        "› second user question",
+        "SECOND TURN ANSWER",
+        "Worked for 1s",
+        "› Ask Codex to do anything",
+    ]
+
+    candidate = CodexAdapter().extract_result(PaneContext("", "codex", tuple(history)))
+
+    assert candidate is not None
+    assert candidate.complete is False
+    assert candidate.body_complete is False
+
+
+def test_get_result_rejects_reused_local_pane_before_recovery(monkeypatch):
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _RecoverTower()
+    tower.rows[0].update({"pane_id": "%9", "pane_pid": "current-pid"})
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions._pane_matches_live_identity",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions._recover_result",
+        lambda *_args, **_kwargs: pytest.fail("reused pane must not reach result recovery"),
+    )
+
+    ok, reason, payload = get_result(tower, "%9", expected_pane_pid="current-pid")
+
+    assert not ok and reason == "stale"
+    assert payload["reason_code"] == "UNKNOWN"
+
+
+def test_get_result_rejects_local_pane_without_expected_pid(monkeypatch):
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _RecoverTower()
+    tower.rows[0].update({"pane_id": "%9", "pane_pid": ""})
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions._pane_matches_live_identity",
+        lambda *_args: pytest.fail("PID-less pane must fail before identity lookup"),
+    )
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions._recover_result",
+        lambda *_args, **_kwargs: pytest.fail("PID-less pane must not reach result recovery"),
+    )
+
+    ok, reason, payload = get_result(tower, "%9", expected_pane_pid="")
+
+    assert not ok and reason == "stale"
+    assert payload["reason_code"] == "UNKNOWN"
+
+
+def test_get_result_rechecks_local_pid_after_capture(monkeypatch):
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _RecoverTower()
+    tower.rows[0].update({"pane_id": "%9", "pane_pid": "1234"})
+    _patch_history(monkeypatch, tower, [
+        "› user request", "complete answer", "Worked for 1s", "› Ask Codex to do anything",
+    ])
+    checks = iter((True, True, False))
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions._pane_matches_live_identity",
+        lambda *_args: next(checks),
+    )
+
+    ok, _reason, payload = get_result(tower, "%9", expected_pane_pid="1234")
+
+    assert ok and payload["complete"] is False
+    assert payload["reason_code"] == "UNKNOWN"
+
+
+def test_result_recovery_reports_when_history_byte_range_was_exceeded(monkeypatch):
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _RecoverTower()
+    _patch_history(monkeypatch, tower, ["partial answer", "Worked for 1s", "› Ask Codex to do anything"])
+    monkeypatch.setattr("tmux_agent_tower.control.actions.RECOVERY_BYTES", 1)
+
+    ok, _reason, payload = get_result(tower, "%9")
+
+    assert ok and payload["complete"] is False
+    assert payload["reason_code"] == "OUTPUT_RANGE_EXCEEDED"
+
+
+def test_recovery_range_reason_requires_actual_truncation():
+    from tmux_agent_tower.control.actions import (
+        RECOVERY_BYTES, RECOVERY_LINES, _bounded_history_with_truncation,
+    )
+
+    exact_lines, exact_lines_truncated = _bounded_history_with_truncation(["x"] * RECOVERY_LINES)
+    over_lines, over_lines_truncated = _bounded_history_with_truncation(["x"] * (RECOVERY_LINES + 1))
+    exact_bytes, exact_bytes_truncated = _bounded_history_with_truncation(["x" * RECOVERY_BYTES])
+    over_bytes, over_bytes_truncated = _bounded_history_with_truncation(["x" * (RECOVERY_BYTES + 1)])
+
+    assert len(exact_lines) == RECOVERY_LINES and not exact_lines_truncated
+    assert len(over_lines) == RECOVERY_LINES and over_lines_truncated
+    assert exact_bytes == ["x" * RECOVERY_BYTES] and not exact_bytes_truncated
+    assert over_bytes == [] and over_bytes_truncated
+
+
+@pytest.mark.parametrize(
+    ("history_size", "expected_reason"),
+    [(800, "UNKNOWN"), (801, "OUTPUT_RANGE_EXCEEDED")],
+)
+def test_recovery_range_reason_uses_history_size_evidence(monkeypatch, history_size, expected_reason):
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _RecoverTower()
+    _patch_history(monkeypatch, tower, ["unrecognized idle output"] * 800)
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions.tmux_capture.pane_history_position",
+        lambda _pane: (history_size, 2000),
+    )
+
+    ok, _reason, payload = get_result(tower, "%9")
+
+    assert ok and not payload["complete"]
+    assert payload["reason_code"] == expected_reason
 
 
 def test_codex_prose_worked_for_is_not_a_turn_boundary():
@@ -237,6 +498,26 @@ def test_opencode_tool_summary_is_not_a_result_but_prose_is():
     result = OpenCodeAdapter().extract_result(PaneContext(title="", command="opencode", lines=tuple(screen)))
     assert result is not None
     assert "promo file" in result.text
+    assert result.complete is False
+    assert result.body_complete is False
+
+
+def test_opencode_first_completed_answer_survives_long_idle_screen():
+    screen = list(lines("opencode-stale-working-idle.txt"))
+    completion = next(i for i, line in enumerate(screen) if line.lstrip().startswith("▣"))
+    screen[completion:completion] = ["┃ synthetic request", "Synthetic complete answer."]
+    screen.extend([""] * 10)
+    context = PaneContext(title="", command="opencode", lines=tuple(screen))
+    adapter = OpenCodeAdapter()
+
+    assert adapter.classify(context).status == "IDLE"
+    assert "ctrl+p commands" not in "\n".join(context.lines[-8:]).lower()
+    result = adapter.extract_result(context)
+    assert result is not None
+    assert result.text == "Synthetic complete answer."
+    assert result.complete is True
+    assert result.turn_complete is True
+    assert result.body_complete is True
 
 
 def test_opencode_working_is_not_a_result():
@@ -276,6 +557,25 @@ def test_grok_and_shell_do_not_invent_a_result():
     assert GrokAdapter().extract_result(ctx("grok-idle.txt")) is None
     assert GrokAdapter().extract_result(ctx("grok-working.txt")) is None
     assert ShellAdapter().extract_result(ctx("shell-idle.txt")) is None
+
+
+def test_cline_terminal_output_stays_unsupported_without_result_boundaries(monkeypatch):
+    from tmux_agent_tower.control.actions import get_result
+
+    tower = _RecoverTower()
+    tower.rows[0].update({"command": "cline", "title": "Cline", "agent": "Cline"})
+    _patch_history(monkeypatch, tower, ["Cline session", "assistant-looking output", "Done"])
+    monkeypatch.setattr(
+        "tmux_agent_tower.control.actions.pane_title_and_command",
+        lambda _pane: ("Cline", "cline"),
+    )
+    monkeypatch.setattr("tmux_agent_tower.control.actions.tmux_capture.pane_history_position", lambda _pane: None)
+
+    ok, reason, payload = get_result(tower, "%9")
+
+    assert ok and reason == ""
+    assert payload["text"] == "" and payload["complete"] is False
+    assert payload["reason_code"] == "AGENT_UNSUPPORTED"
 
 
 def test_completion_words_in_the_wrong_place_are_not_a_result():
@@ -624,6 +924,98 @@ def test_shared_tracker_serializes_concurrent_read_and_poll_without_body_bytes(t
     assert b"PRIVATE PROMPT" not in persisted
 
 
+def test_new_result_state_database_and_journal_are_private(tmp_path):
+    state_path = tmp_path / "state" / "nested" / "result-state.sqlite3"
+    identity = _shared_identity()
+    tracker = ResultTracker(state_path)
+    result = ResultCandidate("Private fixture answer", "private-fingerprint")
+
+    assert tracker.observe("%9", "IDLE", result, identity).state == "ready"
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(state_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(state_path.parent.parent.stat().st_mode) == 0o700
+
+    connection = tracker._connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "UPDATE result_state SET state = 'read' WHERE pane_identity = ?",
+            (json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False),),
+        )
+        journal = Path(f"{state_path}-journal")
+        assert journal.is_file()
+        assert stat.S_IMODE(journal.stat().st_mode) == 0o600
+    finally:
+        connection.rollback()
+        connection.close()
+
+    assert ResultTracker(state_path).snapshot("%9", identity).state == "ready"
+
+
+def test_existing_result_database_data_and_mode_are_preserved(tmp_path):
+    state_path = tmp_path / "result-state.sqlite3"
+    identity = _shared_identity()
+    identity_key = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    with sqlite3.connect(state_path) as connection:
+        connection.execute(
+            "CREATE TABLE result_state (schema_version INTEGER NOT NULL, "
+            "pane_identity TEXT PRIMARY KEY NOT NULL, state TEXT NOT NULL, "
+            "fingerprint TEXT NOT NULL, generated_at REAL NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO result_state VALUES (?, ?, ?, ?, ?)",
+            (1, identity_key, "ready", "existing-fingerprint", 123.0),
+        )
+    state_path.chmod(0o644)
+    before = state_path.read_bytes()
+
+    snapshot = ResultTracker(state_path).snapshot("%9", identity)
+
+    assert snapshot.state == "ready"
+    assert snapshot.fingerprint == "existing-fingerprint"
+    assert snapshot.text == ""
+    assert state_path.read_bytes() == before
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("link_type", ["symlink", "hardlink"])
+def test_result_state_refuses_external_database_links_without_writing_target(tmp_path, link_type):
+    external = tmp_path / "external.sqlite3"
+    with sqlite3.connect(external) as connection:
+        connection.execute("CREATE TABLE external_data (value TEXT)")
+        connection.execute("INSERT INTO external_data VALUES ('preserve-me')")
+    external.chmod(0o600)
+    before = external.read_bytes()
+    state_path = tmp_path / "state" / "result-state.sqlite3"
+    state_path.parent.mkdir(mode=0o700)
+    if link_type == "symlink":
+        state_path.symlink_to(external)
+    else:
+        os.link(external, state_path)
+
+    with pytest.raises(OSError, match="unsafe Result state database"):
+        ResultTracker(state_path)._connect()
+
+    assert external.read_bytes() == before
+    if link_type == "symlink":
+        assert state_path.is_symlink()
+    else:
+        assert state_path.stat().st_nlink == 2
+
+
+def test_result_state_refuses_a_group_or_world_writable_database_directory(tmp_path):
+    state_dir = tmp_path / "unsafe-state"
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o777)
+    state_path = state_dir / "result-state.sqlite3"
+
+    with pytest.raises(OSError, match="writable by other users"):
+        ResultTracker(state_path)._connect()
+
+    assert not state_path.exists()
+    state_dir.chmod(0o700)
+
+
 def test_status_payload_exposes_state_but_not_result_text():
     class Tower:
         session = "s"
@@ -691,6 +1083,9 @@ def test_newest_turn_is_the_only_recovered_body():
         "› Done",
         "older answer that must stay in history",
         "Worked for 10s",
+        "› Ask Codex to do anything",
+        "GPT-6-Luna medium · local project · Previous task",
+        "← for agents · ? for shortcuts",
         "› next question",
         "한글 최종 답변입니다.",
         "```python",
@@ -726,6 +1121,9 @@ def test_an_old_working_line_does_not_hide_a_finished_turn():
         "› first",
         "older answer that must stay in history",
         "Worked for 10s",
+        "› Ask Codex to do anything",
+        "GPT-6-Luna medium · local project · Previous task",
+        "← for agents · ? for shortcuts",
         "› second",
         "second turn answer is this paragraph",
         "Worked for 2s",
@@ -1078,7 +1476,12 @@ def test_empty_tracker_recovers_a_visible_final_and_a_buried_one(monkeypatch):
     assert tower.captures == [RECOVERY_LINES]
 
     buried = ["noise"] * 40
-    buried += ["› question", "buried final answer here", "Worked for 4s", "› Ask Codex to do anything"]
+    buried += [
+        "Worked for 2s", "› Ask Codex to do anything",
+        "GPT-6-Luna medium · local project · Previous task",
+        "← for agents · ? for shortcuts", "› question",
+        "buried final answer here", "Worked for 4s", "› Ask Codex to do anything",
+    ]
     tower = _RecoverTower()
     _patch_history(monkeypatch, tower, buried)
     ok, _reason, payload = get_result(tower, "%9")
@@ -1465,6 +1868,9 @@ def test_y_copies_the_newest_turn_not_a_stored_fragment_or_a_working_screen(monk
         "› first question",
         "Result A stays in history only.",
         "Worked for 10s",
+        "› Ask Codex to do anything",
+        "GPT-6-Luna medium · local project · Previous task",
+        "← for agents · ? for shortcuts",
         "› second question",
         "Result B is the finished answer.",
         "```python",
@@ -1489,6 +1895,61 @@ def test_y_copies_the_newest_turn_not_a_stored_fragment_or_a_working_screen(monk
     _patch_history(monkeypatch, tower, working)
     ok, _reason, payload = get_result(tower, "%9")
     assert ok
+    assert payload["text"] == ""
+
+
+@pytest.mark.parametrize("overflow", ["lines", "bytes"])
+def test_codex_range_truncation_does_not_promote_example_tail_to_complete(monkeypatch, overflow):
+    from tmux_agent_tower.control.actions import RECOVERY_BYTES, RECOVERY_LINES, get_result
+
+    if overflow == "lines":
+        history = ["› actual user request", "required answer beginning"]
+        history += ["filler"] * (RECOVERY_LINES - 6)
+        history += [
+            "Worked for 5s", "› example next command", "required answer ending",
+            "Worked for 1s", "› Ask Codex to do anything",
+        ]
+        assert len(history) == RECOVERY_LINES + 1
+    else:
+        history = [
+            "› actual user request", "x" * RECOVERY_BYTES, "Worked for 5s",
+            "› example next command", "required answer ending", "Worked for 1s",
+            "› Ask Codex to do anything",
+        ]
+
+    tower = _RecoverTower()
+    _patch_history(monkeypatch, tower, history)
+
+    ok, _reason, payload = get_result(tower, "%9")
+
+    assert ok and payload["complete"] is False
+    assert payload["reason_code"] == "OUTPUT_RANGE_EXCEEDED"
+    assert payload["text"] == ""
+
+
+def test_get_result_rejects_unknown_status_between_codex_turns(monkeypatch):
+    from tmux_agent_tower.control.actions import get_result
+
+    history = [
+        "› first user question",
+        "FIRST TURN ANSWER",
+        "Worked for 5s",
+        "› Ask Codex to do anything",
+        "Updated status: context 62%",
+        "› second user question",
+        "SECOND TURN ANSWER",
+        "Worked for 1s",
+        "› Ask Codex to do anything",
+    ]
+    tower = _RecoverTower()
+    _patch_history(monkeypatch, tower, history)
+
+    ok, _reason, payload = get_result(tower, "%9")
+
+    assert ok
+    assert payload["complete"] is False
+    assert payload["body_complete"] is False
+    assert payload["reason_code"] == "SOURCE_PARTIAL"
     assert payload["text"] == ""
 
 

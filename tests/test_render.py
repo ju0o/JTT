@@ -1,11 +1,13 @@
+import pytest
+
 from tmux_agent_tower.ui import render
 
 
 def _label(status):
     return {
         "WORKING": "작업 중",
-        "WAITING": "대기",
-        "IDLE": "대기",
+        "WAITING": "대기 중",
+        "IDLE": "대기 중",
         "UNKNOWN": "확인 불가",
         "DEAD": "종료됨",
     }[status]
@@ -18,7 +20,7 @@ def test_host_summary_hides_zero_counts():
     counts = {"WORKING": 3, "WAITING": 0, "IDLE": 4, "UNKNOWN": 0, "DEAD": 0}
     summary = render.format_host_summary(counts, _label)
     assert "작업 중 3" in summary
-    assert "대기 4" in summary
+    assert "대기 중 4" in summary
     assert summary.count("대기") == 1
     assert "확인 불가" not in summary
     assert "종료됨" not in summary
@@ -171,6 +173,72 @@ def test_default_row_keeps_task_agent_role_together_and_hides_empty_labels():
     assert "역할 없음" not in " ".join(parts.values())
 
 
+@pytest.mark.parametrize(
+    "display_name,project,group",
+    [
+        ("Projects Briping", "Tmux Agent Tower", "릴리스 점검"),
+        ("TmuxTower", "TmuxTower PM", "TmuxTower"),
+    ],
+)
+def test_user_named_task_has_one_representative_title(display_name, project, group):
+    from tmux_agent_tower.i18n import t
+
+    row = {
+        "kind": "pane", "name_origin": "user", "display_name": display_name,
+        "task_name": display_name, "project": project, "work_group_name": group,
+        "agent": "OpenCode", "role": None, "status": "UNKNOWN",
+    }
+    parts = render.list_row_parts(row, 120, t)
+
+    assert parts["project"] == display_name
+    assert parts["task"] == ""
+    assert parts["agent"] == "OpenCode"
+    assert project not in " ".join(parts.values())
+    assert f" · {group}" not in " ".join(parts.values())
+
+
+def test_auto_name_from_manual_tmux_pane_title_is_single_representative_title():
+    """A pane title can be human-authored while its origin remains auto."""
+    from tmux_agent_tower.i18n import t
+
+    row = {
+        "kind": "pane", "name_origin": "auto", "display_name": "Projects Briping",
+        "task_name": "Projects Briping", "pane_title": "Projects Briping",
+        "project": "Tmux Agent Tower", "work_group_name": "Tower QA",
+        "agent": "Codex", "status": "UNKNOWN",
+    }
+    parts = render.list_row_parts(row, 120, t)
+
+    assert parts["project"] == "Projects Briping"
+    assert parts["task"] == ""
+    assert parts["agent"] == "Codex"
+    assert "Tmux Agent Tower" not in " ".join(parts.values())
+    assert "Tower QA" not in " ".join(parts.values())
+    # The underlying row still retains advanced/detail metadata unchanged.
+    assert row["project"] == "Tmux Agent Tower"
+
+
+def test_execution_labels_need_agent_process_evidence():
+    cases = [
+        ({"status": "WORKING", "agent_process_alive": True}, "state.working"),
+        ({"status": "IDLE", "agent_process_alive": True}, "state.input_waiting"),
+        ({"status": "UNKNOWN", "agent_process_alive": True}, "state.running_unknown"),
+        ({"status": "WORKING", "agent_process_ended": True}, "state.dead"),
+        ({"status": "IDLE", "agent_status_unverified": True}, "state.unknown"),
+        ({"status": "DEAD", "agent_status_unverified": True}, "state.dead"),
+    ]
+    for row, expected_key in cases:
+        _symbol, key = render.execution_badge_for_row(row)
+        assert key == expected_key
+
+
+def test_remote_agent_without_process_evidence_is_not_guessed_waiting():
+    _symbol, key = render.execution_badge_for_row({
+        "status": "IDLE", "remote": True, "agent_status_unverified": True,
+    })
+    assert key == "state.unknown"
+
+
 # -- row_matches_filter ----------------------------------------------
 
 
@@ -208,13 +276,13 @@ def test_filter_no_match_returns_false():
     assert not render.row_matches_filter(row, "nonexistent")
 
 
-def test_task_row_puts_role_before_project_context():
+def test_task_row_keeps_project_context_out_of_representative_title():
     parts = render.list_row_parts(
         {"kind": "pane", "display_name": "API 점검", "project": "SamplePortal", "role": "qa", "agent": "Claude", "status": "IDLE"},
-        120, lambda key: {"role.qa": "확인", "state.idle": "대기"}[key],
+        120, lambda key: {"role.qa": "확인", "state.idle": "대기 중"}[key],
     )
     assert parts["project"] == "API 점검"
-    assert parts["task"] == "SamplePortal"
+    assert parts["task"] == ""
     assert parts["agent"] == "확인 · Claude"
 
 
@@ -262,17 +330,31 @@ def test_display_width_mixed():
     assert render.display_width("Pane 이름") == 9
 
 
+@pytest.mark.parametrize(
+    ("width", "height", "expected"),
+    [(60, 18, False), (80, 24, False), (100, 40, False), (109, 40, False),
+     (110, 30, True), (120, 40, True), (120, 24, False)],
+)
+def test_home_side_panel_is_reserved_for_roomy_viewports(width, height, expected):
+    assert render.use_home_side_panel(width, height) is expected
+
+
+def test_home_list_width_preserves_a_useful_left_column():
+    assert render.home_list_width(110) == 66
+    assert render.home_list_width(120) == 72
+
+
 def test_narrow_help_wraps_complete_korean_key_hints():
     hints = [
         "↑↓ 이동", "Enter 열기", "Space 메뉴", "+ 새 작업", "/ 검색",
-        "Y 결과 복사", "G 실제 터미널", "Esc 뒤로", "? 도움말",
+        "Y 최신 답변 복사", "G 실제 터미널", "Esc 뒤로", "? 도움말",
     ]
     lines = render.wrap_items(hints, 45)
 
     assert len(lines) > 1
     assert all(render.display_width(line) <= 45 for line in lines)
     assert "Space 메뉴" in " ".join(lines)
-    assert "Y 결과 복사" in " ".join(lines)
+    assert "Y 최신 답변 복사" in " ".join(lines)
     assert "? 도움말" in " ".join(lines)
     assert all("…" not in line for line in lines)
 
@@ -327,14 +409,14 @@ def test_row_line_count_narrow_is_project_and_state_only():
     assert render.row_line_count({"title_line": None, "activity_text": "테스트 실행 중"}, narrow=True) == 2
 
 
-def test_narrow_row_uses_one_task_name_then_agent_and_status():
+def test_narrow_row_uses_one_representative_name_then_agent_and_status():
     row = {"project": "SamplePortal", "task_name": "로그인 수정", "activity_text": None}
     assert render.row_line_count(row, narrow=True) == 2
     assert render.list_row_parts(
         {"kind": "pane", **row, "agent": "Codex", "status": "WORKING"},
         58,
         lambda _key: "작업 중",
-    ) == {"guide": "", "project": "로그인 수정", "task": "SamplePortal", "agent": "", "badge": ""}
+    ) == {"guide": "", "project": "로그인 수정", "task": "", "agent": "", "badge": ""}
 
 
 def test_role_appears_concisely_without_replacing_task_or_agent():
@@ -346,7 +428,7 @@ def test_role_appears_concisely_without_replacing_task_or_agent():
     parts = render.list_row_parts(row, 100, lambda key: labels.get(key, key))
 
     assert parts["project"] == "로그인 수정"
-    assert parts["task"] == "SamplePortal"
+    assert parts["task"] == ""
     assert parts["agent"] == "구현 · Codex"
     assert render.row_line_count(row, narrow=True) == 2
 

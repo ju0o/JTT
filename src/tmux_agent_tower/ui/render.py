@@ -95,6 +95,8 @@ NARROW_WIDTH_THRESHOLD = 70
 # Below this height, the selected-item detail panel is hidden entirely so
 # the pane list itself keeps as much room as possible.
 SHORT_HEIGHT_THRESHOLD = 18
+HOME_SIDE_PANEL_MIN_WIDTH = 110
+HOME_SIDE_PANEL_MIN_HEIGHT = 30
 
 
 def use_narrow_layout(width: int) -> bool:
@@ -105,6 +107,18 @@ def should_show_detail_panel(height: int) -> bool:
     return height >= SHORT_HEIGHT_THRESHOLD
 
 
+def use_home_side_panel(width: int, height: int) -> bool:
+    """Use a selected-task side panel only when it cannot crowd the work list."""
+
+    return width >= HOME_SIDE_PANEL_MIN_WIDTH and height >= HOME_SIDE_PANEL_MIN_HEIGHT
+
+
+def home_list_width(width: int) -> int:
+    """Keep the task list dominant while reserving room for a readable summary."""
+
+    return max(1, min(width - 44, (width * 3) // 5))
+
+
 def primary_badge(row: Dict) -> Tuple[str, str]:
     """The one mark a list row leads with.
 
@@ -113,6 +127,8 @@ def primary_badge(row: Dict) -> Tuple[str, str]:
     ``card_rank``: approval, input, a new result, an error, then execution.
     """
 
+    if row.get("offline"):
+        return "×", "state.offline"
     attention = row.get("attention") or "none"
     if attention == "approval_required":
         return "!", "state.approval"
@@ -127,13 +143,39 @@ def primary_badge(row: Dict) -> Tuple[str, str]:
         return "✓", "state.result"
     if attention == "error":
         return "!", "state.error"
-    return _execution_badge(row.get("status") or "")
+    return execution_badge_for_row(row)
 
 
-def execution_badge(status: str) -> Tuple[str, str]:
+def execution_badge(
+    status: str,
+    *,
+    agent_process_alive: bool = False,
+    agent_process_ended: bool = False,
+    agent_status_unverified: bool = False,
+) -> Tuple[str, str]:
     """Execution only, for the detail line next to attention and result."""
 
+    if agent_process_ended:
+        return "×", "state.dead"
+    if status in {"IDLE", "WAITING"}:
+        if agent_process_alive:
+            return "○", "state.input_waiting"
+        if agent_status_unverified:
+            return "◇", "state.unknown"
+    if status == "UNKNOWN" and agent_process_alive:
+        return "◇", "state.running_unknown"
     return _execution_badge(status)
+
+
+def execution_badge_for_row(row: Dict) -> Tuple[str, str]:
+    """Render execution status without treating a live pane as a live Agent."""
+
+    return execution_badge(
+        str(row.get("status") or ""),
+        agent_process_alive=bool(row.get("agent_process_alive")),
+        agent_process_ended=bool(row.get("agent_process_ended")),
+        agent_status_unverified=bool(row.get("agent_status_unverified")),
+    )
 
 
 def _execution_badge(status: str) -> Tuple[str, str]:
@@ -151,6 +193,8 @@ def detail_badges(row: Dict) -> List[Tuple[str, str]]:
     ``primary_badge`` alone so the scan stays one glance.
     """
 
+    if row.get("offline"):
+        return [("×", "state.offline")]
     badges: List[Tuple[str, str]] = []
     attention = row.get("attention") or "none"
     if attention == "approval_required":
@@ -167,7 +211,7 @@ def detail_badges(row: Dict) -> List[Tuple[str, str]]:
         badges.append(("✓", "state.result"))
     if attention == "error":
         badges.append(("!", "state.error"))
-    badges.append(_execution_badge(row.get("status") or ""))
+    badges.append(execution_badge_for_row(row))
     return badges
 
 
@@ -191,7 +235,7 @@ def watch_counts(rows: Sequence[Dict]) -> Dict[str, int]:
             counts[category] += 1
         elif row.get("result_state") == "ready":
             counts["result"] += 1
-        elif row.get("status") == "WORKING":
+        elif row.get("status") == "WORKING" and not row.get("agent_process_ended"):
             counts["working"] += 1
     return counts
 
@@ -602,20 +646,17 @@ def list_row_parts(row: Dict, width: int, badge_text: Callable[[str], str], dura
     if project_name == t("project.no_name"):
         project_name = ""
     project = row.get("display_name") or row.get("task_name") or project_name or t("task.terminal")
-    task_parts = []
     role = badge_text(f'role.{row["role"]}') if row.get("role") in ROLE_IDS else ""
-    if project_name and project_name.casefold() not in project.casefold():
-        task_parts.append(project_name)
     agent = (row.get("agent") or "").strip()
     if role and role.casefold() not in project.casefold():
         agent = f"{role} · {agent}" if agent else role
-    group = str(row.get("work_group_name") or "").strip()
-    if group and group.casefold() not in project.casefold():
-        task_parts.append(group)
     return {
         "guide": guide,
         "project": project,
-        "task": " · ".join(task_parts),
+        # The primary heading is the only task name in the simple list.
+        # Project and work-group metadata remain on the row for filters and
+        # detail/advanced views, but must not compete with a pane title.
+        "task": "",
         "agent": truncate_to_width(agent, 24) if not narrow else "",
         "badge": badge if not narrow else "",
     }
@@ -624,8 +665,8 @@ def list_row_parts(row: Dict, width: int, badge_text: Callable[[str], str], dura
 def row_line_count(row: Dict, narrow: bool) -> int:
     """Physical lines for one pane in the main list.
 
-    Narrow terminals use separate project, task-name, and agent/status lines
-    when a task name differs. Wide terminals add current activity underneath.
+    Narrow terminals reserve a second line for agent/status. Wide terminals
+    add current activity underneath when there is room.
     Pane title, path, and pane id stay in selected details.
     """
 
@@ -636,14 +677,24 @@ def row_line_count(row: Dict, narrow: bool) -> int:
     return 2
 
 
-def agent_status_line(agent: str, status_label: str, duration_text: str = "", role: str = "") -> str:
-    """Narrow-layout subtitle: Agent, role, and status under the task name."""
+def agent_status_line(
+    agent: str,
+    status_label: str,
+    duration_text: str = "",
+    role: str = "",
+    host: str = "",
+    max_width: Optional[int] = None,
+) -> str:
+    """Secondary row context: Agent/location identity followed by status."""
 
-    identity = " · ".join(part for part in (agent or "-", role) if part)
-    text = f"{identity}  {status_label}"
+    identity = " · ".join(part for part in (agent or "-", role, host) if part)
+    state = status_label
     if duration_text:
-        text += f" · {duration_text}"
-    return text
+        state += f" · {duration_text}"
+    if max_width is not None:
+        identity_budget = max(0, max_width - display_width("  " + state))
+        identity = truncate_to_width(identity, identity_budget)
+    return f"{identity}  {state}" if identity else state
 
 
 def format_detail_panel(fields: Sequence[Tuple[str, str]]) -> List[str]:

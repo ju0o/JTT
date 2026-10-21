@@ -43,29 +43,38 @@ def _target_host(tower, requested: str):
     return str(host["alias"]), str(host.get("name") or host["alias"]), True
 
 
-def _rollback(tower, results: list[SpawnResult], remote_alias: str = "") -> None:
+def _rollback(tower, results: list[SpawnResult], remote_alias: str = "") -> bool:
     window_ids = {row.window_id for row in results if row.window_id}
     if len(window_ids) != 1:
-        return
+        return False
     window_id = next(iter(window_ids))
     if not structure.valid_window_id(window_id):
-        return
+        return False
     if not remote_alias:
-        structure.kill_window(tower.session, window_id, tower.own_pane_id)
-        return
+        return structure.kill_window(tower.session, window_id, tower.own_pane_id).ok
     # Fixed cleanup command; the host comes from configured remote hosts and the id is validated.
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", remote_alias, f"tmux kill-window -t {window_id}"],
             capture_output=True, text=True, timeout=6, check=False,
         )
+        return result.returncode == 0
     except Exception:
-        pass
+        return False
 
 
-def _rollback_batches(tower, batches) -> None:
+def _rollback_batches(tower, batches) -> bool:
+    ok = True
     for results, alias in reversed(batches):
-        _rollback(tower, results, alias)
+        if not _rollback(tower, results, alias):
+            ok = False
+    return ok
+
+
+def _rollback_message(tower, batches, message: str) -> str:
+    notice = ("이번 실행을 정리했습니다." if _rollback_batches(tower, batches)
+              else "정리 여부를 확인할 수 없습니다. 새 작업이 남아 있을 수 있습니다.")
+    return f"{message} {notice}"
 
 
 def launch_workset(
@@ -141,9 +150,8 @@ def launch_workset(
         )
         created_batches.append((results, host_key if is_remote else ""))
         if len(results) != len(batch) or any(not row.ok for row in results):
-            _rollback_batches(tower, created_batches)
             detail = next((row.detail for row in results if not row.ok), "작업을 시작하지 못했습니다.")
-            raise WorksetLaunchError(detail)
+            raise WorksetLaunchError(_rollback_message(tower, created_batches, detail))
         launched.extend(zip(batch, results))
         if is_remote:
             tower._remote_cache.pop(host_key, None)
@@ -166,8 +174,9 @@ def launch_workset(
                     and (item.get("result_provider_host") == host_key if is_remote
                          else item.get("session") == result.session)), None)
         if row is None:
-            _rollback_batches(tower, created_batches)
-            raise WorksetLaunchError("시작된 작업을 목록에서 확인할 수 없어 이번 실행을 정리했습니다.")
+            raise WorksetLaunchError(_rollback_message(
+                tower, created_batches, "시작된 작업을 목록에서 확인할 수 없습니다."
+            ))
         row_by_member[member.member_id] = row
     live_rows = [row_by_member[member.member_id] for member, *_ in plans]
     checked_members = [(plan[0], plan[1], plan[2]) for plan in plans]
@@ -185,8 +194,9 @@ def launch_workset(
     tower.load()
     refreshed_rows = [next((item for item in tower.rows if item.get("key") == row.get("key")), None) for row in live_rows]
     if any(row is None for row in refreshed_rows):
-        _rollback_batches(tower, created_batches)
-        raise WorksetLaunchError("작업 구성이 바뀌어 시작한 작업을 확인할 수 없습니다. 이번 실행을 정리했습니다.")
+        raise WorksetLaunchError(_rollback_message(
+            tower, created_batches, "작업 구성이 바뀌어 시작한 작업을 확인할 수 없습니다."
+        ))
     live_rows = refreshed_rows
     preserve_name = {}
     for row, (member, _entry, _agent) in zip(live_rows, checked_members):
@@ -200,15 +210,17 @@ def launch_workset(
     tower.load()
     refreshed_rows = [next((item for item in tower.rows if item.get("key") == row.get("key")), None) for row in live_rows]
     if any(row is None for row in refreshed_rows):
-        _rollback_batches(tower, created_batches)
-        raise WorksetLaunchError("작업 이름과 구성을 확인할 수 없어 이번 실행을 정리했습니다.")
+        raise WorksetLaunchError(_rollback_message(
+            tower, created_batches, "작업 이름과 구성을 확인할 수 없습니다."
+        ))
     live_rows = refreshed_rows
     for row, (member, entry, agent) in zip(live_rows, checked_members):
         if (row.get("agent") != agent or row.get("project") != entry.name
                 or (member.role and row.get("role") != member.role)
                 or (str(row.get("key")) in preserve_name and row.get("display_name") != preserve_name[str(row.get("key"))])):
-            _rollback_batches(tower, created_batches)
-            raise WorksetLaunchError("작업 이름, 역할 또는 Agent를 저장하지 못해 이번 실행을 정리했습니다.")
+            raise WorksetLaunchError(_rollback_message(
+                tower, created_batches, "작업 이름, 역할 또는 Agent를 저장하지 못했습니다."
+            ))
     target_ids = [str(row_by_member[member_id]["target_id"]) for member_id in workset.member_order]
     labels = {target: row.get("display_name") or row.get("task_name") or "작업" for target, row in zip(target_ids, live_rows)}
     names = {entry.name for _member, entry, _agent in checked_members}
@@ -227,8 +239,9 @@ def launch_workset(
             layout=workset.layout, layout_slots=layout_slots,
         )
     except (OSError, ValueError, KeyError) as exc:
-        _rollback_batches(tower, created_batches)
-        raise WorksetLaunchError("작업 묶음을 저장하지 못해 새 실행을 정리했습니다.") from exc
+        raise WorksetLaunchError(_rollback_message(
+            tower, created_batches, "작업 묶음을 저장하지 못했습니다."
+        )) from exc
     launch_id = uuid.uuid4().hex
     resources = {
         str(row["target_id"]): {
@@ -247,8 +260,9 @@ def launch_workset(
             tower.work_groups.register_managed_resources(resources)
     except (OSError, ValueError, KeyError) as exc:
         tower.work_groups.dissolve(group["group_id"])
-        _rollback_batches(tower, created_batches)
-        raise WorksetLaunchError("시작한 작업의 안전 정보를 저장하지 못해 이번 실행을 정리했습니다.") from exc
+        raise WorksetLaunchError(_rollback_message(
+            tower, created_batches, "시작한 작업의 안전 정보를 저장하지 못했습니다."
+        )) from exc
     tower.load()
     members = tuple(dict(row) for row in live_rows)
     execution_hosts = tuple(dict.fromkeys(plan[4] for plan in plans))

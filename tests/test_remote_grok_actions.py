@@ -95,6 +95,21 @@ def test_unbound_or_unavailable_provider_never_uses_local_suffix(monkeypatch):
     assert unavailable["source"] == "REMOTE_PROVIDER_UNAVAILABLE"
 
 
+def test_malformed_remote_provider_status_is_unknown(monkeypatch):
+    from tmux_agent_tower.control.actions import _recover_ssh_grok_result
+
+    monkeypatch.setattr(
+        "tmux_agent_tower.remote.collector.fetch_remote_grok_result",
+        lambda *_args, **_kwargs: {},
+    )
+    result = _recover_ssh_grok_result({
+        "result_provider_type": "remote_grok", "result_provider_endpoint": "host",
+        "ssh_client_pid": "123", "ssh_connection": ("192.0.2.1", "22", "192.0.2.2", "50000"),
+    })
+
+    assert result["source"] == "UNKNOWN"
+
+
 def test_provider_rejects_incomplete_native_turn_and_mismatched_tuple(monkeypatch):
     connection = _connection()
     monkeypatch.setattr(

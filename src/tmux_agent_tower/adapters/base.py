@@ -183,12 +183,15 @@ def drop_scrolled_user_prompt(lines: Sequence[str]) -> list:
     return list(lines[first:])
 
 
-def prose_body(lines: Sequence[str]) -> Optional[str]:
+def prose_body(
+    lines: Sequence[str], *, preserve_indented_code: bool = False,
+    preserve_elapsed_examples: bool = False,
+) -> Optional[str]:
     """Drop tool logs and status chrome while preserving answer formatting.
 
     "Finished" alone is still chrome. Length is not evidence: the caller
-    has already found that agent's completion marker. Indentation and blank
-    lines are part of the body, especially inside Markdown code fences.
+    has already found that agent's completion marker. Fenced code and blank
+    lines are preserved; callers may preserve indentation when it denotes code.
     """
 
     kept = []
@@ -206,6 +209,12 @@ def prose_body(lines: Sequence[str]) -> Optional[str]:
             continue
         if stripped.startswith(("```", "~~~")):
             fence = stripped[0]
+            kept.append(raw)
+            continue
+        if preserve_indented_code and line.startswith(("    ", "\t")):
+            kept.append(raw)
+            continue
+        if preserve_elapsed_examples and re.match(r"^(?:Worked|Cooked) for \d", stripped, re.IGNORECASE):
             kept.append(raw)
             continue
         if _BOX_ONLY.match(stripped) or _CHROME_LINE.match(stripped) or _TOOL_LINE.match(stripped):
@@ -226,10 +235,9 @@ class Activity:
     """A best-effort, one-line description of what an agent looks like
     it's doing right now, extracted purely from terminal output patterns
     -- never from an LLM call (see docs/STATUS_ENGINE.md's "Task
-    Awareness" section). ``confidence`` is informational only today
-    ("high"/"medium"/"low"); the UI currently shows any non-None activity
-    the same way, but keeping it lets a future version hide low-confidence
-    guesses instead of showing a plausible-sounding wrong answer.
+    Awareness" section). ``confidence`` is informational ("high"/"medium"/"low");
+    the UI shows activity only alongside an independently confirmed WORKING
+    status so stale output is not presented as current work.
 
     Never persisted to disk: an activity string is a fragment of the
     pane's own terminal output, which can contain private project

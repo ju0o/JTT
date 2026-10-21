@@ -52,6 +52,9 @@ _NOT_AN_ACTIVITY_RE = re.compile(r"^(working\s*\(|finished\b)", re.IGNORECASE)
 # still running the same box instead reads "tab to queue message", which is
 # deliberately NOT treated as an idle signal.
 _IDLE_HINT_RE = re.compile(r"ask codex to do anything|for agents.*for shortcuts", re.IGNORECASE)
+_IDLE_FOOTER_RE = re.compile(r"^\s*[›>]\s*Ask Codex to do anything\s*$", re.IGNORECASE)
+_MODEL_STATUS_RE = re.compile(r"^\s*(?:GPT|Codex)\b[^\n]* · [^\n]+ · [^\n]+$", re.IGNORECASE)
+_SHORTCUT_HINT_RE = re.compile(r"^\s*[←↵].*for agents.*for shortcuts\s*$", re.IGNORECASE)
 _ALLOW_RE = re.compile(r"allow this command to run\?", re.IGNORECASE)
 _WOULD_RUN_RE = re.compile(r"would you like to run the following command\?", re.IGNORECASE)
 _YES_PROCEED_RE = re.compile(r"1\.\s+yes,\s+proceed\b", re.IGNORECASE)
@@ -67,6 +70,7 @@ _WORKED_FOR_RE = re.compile(
     r"(?:\s+\d+(?:\.\d+)?\s*[smh]\b)?(?:\s*[•·].*)?$",
     re.IGNORECASE,
 )
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # Live trust widget (Codex CLI 0.159): the digit does not select the row.
 # The footer is the key binding: "enter continue · esc quit".
 _ENTER_CONTINUE_RE = re.compile(r"enter continue", re.IGNORECASE)
@@ -271,7 +275,7 @@ class CodexAdapter(AgentAdapter):
         lines = list(ctx.lines)
         if not _IDLE_HINT_RE.search(ctx.tail(15)):
             return None
-        worked = [i for i, line in enumerate(lines) if _WORKED_FOR_RE.match(line)]
+        worked = _completion_markers(lines)
         if not worked:
             return None
         end = worked[-1]
@@ -285,22 +289,45 @@ class CodexAdapter(AgentAdapter):
         # A stale title spinner must not hide a finished idle widget.
         if title_has_spinner(ctx.title, BRAILLE_SPINNER_CHARS) and not _IDLE_HINT_RE.search(ctx.tail(15)):
             return None
-        floor = worked[-2] + 1 if len(worked) > 1 else 0
+        prior_transitions = [
+            (marker, *_prior_turn_transition(lines, marker, end))
+            for marker in worked[:-1]
+        ]
+        proven_prior = [marker for marker, proven, _has_prompt in prior_transitions if proven]
+        last_proven = max(proven_prior, default=-1)
+        ambiguous_transition = any(
+            has_prompt and not proven and marker > last_proven
+            for marker, proven, has_prompt in prior_transitions
+        )
+        floor = last_proven + 1 if proven_prior else 0
         start = floor
         found_user = False
-        for i in range(end - 1, floor - 1, -1):
-            stripped = lines[i].strip()
-            if stripped.startswith("›") and "ask codex" not in stripped.lower():
+        for i in range(floor, end):
+            line = lines[i]
+            if not line.strip() or _IDLE_FOOTER_RE.match(line):
+                continue
+            if _MODEL_STATUS_RE.match(line) or _SHORTCUT_HINT_RE.match(line):
+                continue
+            if _WORKING_RE.match(line) or (
+                (bullet := _BULLET_RE.match(line)) and _NOT_AN_ACTIVITY_RE.match(bullet.group(1))
+            ):
+                continue
+            if _USER_LINE_RE.match(line):
                 start = i + 1
                 found_user = True
                 break
-        bounded = found_user or len(worked) > 1
+            # Output before a prompt boundary could be an answer suffix, not
+            # proof that the prompt-shaped lines later in this capture are real.
+            break
+        bounded = found_user and not ambiguous_transition
         if not bounded:
-            # No previous turn marker and no user prompt. Do not treat the
-            # whole scrollback as this answer. A short slice that never
-            # reaches the turn start is a fragment, not the finished body.
+            # A completion marker alone cannot prove where a captured suffix
+            # began, even when older completion-looking lines are present.
             start = max(start, end - 60)
-        text = prose_body(drop_scrolled_user_prompt(lines[start:end]))
+        text = prose_body(
+            drop_scrolled_user_prompt(lines[start:end]),
+            preserve_indented_code=True, preserve_elapsed_examples=True,
+        )
         if text is None:
             return None
         confidence = "high" if bounded else "partial"
@@ -312,3 +339,53 @@ class CodexAdapter(AgentAdapter):
             turn_complete=True,
             body_complete=bounded,
         )
+
+
+def _completion_markers(lines: list[str]) -> list[int]:
+    """Return elapsed-time footers followed by Codex's exact idle prompt."""
+
+    markers = []
+    fence_char = ""
+    fence_size = 0
+    for index, line in enumerate(lines):
+        fence = _FENCE_RE.match(line)
+        if fence:
+            run, suffix = fence.groups()
+            if not fence_char:
+                if run[0] == "`" and "`" in suffix:
+                    continue
+                fence_char, fence_size = run[0], len(run)
+            elif run[0] == fence_char and len(run) >= fence_size and not suffix.strip():
+                fence_char, fence_size = "", 0
+            continue
+        if fence_char or line.startswith(("    ", "\t")) or not _WORKED_FOR_RE.match(line):
+            continue
+        following = next((item for item in lines[index + 1:] if item.strip()), "")
+        if _IDLE_FOOTER_RE.match(following):
+            markers.append(index)
+    return markers
+
+
+def _prior_turn_transition(lines: list[str], marker: int, end: int) -> tuple[bool, bool]:
+    """Require Codex's idle chrome before using an earlier marker as a boundary."""
+
+    footer = next(
+        (index for index in range(marker + 1, end) if lines[index].strip()),
+        end,
+    )
+    if footer == end or not _IDLE_FOOTER_RE.match(lines[footer]):
+        return False, False
+    model_status = shortcut_hint = False
+    for index in range(footer + 1, end):
+        line = lines[index]
+        if not line.strip():
+            continue
+        if _MODEL_STATUS_RE.match(line):
+            model_status = True
+        elif _SHORTCUT_HINT_RE.match(line):
+            shortcut_hint = True
+        elif _USER_LINE_RE.match(line):
+            return model_status and shortcut_hint, True
+        else:
+            return False, any(_USER_LINE_RE.match(item) for item in lines[index + 1:end])
+    return False, False

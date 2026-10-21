@@ -267,7 +267,7 @@ def test_detail_shows_measured_choices_and_withholds_unknown_actions(monkeypatch
 
     remote_row = {"key": "workstation-b:%1", "agent": "Codex", "status": "IDLE", "remote": True, "interaction": {}}
     control_view._draw(screen, tower, remote_row, "", False)
-    assert any("다른 컴퓨터의 작업은 여기서 조작할 수 없습니다" in text for text in screen.written)
+    assert any("다른 컴퓨터 작업은 여기서 입력·터미널 조작을 지원하지 않습니다" in text for text in screen.written)
     assert not any("메시지" in text or "Ctrl+G" in text for text in screen.written)
 
 
