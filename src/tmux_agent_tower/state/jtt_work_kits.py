@@ -218,6 +218,93 @@ class JTTWorkKitStore:
                 ) from exc
             return renamed
 
+    def update_kit(self, kit_id: str, name: str, description: str,
+                   terminals: Iterable[dict], *, expected_snapshot: dict) -> dict:
+        """Edit one template atomically after revalidating its full snapshot.
+
+        Existing template IDs are retained when supplied by the editor. New
+        cards omit ``id`` and receive fresh IDs; IDs belonging to other kits
+        cannot be adopted by this update.
+        """
+        safe_name = " ".join(_text(name, "name", 80, one_line=True).split())
+        safe_description = _text(description, "description", 240, one_line=True,
+                                 allow_empty=True)
+        specs = list(terminals)
+        layout = layout_for_terminal_count(len(specs))
+        with state_write_lock(self.root, self._ensure_private_root, WorkKitStoreError):
+            kits = self.kits()
+            matches = [kit for kit in kits if kit["id"] == kit_id]
+            if len(matches) != 1:
+                raise WorkKitStoreError("Work Kit no longer exists")
+            current = matches[0]
+            try:
+                expected = self._validate_kit(expected_snapshot)
+            except WorkKitStoreError as exc:
+                raise WorkKitStoreError("Work Kit edit snapshot is invalid") from exc
+            if current != expected:
+                raise WorkKitStoreError("Work Kit changed before edit")
+            if any(kit["id"] != kit_id and kit["name"].casefold() == safe_name.casefold()
+                   for kit in kits):
+                raise WorkKitStoreError("A Work Kit with this name already exists")
+
+            existing_ids = {terminal["id"] for terminal in current["terminals"]}
+            all_ids = {terminal["id"] for kit in kits for terminal in kit["terminals"]}
+            used_ids: set[str] = set()
+            used_names: set[str] = set()
+            normalized = []
+            for spec in specs:
+                if (not isinstance(spec, dict)
+                        or set(spec) - {"id", "name", "role", "working_directory"}):
+                    raise WorkKitStoreError("Invalid Work Kit terminal template")
+                template_id = spec.get("id")
+                if template_id is None:
+                    template_id = "template-" + secrets.token_hex(8)
+                    while template_id in all_ids or template_id in used_ids:
+                        template_id = "template-" + secrets.token_hex(8)
+                elif (not isinstance(template_id, str)
+                      or not _TERMINAL_ID.fullmatch(template_id)
+                      or template_id not in existing_ids):
+                    raise WorkKitStoreError("Work Kit edit contains an unknown template ID")
+                if template_id in used_ids:
+                    raise WorkKitStoreError("Duplicate Work Kit template ID")
+                terminal_name = " ".join(
+                    _text(spec.get("name"), "terminal name", 80, one_line=True).split()
+                )
+                role = " ".join(_text(spec.get("role"), "terminal role", 120,
+                                      one_line=True).split())
+                working_directory = spec.get("working_directory")
+                if working_directory is not None:
+                    working_directory = _text(working_directory, "working directory", 1024,
+                                              one_line=True)
+                folded_name = terminal_name.casefold()
+                if folded_name in used_names:
+                    raise WorkKitStoreError("Work Kit terminal names must be unique")
+                used_ids.add(template_id)
+                used_names.add(folded_name)
+                normalized.append({
+                    "id": template_id,
+                    "name": terminal_name,
+                    "role": role,
+                    "working_directory": working_directory,
+                })
+
+            updated = {
+                "id": current["id"],
+                "name": safe_name,
+                "description": safe_description,
+                "layout": layout,
+                "terminals": normalized,
+            }
+            self._validate_kit(updated)
+            candidate = [updated if kit["id"] == kit_id else kit for kit in kits]
+            try:
+                self._write(candidate)
+            except WorkKitStoreCommittedDurabilityError as exc:
+                raise WorkKitStoreCommittedDurabilityError(
+                    str(exc), record_id=kit_id,
+                ) from exc
+            return updated
+
     def _validate_kit(self, value: object) -> dict:
         if not isinstance(value, dict) or set(value) != {
             "id", "name", "description", "layout", "terminals",
