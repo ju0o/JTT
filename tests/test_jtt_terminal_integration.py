@@ -14,6 +14,7 @@ import signal
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -28,10 +29,8 @@ from tmux_agent_tower.ui import jtt
 from tmux_agent_tower.ui import ux_preview_v2 as renderer
 
 
-pytestmark = [
-    pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable"),
-    pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash fixture requires /bin/bash"),
-]
+pytestmark = [pytest.mark.skipif(not Path("/bin/bash").exists(),
+                                 reason="bash fixture requires /bin/bash")]
 
 
 class _Screen:
@@ -40,7 +39,8 @@ class _Screen:
 
 
 class _UIProcess:
-    def __init__(self, runtime_root: Path, source_root: Path, pyte_root: Path):
+    def __init__(self, runtime_root: Path, source_root: Path, pyte_root: Path,
+                 *, height: int = 45, width: int = 160):
         import pyte
 
         self.pid, self.fd = pty.fork()
@@ -63,8 +63,8 @@ class _UIProcess:
                 os._exit(127)
         os.set_blocking(self.fd, False)
         import fcntl
-        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 45, 160, 0, 0))
-        self.screen = pyte.Screen(160, 45)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+        self.screen = pyte.Screen(width, height)
         self.stream = pyte.Stream(self.screen)
 
     def send(self, data: bytes) -> None:
@@ -114,7 +114,80 @@ class _UIProcess:
             self.fd = -1
 
 
-def _set_private_process_environment(monkeypatch, root: Path, source_root: Path, pyte_root: Path):
+class _RawUIProcess:
+    """Isolated curses PTY capture for screens that need no VT emulator."""
+
+    def __init__(self, runtime_root: Path, source_root: Path, *, height: int, width: int):
+        self.pid, self.fd = pty.fork()
+        self.raw = bytearray()
+        if self.pid == 0:
+            env = {
+                "PATH": os.defpath,
+                "HOME": str(runtime_root / "shell-home"),
+                "JTT_HOME": str(runtime_root / "state"),
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "TERM": "xterm",
+                "PYTHONPATH": str(source_root),
+                "ESCDELAY": "25",
+            }
+            try:
+                os.execve(sys.executable,
+                          [sys.executable, "-m", "tmux_agent_tower.jtt"], env)
+            except OSError:
+                os._exit(127)
+        os.set_blocking(self.fd, False)
+        import fcntl
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+
+    def send(self, data: bytes) -> None:
+        os.write(self.fd, data)
+
+    def pump(self, timeout: float = 0.05) -> None:
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if not ready:
+            return
+        try:
+            data = os.read(self.fd, 65536)
+        except OSError:
+            return
+        if data:
+            self.raw.extend(data)
+
+    def text(self) -> str:
+        return self.raw.decode("utf-8", errors="replace")
+
+    def exit(self, timeout: float = 5.0) -> int:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.pump()
+            waited, status = os.waitpid(self.pid, os.WNOHANG)
+            if waited:
+                self.pid = -1
+                return os.waitstatus_to_exitcode(status)
+        raise AssertionError("JTT curses process did not exit")
+
+    def terminate(self) -> None:
+        if self.pid > 0:
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(self.pid, 0)
+            except ChildProcessError:
+                pass
+            self.pid = -1
+        if self.fd >= 0:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
+
+
+def _set_private_process_environment(monkeypatch, root: Path, source_root: Path,
+                                    pyte_root: Path | None = None):
     home = root / "shell-home"
     home.mkdir(mode=0o700)
     home.chmod(0o700)
@@ -128,7 +201,9 @@ def _set_private_process_environment(monkeypatch, root: Path, source_root: Path,
     monkeypatch.setenv("LANG", "C.UTF-8")
     monkeypatch.setenv("LC_ALL", "C.UTF-8")
     monkeypatch.setenv("TERM", "xterm")
-    monkeypatch.setenv("PYTHONPATH", os.pathsep.join((str(pyte_root), str(source_root))))
+    python_path = (os.pathsep.join((str(pyte_root), str(source_root)))
+                   if pyte_root is not None else str(source_root))
+    monkeypatch.setenv("PYTHONPATH", python_path)
     monkeypatch.setenv("JTT_HOME", str(root / "state"))
 
 
@@ -156,6 +231,25 @@ def _wait_for_ui_text(ui: _UIProcess, expected: str, timeout: float = 5.0) -> No
         if expected in ui.text():
             return
     raise AssertionError("JTT curses UI did not render the expected terminal marker")
+
+
+def _wait_for_raw_ui_text(ui: _RawUIProcess, expected: str, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ui.pump()
+        if expected in ui.text():
+            return
+    raise AssertionError("JTT curses PTY did not emit the expected UI text")
+
+
+def _wait_for_raw_ui_occurrence(ui: _RawUIProcess, expected: str, minimum: int,
+                                timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ui.pump()
+        if ui.text().count(expected) >= minimum:
+            return
+    raise AssertionError("JTT curses PTY did not redraw the expected navigation state")
 
 
 def _wait_for_created_terminal(ui: _UIProcess, registry: TerminalRegistry,
@@ -192,6 +286,7 @@ def _type_through_ui(screen, state, text: str) -> None:
         assert renderer._handle_key(screen, state, char) is False
 
 
+@pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")
 def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
     if Path(pwd.getpwuid(os.getuid()).pw_shell).resolve() != Path("/bin/bash").resolve():
         pytest.skip("fixture deliberately exercises the account's /bin/bash login shell")
@@ -309,6 +404,7 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
         shutil.rmtree(root, ignore_errors=True)
 
 
+@pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")
 def test_read_only_observe_keeps_two_pty_screens_distinct_and_does_not_take_lease(monkeypatch):
     if Path(pwd.getpwuid(os.getuid()).pw_shell).resolve() != Path("/bin/bash").resolve():
         pytest.skip("fixture deliberately exercises the account's /bin/bash login shell")
@@ -367,6 +463,7 @@ def test_read_only_observe_keeps_two_pty_screens_distinct_and_does_not_take_leas
         shutil.rmtree(root, ignore_errors=True)
 
 
+@pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")
 def test_real_curses_launch_and_prefix_detach_does_not_autostart_a_shell(monkeypatch):
     root = Path(tempfile.mkdtemp(prefix="jtt-tty-"))
     root.chmod(0o700)
@@ -397,48 +494,98 @@ def test_real_curses_launch_and_prefix_detach_does_not_autostart_a_shell(monkeyp
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_real_curses_work_kit_creation_selects_template_without_starting_shells(monkeypatch):
-    """Create and select a Work Kit through the actual curses PTY, not a mock UI."""
+@pytest.mark.parametrize(("height", "width"), [(24, 80), (44, 160)])
+def test_real_curses_flat_window_create_and_archive_route_create_no_pty(
+        monkeypatch, height, width):
+    """Exercise the flat LEFT actions through curses at narrow and wide sizes."""
+    root = Path(tempfile.mkdtemp(prefix="jtt-window-nav-pty-"))
+    root.chmod(0o700)
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    _set_private_process_environment(monkeypatch, root, source_root)
+    ui = None
+    registry = TerminalRegistry(root=root / "state" / "terminals")
+    try:
+        ui = _RawUIProcess(root, source_root, height=height, width=width)
+        _wait_for_raw_ui_text(ui, "Window 1")
+        assert registry.list_sessions() == ()
+
+        # Window 1 -> + 새 Window -> accept its suggested `Window 2` name.
+        ui.send(b"\x1bOB\n")
+        _wait_for_raw_ui_text(ui, "새 Window 이름:")
+        ui.send(b"\n")
+        _wait_for_raw_ui_text(ui, "Window 생성 완료")
+        layout = jtt.JTTLayoutStore(root / "state").layout(
+            JTTWorkspaceStore.DEFAULT_ID, [],
+        )
+        assert [item["name"] for item in layout["windows"]] == ["기본 Window", "Window 2"]
+        assert layout["windows"][1]["terminal_ids"] == []
+        assert registry.list_sessions() == ()
+
+        # The unified Archive action is reachable from the same flat list.
+        ui.send(b"\x1bOB\x1bOB\n")
+        _wait_for_raw_ui_text(ui, "보관함")
+        assert registry.list_sessions() == ()
+        ui.send(b"\x1b")
+        ui.pump(0.05)
+        ui.send(b"\x07d")
+        assert ui.exit() == 0
+        assert b"\x1b[?1049l" in ui.raw
+        assert registry.list_sessions() == ()
+    finally:
+        if ui is not None:
+            ui.terminate()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_real_curses_work_kit_archive_create_and_preview_never_starts_shells(monkeypatch):
+    """Exercise Work Kit creation and preview through the Archive curses flow."""
     root = Path(tempfile.mkdtemp(prefix="jtt-work-kit-pty-"))
     root.chmod(0o700)
     source_root = Path(__file__).resolve().parents[1] / "src"
-    import pyte
-    pyte_root = Path(pyte.__file__).resolve().parent.parent
-    _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
+    _set_private_process_environment(monkeypatch, root, source_root)
     registry = TerminalRegistry(root=root / "state" / "terminals")
     ui = None
     try:
         assert registry.list_sessions() == ()
-        ui = _UIProcess(root, source_root, pyte_root)
-        _wait_for_ui_text(ui, "터미널 배치")
+        ui = _RawUIProcess(root, source_root, height=44, width=160)
+        _wait_for_raw_ui_text(ui, "Window 1")
         assert registry.list_sessions() == ()
 
-        # A fresh store exposes the default workspace, default folder,
-        # default Window, then the Work Kit create action. Selecting a folder
-        # or Window moves focus to CENTER, so tab back to LEFT before each
-        # next selection. This follows the actual three-panel focus contract.
-        ui.send(b"\x1bOB\t\t\x1bOB\t\t\x1bOB\n")
-        _wait_for_ui_text(ui, "Work Kit 이름:")
+        # Flat LEFT: Window 1, new Window, Archive. Open Archive and choose
+        # its fifth action (create Work Kit), then enter one template.
+        ui.send(b"\x1bOB\x1bOB\n")
+        _wait_for_raw_ui_text(ui, "보관함")
+        ui.send(b"\x1bOB\x1bOB\x1bOB\x1bOB\n")
+        _wait_for_raw_ui_text(ui, "Work Kit 이름:")
         ui.send("Integration Kit\nTemplate preview only\n1\nShell\nLocal command line\n\n".encode("utf-8"))
 
-        _wait_for_ui_text(
+        _wait_for_raw_ui_text(
             ui, "Integration Kit Work Kit 저장 완료 · 터미널 1개 구성 · 아직 실행되지 않음",
         )
-        # The newly created Kit is the selected LEFT entry and its saved
-        # template is visible as the selected CENTER card, not as a live PTY.
-        _wait_for_ui_text(ui, "▶ Integration Kit")
-        _wait_for_ui_text(ui, "▶ Shell")
-        _wait_for_ui_text(ui, "Local command line")
-        _wait_for_ui_text(ui, "터미널 · Shell")
-        _wait_for_ui_text(ui, "템플릿 · 셸/명령 미실행")
-        assert "실행 중인 터미널이 아닙니다." in ui.text()
-        assert "관찰 중" not in ui.text()
         assert registry.list_sessions() == ()
         kits = JTTWorkKitStore(root / "state").kits()
         assert len(kits) == 1
         assert kits[0]["name"] == "Integration Kit"
         assert kits[0]["layout"] == "single"
         assert not (root / "state" / "workspaces.json").exists()
+
+        # Saving does not auto-preview. Reopen Archive and preview by explicit
+        # action, then return to the concrete Window without starting a shell.
+        ui.send(b"\n")
+        _wait_for_raw_ui_text(ui, "보관함")
+        ui.send(b"\x1bOB\x1bOB\x1bOB\x1bOB\x1bOB\n\n")
+        _wait_for_raw_ui_text(ui, "Work Kit 미리보기")
+        _wait_for_raw_ui_text(ui, "▶ Shell")
+        _wait_for_raw_ui_text(ui, "Local command line")
+        _wait_for_raw_ui_text(ui, "터미널 · Shell")
+        _wait_for_raw_ui_text(ui, "템플릿 · 셸/명령 미실행")
+        assert "실행 중인 터미널이 아닙니다." in ui.text()
+        assert registry.list_sessions() == ()
+
+        window_one_count = ui.text().count("Window 1")
+        ui.send(b"\x1bOA\x1bOA\n")
+        _wait_for_raw_ui_occurrence(ui, "Window 1", window_one_count + 1)
+        assert registry.list_sessions() == ()
 
         ui.send(b"\x07d")
         assert ui.exit() == 0
@@ -450,6 +597,7 @@ def test_real_curses_work_kit_creation_selects_template_without_starting_shells(
         shutil.rmtree(root, ignore_errors=True)
 
 
+@pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")
 def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(monkeypatch):
     if Path(pwd.getpwuid(os.getuid()).pw_shell).resolve() != Path("/bin/bash").resolve():
         pytest.skip("fixture deliberately exercises the account's /bin/bash login shell")
@@ -540,6 +688,7 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
 
 
 @pytest.mark.skipif(shutil.which("vim") is None, reason="interactive Vim TUI is unavailable")
+@pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")
 def test_vim_alternate_screen_unicode_keys_resize_and_shell_return(monkeypatch):
     """Exercise an installed, no-config TUI only inside a fresh JTT PTY."""
 
@@ -655,6 +804,7 @@ def test_vim_alternate_screen_unicode_keys_resize_and_shell_return(monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux fixture is unavailable")
+@pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")
 def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monkeypatch):
     """Exercise a real nested tmux TUI only in a fresh JTT-owned PTY."""
 

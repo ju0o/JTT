@@ -190,6 +190,34 @@ class JTTWorkKitStore:
             self._write([kit for kit in kits if kit["id"] != kit_id])
             return current
 
+    def rename_kit(self, kit_id: str, name: str, *, expected_snapshot: dict) -> dict:
+        """Rename one template without changing its terminal definitions."""
+        safe_name = " ".join(_text(name, "name", 80, one_line=True).split())
+        with state_write_lock(self.root, self._ensure_private_root, WorkKitStoreError):
+            kits = self.kits()
+            matches = [kit for kit in kits if kit["id"] == kit_id]
+            if len(matches) != 1:
+                raise WorkKitStoreError("Work Kit no longer exists")
+            current = matches[0]
+            try:
+                expected = self._validate_kit(expected_snapshot)
+            except WorkKitStoreError as exc:
+                raise WorkKitStoreError("Work Kit confirmation snapshot is invalid") from exc
+            if current != expected:
+                raise WorkKitStoreError("Work Kit changed before rename")
+            if any(kit["id"] != kit_id and kit["name"].casefold() == safe_name.casefold()
+                   for kit in kits):
+                raise WorkKitStoreError("A Work Kit with this name already exists")
+            renamed = {**current, "name": safe_name}
+            self._validate_kit(renamed)
+            try:
+                self._write([renamed if kit["id"] == kit_id else kit for kit in kits])
+            except WorkKitStoreCommittedDurabilityError as exc:
+                raise WorkKitStoreCommittedDurabilityError(
+                    str(exc), record_id=kit_id,
+                ) from exc
+            return renamed
+
     def _validate_kit(self, value: object) -> dict:
         if not isinstance(value, dict) or set(value) != {
             "id", "name", "description", "layout", "terminals",

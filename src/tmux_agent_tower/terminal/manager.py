@@ -36,6 +36,7 @@ SESSION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 SESSION_META = "session.json"
 SOCKET_NAME = "s"
 MAX_UNIX_SOCKET_PATH_BYTES = 107  # Linux sockaddr_un.sun_path, excluding NUL.
+SUPERVISOR_STARTUP_TIMEOUT = 5.0
 WORKER = Path(__file__).with_name("_worker.py")
 
 
@@ -177,22 +178,32 @@ def _proc_start(pid: int) -> Optional[str]:
         return None
 
 
-def _worker_is_same_process(pid: int, start: str, session_dir: Path,
-                            session_id: str, generation: str) -> bool:
-    """Match a live supervisor by start time and its fixed argv identity."""
+def _worker_identity_status(pid: int, start: str, session_dir: Path,
+                            session_id: str, generation: str) -> str:
+    """Classify a supervisor process check without exposing argv contents."""
 
     try:
         raw_stat = Path("/proc/{}/stat".format(pid)).read_text(encoding="ascii")
         fields = raw_stat.rsplit(")", 1)[1].split()
-        if fields[0] in ("Z", "X") or fields[19] != start:
-            return False
+        if fields[0] in ("Z", "X"):
+            return "not_running"
+        if fields[19] != start:
+            return "start_mismatch"
         raw_args = Path("/proc/{}/cmdline".format(pid)).read_bytes()
         argv = [os.fsdecode(item) for item in raw_args.split(b"\0") if item]
     except (OSError, IndexError, ValueError):
-        # If /proc is only partially readable, fail closed and keep waiting.
-        return _proc_start(pid) == start
+        return "unavailable"
     expected = [str(WORKER), str(session_dir), session_id, generation]
-    return len(argv) == 5 and argv[1:] == expected
+    return "verified" if len(argv) == 5 and argv[1:] == expected else "argv_mismatch"
+
+
+def _worker_is_same_process(pid: int, start: str, session_dir: Path,
+                            session_id: str, generation: str) -> bool:
+    """Match a live supervisor by start time and its fixed argv identity."""
+
+    return _worker_identity_status(
+        pid, start, session_dir, session_id, generation
+    ) == "verified"
 
 
 def _private_stat(path: Path, *, directory: bool) -> os.stat_result:
@@ -254,6 +265,39 @@ def _ensure_private_root(root: Path) -> Path:
 
     _require_private_directory(private_home)
     _require_private_directory(path)
+    return path
+
+
+def _short_socket_root() -> Path:
+    """Return a short, per-user runtime directory for long JTT_HOME paths."""
+
+    return Path("/tmp") / "jtt-{}".format(os.getuid()) / "sockets"
+
+
+def _planned_socket_path(session_dir: Path, session_id: str) -> Path:
+    """Keep the historical in-session socket unless AF_UNIX path limits require
+    a short private runtime location.
+    """
+
+    local_path = session_dir / SOCKET_NAME
+    if len(os.fsencode(local_path)) <= MAX_UNIX_SOCKET_PATH_BYTES:
+        return local_path
+    return _short_socket_root() / session_id
+
+
+def _session_socket_path(session_dir: Path, metadata: Dict[str, Any]) -> Path:
+    """Resolve a socket path while accepting legacy in-session metadata."""
+
+    stored = metadata.get("socket_path")
+    if stored is None:
+        path = session_dir / SOCKET_NAME
+    else:
+        expected = _short_socket_root() / session_dir.name
+        if not isinstance(stored, str) or stored != str(expected):
+            raise TerminalError("terminal socket path does not match the session")
+        path = expected
+    if len(os.fsencode(path)) > MAX_UNIX_SOCKET_PATH_BYTES:
+        raise TerminalError("terminal socket path is too long")
     return path
 
 
@@ -492,6 +536,9 @@ class TerminalRegistry:
         session_id = uuid.uuid4().hex
         generation = uuid.uuid4().hex
         session_dir = self.root / session_id
+        socket_path = _planned_socket_path(session_dir, session_id)
+        if socket_path.parent != session_dir:
+            _ensure_private_root(socket_path.parent)
         try:
             session_dir.mkdir(mode=0o700)
             os.chmod(str(session_dir), 0o700)
@@ -509,6 +556,8 @@ class TerminalRegistry:
             "name": display_name,
             "state": "starting",
         }
+        if socket_path.parent != session_dir:
+            initial["socket_path"] = str(socket_path)
         try:
             _atomic_metadata(session_dir / SESSION_META, initial)
         except Exception:
@@ -528,21 +577,45 @@ class TerminalRegistry:
         except OSError as exc:
             _remove_private_session(session_dir)
             raise TerminalError("cannot start local terminal supervisor") from exc
-        deadline = time.monotonic() + 5.0
-        last_error = None
+        deadline = time.monotonic() + SUPERVISOR_STARTUP_TIMEOUT
         while time.monotonic() < deadline:
             try:
                 _, current = _validate_identity(self.root, session_id)
                 if (current.get("generation") == generation
                         and current.get("state") == "running"
-                        and (session_dir / SOCKET_NAME).exists()):
+                        and socket_path.exists()):
                     return self.connect(session_id)
-            except TerminalError as exc:
-                last_error = exc
+            except TerminalError:
+                # Startup begins with a deliberately incomplete identity. Keep
+                # waiting, but do not later report that transient stale check as
+                # the actual worker startup failure.
+                pass
             if process.poll() is not None:
                 break
             time.sleep(0.02)
-        if process.poll() is None:
+        timed_out = process.poll() is None
+        exit_code = process.poll()
+        startup_stage = None
+        identity_status = None
+        try:
+            startup_metadata = _read_metadata(session_dir / SESSION_META)
+            candidate_stage = startup_metadata.get("startup_stage")
+            if isinstance(candidate_stage, str) and candidate_stage.isidentifier():
+                startup_stage = candidate_stage
+            if timed_out and startup_metadata.get("supervisor_pid") == process.pid:
+                candidate_start = startup_metadata.get("supervisor_start")
+                if isinstance(candidate_start, str) and candidate_start:
+                    identity_status = _worker_identity_status(
+                        process.pid, candidate_start, session_dir, session_id, generation
+                    )
+                else:
+                    identity_status = "start_missing"
+            elif timed_out:
+                identity_status = "identity_not_published"
+        except TerminalError:
+            if timed_out:
+                identity_status = "metadata_unavailable"
+        if timed_out:
             process.terminate()
             try:
                 process.wait(timeout=2)
@@ -570,9 +643,26 @@ class TerminalRegistry:
                 detail,
                 diagnostic=diagnostic,
             )
-        detail = "supervisor did not become ready"
-        if last_error is not None:
-            detail = str(last_error)
+        if not timed_out:
+            detail = "terminal supervisor exited during startup (exit_code={})".format(
+                exit_code
+            )
+            if startup_stage is not None:
+                detail += " (stage={})".format(startup_stage)
+        elif identity_status == "argv_mismatch":
+            detail = "terminal supervisor argv identity could not be verified"
+        elif identity_status == "start_mismatch":
+            detail = "terminal supervisor process start identity changed"
+        elif identity_status == "unavailable":
+            detail = "terminal supervisor process identity is unavailable"
+        elif identity_status == "identity_not_published":
+            detail = "terminal supervisor timed out before publishing its identity"
+        elif identity_status == "metadata_unavailable":
+            detail = "terminal supervisor timed out with unreadable identity metadata"
+        elif startup_stage is not None:
+            detail = "terminal supervisor startup timed out (stage={})".format(startup_stage)
+        else:
+            detail = "terminal supervisor startup timed out"
         raise TerminalError(detail)
 
     def connect(self, session_id: str, *, timeout: float = 3.0) -> "TerminalClient":
@@ -580,7 +670,9 @@ class TerminalRegistry:
         identity = _identity(metadata)
         if identity.state not in ("running", "exited"):
             raise TerminalError("terminal session is not ready")
-        sock_path = session_dir / SOCKET_NAME
+        sock_path = _session_socket_path(session_dir, metadata)
+        if sock_path.parent != session_dir:
+            _require_private_directory(sock_path.parent)
         try:
             info = sock_path.lstat()
         except OSError as exc:
@@ -590,7 +682,7 @@ class TerminalRegistry:
             raise TerminalError("terminal control socket is not private")
         if len(os.fsencode(sock_path)) > MAX_UNIX_SOCKET_PATH_BYTES:
             raise TerminalError("terminal socket path is too long for this platform")
-        return TerminalClient(session_dir, identity, timeout=timeout)
+        return TerminalClient(session_dir, identity, socket_path=sock_path, timeout=timeout)
 
     def stop(
         self,
@@ -666,8 +758,10 @@ def _remove_private_session(path: Path) -> None:
 class TerminalClient:
     """A reconnectable client for one supervisor-owned PTY."""
 
-    def __init__(self, session_dir: Path, identity: TerminalIdentity, *, timeout: float = 3.0):
+    def __init__(self, session_dir: Path, identity: TerminalIdentity, *,
+                 socket_path: Optional[Path] = None, timeout: float = 3.0):
         self._session_dir = session_dir
+        self._socket_path = socket_path or (session_dir / SOCKET_NAME)
         self.identity = identity
         self.state = identity.state
         self.synced = False
@@ -684,7 +778,7 @@ class TerminalClient:
         self._sock.settimeout(timeout)
         self._closed = False
         try:
-            self._sock.connect(str(session_dir / SOCKET_NAME))
+            self._sock.connect(str(self._socket_path))
             _check_peer_uid(self._sock, expected_pid=identity.supervisor_pid)
             self._request("hello", client_id=self._client_id,
                           session_id=identity.session_id, generation=identity.generation,

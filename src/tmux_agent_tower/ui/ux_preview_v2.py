@@ -460,6 +460,9 @@ def _append_hit(state: dict, rect, kind: str, index: int = -1) -> None:
 def _draw_left(stdscr, rect, state: dict, active: bool) -> None:
     unicode = state.get("runtime_mode") == "jtt"
     ix, iy, iw, ih = _draw_box(stdscr, rect, "내 작업공간", active, unicode=unicode)
+    if unicode:
+        _draw_jtt_left_contents(stdscr, (ix, iy, iw, ih), state, active)
+        return
     choices = state["choices"]
     windows = [(i, item) for i, item in enumerate(choices)
                if item.get("group") == "windows"
@@ -516,6 +519,57 @@ def _draw_left(stdscr, rect, state: dict, active: bool) -> None:
         action_rect = (ix, cursor, iw, action_height)
         _draw_action_choice(stdscr, action_rect, index, item, state, active, unicode=unicode)
         cursor += action_height + gap
+
+
+def _draw_jtt_left_contents(stdscr, rect, state: dict, active: bool) -> None:
+    """Render JTT's logical Windows as one flat list, without exposing folders."""
+    ix, iy, iw, ih = rect
+    if ih <= 0 or iw <= 0:
+        return
+    workspace_name = str(state.get("workspace_name") or "내 작업공간")
+    _put(stdscr, iy, ix + 1, max(0, iw - 2), workspace_name, curses.A_BOLD)
+    choices = state.get("choices", ())
+    windows = [(index, item) for index, item in enumerate(choices)
+               if item.get("kind") == "logical_window"]
+    actions = [(index, item) for index, item in enumerate(choices)
+               if item.get("kind") == "action" and item.get("group") == "actions"]
+
+    action_rows = min(len(actions), max(0, ih - 1))
+    window_rows = max(0, ih - 1 - action_rows)
+    scrolls = state.setdefault("choice_scrolls", {})
+    selected_position = next((position for position, (index, _item) in enumerate(windows)
+                              if index == state.get("nav_index")), None)
+    first = max(0, min(int(scrolls.get("jtt_windows", 0)),
+                       max(0, len(windows) - window_rows)))
+    if selected_position is not None:
+        if selected_position < first:
+            first = selected_position
+        elif window_rows and selected_position >= first + window_rows:
+            first = selected_position - window_rows + 1
+    scrolls["jtt_windows"] = first
+    visible_windows = windows[first:first + window_rows]
+    for row_offset, (choice_index, item) in enumerate(visible_windows):
+        y = iy + 1 + row_offset
+        selected = choice_index == state.get("nav_index")
+        prefix = "▶ " if selected else "  "
+        label = truncate_to_width(prefix + str(item.get("label") or "Window"), max(1, iw - 2))
+        attr = (_color(_COLOR_SELECTED) | curses.A_BOLD) if selected else curses.A_NORMAL
+        if selected and not active:
+            attr |= curses.A_DIM
+        _put(stdscr, y, ix + 1, max(0, iw - 2), label, attr)
+        _append_hit(state, (ix, y, iw, 1), "left", choice_index)
+
+    action_start = iy + 1 + window_rows
+    for offset, (choice_index, item) in enumerate(actions[-action_rows:] if action_rows else ()):
+        y = action_start + offset
+        selected = choice_index == state.get("nav_index")
+        label = f"▶ {item.get('label', '')}" if selected else str(item.get("label") or "")
+        attr = (_color(_COLOR_SELECTED) | curses.A_BOLD) if selected else curses.A_DIM
+        if selected and not active:
+            attr |= curses.A_DIM
+        _put(stdscr, y, ix + 1, max(0, iw - 2),
+             truncate_to_width(label, max(1, iw - 2)), attr)
+        _append_hit(state, (ix, y, iw, 1), "left", choice_index)
 
 
 def _draw_choice_group(stdscr, rect, title, items, state, active, *, unicode=False):
@@ -1238,7 +1292,13 @@ def _activate_choice(state: dict, choice_index: int) -> None:
     state["nav_index"] = choice_index
     if choice.get("kind") in ("workspace", "work_kit", "logical_folder", "logical_window"):
         _set_choice(state, choice_index)
-        state["active_panel"] = 1
+        if state.get("runtime_mode") == "jtt" and choice.get("kind") == "logical_window":
+            state["active_panel"] = (
+                1 if state.get("selected_window_id") == str(choice.get("window_id") or "")
+                else 0
+            )
+        else:
+            state["active_panel"] = 1
     elif choice.get("kind") == "action":
         if state.get("runtime_mode") == "jtt":
             handler = state.get("jtt_action_handler")
@@ -1286,7 +1346,7 @@ def _hit_test(state: dict, x: int, y: int) -> str | None:
                 choice = state["choices"][index]
                 if choice.get("kind") in ("workspace", "work_kit", "logical_folder", "logical_window"):
                     _set_choice(state, index)
-                    state["active_panel"] = 0
+                    state["active_panel"] = 0 if state.get("runtime_mode") == "jtt" else 0
                 else:
                     state["nav_index"] = index
                     if state.get("runtime_mode") == "tower":

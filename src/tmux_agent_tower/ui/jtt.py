@@ -630,23 +630,63 @@ def _default_layout(workspace_id: str, terminal_ids) -> dict:
             "placements": {}, "terminal_ids": ids}
 
 
-def _layout_choices(workspace_id: str, layout: dict) -> list[dict]:
+def _layout_choices(workspace_id: str, layout: dict,
+                    registry: TerminalRegistry | None = None) -> list[dict]:
+    """Project every logical Window into one flat, identity-bearing LEFT list."""
+    folders = {str(item["id"]): item for item in layout["folders"]}
+    display_names = {
+        str(window["id"]): ("Window 1" if window["id"] == "window-default"
+                            else str(window["name"]))
+        for window in layout["windows"]
+    }
+    duplicate_names: dict[str, list[dict]] = {}
+    for window in layout["windows"]:
+        duplicate_names.setdefault(display_names[str(window["id"])].casefold(), []).append(window)
+
+    registry_available = registry is not None
+    identities = {}
+    if registry is not None:
+        try:
+            identities = {str(item.session_id): item for item in registry.list_sessions()}
+        except (OSError, RuntimeError, ValueError, TypeError):
+            registry_available = False
+
     choices = []
-    for folder in layout["folders"]:
-        folder_id = str(folder["id"])
-        choices.append({"kind": "logical_folder", "group": "windows",
-                        "scope": "logical_folder", "id": f"folder:{workspace_id}:{folder_id}",
-                        "workspace_id": workspace_id, "folder_id": folder_id,
-                        "label": f"▰ {folder['name']}"})
-        for window in layout["windows"]:
-            if window["folder_id"] != folder_id:
-                continue
-            choices.append({"kind": "logical_window", "group": "windows",
-                            "scope": "logical_window",
-                            "id": f"window:{workspace_id}:{window['id']}",
-                            "workspace_id": workspace_id, "folder_id": folder_id,
-                            "window_id": window["id"],
-                            "label": f"  › {window['name']}"})
+    for window in layout["windows"]:
+        window_id = str(window["id"])
+        folder_id = str(window["folder_id"])
+        folder = folders.get(folder_id)
+        folder_name = str((folder or {}).get("name") or "폴더")
+        name = display_names[window_id]
+        suffix = (f" · {folder_name}"
+                  if len(duplicate_names[name.casefold()]) > 1 else "")
+        session_ids = list(window.get("terminal_ids") or ())
+        if not registry_available:
+            activity = "상태 UNKNOWN"
+            current_count = None
+        else:
+            current = [identities[item] for item in session_ids if item in identities]
+            current_count = len(current)
+            running = sum(str(getattr(item, "state", "unknown")).lower()
+                          in {"running", "stopping"} for item in current)
+            exited = sum(str(getattr(item, "state", "unknown")).lower()
+                         in {"exited", "dead", "stopped", "orphaned"} for item in current)
+            if not session_ids:
+                activity = "비어 있음"
+            elif not current:
+                activity = "세션 확인 필요"
+            else:
+                activity = f"실행 {running} · 종료 {exited}"
+        count = "UNKNOWN" if current_count is None else str(current_count)
+        choices.append({
+            "kind": "logical_window", "group": "windows", "scope": "logical_window",
+            "id": f"window:{workspace_id}:{window_id}",
+            "workspace_id": workspace_id, "folder_id": folder_id,
+            "window_id": window_id,
+            "label": f"{name}{suffix} · 터미널 {count} · {activity}",
+            "window_name": name, "folder_name": folder_name,
+            "terminal_count": current_count, "terminal_refs": tuple(session_ids),
+        })
     return choices
 
 
@@ -665,25 +705,14 @@ def _workspace_layout(state: dict, workspace_id: str | None = None):
 def _replace_workspace_layout_choices(state: dict, workspace: dict, layout: dict,
                                       *, selected_choice_id: str | None = None) -> None:
     choices = [item for item in state["choices"]
-               if item.get("kind") not in {"logical_folder", "logical_window"}]
-    for item in choices:
-        if item.get("kind") == "workspace" and str(item.get("id") or "") == str(workspace["id"]):
-            item["label"] = str(workspace["name"])
-            item["terminal_ids"] = list(workspace["terminal_ids"])
-    workspace_index = next((index for index, item in enumerate(choices)
-                            if item.get("kind") == "workspace"
-                            and str(item.get("id") or "") == str(workspace["id"])), None)
-    insert_at = workspace_index + 1 if workspace_index is not None else next(
-        (index for index, item in enumerate(choices) if item.get("group") == "actions"),
-        len(choices),
-    )
-    logical = _layout_choices(str(workspace["id"]), layout)
-    choices[insert_at:insert_at] = logical
-    state["choices"] = choices
+               if item.get("kind") not in {"logical_folder", "logical_window"}
+               and item.get("kind") != "workspace"]
+    logical = _layout_choices(str(workspace["id"]), layout, state.get("jtt_registry"))
+    state["choices"] = [*logical, *choices]
     state["jtt_layout"] = layout
     state["jtt_layout_error"] = False
     if selected_choice_id:
-        index = next((i for i, item in enumerate(choices)
+        index = next((i for i, item in enumerate(state["choices"])
                       if str(item.get("id") or "") == selected_choice_id), None)
         if index is not None:
             state["nav_index"] = index
@@ -831,20 +860,14 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
     except JTTLayoutStoreError:
         default_layout = _default_layout(default["id"], default["terminal_ids"])
         layout_error = True
-    choices = [{"kind": "workspace", "group": "windows", "scope": "jtt_workspace",
-                "id": default["id"], "label": default["name"], "terminal_ids": default["terminal_ids"]}]
-    choices.extend(_layout_choices(default["id"], default_layout))
-    choices.extend({"kind": "workspace", "group": "saved", "scope": "jtt_workspace",
-                    "id": item["id"], "label": item["name"], "terminal_ids": item["terminal_ids"]}
-                   for item in saved)
-    choices.extend(_work_kit_choices(work_kits, unavailable=work_kit_error))
+    choices = _layout_choices(default["id"], default_layout, registry)
     choices.extend([
-        {"kind": "action", "group": "actions", "id": "action:save", "label": "구성 저장",
-         "dialog": "구성 저장"},
+        {"kind": "action", "group": "actions", "id": "action:new-window",
+         "label": "+ 새 Window", "dialog": "새 Window"},
+        {"kind": "action", "group": "actions", "id": "action:archive",
+         "label": "보관함", "dialog": "보관함"},
         {"kind": "action", "group": "actions", "id": "action:settings", "label": "설정 · 메뉴",
          "dialog": "설정 · 메뉴"},
-        {"kind": "action", "group": "actions", "id": "action:layout",
-         "label": "폴더 · Window 관리", "dialog": "폴더 · Window 관리"},
     ])
     selected = default
     rows_by_choice = {
@@ -900,6 +923,7 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
         "jtt_workspaces": workspaces,
         "jtt_notice": "",
         "jtt_notice_until": 0.0,
+        "jtt_archive_return_workspace_id": None,
         "jtt_prefix_pending": False,
         "jtt_prefix_deadline": 0.0,
         "jtt_prefix_target": None,
@@ -937,6 +961,8 @@ def _work_kit_choices(work_kits: list[dict], *, unavailable: bool = False) -> li
 
 def _preview_work_kit(state: dict, choice: dict) -> None:
     """Project one saved template into cards without resolving any processes."""
+    if state.get("work_kit_preview") is None:
+        state["jtt_archive_return_workspace_id"] = str(state.get("workspace_id") or "")
     renderer._release_managed_input(state)
     state["jtt_pending_auto_acquire"] = None
     state["work_kit_preview"] = None
@@ -952,6 +978,7 @@ def _preview_work_kit(state: dict, choice: dict) -> None:
         state["selected_signature"] = None
         state["jtt_notice"] = "Work Kit을 읽을 수 없습니다. 템플릿 미리보기를 중단했습니다."
         state["jtt_notice_until"] = 0.0
+        state["jtt_archive_return_workspace_id"] = None
         return
     kit = matches[0]
     state["work_kit_preview"] = kit
@@ -980,22 +1007,10 @@ def _preview_work_kit(state: dict, choice: dict) -> None:
     state["jtt_notice_until"] = 0.0
 
 
-def _refresh_work_kit_choices(state: dict, selected_id: str | None = None) -> None:
+def _refresh_work_kit_choices(state: dict) -> None:
     work_kits = state["jtt_work_kit_store"].kits()
-    choices = [item for item in state["choices"] if item.get("group") != "work_kits"]
-    insertion = next((index for index, item in enumerate(choices)
-                      if item.get("group") == "actions"), len(choices))
-    choices[insertion:insertion] = _work_kit_choices(work_kits)
-    state["choices"] = choices
     state["jtt_work_kits"] = work_kits
     state["jtt_work_kit_error"] = False
-    if selected_id:
-        index = next((i for i, item in enumerate(choices)
-                      if item.get("kind") == "work_kit" and item.get("id") == selected_id), None)
-        if index is not None:
-            state["nav_index"] = index
-            _preview_work_kit(state, choices[index])
-            state["active_panel"] = 1
 
 
 def _create_work_kit(stdscr, state: dict) -> None:
@@ -1050,14 +1065,14 @@ def _create_work_kit(stdscr, state: dict) -> None:
                 "working_directory": working_directory or None,
             })
         kit = state["jtt_work_kit_store"].create_kit(name, description, terminals)
-        _refresh_work_kit_choices(state, kit["id"])
+        _refresh_work_kit_choices(state)
         terminal_count = len(kit["terminals"])
         state["jtt_notice"] = (
             f"{kit['name']} Work Kit 저장 완료 · 터미널 {terminal_count}개 구성 · 아직 실행되지 않음"
         )
         state["jtt_notice_until"] = 0.0
-    except WorkKitStoreCommittedDurabilityError as exc:
-        _refresh_work_kit_choices(state, exc.record_id)
+    except WorkKitStoreCommittedDurabilityError:
+        _refresh_work_kit_choices(state)
         state["jtt_notice"] = (
             f"Work Kit 저장 완료 · 터미널 {len(terminals)}개 구성 · "
             "디렉터리 동기화 확인 필요 · 아직 실행되지 않음"
@@ -1107,6 +1122,7 @@ def _prompt_working_directory(stdscr, label: str) -> str | None:
 def _attach_choice(state: dict, choice: dict) -> None:
     """Attach only the selected workspace's exact sessions to this UI client."""
     state["work_kit_preview"] = None
+    state["jtt_archive_return_workspace_id"] = None
     workspace_id = str(choice.get("id") or "")
     workspaces = state["jtt_store"].workspaces()
     workspace = next((item for item in workspaces if item["id"] == workspace_id), None)
@@ -1160,6 +1176,7 @@ def _attach_choice(state: dict, choice: dict) -> None:
     state["card_scroll"] = 0
     state["live_scroll"] = 0
     state["window_refs"] = tuple(default_window["terminal_ids"])
+    state["active_panel"] = 0
     _clear_mini_live(state)
 
 
@@ -1173,12 +1190,15 @@ def _release_layout_clients(state: dict, keep: set[str] | None = None) -> None:
 
 
 def _attach_layout_choice(state: dict, choice: dict) -> None:
-    """Select a logical folder/window and attach only its exact canonical refs."""
-    if state.get("work_kit_preview") is not None:
-        return
+    """Select a flat logical Window and attach only its exact canonical refs."""
     workspace_id = str(choice.get("workspace_id") or "")
-    if workspace_id != str(state.get("workspace_id") or ""):
-        state["jtt_notice"] = "작업공간이 변경되어 폴더 선택을 차단했습니다."
+    active_workspace_id = str(
+        state.get("jtt_archive_return_workspace_id")
+        if state.get("work_kit_preview") is not None
+        else state.get("workspace_id") or ""
+    )
+    if workspace_id != active_workspace_id:
+        state["jtt_notice"] = "작업공간이 변경되어 Window 선택을 차단했습니다."
         state["jtt_notice_until"] = 0.0
         return
     try:
@@ -1196,29 +1216,26 @@ def _attach_layout_choice(state: dict, choice: dict) -> None:
         state["jtt_notice_until"] = 0.0
         return
 
-    kind = choice.get("kind")
-    folder_id = str(choice.get("folder_id") or "")
-    if kind == "logical_folder":
-        folder = next((item for item in layout["folders"] if item["id"] == folder_id), None)
-        if folder is None:
-            return
-        windows = [item for item in layout["windows"] if item["folder_id"] == folder_id]
-        ids = list(dict.fromkeys(session_id for item in windows for session_id in item["terminal_ids"]))
-        window_id = ""
-        selected_choice_id = str(choice.get("id") or "")
-    elif kind == "logical_window":
-        window_id = str(choice.get("window_id") or "")
-        window = next((item for item in layout["windows"] if item["id"] == window_id), None)
-        if window is None or window["folder_id"] != folder_id:
-            return
-        folder = next(item for item in layout["folders"] if item["id"] == folder_id)
-        ids = list(window["terminal_ids"])
-        selected_choice_id = str(choice.get("id") or "")
-    else:
+    if choice.get("kind") != "logical_window":
         return
+    window_id = str(choice.get("window_id") or "")
+    window = next((item for item in layout["windows"] if item["id"] == window_id), None)
+    if window is None or window["folder_id"] != str(choice.get("folder_id") or ""):
+        return
+    folder = next((item for item in layout["folders"] if item["id"] == window["folder_id"]), None)
+    if folder is None:
+        return
+    ids = list(window["terminal_ids"])
+    selected_choice_id = str(choice.get("id") or "")
 
+    # The validated choice points back to the canonical workspace. A Work Kit
+    # preview temporarily replaces state["workspace_id"] with a template ID;
+    # restore the real ID before subsequent Window navigation or creation.
+    state["workspace_id"] = str(workspace["id"])
     _replace_workspace_layout_choices(state, workspace, layout,
                                       selected_choice_id=selected_choice_id)
+    state["work_kit_preview"] = None
+    state["jtt_archive_return_workspace_id"] = None
     state["jtt_workspaces"] = workspaces
     state["workspace_name"] = workspace["name"]
     state["selected_folder_id"] = folder["id"]
@@ -1240,7 +1257,7 @@ def _attach_layout_choice(state: dict, choice: dict) -> None:
     state["selected_signature"] = renderer._pane_signature(selected)
     state["card_scroll"] = 0
     state["live_scroll"] = 0
-    state["active_panel"] = 1
+    state["active_panel"] = 0
     state["center_actions_focused"] = False
     _clear_mini_live(state)
 
@@ -1248,19 +1265,30 @@ def _attach_layout_choice(state: dict, choice: dict) -> None:
 def _refresh_workspaces(state: dict, selected_id: str | None = None) -> None:
     stdscr = state.get("stdscr")
     mini_sampler = state.get("mini_live_sampler")
+    old_workspace_id = str(
+        state.get("jtt_archive_return_workspace_id")
+        if state.get("work_kit_preview") is not None
+        else state.get("workspace_id") or ""
+    )
+    old_window_id = str(state.get("selected_window_id") or "")
     refreshed = build_state(state["jtt_store"], state["jtt_registry"],
                             state["managed_terminals"], attach_default=False,
                             keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS))
     refreshed["stdscr"] = stdscr
     refreshed["mini_live_sampler"] = mini_sampler
-    index = next((i for i, choice in enumerate(refreshed["choices"])
-                 if choice.get("id") == selected_id), None) if selected_id else None
-    if index is None:
-        index = next((i for i, choice in enumerate(refreshed["choices"])
-                      if choice.get("kind") == "workspace"), None)
-    if index is not None:
-        renderer._set_choice(refreshed, index)
-        refreshed["active_panel"] = 1
+    workspaces = refreshed["jtt_store"].workspaces()
+    available_ids = {str(item["id"]) for item in workspaces}
+    target_workspace_id = str(selected_id or "")
+    if target_workspace_id not in available_ids:
+        target_workspace_id = old_workspace_id if old_workspace_id in available_ids else JTTWorkspaceStore.DEFAULT_ID
+    _attach_choice(refreshed, {"kind": "workspace", "id": target_workspace_id})
+    if target_workspace_id == old_workspace_id and old_window_id:
+        choice_id = f"window:{target_workspace_id}:{old_window_id}"
+        index = next((i for i, item in enumerate(refreshed["choices"])
+                      if item.get("id") == choice_id), None)
+        if index is not None:
+            renderer._set_choice(refreshed, index)
+    refreshed["active_panel"] = 0
     state.clear()
     state.update(refreshed)
 
@@ -1294,12 +1322,24 @@ def _selected_choice(state: dict) -> dict | None:
     return choices[index] if 0 <= index < len(choices) else None
 
 
-def _capture_workspace_delete_target(state: dict) -> dict | None:
+def _capture_workspace_delete_target(state: dict, workspace_id: str | None = None) -> dict | None:
     if state.get("work_kit_preview") is not None:
         return None
+    archive_target = workspace_id is not None
     choice = _selected_choice(state)
-    workspace_id = str(state.get("workspace_id") or "")
-    if workspace_id == JTTWorkspaceStore.DEFAULT_ID or not choice:
+    workspace_id = str(workspace_id or state.get("workspace_id") or "")
+    if workspace_id == JTTWorkspaceStore.DEFAULT_ID:
+        return None
+    if archive_target:
+        try:
+            matches = [item for item in state["jtt_store"].workspaces()
+                       if str(item.get("id") or "") == workspace_id]
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+            return None
+        if len(matches) != 1 or not matches[0].get("saved"):
+            return None
+        return {"workspace": dict(matches[0]), "workspace_id": workspace_id}
+    if not choice:
         return None
     try:
         matches = [item for item in state["jtt_store"].workspaces()
@@ -1549,8 +1589,8 @@ def _finish_card_reference_removal(state: dict, target: dict) -> None:
     _refresh_workspaces(state, target["workspace_id"])
 
 
-def _confirm_and_delete_workspace(stdscr, state: dict) -> None:
-    target = _capture_workspace_delete_target(state)
+def _confirm_and_delete_workspace(stdscr, state: dict, workspace_id: str | None = None) -> None:
+    target = _capture_workspace_delete_target(state, workspace_id)
     if target is None:
         state["jtt_notice"] = "저장 작업공간을 확인할 수 없어 삭제를 차단했습니다."
         state["jtt_notice_until"] = 0.0
@@ -1565,8 +1605,8 @@ def _confirm_and_delete_workspace(stdscr, state: dict) -> None:
     )
     if confirm.cancelled or confirm.selected_key != "delete":
         return
-    current = _capture_workspace_delete_target(state)
-    if current != target:
+    current = _capture_workspace_delete_target(state, target["workspace_id"])
+    if current is None or current.get("workspace") != target["workspace"]:
         state["jtt_notice"] = "선택 작업공간이 변경되어 삭제를 차단했습니다."
         state["jtt_notice_until"] = 0.0
         return
@@ -1574,10 +1614,16 @@ def _confirm_and_delete_workspace(stdscr, state: dict) -> None:
         state["jtt_store"].delete_workspace(
             target["workspace_id"], expected_snapshot=target["workspace"],
         )
-        _refresh_workspaces(state, JTTWorkspaceStore.DEFAULT_ID)
+        selected_workspace_id = (JTTWorkspaceStore.DEFAULT_ID
+                                 if str(state.get("workspace_id") or "") == target["workspace_id"]
+                                 else str(state.get("workspace_id") or JTTWorkspaceStore.DEFAULT_ID))
+        _refresh_workspaces(state, selected_workspace_id)
         state["jtt_notice"] = "작업공간을 삭제했습니다 · 셸은 유지되고 마지막 참조는 내 작업공간으로 이동했습니다."
     except WorkspaceStoreCommittedDurabilityError:
-        _refresh_workspaces(state, JTTWorkspaceStore.DEFAULT_ID)
+        selected_workspace_id = (JTTWorkspaceStore.DEFAULT_ID
+                                 if str(state.get("workspace_id") or "") == target["workspace_id"]
+                                 else str(state.get("workspace_id") or JTTWorkspaceStore.DEFAULT_ID))
+        _refresh_workspaces(state, selected_workspace_id)
         state["jtt_notice"] = (
             "작업공간 삭제 반영됨 · 마지막 참조는 내 작업공간으로 이동 · "
             "디렉터리 동기화 확인 필요"
@@ -1619,14 +1665,206 @@ def _confirm_and_delete_work_kit(stdscr, state: dict) -> None:
     state["jtt_notice_until"] = 0.0
 
 
-def _settings_menu(stdscr, state: dict) -> None:
-    actions = [("new", "새 작업공간"), ("layout", "폴더 · Window 관리"), ("help", "키 안내")]
+def _archive_menu(stdscr, state: dict) -> None:
+    """Keep saved configurations and Work Kits together in one UI only."""
     if state.get("work_kit_preview") is not None:
-        if _capture_work_kit_delete_target(state) is not None:
-            actions.append(("delete_kit", "선택한 Work Kit 삭제"))
-    else:
-        if _capture_workspace_delete_target(state) is not None:
-            actions.append(("delete_workspace", "선택한 저장 작업공간 삭제"))
+        state["jtt_notice"] = "Work Kit 미리보기 중입니다 · Window를 선택하면 작업공간으로 돌아갑니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    workspace_read_ok = True
+    try:
+        saved = [item for item in state["jtt_store"].workspaces()
+                 if item["id"] != JTTWorkspaceStore.DEFAULT_ID and item.get("saved")]
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        saved = []
+        workspace_read_ok = False
+        state["jtt_notice"] = "저장 작업공간을 읽을 수 없습니다 · 기존 데이터는 변경하지 않았습니다."
+        state["jtt_notice_until"] = 0.0
+    if not workspace_read_ok:
+        return
+    kit_read_ok = True
+    try:
+        kits = state["jtt_work_kit_store"].kits()
+        state["jtt_work_kits"] = kits
+        state["jtt_work_kit_error"] = False
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkKitStoreError):
+        kits = []
+        kit_read_ok = False
+        state["jtt_work_kit_error"] = True
+
+    active_workspace_id = str(state.get("workspace_id") or "")
+    active_saved_workspace = next((item for item in saved
+                                   if str(item.get("id") or "") == active_workspace_id), None)
+    actions = []
+    if active_saved_workspace is not None:
+        actions.append(("return_default", "내 작업공간으로 돌아가기"))
+    actions.extend([
+        ("save", "현재 터미널 구성 저장"),
+        ("load_workspace", "저장한 작업공간 불러오기"),
+        ("rename_workspace", "저장한 작업공간 이름 변경"),
+        ("delete_workspace", "저장한 작업공간 삭제"),
+    ])
+    if kit_read_ok:
+        actions.append(("create_kit", "Work Kit 템플릿 만들기"))
+    if kits:
+        actions.extend([
+            ("preview_kit", "Work Kit 미리보기"),
+            ("rename_kit", "Work Kit 이름 변경"),
+            ("delete_kit", "Work Kit 삭제"),
+        ])
+    result = run_list_picker(
+        stdscr, "보관함", actions, centered=True,
+        footer_hint="저장 구성은 세션 참조 · Work Kit은 실행되지 않는 템플릿입니다",
+    )
+    if result.cancelled or result.selected_key is None:
+        return
+    action = result.selected_key
+    if action == "return_default":
+        try:
+            current_workspaces = state["jtt_store"].workspaces()
+            current_active = [item for item in current_workspaces
+                              if str(item.get("id") or "") == active_workspace_id]
+            default_matches = [item for item in current_workspaces
+                               if str(item.get("id") or "") == JTTWorkspaceStore.DEFAULT_ID]
+            if (str(state.get("workspace_id") or "") != active_workspace_id
+                    or len(current_active) != 1 or not current_active[0].get("saved")
+                    or len(default_matches) != 1):
+                raise WorkspaceStoreError("Active workspace changed before return")
+            _attach_choice(state, {"kind": "workspace", "id": JTTWorkspaceStore.DEFAULT_ID})
+            if state.get("workspace_id") != JTTWorkspaceStore.DEFAULT_ID:
+                raise WorkspaceStoreError("Default workspace could not be attached")
+            state["active_panel"] = 0
+            state["jtt_notice"] = "내 작업공간으로 돌아왔습니다 · 기본 Window의 저장 참조를 표시합니다."
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+            state["jtt_notice"] = "내 작업공간으로 돌아가지 못했습니다 · 셸 종료 명령은 실행하지 않았습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    if action == "save":
+        _save_configuration(stdscr, state)
+        return
+    if action == "create_kit":
+        _create_work_kit(stdscr, state)
+        return
+    if action in {"load_workspace", "rename_workspace", "delete_workspace"}:
+        if not saved:
+            state["jtt_notice"] = "저장된 작업공간이 없습니다."
+            state["jtt_notice_until"] = 0.0
+            return
+        selected_id = _pick_archive_record(stdscr, "저장한 작업공간", saved)
+        if selected_id is None:
+            return
+        target = next((item for item in saved if item["id"] == selected_id), None)
+        if target is None:
+            return
+        if action == "load_workspace":
+            _attach_choice(state, {"kind": "workspace", "id": selected_id})
+            state["active_panel"] = 0
+            state["jtt_notice"] = f"저장한 작업공간 · {target['name']}"
+            state["jtt_notice_until"] = 0.0
+        elif action == "rename_workspace":
+            name = prompt_text(stdscr, "작업공간 새 이름: ", initial=target["name"])
+            if name is None or name == target["name"]:
+                return
+            try:
+                current = next((item for item in state["jtt_store"].workspaces()
+                                if item["id"] == selected_id), None)
+                if current != target:
+                    raise WorkspaceStoreError("Workspace changed before rename")
+                state["jtt_store"].rename_workspace(
+                    selected_id, name, expected_snapshot=target,
+                )
+                _refresh_workspaces(state, selected_id if state["workspace_id"] == selected_id
+                                    else state["workspace_id"])
+                state["jtt_notice"] = "저장한 작업공간 이름을 변경했습니다 · 터미널 참조는 유지됩니다."
+            except WorkspaceStoreCommittedDurabilityError as exc:
+                _refresh_workspaces(state, exc.record_id)
+                state["jtt_notice"] = "이름 변경 반영됨 · 디렉터리 동기화 확인 필요"
+            except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+                state["jtt_notice"] = "작업공간을 변경하지 못했습니다 · 데이터를 다시 확인하세요."
+            state["jtt_notice_until"] = 0.0
+        else:
+            _confirm_and_delete_workspace(stdscr, state, selected_id)
+        return
+    if action in {"preview_kit", "rename_kit", "delete_kit"}:
+        if state.get("jtt_work_kit_error"):
+            state["jtt_notice"] = "Work Kit 저장 데이터 오류 · 기존 파일은 변경하지 않았습니다."
+            state["jtt_notice_until"] = 0.0
+            return
+        selected_id = _pick_archive_record(stdscr, "Work Kit", kits)
+        if selected_id is None:
+            return
+        target = next((item for item in kits if item["id"] == selected_id), None)
+        if target is None:
+            return
+        if action == "preview_kit":
+            choice = {"kind": "work_kit", "id": selected_id}
+            _preview_work_kit(state, choice)
+            state["active_panel"] = 0
+            return
+        if action == "rename_kit":
+            name = prompt_text(stdscr, "Work Kit 새 이름: ", initial=target["name"])
+            if name is None or name == target["name"]:
+                return
+            try:
+                current = next((item for item in state["jtt_work_kit_store"].kits()
+                                if item["id"] == selected_id), None)
+                if current != target:
+                    raise WorkKitStoreError("Work Kit changed before rename")
+                state["jtt_work_kit_store"].rename_kit(
+                    selected_id, name, expected_snapshot=target,
+                )
+                state["jtt_notice"] = "Work Kit 이름을 변경했습니다 · 템플릿 구성은 유지됩니다."
+            except WorkKitStoreCommittedDurabilityError:
+                state["jtt_notice"] = "Work Kit 이름 변경 반영됨 · 디렉터리 동기화 확인 필요"
+            except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkKitStoreError):
+                state["jtt_notice"] = "Work Kit 이름을 변경하지 못했습니다 · 템플릿을 다시 확인하세요."
+            state["jtt_notice_until"] = 0.0
+            return
+        _confirm_and_delete_kit_from_archive(stdscr, state, target)
+
+
+def _pick_archive_record(stdscr, title: str, records: list[dict]) -> str | None:
+    labels = []
+    for record in records:
+        label = str(record["name"])
+        if sum(1 for item in records if str(item["name"]).casefold() == label.casefold()) > 1:
+            label += (f" · {len(record.get('terminal_ids', record.get('terminals', ())))}개"
+                      f" · {str(record['id'])[-4:]}")
+        labels.append((str(record["id"]), label))
+    result = run_list_picker(
+        stdscr, title, labels, centered=True,
+        footer_hint="Esc 취소 · 저장 데이터는 항목별 형식을 유지합니다",
+    )
+    return None if result.cancelled else result.selected_key
+
+
+def _confirm_and_delete_kit_from_archive(stdscr, state: dict, target: dict) -> None:
+    confirm = run_list_picker(
+        stdscr, "Work Kit 삭제",
+        [("cancel", "취소"), ("delete", f"{target['name']} 템플릿 삭제")],
+        centered=True, footer_hint="취소가 기본 선택입니다 · 셸과 작업공간은 변경하지 않습니다",
+        preamble=["Work Kit 템플릿 정의만 삭제합니다 · PTY는 종료하거나 만들지 않습니다."],
+    )
+    if confirm.cancelled or confirm.selected_key != "delete":
+        return
+    try:
+        current = next((item for item in state["jtt_work_kit_store"].kits()
+                        if item["id"] == target["id"]), None)
+        if current != target:
+            raise WorkKitStoreError("Work Kit changed before deletion")
+        state["jtt_work_kit_store"].delete_kit(target["id"], expected_snapshot=target)
+        state["jtt_work_kits"] = state["jtt_work_kit_store"].kits()
+        state["jtt_notice"] = "Work Kit 템플릿을 삭제했습니다 · 작업공간과 터미널은 변경하지 않았습니다."
+    except WorkKitStoreCommittedDurabilityError:
+        state["jtt_notice"] = "Work Kit 삭제 반영됨 · 디렉터리 동기화 확인 필요"
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkKitStoreError):
+        state["jtt_notice"] = "Work Kit을 안전하게 삭제하지 못했습니다 · 템플릿을 다시 확인하세요."
+    state["jtt_notice_until"] = 0.0
+
+
+def _settings_menu(stdscr, state: dict) -> None:
+    actions = [("layout", "폴더 · Window 관리"), ("help", "키 안내")]
+    if state.get("work_kit_preview") is None:
         row = renderer._selected_row(state)
         if row and row.get("terminal_kind") == "tower_managed":
             if _capture_card_reference_target(state) is not None:
@@ -1639,27 +1877,10 @@ def _settings_menu(stdscr, state: dict) -> None:
     )
     if result.cancelled or result.selected_key is None:
         return
-    if result.selected_key == "new":
-        name = prompt_text(stdscr, "새 작업공간 이름: ")
-        if not name:
-            return
-        try:
-            item = state["jtt_store"].create_workspace(name)
-            _refresh_workspaces(state, item["id"])
-            state["jtt_notice"] = "새 빈 작업공간을 만들었습니다."
-        except WorkspaceStoreCommittedDurabilityError as exc:
-            _refresh_workspaces(state, exc.record_id)
-            state["jtt_notice"] = f"{name} 작업공간 생성 반영됨 · 디렉터리 동기화 확인 필요"
-        except WorkspaceStoreError:
-            state["jtt_notice"] = "작업공간을 안전하게 저장하지 못했습니다."
-    elif result.selected_key == "layout":
+    if result.selected_key == "layout":
         _layout_menu(stdscr, state)
     elif result.selected_key == "stop":
         _confirm_and_stop_selected_terminal(stdscr, state)
-    elif result.selected_key == "delete_workspace":
-        _confirm_and_delete_workspace(stdscr, state)
-    elif result.selected_key == "delete_kit":
-        _confirm_and_delete_work_kit(stdscr, state)
     elif result.selected_key == "cleanup_card":
         _remove_card_reference(stdscr, state)
     else:
@@ -1754,7 +1975,10 @@ def _layout_menu(stdscr, state: dict) -> None:
                 JTTLayoutStoreError):
             state["jtt_notice"] = "폴더를 만들지 못했습니다 · 작업공간 상태를 다시 확인하세요."
     elif action == "create_window":
-        name = prompt_text(stdscr, "새 Window 이름: ")
+        name = prompt_text(
+            stdscr, "새 Window 이름: ",
+            initial=_suggest_window_name(expected_layout, selected_folder["id"]),
+        )
         if not name:
             return
         try:
@@ -1810,10 +2034,22 @@ def _layout_target_unchanged(state: dict, expected_workspace: dict, expected_lay
 
 def _select_layout_target(state: dict, kind: str, *, folder_id: str,
                           window_id: str = "") -> None:
+    if kind == "logical_folder":
+        try:
+            workspace, layout, _workspaces = _workspace_layout(state)
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+                JTTLayoutStoreError):
+            state["jtt_layout_error"] = True
+            return
+        if any(item["id"] == folder_id for item in layout.get("folders", ())):
+            _replace_workspace_layout_choices(state, workspace, layout)
+            state["selected_folder_id"] = folder_id
+            state["active_panel"] = 0
+        return
     workspace, layout, _workspaces = _workspace_layout(state)
-    item_id = window_id if kind == "logical_window" else folder_id
-    choice_id = f"{'window' if kind == 'logical_window' else 'folder'}:{workspace['id']}:{item_id}"
-    choice = next((item for item in _layout_choices(workspace["id"], layout)
+    choice_id = f"window:{workspace['id']}:{window_id}"
+    choice = next((item for item in _layout_choices(workspace["id"], layout,
+                                                    state.get("jtt_registry"))
                    if item["id"] == choice_id), None)
     if choice is None:
         state["jtt_layout_error"] = True
@@ -1829,7 +2065,7 @@ def _reconcile_committed_layout(state: dict, workspace_id: str, kind: str,
         workspace, layout, _workspaces = _workspace_layout(state, workspace_id)
         choice_id = (f"folder:{workspace_id}:{item_id}" if kind == "logical_folder"
                      else f"window:{workspace_id}:{item_id}")
-        choices = _layout_choices(workspace_id, layout)
+        choices = _layout_choices(workspace_id, layout, state.get("jtt_registry"))
         choice = next((entry for entry in choices if entry["id"] == choice_id), None)
         if choice is None:
             choice = next(entry for entry in choices
@@ -1837,6 +2073,10 @@ def _reconcile_committed_layout(state: dict, workspace_id: str, kind: str,
         _replace_workspace_layout_choices(state, workspace, layout,
                                           selected_choice_id=choice["id"])
         _attach_layout_choice(state, choice)
+        if kind == "logical_folder" and any(
+                folder["id"] == item_id for folder in layout["folders"]):
+            state["selected_folder_id"] = item_id
+            state["active_panel"] = 0
         return not state.get("jtt_layout_error", False)
     except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
             JTTLayoutStoreError):
@@ -1862,7 +2102,9 @@ def _pick_layout_item(stdscr, state: dict, layout: dict, action: str) -> None:
         items = [(item["id"], item["name"]) for item in layout["folders"]]
         title = "폴더 선택"
     else:
-        items = [(item["id"], f"{item['folder_name']} / {item['name']} · {len(item['terminal_ids'])}개")
+        labels = {item["window_id"]: item["label"] for item in
+                  _layout_choices(state["workspace_id"], layout, state.get("jtt_registry"))}
+        items = [(item["id"], labels.get(item["id"], item["name"]))
                  for item in layout["windows"]]
         title = "Window 선택"
     result = run_list_picker(stdscr, title, items, centered=True,
@@ -1875,12 +2117,14 @@ def _pick_layout_item(stdscr, state: dict, layout: dict, action: str) -> None:
         )
     if current is None:
         return
-    choice = next((item for item in _layout_choices(state["workspace_id"], layout)
-                   if (item["kind"] == "logical_folder" if action == "select_folder"
-                       else item["kind"] == "logical_window")
-                   and item.get("folder_id") == (current["id"] if action == "select_folder"
-                                                   else current["folder_id"])
-                   and (action == "select_folder" or item.get("window_id") == current["id"])), None)
+    if action == "select_folder":
+        state["selected_folder_id"] = current["id"]
+        state["jtt_notice"] = f"폴더 선택 · 새 Window 위치: {current['name']}"
+        state["jtt_notice_until"] = 0.0
+        return
+    choice = next((item for item in _layout_choices(
+        state["workspace_id"], layout, state.get("jtt_registry"))
+        if item.get("kind") == "logical_window" and item.get("window_id") == current["id"]), None)
     if choice is not None:
         _attach_layout_choice(state, choice)
 
@@ -2202,7 +2446,8 @@ def _select_created_terminal(state: dict, session_id: str) -> None:
                           and session_id in item["terminal_ids"]), None)
     if target_window is None:
         target_window = layout["windows"][0]
-    choice = next((item for item in _layout_choices(workspace_id, layout)
+    choice = next((item for item in _layout_choices(workspace_id, layout,
+                                                    state.get("jtt_registry"))
                    if item.get("kind") == "logical_window"
                    and item.get("window_id") == target_window["id"]), None)
     if choice is None:
@@ -2291,7 +2536,11 @@ def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
 
 
 def _activate_jtt_action(stdscr, state: dict, choice: dict) -> None:
-    if choice.get("id") == "action:work-kit-create":
+    if choice.get("id") == "action:new-window":
+        _create_logical_window(stdscr, state)
+    elif choice.get("id") == "action:archive":
+        _archive_menu(stdscr, state)
+    elif choice.get("id") == "action:work-kit-create":
         _create_work_kit(stdscr, state)
     elif choice.get("id") == "action:save":
         _save_configuration(stdscr, state)
@@ -2299,6 +2548,63 @@ def _activate_jtt_action(stdscr, state: dict, choice: dict) -> None:
         _settings_menu(stdscr, state)
     elif choice.get("id") == "action:layout":
         _layout_menu(stdscr, state)
+
+
+def _create_logical_window(stdscr, state: dict) -> None:
+    """Create only logical Window metadata; never creates or connects a PTY."""
+    if state.get("work_kit_preview") is not None:
+        state["jtt_notice"] = (
+            "Work Kit 미리보기에서는 Window를 만들 수 없습니다 · 터미널은 실행되지 않았습니다."
+        )
+        state["jtt_notice_until"] = 0.0
+        return
+    try:
+        workspace, layout, _workspaces = _workspace_layout(state)
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+            JTTLayoutStoreError):
+        state["jtt_notice"] = "작업공간을 확인할 수 없어 새 Window를 만들지 않았습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    folders = {str(item["id"]): item for item in layout["folders"]}
+    folder_id = str(state.get("selected_folder_id") or "")
+    if folder_id not in folders:
+        selected = next((item for item in layout["windows"]
+                         if item["id"] == state.get("selected_window_id")), None)
+        folder_id = str((selected or {}).get("folder_id") or "folder-default")
+    if folder_id not in folders:
+        folder_id = str(layout["folders"][0]["id"])
+    suggested = _suggest_window_name(layout, folder_id)
+    name = prompt_text(stdscr, "새 Window 이름: ", initial=suggested)
+    if not name:
+        state["jtt_notice"] = "Window 생성을 취소했습니다 · 터미널은 실행되지 않았습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    try:
+        if not _layout_target_unchanged(state, workspace, layout):
+            raise JTTLayoutStoreError("Workspace layout changed")
+        created = state["jtt_layout_store"].create_window(workspace["id"], folder_id, name)
+        _select_layout_target(state, "logical_window", folder_id=created["folder_id"],
+                              window_id=created["id"])
+        state["active_panel"] = 0
+        state["jtt_notice"] = (
+            f"Window 생성 완료 · {created['name']} · 빈 논리 공간 · 터미널은 생성되지 않았습니다."
+        )
+    except JTTLayoutStoreCommittedDurabilityError as exc:
+        _reconcile_committed_layout(state, exc.workspace_id, "logical_window", exc.item_id)
+        state["jtt_notice"] = _committed_layout_notice("Window 생성", state)
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError,
+            JTTLayoutStoreError):
+        state["jtt_notice"] = "Window를 만들지 못했습니다 · 터미널은 생성되지 않았습니다."
+    state["jtt_notice_until"] = 0.0
+
+
+def _suggest_window_name(layout: dict, folder_id: str) -> str:
+    used_names = {str(item["name"]).casefold() for item in layout["windows"]
+                  if str(item["folder_id"]) == str(folder_id)}
+    suffix = 2
+    while f"window {suffix}".casefold() in used_names:
+        suffix += 1
+    return f"Window {suffix}"
 
 
 def _refresh_and_resize(state: dict, stdscr) -> None:

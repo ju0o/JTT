@@ -129,6 +129,31 @@ class JTTWorkspaceStore:
     def create_workspace(self, name: str) -> dict:
         return self.save_configuration("", name, ())
 
+    def rename_workspace(self, workspace_id: str, name: str, *,
+                         expected_snapshot: dict) -> dict:
+        """Rename one saved configuration without changing terminal references."""
+        safe_name = " ".join(str(name).split())
+        if not safe_name or len(safe_name) > 80 or "\x00" in safe_name:
+            raise WorkspaceStoreError("Invalid workspace name")
+        if workspace_id == self.DEFAULT_ID:
+            raise WorkspaceStoreError("The default workspace cannot be renamed")
+        with state_write_lock(self.root, self._ensure_private_root, WorkspaceStoreError):
+            values = self.workspaces()
+            matches = [item for item in values if item["id"] == workspace_id]
+            if len(matches) != 1 or not matches[0].get("saved"):
+                raise WorkspaceStoreError("Saved workspace no longer exists")
+            target = matches[0]
+            if not _workspace_snapshot_matches(target, expected_snapshot):
+                raise WorkspaceStoreError("Workspace changed before rename")
+            target["name"] = safe_name
+            try:
+                self._write(values)
+            except WorkspaceStoreCommittedDurabilityError as exc:
+                raise WorkspaceStoreCommittedDurabilityError(
+                    str(exc), record_id=target["id"],
+                ) from exc
+            return dict(target)
+
     def delete_workspace(self, workspace_id: str, *, expected_snapshot: dict) -> dict:
         """Delete one saved workspace and preserve terminal references atomically.
 
