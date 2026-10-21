@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,69 @@ pytestmark = [pytest.mark.skipif(not Path("/bin/bash").exists(),
                                  reason="bash fixture requires /bin/bash")]
 
 
+def _drain_pty_until_eof(fd: int, consume, timeout: float) -> tuple[int, bool]:
+    """Collect bytes queued on a PTY master until its slave closes."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    total = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return total, False
+        try:
+            ready, _, _ = select.select([fd], [], [], min(0.05, remaining))
+        except InterruptedError:
+            continue
+        if not ready:
+            continue
+        try:
+            data = os.read(fd, 65536)
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                return total, True
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                continue
+            raise
+        if not data:
+            return total, True
+        consume(data)
+        total += len(data)
+
+
+def _assert_output_drain_complete(ui) -> None:
+    assert ui.output_drain_complete, (
+        "JTT exited but PTY output did not reach EOF within the drain deadline: "
+        f"exit_status={ui.exit_status}, captured_bytes={len(ui.raw)}, "
+        f"bytes_after_reap={ui.output_bytes_after_exit}"
+    )
+
+
+def test_pty_drain_collects_final_bytes_after_child_exit():
+    """Bytes queued before exit remain readable after waitpid reaps the child."""
+    master_fd, slave_fd = pty.openpty()
+    expected = b"queued-before-exit:\x1b[?1049l"
+    chunks = []
+    pid = os.fork()
+    if pid == 0:
+        os.close(master_fd)
+        try:
+            os.write(slave_fd, expected)
+        finally:
+            os.close(slave_fd)
+        os._exit(0)
+
+    os.close(slave_fd)
+    try:
+        waited, status = os.waitpid(pid, 0)
+        assert waited == pid
+        assert os.waitstatus_to_exitcode(status) == 0
+        drained, reached_eof = _drain_pty_until_eof(master_fd, chunks.append, 1.0)
+        assert reached_eof
+        assert drained == len(expected)
+        assert b"".join(chunks) == expected
+    finally:
+        os.close(master_fd)
+
+
 class _Screen:
     def getmaxyx(self):
         return (45, 160)
@@ -46,6 +110,10 @@ class _UIProcess:
 
         self.pid, self.fd = pty.fork()
         self.raw = bytearray()
+        self.exit_status: int | None = None
+        self.output_bytes_at_exit: int | None = None
+        self.output_bytes_after_exit = 0
+        self.output_drain_complete = False
         if self.pid == 0:
             env = {
                 "PATH": os.defpath,
@@ -77,24 +145,45 @@ class _UIProcess:
             return
         try:
             data = os.read(self.fd, 65536)
-        except OSError:
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                self.output_drain_complete = True
+                return
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return
+            raise
+        if not data:
+            self.output_drain_complete = True
             return
-        if data:
-            self.raw.extend(data)
-            self.stream.feed(data.decode("utf-8", errors="replace"))
+        self.raw.extend(data)
+        self.stream.feed(data.decode("utf-8", errors="replace"))
 
     def text(self) -> str:
         return "\n".join(self.screen.display)
 
-    def exit(self, timeout: float = 5.0) -> int:
+    def exit(self, timeout: float = 5.0, drain_timeout: float = 1.0) -> int:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            self.pump()
+            self.pump(min(0.05, max(0.0, deadline - time.monotonic())))
             waited, status = os.waitpid(self.pid, os.WNOHANG)
             if waited:
+                self.output_bytes_at_exit = len(self.raw)
+                self.exit_status = os.waitstatus_to_exitcode(status)
                 self.pid = -1
-                return os.waitstatus_to_exitcode(status)
-        raise AssertionError("JTT curses process did not exit")
+                break
+        if self.exit_status is None:
+            raise AssertionError(
+                "JTT curses process did not exit before timeout: "
+                f"pid={self.pid}, timeout={timeout:.2f}s, captured_bytes={len(self.raw)}"
+            )
+        if not self.output_drain_complete:
+            self.output_bytes_after_exit, self.output_drain_complete = _drain_pty_until_eof(
+                self.fd,
+                lambda data: (self.raw.extend(data),
+                              self.stream.feed(data.decode("utf-8", errors="replace"))),
+                drain_timeout,
+            )
+        return self.exit_status
 
     def terminate(self) -> None:
         if self.pid > 0:
@@ -121,6 +210,10 @@ class _RawUIProcess:
     def __init__(self, runtime_root: Path, source_root: Path, *, height: int, width: int):
         self.pid, self.fd = pty.fork()
         self.raw = bytearray()
+        self.exit_status: int | None = None
+        self.output_bytes_at_exit: int | None = None
+        self.output_bytes_after_exit = 0
+        self.output_drain_complete = False
         if self.pid == 0:
             env = {
                 "PATH": os.defpath,
@@ -150,23 +243,41 @@ class _RawUIProcess:
             return
         try:
             data = os.read(self.fd, 65536)
-        except OSError:
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                self.output_drain_complete = True
+                return
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return
+            raise
+        if not data:
+            self.output_drain_complete = True
             return
-        if data:
-            self.raw.extend(data)
+        self.raw.extend(data)
 
     def text(self) -> str:
         return self.raw.decode("utf-8", errors="replace")
 
-    def exit(self, timeout: float = 5.0) -> int:
+    def exit(self, timeout: float = 5.0, drain_timeout: float = 1.0) -> int:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            self.pump()
+            self.pump(min(0.05, max(0.0, deadline - time.monotonic())))
             waited, status = os.waitpid(self.pid, os.WNOHANG)
             if waited:
+                self.output_bytes_at_exit = len(self.raw)
+                self.exit_status = os.waitstatus_to_exitcode(status)
                 self.pid = -1
-                return os.waitstatus_to_exitcode(status)
-        raise AssertionError("JTT curses process did not exit")
+                break
+        if self.exit_status is None:
+            raise AssertionError(
+                "JTT curses process did not exit before timeout: "
+                f"pid={self.pid}, timeout={timeout:.2f}s, captured_bytes={len(self.raw)}"
+            )
+        if not self.output_drain_complete:
+            self.output_bytes_after_exit, self.output_drain_complete = _drain_pty_until_eof(
+                self.fd, self.raw.extend, drain_timeout
+            )
+        return self.exit_status
 
     def terminate(self) -> None:
         if self.pid > 0:
@@ -408,6 +519,7 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
             ui.send(b"\x1b")  # Close the help dialog, not the JTT UI.
             ui.send(b"\x07d")  # Only the explicit prefix command detaches.
             assert ui.exit() == 0
+            _assert_output_drain_complete(ui)
             assert b"\x1b[?1049l" in ui.raw
         finally:
             ui.terminate()
@@ -426,6 +538,7 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
             assert "Fixture B" in ui.text()
             ui.send(b"\x07d")
             assert ui.exit() == 0
+            _assert_output_drain_complete(ui)
             assert b"\x1b[?1049l" in ui.raw
         finally:
             ui.terminate()
@@ -559,6 +672,7 @@ def test_real_curses_launch_and_prefix_detach_does_not_autostart_a_shell(monkeyp
         assert not (root / "state").exists()
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         assert b"\x1b[?1049l" in ui.raw
         assert not (root / "state").exists()
         ui.terminate()
@@ -604,6 +718,7 @@ def test_real_curses_flat_window_create_and_archive_route_create_no_pty(
         ui.pump(0.05)
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         assert b"\x1b[?1049l" in ui.raw
         assert registry.list_sessions() == ()
     finally:
@@ -664,6 +779,7 @@ def test_real_curses_work_kit_archive_create_and_preview_never_starts_shells(mon
 
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         assert b"\x1b[?1049l" in ui.raw
         assert registry.list_sessions() == ()
     finally:
@@ -714,6 +830,7 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
         _wait_for_ui_text(ui, "관찰 중")
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         ui = None
         assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
             (session_id, shell_pid)
@@ -733,6 +850,7 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
         # Prefix detach releases only the UI client and leaves the shell alive.
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         ui = None
         assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
             (session_id, shell_pid)
@@ -747,6 +865,7 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
         ]
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         ui = None
         assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
             (session_id, shell_pid)
