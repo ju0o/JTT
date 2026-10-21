@@ -21,7 +21,7 @@ def test_unqualified_tmux_commands_are_pinned_and_can_only_stop_the_private_serv
     assert created.returncode == 0, created.stderr
     path = tmux_test_safety.socket_path
     assert path.exists() and stat.S_ISSOCK(path.lstat().st_mode)
-    assert path.stat().st_uid == os.geteuid()
+    assert path.stat().st_uid == os.getuid()
 
     stopped = subprocess.run(
         ["tmux", "kill-server"], capture_output=True, text=True, timeout=10, check=False,
@@ -99,3 +99,15 @@ def test_explicit_helper_drops_inherited_tmux_routing(monkeypatch, tmux_test_saf
     assert tmux_test_safety.socket_path.exists()
     assert run_isolated_tmux("kill-server").returncode == 0
     assert not tmux_test_safety.socket_path.exists()
+
+
+def test_test_teardown_uses_real_file_owner_not_application_uid_mock(
+        monkeypatch, tmux_test_safety):
+    created = run_isolated_tmux(
+        "new-session", "-d", "-s", "uid-mock", "sleep", "30",
+    )
+    assert created.returncode == 0, created.stderr
+
+    # Some application tests monkeypatch os.geteuid globally via the shared
+    # os module. Cleanup must validate actual filesystem ownership instead.
+    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 10000)

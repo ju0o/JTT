@@ -45,11 +45,11 @@ def _validate_root(root: Path) -> None:
         marker_stat = (root / _MARKER).lstat()
     except OSError as exc:
         raise TmuxSafetyError("refused tmux: test root marker is unavailable") from exc
-    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.geteuid():
+    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.getuid():
         raise TmuxSafetyError("refused tmux: test root is not owned by this user")
     if stat.S_IMODE(root_stat.st_mode) & 0o077:
         raise TmuxSafetyError("refused tmux: test root permissions are not private")
-    if (not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_uid != os.geteuid()
+    if (not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_uid != os.getuid()
             or stat.S_IMODE(marker_stat.st_mode) & 0o077
             or (root / _MARKER).read_bytes() != _MARKER_CONTENT):
         raise TmuxSafetyError("refused tmux: test root marker is invalid")
@@ -72,7 +72,7 @@ def _validate_socket_path(path: Path, root: Path, *, must_exist: bool) -> Path:
                 raise TmuxSafetyError("refused tmux: socket directory is missing")
             parent = parent.parent
             continue
-        if (not stat.S_ISDIR(item.st_mode) or item.st_uid != os.geteuid()
+        if (not stat.S_ISDIR(item.st_mode) or item.st_uid != os.getuid()
                 or stat.S_IMODE(item.st_mode) & 0o077):
             raise TmuxSafetyError("refused tmux: socket directory is not private and owned")
         parent = parent.parent
@@ -82,7 +82,7 @@ def _validate_socket_path(path: Path, root: Path, *, must_exist: bool) -> Path:
         if must_exist:
             raise TmuxSafetyError("refused tmux: expected test socket is missing")
         return lexical
-    if (not stat.S_ISSOCK(item.st_mode) or item.st_uid != os.geteuid()
+    if (not stat.S_ISSOCK(item.st_mode) or item.st_uid != os.getuid()
             or stat.S_IMODE(item.st_mode) & 0o022):
         raise TmuxSafetyError("refused tmux: socket type or owner is invalid")
     return lexical
@@ -123,7 +123,7 @@ def _server_pid(binary: str, socket_path: Path, root: Path, *, env=None) -> int:
         raise TmuxSafetyError("refused tmux shutdown: isolated server did not identify itself")
     pid = int(result.stdout.strip())
     uid, _start, _state = _process_identity(pid)
-    if uid != os.geteuid():
+    if uid != os.getuid():
         raise TmuxSafetyError("refused tmux shutdown: server is owned by another user")
     return pid
 
@@ -447,12 +447,12 @@ class IsolatedTmuxTestRoot:
             pass
         else:
             paths.append(self.socket_path)
-        socket_dir = self.root / ("tmux-" + str(os.geteuid()))
+        socket_dir = self.root / ("tmux-" + str(os.getuid()))
         try:
             item = socket_dir.lstat()
         except FileNotFoundError:
             return paths
-        if (not stat.S_ISDIR(item.st_mode) or item.st_uid != os.geteuid()
+        if (not stat.S_ISDIR(item.st_mode) or item.st_uid != os.getuid()
                 or stat.S_IMODE(item.st_mode) & 0o077):
             raise TmuxSafetyError("refused tmux cleanup: named-socket directory is not private")
         try:
@@ -469,13 +469,13 @@ class IsolatedTmuxTestRoot:
         leftovers = self._socket_paths()
         if leftovers:
             raise TmuxSafetyError("isolated tmux sockets remain; sandbox retained")
-        socket_dir = self.root / ("tmux-" + str(os.geteuid()))
+        socket_dir = self.root / ("tmux-" + str(os.getuid()))
         try:
             item = socket_dir.lstat()
         except FileNotFoundError:
             item = None
         if item is not None:
-            if (not stat.S_ISDIR(item.st_mode) or item.st_uid != os.geteuid()
+            if (not stat.S_ISDIR(item.st_mode) or item.st_uid != os.getuid()
                     or stat.S_IMODE(item.st_mode) & 0o077):
                 raise TmuxSafetyError("refused tmux cleanup: named-socket directory changed")
             try:
@@ -484,7 +484,7 @@ class IsolatedTmuxTestRoot:
                 pass
         shim_stat = self.shim.lstat()
         marker_stat = self.marker.lstat()
-        if shim_stat.st_uid != os.geteuid() or marker_stat.st_uid != os.geteuid():
+        if shim_stat.st_uid != os.getuid() or marker_stat.st_uid != os.getuid():
             raise TmuxSafetyError("test artifacts changed owner; sandbox retained")
         self.shim.unlink()
         self.bin_dir.rmdir()

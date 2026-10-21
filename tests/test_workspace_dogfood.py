@@ -30,7 +30,7 @@ def _private_tmux_socket(socket_root: Path) -> Path:
     socket_path = socket_root / "server.sock"
     assert socket_path.exists(), socket_path
     assert stat.S_ISSOCK(socket_path.lstat().st_mode), socket_path
-    assert socket_path.stat().st_uid == os.geteuid(), socket_path
+    assert socket_path.stat().st_uid == os.getuid(), socket_path
     return socket_path
 
 
