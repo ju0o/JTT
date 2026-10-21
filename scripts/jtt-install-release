@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+python_bin=${PYTHON:-python3}
+
+if ! command -v "$python_bin" >/dev/null 2>&1; then
+    printf '%s\n' "Python 3을 찾지 못했습니다. 공식 Release 설치에는 Python 3.9 이상이 필요합니다." >&2
+    exit 2
+fi
+
+# This command accepts only a clean checkout at an exact, published GitHub
+# Release tag. The module independently verifies that the tag resolves to the
+# same commit before creating a versioned install or PATH launcher.
+exec env PYTHONNOUSERSITE=1 PYTHONPATH="$repo_dir/src" \
+    "$python_bin" -m tmux_agent_tower.jtt_update install-release \
+    --source "$repo_dir"

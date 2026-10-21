@@ -7,17 +7,53 @@ Each terminal owns a local PTY and shell; the selected terminal is rendered
 and operated directly in the RIGHT panel. JTT has no hosted service and does
 not manage Agent accounts, prompts, or model APIs.
 
-## Current JTT RC
+## Install and run JTT
 
-This repository also retains the earlier tmux Agent monitor. The standalone
-JTT application is the separate `jtt` command; the existing `tower` command
-and its legacy behavior are unchanged.
+This repository also retains the earlier tmux Agent monitor. JTT is the
+separate `jtt` command; the existing `tower` command and its legacy update
+path are unchanged.
 
-For a source checkout, run `./scripts/jtt-setup-dev` to create/use the
-checkout-local `.venv-jtt` and install dependencies, then run
-`./scripts/jtt-dev`. Setup is explicit and may contact the configured Python
-package index; JTT startup does not install packages. Opening JTT does not
-create a shell. Use the explicit new-terminal action when one is wanted.
+### Development checkout
+
+From a JTT checkout, explicitly prepare its private Python environment and
+install a checkout-pinned development launcher:
+
+```sh
+./scripts/jtt-setup-dev
+./scripts/jtt-install-dev
+jtt
+```
+
+The launcher installs only at `~/.local/bin/jtt`. It refuses an unrelated
+`jtt` command and never edits shell startup files. If `~/.local/bin` is not on
+your PATH, use `export PATH="$HOME/.local/bin:$PATH"` for the current shell;
+review any permanent shell-profile change yourself. `jtt --version` labels
+this as `DEV`; `jtt update` is disabled for checkouts. The older
+`scripts/jtt-dev` and `scripts/jtt-setup-dev` remain available. Setup is
+explicit and may use the configured Python package index; normal JTT startup
+does not install packages.
+
+### Official Release
+
+JTT is currently under **Release HOLD**. Do not treat a Draft PR or a source
+branch as an installable Release. After a JTT version has been published, use
+its exact tag in a clean checkout and run the verified bootstrap installer:
+
+```sh
+git clone --branch <published-JTT-tag> --depth 1 https://github.com/ju0o/tmux-agent-tower.git jtt-release
+cd jtt-release
+./scripts/jtt-install-release
+```
+
+The installer verifies that the clean checkout is exactly the commit attached
+to a published GitHub Release, asks before writing, and refuses an existing
+`jtt` PATH command. It does not modify Tower's `tower` launcher, shell
+profiles, JTT workspaces, or running sessions. See
+[`docs/JTT_UPDATING.md`](docs/JTT_UPDATING.md) for the update and rollback
+contract. The current release process has not been performed.
+
+Opening JTT does not create a shell. Use the explicit new-terminal action when
+one is wanted.
 
 JTT keys: within 4 seconds after `Ctrl+G`, `n` creates a terminal; `h`/`l`
 changes cards; `w` focuses the workspace panel; `x` opens a cancel-first

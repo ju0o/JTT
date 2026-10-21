@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+python_bin="$repo_dir/.venv-jtt/bin/python"
+
+if [ ! -x "$python_bin" ]; then
+    printf '%s\n' "JTT 전용 개발 Python 환경이 없습니다." \
+        "먼저 명시적으로 실행하세요: $repo_dir/scripts/jtt-setup-dev" >&2
+    exit 2
+fi
+
+if ! env PYTHONNOUSERSITE=1 PYTHONPATH="$repo_dir/src" "$python_bin" - <<'PY'
+try:
+    import pyte
+    screen = pyte.Screen(4, 2)
+    stream = pyte.Stream(screen)
+    stream.feed("\x1b[H JTT")
+    if "JTT" not in "".join(screen.display):
+        raise RuntimeError("VT renderer smoke test failed")
+except Exception as exc:
+    print("JTT pyte check failed ({})".format(type(exc).__name__))
+    raise SystemExit(1)
+PY
+then
+    printf '%s\n' "pyte를 확인하지 못해 JTT 명령을 설치하지 않았습니다." \
+        "복구하려면 명시적으로 실행하세요: $repo_dir/scripts/jtt-setup-dev" >&2
+    exit 2
+fi
+
+exec env PYTHONNOUSERSITE=1 PYTHONPATH="$repo_dir/src" \
+    "$python_bin" -m tmux_agent_tower.jtt_install \
+    --source "$repo_dir" --python "$python_bin"
