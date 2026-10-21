@@ -499,24 +499,18 @@ def test_collapse_hides_children_and_search_keeps_the_window(tmp_path, monkeypat
     assert render.display_width("├─ ") == render.display_width("└─ ")
 
 
-def test_live_session_tree_is_readable_and_does_not_focus():
-    import subprocess
-
+def test_live_session_tree_is_readable_and_does_not_focus(tmux_test_safety):
+    from tmux_test_safety import run_isolated_tmux
     from tmux_agent_tower.control.actions import enter_intent
 
-    def tmux(*args):
-        return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False)
-
-    if tmux("-V").returncode != 0:
-        return
-    before = tmux("list-windows", "-t", "0", "-F", "#{window_id}")
-    if before.returncode != 0:
-        return
-    listed = tmux(
+    session = "navigator-live-fixture"
+    created = run_isolated_tmux("new-session", "-d", "-s", session, "sleep", "60")
+    assert created.returncode == 0, created.stderr
+    before = run_isolated_tmux("list-windows", "-t", session, "-F", "#{window_id}")
+    listed = run_isolated_tmux(
         "list-panes",
         "-s",
-        "-t",
-        "0",
+        "-t", session,
         "-F",
         "#{window_id}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_index}\t#{pane_current_command}",
     )
@@ -528,7 +522,7 @@ def test_live_session_tree_is_readable_and_does_not_focus():
                 "kind": "pane",
                 "key": pane_id,
                 "pane_id": pane_id,
-                "session": "0",
+                "session": session,
                 "window_id": window_id,
                 "window_index": index,
                 "window_name": name,
@@ -548,7 +542,7 @@ def test_live_session_tree_is_readable_and_does_not_focus():
     pane = next(row for row in rows if row["kind"] == "pane")
     assert enter_intent(pane) == "control"
     assert pane["guide"]
-    after = tmux("list-windows", "-t", "0", "-F", "#{window_id}")
+    after = run_isolated_tmux("list-windows", "-t", session, "-F", "#{window_id}")
     assert after.stdout == before.stdout
 
 

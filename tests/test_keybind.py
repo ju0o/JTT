@@ -258,7 +258,15 @@ def test_install_for_user_keeps_the_live_custom_binding(monkeypatch, tmp_path):
     assert applied[-1][-1] == "choose-tree -Zw"
 
 
-def test_configured_server_keeps_a_sourced_binding_and_ignores_the_tower_block(tmp_path):
+def test_configured_server_keeps_a_sourced_binding_and_ignores_the_tower_block(
+        tmp_path, monkeypatch, tmux_test_safety):
+    original_named_temporary_file = keybind.tempfile.NamedTemporaryFile
+
+    def private_temporary_file(*args, **kwargs):
+        kwargs.setdefault("dir", tmux_test_safety.root)
+        return original_named_temporary_file(*args, **kwargs)
+
+    monkeypatch.setattr(keybind.tempfile, "NamedTemporaryFile", private_temporary_file)
     conf = tmp_path / "tmux.conf"
     conf.write_text(
         "bind-key -T prefix w display-message kept\n" + keybind.render_block("choose-tree -Zw"),

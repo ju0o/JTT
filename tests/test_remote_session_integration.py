@@ -11,17 +11,16 @@ never touched. Skipped when tmux is not installed.
 import json
 import os
 import shutil
-import subprocess
 import threading
 import urllib.error
 import urllib.request
-import uuid
 
 import pytest
 
 from tmux_agent_tower.server import httpapi, service
 from tmux_agent_tower.tmux import capture as tmux_capture
 from tmux_agent_tower.ui import tower as tower_module
+from tmux_test_safety import run_isolated_tmux
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
 
@@ -29,23 +28,13 @@ SESSION = "scratch-A"
 
 
 @pytest.fixture
-def private_tmux(tmp_path, monkeypatch):
-    socket_dir = tmp_path / f"tmux-{uuid.uuid4().hex[:8]}"
-    socket_dir.mkdir()
-    monkeypatch.setenv("TMUX_TMPDIR", str(socket_dir))
-    monkeypatch.delenv("TMUX", raising=False)
-    monkeypatch.delenv("TMUX_PANE", raising=False)
-    created = subprocess.run(
-        ["tmux", "new-session", "-d", "-s", SESSION, "-x", "80", "-y", "24", "sleep 300"],
-        capture_output=True, text=True, timeout=10, check=False,
+def private_tmux(tmux_test_safety):
+    created = tmux_test_safety.run(
+        "new-session", "-d", "-s", SESSION, "-x", "80", "-y", "24", "sleep 300",
     )
     if created.returncode != 0:
         pytest.skip(f"could not start a private tmux server: {created.stderr.strip()}")
-
-    try:
-        yield socket_dir
-    finally:
-        subprocess.run(["tmux", "kill-server"], capture_output=True, timeout=10, check=False)
+    return tmux_test_safety
 
 
 @pytest.fixture
@@ -69,8 +58,8 @@ def isolated(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _kill_session(_socket_dir):
-    subprocess.run(["tmux", "kill-session", "-t", f"={SESSION}"], capture_output=True, timeout=10, check=False)
+def _kill_session(test_tmux):
+    run_isolated_tmux("kill-session", "-t", f"={SESSION}", timeout=10)
 
 
 def _get(srv, path, token):
