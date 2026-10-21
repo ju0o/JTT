@@ -1241,14 +1241,18 @@ def _archive_visual_screen(stdscr, saved: list[dict], kits: list[dict], *,
                 for offset, line in enumerate(details[:max(0, height - preview_y - 7)]):
                     safe_add(stdscr, preview_y + 1 + offset, 2, line, curses.A_DIM)
                 action_y = max(preview_y + 2, height - 5)
+                columns = max(1, min(4, (width - 4) // 22))
+                cell_width = max(1, (width - 4) // columns)
                 for index, (_action, label) in enumerate(actions):
-                    x = 2 + index * max(10, min(19, width // max(1, len(actions))))
-                    if x >= width - 2:
-                        break
-                    safe_add(stdscr, action_y + index // 4, x, f"[{label}]",
+                    row, column = divmod(index, columns)
+                    x = 2 + column * cell_width
+                    y = action_y + row
+                    button = truncate_to_width(f"[{label}]", max(1, cell_width - 1))
+                    safe_add(stdscr, y, x, button,
                              curses.A_REVERSE if focus == "actions" and index == action_index else 0)
-                    hit_boxes.append((x, action_y + index // 4, max(5, display_width(label) + 2), 1,
-                                      "action", index))
+                    rendered_width = min(display_width(button), max(0, width - x))
+                    if rendered_width:
+                        hit_boxes.append((x, y, rendered_width, 1, "action", index))
             else:
                 left_width = max(30, min(48, width // 3))
                 safe_add(stdscr, 2, 2, "항목", curses.A_UNDERLINE)
@@ -1411,9 +1415,13 @@ def _edit_work_kit(stdscr, state: dict, original: dict | None) -> None:
             if original is not None:
                 state["jtt_archive_selected_kit_id"] = original["id"]
             return
-        if key == "\t" or key == curses.KEY_BTAB:
+        if key == "\t":
             focus = {"cards": "actions", "actions": "name", "name": "description",
                      "description": "cards"}.get(focus, "cards")
+            continue
+        if key == curses.KEY_BTAB:
+            focus = {"cards": "description", "description": "name", "name": "actions",
+                     "actions": "cards"}.get(focus, "cards")
             continue
         if key in (curses.KEY_UP, curses.KEY_DOWN) and focus == "cards":
             selected = min(len(draft["terminals"]) - 1,

@@ -634,6 +634,29 @@ def test_visual_work_kit_edit_uses_snapshot_and_preserves_template_identity(tmp_
     assert state["jtt_registry"].created == 0
 
 
+def test_visual_work_kit_editor_shift_tab_moves_backward_and_escape_discards(
+        tmp_path, monkeypatch):
+    workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+    kit_store = JTTWorkKitStore(workspace_store.root)
+    kit = kit_store.create_kit("Editable", "Original description", _specs(1))
+    before = kit_store.path.read_bytes()
+    state = jtt.build_state(workspace_store, FakeRegistry())
+    screen = FakeCursesScreen([curses.KEY_BTAB, "\n", "\x1b"])
+    prompts = []
+
+    def prompt(_screen, label, **_kwargs):
+        prompts.append(label)
+        return "Edited description"
+
+    monkeypatch.setattr(jtt, "prompt_text", prompt)
+    jtt._edit_work_kit(screen, state, kit)
+
+    assert prompts == ["한 줄 설명: "]
+    assert kit_store.path.read_bytes() == before
+    assert kit_store.kits() == [kit]
+    assert state["jtt_registry"].created == 0
+
+
 def test_work_kit_directory_browser_uses_safe_local_listing_and_validation(tmp_path, monkeypatch):
     root = tmp_path / "folders"
     child = root / "project"
@@ -671,6 +694,31 @@ def test_archive_visual_tabs_selection_and_mouse_action(tmp_path, monkeypatch):
     assert result == ("preview_kit", kit["id"])
     assert "[ Work Kit ]" in screen.text()
     assert "No execution" in screen.text()
+
+
+def test_archive_narrow_fifth_workspace_action_has_matching_mouse_hitbox(monkeypatch, tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    screen = FakeCursesScreen(
+        [curses.KEY_MOUSE], height=24, width=80,
+    )
+    # At 80 columns the fifth action is rendered in row 2, column 2.
+    # Click inside its visible label, not the former off-screen position.
+    monkeypatch.setattr(
+        curses, "getmouse",
+        lambda: (0, 28, 20, 0, curses.BUTTON1_CLICKED),
+    )
+
+    result = jtt._archive_visual_screen(
+        screen, [], [], return_default=True,
+    )
+
+    assert result == ("save", None)
+    assert any(y == 20 and x == 27 and text == "[현재 구성 저장]"
+               for y, x, text in screen.writes)
+    # The visible fifth button and its click box occupy the same row/column.
+    # The action selection above would not occur if the hit box were detached
+    # from the rendered cell.
+    assert store.workspaces()[0]["id"] == store.DEFAULT_ID
 
 
 def test_work_kit_create_reports_committed_when_directory_sync_fails(tmp_path, monkeypatch):
