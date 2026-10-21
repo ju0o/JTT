@@ -45,6 +45,13 @@ cd jtt-release
 ./scripts/jtt-install-release
 ```
 
+JTT will use product-specific tags: `jtt-vMAJOR.MINOR.PATCH` for stable and
+`jtt-vMAJOR.MINOR.PATCH-rcN` for RC. The legacy Tower tag `v0.3.0-rc2` is not
+a JTT release, even though both commands currently come from the same Python
+distribution and their numeric package versions can overlap. JTT verification
+requires the namespaced tag, matching package metadata, and its `jtt` entry
+point; the installed sidecar is also recorded as `product: jtt`.
+
 The installer verifies that the clean checkout is exactly the commit attached
 to a published GitHub Release, asks before writing, and refuses an existing
 `jtt` PATH command. It does not modify Tower's `tower` launcher, shell

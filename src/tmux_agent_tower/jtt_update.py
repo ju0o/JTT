@@ -26,6 +26,9 @@ from typing import Callable
 from . import __version__, update_manager as releases
 from .jtt_install import OFFICIAL_MARKER, installation_kind, inspect_official_launcher, source_checkout_root
 
+JTT_RELEASE_NAMESPACE = "jtt-"
+JTT_RELEASE_TAG_PREFIX = "jtt-v"
+
 
 class JTTUpdateError(RuntimeError):
     def __init__(self, code: str, message: str):
@@ -335,15 +338,16 @@ def _read_release_record(directory: Path) -> dict | None:
         value = _private_json(marker)
         if value.get("product") != "jtt":
             return None
-        parsed = releases.parse_version(value.get("version", ""))
-        parsed_tag = releases.parse_version(value.get("tag", ""), tag=True)
+        parsed_tag = _parse_jtt_tag(value.get("tag", ""))
+        parsed_version = releases.parse_version(value.get("version", ""))
         sha = value.get("commit_sha", "")
         python = value.get("python", "")
         site = value.get("site", "")
-        expected_name = f"{parsed.package}-{str(sha)[:12]}"
+        expected_name = f"{parsed_version.package}-{str(sha)[:12]}"
         if (
-            parsed_tag.package != parsed.package
-            or parsed_tag.key != parsed.key
+            parsed_tag.package != parsed_version.package
+            or parsed_tag.key != parsed_version.key
+            or value.get("channel") not in ("stable", "rc")
             or parsed_tag.prerelease != (value.get("channel") == "rc")
             or not releases._SHA_RE.fullmatch(str(sha))
             or not Path(python).is_file()
@@ -353,7 +357,7 @@ def _read_release_record(directory: Path) -> dict | None:
             return None
         if not Path(site).is_dir() or not _path_owned_private(Path(site)):
             return None
-        return {**value, "_key": parsed.key}
+        return {**value, "_key": parsed_version.key}
     except (JTTUpdateError, releases.UpdateError, OSError, TypeError, ValueError):
         return None
 
@@ -583,7 +587,7 @@ def apply_update(
 
 def _validate_release(release: releases.Release) -> None:
     try:
-        tag_version = releases.parse_version(release.tag, tag=True)
+        tag_version = _parse_jtt_tag(release.tag)
         version = releases.parse_version(release.package_version)
     except releases.UpdateError as exc:
         raise JTTUpdateError("UNVERIFIED_RELEASE", "The selected JTT Release has an invalid tag or version.") from exc
@@ -594,6 +598,104 @@ def _validate_release(release: releases.Release) -> None:
         or not releases._SHA_RE.fullmatch(str(release.commit_sha))
     ):
         raise JTTUpdateError("UNVERIFIED_RELEASE", "The selected JTT Release tag, channel, version, and commit do not agree.")
+
+
+def _parse_jtt_tag(tag: str) -> releases.Version:
+    """Parse a product-scoped JTT tag; legacy Tower semver tags are excluded."""
+
+    if not isinstance(tag, str) or not tag.startswith(JTT_RELEASE_TAG_PREFIX):
+        raise releases.UpdateError("JTT_TAG_REQUIRED", "JTT Releases must use the jtt-v<version> tag namespace.")
+    return releases.parse_version(tag[len(JTT_RELEASE_NAMESPACE):], tag=True)
+
+
+def _parse_jtt_release_item(item: dict) -> releases.Release | None:
+    if not isinstance(item, dict):
+        raise releases.UpdateError("INVALID_RELEASE_METADATA", "GitHub returned a non-object release entry.")
+    tag = item.get("tag_name")
+    if not isinstance(tag, str):
+        raise releases.UpdateError("INVALID_RELEASE_METADATA", "GitHub release has no valid tag_name.")
+    if not tag.startswith(JTT_RELEASE_NAMESPACE):
+        # The repository also publishes legacy Tower Releases. Their tags do
+        # not enter JTT version selection, even when they have newer semver.
+        return None
+    try:
+        version = _parse_jtt_tag(tag)
+    except releases.UpdateError as exc:
+        raise releases.UpdateError("INVALID_JTT_RELEASE_TAG", "A JTT Release has an invalid product-scoped tag.") from exc
+    if item.get("draft") is True:
+        return None
+    if item.get("draft") is not False:
+        raise releases.UpdateError("INVALID_RELEASE_METADATA", "JTT Release is missing a valid draft flag.")
+    if not isinstance(item.get("published_at"), str) or not item["published_at"]:
+        raise releases.UpdateError("INVALID_RELEASE_METADATA", "JTT Release is not published.")
+    prerelease = item.get("prerelease")
+    if not isinstance(prerelease, bool) or prerelease != version.prerelease:
+        raise releases.UpdateError("INVALID_RELEASE_METADATA", "JTT Release channel metadata conflicts with its tag.")
+    return releases.Release(tag, version.package, prerelease, version.key)
+
+
+def _select_jtt_release(release_items, channel: str) -> releases.Release:
+    if channel not in ("stable", "rc"):
+        raise releases.UpdateError("INVALID_CHANNEL", f"Unsupported JTT release channel: {channel}")
+    candidates = [
+        release for item in release_items
+        if (release := _parse_jtt_release_item(item)) is not None
+        and release.prerelease == (channel == "rc")
+    ]
+    if not candidates:
+        raise releases.UpdateError("NO_RELEASE", f"No published JTT {channel} Release is available.")
+    newest_key = max(release.key for release in candidates)
+    newest = [release for release in candidates if release.key == newest_key]
+    if len({release.tag for release in newest}) != 1:
+        raise releases.UpdateError("AMBIGUOUS_RELEASE", "Multiple JTT Releases have the same version.")
+    return newest[0]
+
+
+def check_for_updates(current_version: str, requested_channel: str = "auto", fetch_json: Callable = releases._api_json) -> releases.UpdateStatus:
+    """Select only published product-scoped JTT Releases and verify the Git tag."""
+
+    current = releases.parse_version(current_version)
+    if requested_channel not in ("auto", "stable", "rc"):
+        raise releases.UpdateError("INVALID_CHANNEL", f"Unsupported JTT release channel: {requested_channel}")
+    records = fetch_json("/releases?per_page=100")
+    if not isinstance(records, list):
+        raise releases.UpdateError("INVALID_GITHUB_RESPONSE", "GitHub Releases response is not a list.")
+    channel = releases.default_channel(current_version) if requested_channel == "auto" else requested_channel
+    latest = _select_jtt_release(records, channel)
+    commit_sha = releases._tag_commit(latest.tag, fetch_json)
+    latest = releases.Release(latest.tag, latest.package_version, latest.prerelease, latest.key, commit_sha)
+    return releases.UpdateStatus(current, channel, latest, latest.key > current.key, tuple(records))
+
+
+def verify_bootstrap(root: Path, version: str, release_items, fetch_json: Callable = releases._api_json) -> releases.Release:
+    """Verify a clean checkout at a published, product-scoped JTT tag."""
+
+    if releases._checkout_dirty(root) is not False:
+        raise JTTUpdateError("BOOTSTRAP_DIRTY", "Use a fresh, clean checkout of an official published JTT Release.")
+    try:
+        tag = releases._git_value(root, "describe", "--tags", "--exact-match", "HEAD")
+        tagged_version = _parse_jtt_tag(tag)
+        expected_version = releases.parse_version(version)
+    except releases.UpdateError as exc:
+        code = "JTT_BOOTSTRAP_TAG_REQUIRED" if exc.code == "JTT_TAG_REQUIRED" else "BOOTSTRAP_TAG_INVALID"
+        raise JTTUpdateError(code, "Bootstrap requires an exact jtt-v<version> Release tag.") from exc
+    if tagged_version.package != expected_version.package:
+        raise JTTUpdateError("BOOTSTRAP_VERSION_MISMATCH", "The JTT checkout version does not match its product Release tag.")
+    matching = [
+        release for item in release_items
+        if (release := _parse_jtt_release_item(item)) is not None and release.tag == tag
+    ]
+    if len(matching) != 1:
+        raise JTTUpdateError("BOOTSTRAP_NOT_PUBLISHED", "The JTT tag is not a unique published JTT Release.")
+    try:
+        remote_commit = releases._tag_commit(tag, fetch_json)
+        local_commit = releases._git_value(root, "rev-parse", "HEAD")
+    except releases.UpdateError as exc:
+        raise JTTUpdateError("BOOTSTRAP_NOT_VERIFIED", "The JTT Release tag could not be resolved safely.") from exc
+    if remote_commit != local_commit:
+        raise JTTUpdateError("BOOTSTRAP_COMMIT_MISMATCH", "The checkout does not match the published JTT tag commit.")
+    release = matching[0]
+    return releases.Release(tag, release.package_version, release.prerelease, release.key, remote_commit)
 
 
 def _current_is_dev() -> bool:
@@ -633,7 +735,7 @@ def run_update_cli(
         return 2
     current_version = (current_facts or {}).get("version", __version__)
     try:
-        status = releases.check_for_updates(current_version, requested_channel, fetch_json)
+        status = check_for_updates(current_version, requested_channel, fetch_json)
     except releases.UpdateError as exc:
         print(f"{exc.code}: {exc}", file=error)
         if exc.code == "OFFLINE":
@@ -785,9 +887,9 @@ def install_release_checkout(
     if not isinstance(releases_list, list):
         raise JTTUpdateError("INVALID_GITHUB_RESPONSE", "GitHub Releases response is not a list.")
     try:
-        release = releases.verify_bootstrap(root, version, releases_list, fetch_json)
-    except releases.UpdateError as exc:
-        raise JTTUpdateError(exc.code, str(exc)) from exc
+        release = verify_bootstrap(root, version, releases_list, fetch_json)
+    except (JTTUpdateError, releases.UpdateError) as exc:
+        raise JTTUpdateError(getattr(exc, "code", "BOOTSTRAP_NOT_VERIFIED"), str(exc)) from exc
     python = python or sys.executable
     target_launcher = (Path(home) if home is not None else Path.home()) / ".local" / "bin" / "jtt"
     existing_command = path_lookup("jtt")

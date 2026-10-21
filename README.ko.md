@@ -43,6 +43,12 @@ cd jtt-release
 ./scripts/jtt-install-release
 ```
 
+JTT는 Stable에 `jtt-v주버전.부버전.수정버전`, RC에
+`jtt-v주버전.부버전.수정버전-rc번호` 태그를 사용합니다. 기존 Tower 태그
+`v0.3.0-rc2`는 JTT Release가 아닙니다. 두 명령이 현재 같은 Python 배포 패키지에서
+빌드되어 숫자 버전이 겹칠 수 있지만, JTT 설치 검증은 제품 태그, 일치하는 패키지
+메타데이터, `jtt` 진입점 및 `product: jtt` 설치 기록을 함께 확인합니다.
+
 설치기는 체크아웃이 공개 GitHub Release의 정확한 커밋인지 확인하고, 파일을 쓰기
 전에 사용자 확인을 받습니다. PATH에 이미 `jtt` 명령이 있으면 덮어쓰지 않습니다.
 기존 `tower` 런처, 셸 설정 파일, JTT 작업공간이나 실행 중인 세션도 변경하지

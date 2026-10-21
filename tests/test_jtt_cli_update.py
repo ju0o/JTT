@@ -5,13 +5,14 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 
 import pytest
 
 from tmux_agent_tower import jtt, jtt_diagnostics, jtt_install, jtt_update, update_manager
 
 
-def _release(tag="v0.3.1-rc0", version="0.3.1rc0", sha="a" * 40, prerelease=True):
+def _release(tag="jtt-v0.3.1-rc0", version="0.3.1rc0", sha="a" * 40, prerelease=True):
     parsed = update_manager.parse_version(version)
     return update_manager.Release(tag, version, prerelease, parsed.key, sha)
 
@@ -67,8 +68,100 @@ def test_release_channel_selection_skips_drafts_and_resolves_tag_commit():
     assert rc.latest.commit_sha == "b" * 40
 
 
+def test_jtt_release_selection_ignores_tower_semver_releases():
+    records = [
+        _published("v99.0.0-rc9", True),
+        _published("jtt-v0.3.0-rc2", True),
+        _published("jtt-v0.4.0-rc1", True),
+        _published("jtt-v0.4.0", False),
+    ]
+    fetch = _fake_release_api(records)
+
+    rc = jtt_update.check_for_updates("0.3.0rc2", "rc", fetch)
+    stable = jtt_update.check_for_updates("0.3.0rc2", "stable", fetch)
+
+    assert (rc.latest.tag, rc.latest.package_version, rc.latest.commit_sha) == (
+        "jtt-v0.4.0-rc1", "0.4.0rc1", "c" * 40,
+    )
+    assert (stable.latest.tag, stable.latest.package_version) == ("jtt-v0.4.0", "0.4.0")
+    assert update_manager.select_release(records, "rc").tag == "v99.0.0-rc9"
+
+
+def test_jtt_update_has_no_candidate_when_only_legacy_tower_releases_exist():
+    fetch = _fake_release_api([_published("v99.0.0-rc9", True)])
+    with pytest.raises(update_manager.UpdateError) as error:
+        jtt_update.check_for_updates("0.3.0rc2", "rc", fetch)
+    assert error.value.code == "NO_RELEASE"
+
+
+def test_jtt_release_channel_flag_must_match_namespaced_tag():
+    mismatched = [_published("jtt-v0.4.0-rc1", False)]
+    with pytest.raises(update_manager.UpdateError) as error:
+        jtt_update.check_for_updates("0.3.0rc2", "rc", _fake_release_api(mismatched))
+    assert error.value.code == "INVALID_RELEASE_METADATA"
+
+
+def test_jtt_bootstrap_requires_product_namespaced_tag(monkeypatch, tmp_path):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    monkeypatch.setattr(update_manager, "_checkout_dirty", lambda _root: False)
+    monkeypatch.setattr(update_manager, "_git_value", lambda _root, *args: "v0.3.0-rc2" if args[0] == "describe" else "a" * 40)
+
+    with pytest.raises(jtt_update.JTTUpdateError) as error:
+        jtt_update.verify_bootstrap(
+            root, "0.3.0rc2", [_published("v0.3.0-rc2", True)],
+            _fake_release_api([_published("v0.3.0-rc2", True)]),
+        )
+
+    assert error.value.code == "JTT_BOOTSTRAP_TAG_REQUIRED"
+
+
+def test_jtt_bootstrap_accepts_matching_jtt_tag_not_neighboring_tower_tag(monkeypatch, tmp_path):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    records = [_published("v0.3.0-rc2", True), _published("jtt-v0.3.0-rc2", True)]
+    fetch = _fake_release_api(records)
+    selected_sha = "b" * 40
+    monkeypatch.setattr(update_manager, "_checkout_dirty", lambda _root: False)
+    monkeypatch.setattr(
+        update_manager, "_git_value",
+        lambda _root, *args: "jtt-v0.3.0-rc2" if args[0] == "describe" else selected_sha,
+    )
+    fetch = lambda path: (
+        {"ref": "refs/tags/jtt-v0.3.0-rc2", "object": {"type": "commit", "sha": selected_sha}}
+        if path == "/git/ref/tags/jtt-v0.3.0-rc2" else records if path == "/releases?per_page=100" else None
+    )
+
+    verified = jtt_update.verify_bootstrap(root, "0.3.0rc2", records, fetch)
+
+    assert (verified.tag, verified.package_version, verified.commit_sha) == (
+        "jtt-v0.3.0-rc2", "0.3.0rc2", selected_sha,
+    )
+
+
+def test_jtt_bootstrap_rejects_package_version_that_differs_from_tag(monkeypatch, tmp_path):
+    root = tmp_path / "checkout"
+    root.mkdir()
+    selected_sha = "b" * 40
+    records = [_published("jtt-v0.3.1-rc0", True)]
+    fetch = lambda path: (
+        {"ref": "refs/tags/jtt-v0.3.1-rc0", "object": {"type": "commit", "sha": selected_sha}}
+        if path == "/git/ref/tags/jtt-v0.3.1-rc0" else records if path == "/releases?per_page=100" else None
+    )
+    monkeypatch.setattr(update_manager, "_checkout_dirty", lambda _root: False)
+    monkeypatch.setattr(
+        update_manager, "_git_value",
+        lambda _root, *args: "jtt-v0.3.1-rc0" if args[0] == "describe" else selected_sha,
+    )
+
+    with pytest.raises(jtt_update.JTTUpdateError) as error:
+        jtt_update.verify_bootstrap(root, "0.3.0rc2", records, fetch)
+
+    assert error.value.code == "BOOTSTRAP_VERSION_MISMATCH"
+
+
 def test_update_check_and_dry_run_do_not_write_files(tmp_path, monkeypatch):
-    records = [_published("v0.3.1-rc0", True)]
+    records = [_published("jtt-v0.3.1-rc0", True)]
     fetch = _fake_release_api(records)
     launcher = tmp_path / "bin" / "jtt"
     installation = {"managed": True, "kind": "official", "launcher": launcher}
@@ -90,7 +183,7 @@ def test_update_check_and_dry_run_do_not_write_files(tmp_path, monkeypatch):
 
 
 def test_update_apply_requires_exact_interactive_confirmation(tmp_path, monkeypatch, capsys):
-    records = [_published("v0.3.1-rc0", True)]
+    records = [_published("jtt-v0.3.1-rc0", True)]
     monkeypatch.setattr(jtt_update, "_current_is_dev", lambda: False)
     installation = {"managed": True, "kind": "official", "launcher": tmp_path / "jtt"}
     result = jtt_update.run_update_cli(
@@ -101,6 +194,27 @@ def test_update_apply_requires_exact_interactive_confirmation(tmp_path, monkeypa
     text = capsys.readouterr().out.lower()
     assert "confirmation was not provided" in text or "no files changed" in text
     assert not (tmp_path / "data").exists()
+
+
+def test_confirmed_update_dispatches_only_namespaced_jtt_release(tmp_path, monkeypatch):
+    records = [_published("v99.0.0-rc9", True), _published("jtt-v0.4.0-rc1", True)]
+    monkeypatch.setattr(jtt_update, "_current_is_dev", lambda: False)
+    installation = {"managed": True, "kind": "official", "launcher": tmp_path / "jtt"}
+    applied = []
+    monkeypatch.setattr(
+        jtt_update, "apply_update",
+        lambda release, _installation, **_kwargs: applied.append(release) or {"version": release.package_version, "backup": "kept"},
+    )
+
+    result = jtt_update.run_update_cli(
+        "apply", current_facts={"version": "0.3.0rc2"}, installation=installation,
+        fetch_json=_fake_release_api(records), confirm=lambda _prompt: "yes",
+        output=io.StringIO(), error=io.StringIO(), root=tmp_path / "isolated-store",
+    )
+
+    assert result == 0
+    assert len(applied) == 1
+    assert applied[0].tag == "jtt-v0.4.0-rc1"
 
 
 def _managed_launcher(tmp_path, version="0.3.0rc2"):
@@ -163,7 +277,7 @@ def test_verified_release_sidecar_switch_and_rollback_preserve_previous_version(
     old_site = old_version / "site"
     old_site.mkdir(mode=0o700)
     old_record = {
-        "schema_version": 1, "product": "jtt", "tag": "v0.3.0-rc2", "version": "0.3.0rc2",
+        "schema_version": 1, "product": "jtt", "tag": "jtt-v0.3.0-rc2", "version": "0.3.0rc2",
         "channel": "rc", "commit_sha": "b" * 40, "python": sys_executable(),
         "site": str(old_site), "installed_at": "2026-10-20T00:00:00Z",
     }
@@ -244,9 +358,51 @@ def test_staging_publish_refuses_existing_sidecar_without_replacing_it(tmp_path)
 
 
 def test_unverified_release_tag_is_rejected_before_install(tmp_path):
-    bad = _release(tag="v0.3.2-rc0", version="0.3.1rc0")
+    bad = _release(tag="jtt-v0.3.2-rc0", version="0.3.1rc0")
     with pytest.raises(jtt_update.JTTUpdateError, match="tag, channel, version"):
         jtt_update._validate_release(bad)
+
+
+def test_jtt_release_validation_requires_namespaced_tag():
+    legacy_tower_release = _release(tag="v0.4.0-rc1", version="0.4.0rc1")
+    with pytest.raises(jtt_update.JTTUpdateError, match="invalid tag or version"):
+        jtt_update._validate_release(legacy_tower_release)
+    noncanonical_jtt_release = _release(tag="jtt-0.4.0-rc1", version="0.4.0rc1")
+    with pytest.raises(jtt_update.JTTUpdateError, match="invalid tag or version"):
+        jtt_update._validate_release(noncanonical_jtt_release)
+
+
+def _synthetic_release_site(tmp_path, *, module_version="0.3.1rc0", metadata_version="0.3.1rc0", entry="tmux_agent_tower.jtt:cli"):
+    site = tmp_path / "site"
+    package = site / "tmux_agent_tower"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(f"__version__ = {module_version!r}\n", encoding="utf-8")
+    dist = site / f"tmux_agent_tower-{metadata_version}.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: tmux-agent-tower\nVersion: {metadata_version}\n\n",
+        encoding="utf-8",
+    )
+    (dist / "entry_points.txt").write_text(f"[console_scripts]\njtt = {entry}\n", encoding="utf-8")
+    return site
+
+
+def test_release_package_identity_requires_version_metadata_and_jtt_entrypoint(tmp_path):
+    release = _release(tag="jtt-v0.3.1-rc0", version="0.3.1rc0", sha="c" * 40)
+    matching_site = _synthetic_release_site(tmp_path / "matching")
+    jtt_update._verify_package(matching_site, sys_executable(), release)
+
+    mismatched_site = _synthetic_release_site(
+        tmp_path / "mismatch", module_version="0.3.0rc2", metadata_version="0.3.0rc2",
+    )
+    with pytest.raises(jtt_update.JTTUpdateError, match="verified JTT version and entry point"):
+        jtt_update._verify_package(mismatched_site, sys_executable(), release)
+
+    wrong_entry_site = _synthetic_release_site(
+        tmp_path / "wrong-entry", entry="tmux_agent_tower.main:cli",
+    )
+    with pytest.raises(jtt_update.JTTUpdateError, match="verified JTT version and entry point"):
+        jtt_update._verify_package(wrong_entry_site, sys_executable(), release)
 
 
 def test_dev_launcher_installs_only_when_no_command_conflicts(tmp_path):
@@ -386,8 +542,8 @@ def test_official_installer_refuses_existing_path_command_before_writing(tmp_pat
     root.mkdir()
     foreign = tmp_path / "existing-jtt"
     foreign.write_text("keep me", encoding="utf-8")
-    release = _release(tag="v0.3.0-rc2", version="0.3.0rc2", sha="b" * 40)
-    monkeypatch.setattr(update_manager, "verify_bootstrap", lambda *_args: release)
+    release = _release(tag="jtt-v0.3.0-rc2", version="0.3.0rc2", sha="b" * 40)
+    monkeypatch.setattr(jtt_update, "verify_bootstrap", lambda *_args: release)
     with pytest.raises(jtt_update.JTTUpdateError, match="already on PATH"):
         jtt_update.install_release_checkout(
             root, fetch_json=lambda _path: [], confirm=lambda _prompt: "yes",
@@ -402,8 +558,8 @@ def test_official_bootstrap_installs_only_verified_release_sidecar(tmp_path, mon
     source = tmp_path / "clean-tag-checkout"
     source.mkdir(mode=0o700)
     home = tmp_path / "home"
-    selected = _release(tag="v0.3.0-rc2", version="0.3.0rc2", sha="b" * 40)
-    monkeypatch.setattr(update_manager, "verify_bootstrap", lambda _root, _version, _items, _fetch: selected)
+    selected = _release(tag="jtt-v0.3.0-rc2", version="0.3.0rc2", sha="b" * 40)
+    monkeypatch.setattr(jtt_update, "verify_bootstrap", lambda _root, _version, _items, _fetch: selected)
     output = io.StringIO()
     result = jtt_update.install_release_checkout(
         source,
@@ -431,6 +587,75 @@ def test_official_bootstrap_installs_only_verified_release_sidecar(tmp_path, mon
     assert stat.S_IMODE((version_dir / "release.json").stat().st_mode) == 0o600
     assert stat.S_IMODE(version_dir.stat().st_mode) == 0o700
     assert "JTT_HOME" in output.getvalue()
+
+
+def test_mocked_official_bootstrap_checks_exact_jtt_tag_and_package_metadata(tmp_path):
+    source = tmp_path / "tagged-source"
+    source.mkdir(mode=0o700)
+    (source / "pyproject.toml").write_text("[project]\nname='tmux-agent-tower'\nversion='0.3.0rc2'\n", encoding="utf-8")
+    package = source / "src" / "tmux_agent_tower"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("__version__ = '0.3.0rc2'\n", encoding="utf-8")
+    (package / "jtt.py").write_text("def cli(): return 0\n", encoding="utf-8")
+    git_env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
+    subprocess.run(["git", "-C", str(source), "init", "--quiet"], check=True, env=git_env)
+    subprocess.run(["git", "-C", str(source), "add", "pyproject.toml", "src"], check=True, env=git_env)
+    subprocess.run([
+        "git", "-C", str(source), "-c", "user.name=JTT Fixture", "-c",
+        "user.email=jtt-fixture@example.invalid", "commit", "--quiet", "-m", "fixture",
+    ], check=True, env=git_env)
+    subprocess.run([
+        "git", "-C", str(source), "-c", "tag.gpgSign=false", "tag", "jtt-v0.3.0-rc2",
+    ], check=True, env=git_env)
+    commit = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"], check=True, capture_output=True, text=True, env=git_env,
+    ).stdout.strip()
+    legacy = _published("v0.3.0-rc2", True)
+    jtt_release = _published("jtt-v0.3.0-rc2", True)
+    records = [legacy, jtt_release]
+
+    def fetch(path):
+        if path == "/releases?per_page=100":
+            return records
+        if path == "/git/ref/tags/jtt-v0.3.0-rc2":
+            return {"ref": "refs/tags/jtt-v0.3.0-rc2", "object": {"type": "commit", "sha": commit}}
+        raise AssertionError("unexpected mocked GitHub request")
+
+    def install_source(_checkout, site_dir, _python):
+        site_dir.mkdir(parents=True, mode=0o700)
+        pkg = site_dir / "tmux_agent_tower"
+        pkg.mkdir(mode=0o700)
+        (pkg / "__init__.py").write_text("__version__ = '0.3.0rc2'\n", encoding="utf-8")
+
+    result = jtt_update.install_release_checkout(
+        source, fetch_json=fetch, confirm=lambda _prompt: "yes", output=io.StringIO(),
+        error=io.StringIO(), home=tmp_path / "isolated-home", python=sys_executable(),
+        path_lookup=lambda _name: None, install_source=install_source,
+        verify_package=lambda _site, _python, release: (
+            pytest.fail("bootstrap selected the Tower release") if release.tag != "jtt-v0.3.0-rc2" else None
+        ),
+        run_version=lambda *_args, **_kwargs: True,
+    )
+
+    assert result["release"].tag == "jtt-v0.3.0-rc2"
+    assert result["release"].commit_sha == commit
+    assert result["launcher"].is_file()
+
+
+def test_tower_release_record_is_not_a_jtt_rollback_candidate(tmp_path):
+    versions = tmp_path / "versions"
+    versions.mkdir(mode=0o700)
+    release_dir = versions / ("0.3.0rc2-" + "b" * 12)
+    site = release_dir / "site"
+    site.mkdir(parents=True, mode=0o700)
+    jtt_update._write_json(release_dir / "release.json", {
+        "schema_version": 1, "product": "jtt", "tag": "v0.3.0-rc2", "version": "0.3.0rc2",
+        "channel": "rc", "commit_sha": "b" * 40, "python": sys_executable(),
+        "site": str(site), "installed_at": "2026-10-20T00:00:00Z",
+    })
+
+    assert jtt_update._read_release_record(release_dir) is None
+    assert jtt_update.managed_releases(tmp_path) == []
 
 
 def test_offline_check_does_not_create_install_or_touch_launcher(tmp_path, monkeypatch):
@@ -464,8 +689,8 @@ def test_bootstrap_candidate_failure_leaves_no_launcher_or_partial_candidate(tmp
     source = tmp_path / "tag-checkout"
     source.mkdir(mode=0o700)
     home = tmp_path / "home"
-    release = _release(tag="v0.3.0-rc2", version="0.3.0rc2", sha="b" * 40)
-    monkeypatch.setattr(update_manager, "verify_bootstrap", lambda *_args: release)
+    release = _release(tag="jtt-v0.3.0-rc2", version="0.3.0rc2", sha="b" * 40)
+    monkeypatch.setattr(jtt_update, "verify_bootstrap", lambda *_args: release)
 
     with pytest.raises(jtt_update.JTTUpdateError, match="failed validation"):
         jtt_update.install_release_checkout(

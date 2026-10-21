@@ -34,6 +34,15 @@ cd jtt-release
 ./scripts/jtt-install-release
 ```
 
+JTT 태그는 제품 접두어를 사용합니다. Stable은 `jtt-v주버전.부버전.수정버전`,
+RC는 `jtt-v주버전.부버전.수정버전-rc번호` 형식입니다. 예를 들어 태그의
+버전 부분 `v0.3.0-rc2`는 Python 패키지 버전 `0.3.0rc2`와 대응합니다.
+기존 Tower 태그 `v0.3.0-rc2`는 JTT Release 후보가 아닙니다. 현재 저장소는
+두 명령을 `tmux-agent-tower` 배포 패키지 하나로 빌드하므로 제품별 숫자 버전이
+겹칠 수 있습니다. JTT의 전체 식별은 `jtt-` 태그 접두어, 일치하는 패키지 버전,
+JTT console entry point, 비공개 설치 기록의 `product: jtt` 조합입니다.
+설치기와 업데이트기는 버전이 더 높아도 기존 Tower 태그를 거부합니다.
+
 부트스트랩은 태그 체크아웃이 깨끗한지, GitHub에 실제 공개된 Release와 일치하는지,
 태그가 가리키는 커밋이 같은지 확인한 다음 사용자 확인을 받습니다. 설치는
 `${XDG_DATA_HOME:-~/.local/share}/jtt/` 아래 새 버전 경로에 진행합니다.
@@ -55,8 +64,9 @@ cd jtt-release
 | `jtt rollback` | 대화형 확인 뒤 보존된 이전 Release로 복원합니다. |
 
 `--channel stable` 또는 `--channel rc`로 배포 흐름을 명시할 수 있습니다. 기본
-`auto`는 설치 버전의 흐름을 따릅니다. Draft, 임의 브랜치, 공개 Release가 없는
-태그, 잘못된 버전, 검증 커밋으로 해석되지 않는 태그는 거부합니다. 프로그램
+`auto`는 설치 버전의 흐름을 따릅니다. `jtt-v...` 네임스페이스의 공개 JTT Release만
+대상입니다. Draft, 기존 Tower 태그, 임의 브랜치, 공개 Release가 없는 태그,
+잘못된 버전·채널 조합, 검증 커밋으로 해석되지 않는 태그는 거부합니다. 프로그램
 소스는 검증된 Release 커밋에서 가져옵니다. 확인된 업데이트를 준비할 때 Python
 런타임 의존성은 설정된 pip 패키지 인덱스에서 받을 수 있습니다. 설치가 실패하면
 현재 런처를 유지합니다. 오프라인 또는 다운로드 실패에서도 버전을 전환하지
