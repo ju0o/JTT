@@ -47,6 +47,10 @@ class JTTWorkspaceStore:
 
     SCHEMA_VERSION = 1
     DEFAULT_ID = "workspace-default"
+    # One stable home for final references whose live state is uncertain.
+    # Entries in it are still ordinary workspace references; the registry and
+    # PTY data are never deleted by moving a card here.
+    RECOVERY_ID = "workspace-recovery"
 
     def __init__(self, root: str | Path | None = None):
         self.root = Path(root).expanduser() if root is not None else default_jtt_root()
@@ -193,8 +197,10 @@ class JTTWorkspaceStore:
         """Remove one workspace card reference without stopping its PTY.
 
         If this was the final reference, preserve the session ID in the default
-        workspace, or in a uniquely named recovery workspace when removing it
-        from the default workspace itself.
+        workspace, or in one stable recovery workspace when removing it from
+        the default workspace. Removing a reference from the recovery archive
+        is an explicit card-only cleanup; registry metadata and any process
+        remain untouched.
         """
         if not isinstance(terminal_id, str) or not terminal_id or "\x00" in terminal_id:
             raise WorkspaceStoreError("Invalid terminal ID")
@@ -215,7 +221,11 @@ class JTTWorkspaceStore:
                                 and terminal_id in item["terminal_ids"]]
             recovery_workspace_id = None
             if not other_references:
-                if workspace_id != self.DEFAULT_ID:
+                if workspace_id == self.RECOVERY_ID:
+                    # Explicit card-reference cleanup in the archive leaves no
+                    # workspace handle, but the registry/session record remains.
+                    pass
+                elif workspace_id != self.DEFAULT_ID:
                     default = next((item for item in values
                                     if item["id"] == self.DEFAULT_ID), None)
                     if default is None:
@@ -226,22 +236,59 @@ class JTTWorkspaceStore:
                         [*default["terminal_ids"], terminal_id]
                     ))
                 else:
-                    names = {item["name"].casefold() for item in values}
-                    recovery_name = "복구 보관함"
-                    suffix = 2
-                    while recovery_name.casefold() in names:
-                        recovery_name = f"복구 보관함 {suffix}"
-                        suffix += 1
-                    recovery_workspace_id = "workspace-" + secrets.token_hex(8)
-                    used_ids = {item["id"] for item in values}
-                    while recovery_workspace_id in used_ids:
-                        recovery_workspace_id = "workspace-" + secrets.token_hex(8)
-                    values.append({"id": recovery_workspace_id, "name": recovery_name,
-                                   "terminal_ids": [terminal_id], "saved": True})
+                    recovery = next((item for item in values
+                                     if item["id"] == self.RECOVERY_ID), None)
+                    if recovery is None:
+                        names = {item["name"].casefold() for item in values}
+                        recovery_name = "복구 보관함"
+                        if recovery_name.casefold() in names:
+                            recovery_name = "복구 보관함 · JTT"
+                        if recovery_name.casefold() in names:
+                            raise WorkspaceStoreError(
+                                "Recovery archive name conflicts with an existing workspace"
+                            )
+                        recovery = {"id": self.RECOVERY_ID, "name": recovery_name,
+                                    "terminal_ids": [], "saved": True}
+                        values.append(recovery)
+                    elif "복구 보관함" not in recovery["name"]:
+                        raise WorkspaceStoreError("Recovery archive identity conflicts")
+                    recovery["terminal_ids"] = list(dict.fromkeys(
+                        [*recovery["terminal_ids"], terminal_id]
+                    ))
+                    recovery_workspace_id = self.RECOVERY_ID
             self._write(values)
             return {"workspace_id": workspace_id, "terminal_id": terminal_id,
                     "recovery_workspace_id": recovery_workspace_id,
                     "preserved_elsewhere": bool(other_references)}
+
+    def forget_terminal_reference(self, workspace_id: str, terminal_id: str, *,
+                                  expected_snapshot: dict) -> dict:
+        """Forget one reference after the caller has re-confirmed normal exit.
+
+        This removes only the requested workspace reference. It does not
+        transfer it, delete registry metadata, stop a shell, or affect any
+        other workspace. UI callers must independently revalidate the exact
+        session ID, generation, PID, and exited state immediately beforehand.
+        """
+        if not isinstance(terminal_id, str) or not terminal_id or "\x00" in terminal_id:
+            raise WorkspaceStoreError("Invalid terminal ID")
+        with state_write_lock(self.root, self._ensure_private_root, WorkspaceStoreError):
+            values = self.workspaces()
+            matches = [item for item in values if item["id"] == workspace_id]
+            if len(matches) != 1:
+                raise WorkspaceStoreError("Workspace no longer exists")
+            source = matches[0]
+            if not _workspace_snapshot_matches(source, expected_snapshot):
+                raise WorkspaceStoreError("Workspace changed before reference cleanup")
+            if terminal_id not in source["terminal_ids"]:
+                raise WorkspaceStoreError("Terminal card is no longer in this workspace")
+            source["terminal_ids"] = [item for item in source["terminal_ids"]
+                                      if item != terminal_id]
+            self._write(values)
+            return {"workspace_id": workspace_id, "terminal_id": terminal_id,
+                    "remaining_references": sum(
+                        terminal_id in item["terminal_ids"] for item in values
+                    )}
 
     def set_terminal_ids(self, workspace_id: str, terminal_ids: Iterable[str]) -> None:
         with state_write_lock(self.root, self._ensure_private_root, WorkspaceStoreError):

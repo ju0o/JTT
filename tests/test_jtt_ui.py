@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import curses
 import os
 import stat
@@ -91,7 +91,9 @@ class FakeRegistry:
 
 def _identity(session_id, pid, generation, state="running", renderer_state="ready"):
     return TerminalIdentity(session_id, generation, 1000, "s1", pid, f"p{pid}",
-                             "/bin/bash", session_id, state, renderer_state=renderer_state)
+                             "/bin/bash", session_id, state,
+                             exit_code=0 if state == "exited" else None,
+                             renderer_state=renderer_state)
 
 
 class FakeScreen:
@@ -970,6 +972,220 @@ def test_supervisor_failure_is_not_reported_as_shell_exit(tmp_path):
     assert renderer._status(row) == "! Supervisor 연결 실패"
 
 
+@pytest.mark.parametrize(
+    ("identity_state", "view_state", "expected_label"),
+    [
+        ("orphaned", "orphaned", "Supervisor 종료 · 셸 상태 확인 필요"),
+        ("identity_mismatch", "identity_mismatch", "세션 신원 불일치 · 입력 차단"),
+        ("stopped", "orphaned", "Supervisor 종료 · 셸 상태 확인 필요"),
+        ("exited", "exited", "셸 종료"),
+    ],
+)
+def test_session_cards_do_not_conflate_orphan_identity_mismatch_and_normal_exit(
+    tmp_path, identity_state, view_state, expected_label,
+):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    registry = FakeRegistry([_identity("session-a", 101, "gen-a", identity_state)])
+    store.set_terminal_ids(store.DEFAULT_ID, ["session-a"])
+
+    state = jtt.build_state(store, registry)
+    row = state["panes"][0]
+
+    assert row["terminal_shell_state"] == identity_state
+    assert row["terminal_view_state"] == view_state
+    assert expected_label in renderer._status(row)
+    if identity_state != "exited":
+        assert row["status"] != "DEAD"
+        assert jtt._capture_stop_target(state) is None
+
+
+def test_restored_card_identity_change_closes_old_binding_and_blocks_silent_replacement(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    original = _identity("session-a", 101, "gen-a")
+    registry = FakeRegistry([original])
+    store.set_terminal_ids(store.DEFAULT_ID, [original.session_id])
+    state = jtt.build_state(store, registry)
+    old_client = registry.clients[original.session_id]
+    registry.identities = (_identity("session-a", 202, "gen-b"),)
+    choice = next(item for item in state["choices"]
+                  if item.get("kind") == "logical_window")
+
+    jtt._attach_layout_choice(state, choice)
+
+    row = state["panes"][0]
+    assert old_client.closed is True
+    assert row["managed_identity"]["generation"] == "gen-b"
+    assert row["terminal_view_state"] == "identity_mismatch"
+    assert row["status"] == "UNKNOWN"
+    assert registry.connected == ["session-a"]
+    assert jtt._capture_stop_target(state) is None
+    assert state["managed_identity_guards"]["session-a"]["generation"] == "gen-a"
+    assert jtt._capture_card_reference_target(state)["classification"] == "uncertain"
+
+    # Rebuilding the same Window must not replace the old observed identity
+    # with the registry's new generation; explicit recheck remains fail-closed.
+    jtt._attach_layout_choice(state, choice)
+    registry.connected.clear()
+    jtt._recheck_selected_terminal(state)
+    assert registry.connected == []
+    assert registry.created == 0
+    assert state["managed_identity_guards"]["session-a"]["generation"] == "gen-a"
+    assert "신원 불일치" in state["jtt_notice"]
+
+
+def test_prefix_r_rechecks_exact_identity_and_reconnects_without_creating_shell(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    identity = _identity("session-a", 101, "gen-a")
+    registry = FakeRegistry([identity])
+    store.set_terminal_ids(store.DEFAULT_ID, [identity.session_id])
+    registry.connect = lambda _session: (_ for _ in ()).throw(RuntimeError("fixture outage"))
+    state = jtt.build_state(store, registry)
+    assert state["panes"][0]["terminal_view_state"] == "supervisor_connection_failed"
+
+    client = FakeClient(identity)
+    registry.connect = lambda session_id: client if session_id == identity.session_id else None
+    assert _prefix(FakeScreen(), state, "r") is False
+
+    binding = state["managed_terminals"][identity.session_id]
+    assert binding.matches(state["panes"][0])
+    assert state["panes"][0]["terminal_view_state"] == "running_ready"
+    assert state["jtt_notice"] == "터미널 세션 신원(ID/generation/PID) 재검증 및 연결 완료."
+    assert registry.created == 0
+
+
+def test_prefix_r_blocks_changed_generation_or_pid_and_does_not_create_shell(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    identity = _identity("session-a", 101, "gen-a")
+    registry = FakeRegistry([identity])
+    store.set_terminal_ids(store.DEFAULT_ID, [identity.session_id])
+    registry.connect = lambda _session: (_ for _ in ()).throw(RuntimeError("fixture outage"))
+    state = jtt.build_state(store, registry)
+    replacement = _identity("session-a", 202, "replacement-generation")
+    registry.identities = (replacement,)
+    connected = []
+    registry.connect = lambda session_id: connected.append(session_id)
+
+    assert _prefix(FakeScreen(), state, "r") is False
+
+    assert connected == []
+    assert registry.created == 0
+    assert "신원 불일치" in state["jtt_notice"]
+    assert state["jtt_store"].workspaces()[0]["terminal_ids"] == [identity.session_id]
+    assert state["managed_identity_guards"][identity.session_id]["generation"] == "gen-a"
+
+    # A subsequent layout/window refresh must not silently adopt gen-b either.
+    choice = next(item for item in state["choices"] if item.get("kind") == "logical_window")
+    connected.clear()
+    jtt._attach_layout_choice(state, choice)
+    assert connected == []
+    assert state["panes"][0]["terminal_view_state"] == "identity_mismatch"
+
+
+def test_prefix_r_missing_session_keeps_reference_and_never_recreates(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    store.set_terminal_ids(store.DEFAULT_ID, ["a" * 32])
+    registry = FakeRegistry([])
+    state = jtt.build_state(store, registry)
+
+    assert _prefix(FakeScreen(), state, "r") is False
+
+    assert registry.created == 0
+    assert state["jtt_store"].workspaces()[0]["terminal_ids"] == ["a" * 32]
+    assert "새 셸은 만들지 않았습니다" in state["jtt_notice"]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"generation": "other-generation"},
+        {"shell_pid": 202},
+        {"shell_start": "reused-pid-start"},
+        {"supervisor_pid": 2020},
+        {"supervisor_start": "reused-supervisor-start"},
+    ],
+    ids=["generation", "shell-pid", "shell-start", "supervisor-pid", "supervisor-start"],
+)
+def test_prefix_r_rejects_client_identity_that_differs_from_registry(tmp_path, changes):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    identity = _identity("session-a", 101, "gen-a")
+    registry = FakeRegistry([identity])
+    store.set_terminal_ids(store.DEFAULT_ID, [identity.session_id])
+    registry.connect = lambda _session: (_ for _ in ()).throw(RuntimeError("fixture outage"))
+    state = jtt.build_state(store, registry)
+    wrong_client = FakeClient(replace(identity, **changes))
+    registry.connect = lambda _session: wrong_client
+
+    assert _prefix(FakeScreen(), state, "r") is False
+
+    assert wrong_client.closed is True
+    assert "신원 불일치" in state["jtt_notice"]
+    assert identity.session_id not in state["managed_terminals"]
+    assert state["jtt_store"].workspaces()[0]["terminal_ids"] == [identity.session_id]
+
+
+def test_recovery_archive_exited_card_can_be_pruned_without_stopping_or_dropping_other_refs(
+    tmp_path, monkeypatch,
+):
+    identity = _identity("session-a", 101, "gen-a", "exited")
+    state, registry = _exited_ready_state(tmp_path, identity)
+    monkeypatch.setattr(
+        jtt, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="remove"),
+    )
+    jtt._remove_card_reference(FakeScreen(), state)
+    assert registry.stop_calls == []
+    recovery = next(item for item in state["jtt_store"].workspaces()
+                    if item["id"] == state["jtt_store"].RECOVERY_ID)
+    assert identity.session_id in recovery["terminal_ids"]
+
+    # Simulate entering the existing recovery workspace through LEFT.
+    state["jtt_workspaces"] = state["jtt_store"].workspaces()
+    jtt._attach_choice(state, {"kind": "workspace", "id": state["jtt_store"].RECOVERY_ID})
+    other = state["jtt_store"].create_workspace("Other")
+    state["jtt_store"].set_terminal_ids(other["id"], [identity.session_id])
+    dialogs = []
+
+    def confirm(_screen, title, items, **kwargs):
+        dialogs.append((title, items, kwargs))
+        return SimpleNamespace(cancelled=False,
+                               selected_key="forget" if title == "종료 터미널 기록 정리" else "forget_exited")
+
+    monkeypatch.setattr(jtt, "run_list_picker", confirm)
+    jtt._settings_menu(FakeScreen(), state)
+
+    workspaces = {item["id"]: item for item in state["jtt_store"].workspaces()}
+    assert workspaces[state["jtt_store"].RECOVERY_ID]["terminal_ids"] == []
+    assert workspaces[other["id"]]["terminal_ids"] == [identity.session_id]
+    assert [item.session_id for item in registry.list_sessions()] == [identity.session_id]
+    assert registry.stop_calls == []
+    assert any(title == "종료 터미널 기록 정리" for title, _items, _kwargs in dialogs)
+
+
+def test_uncertain_recovery_card_can_be_removed_without_ending_or_deleting_session(
+        tmp_path, monkeypatch,
+):
+    identity = _identity("session-orphan", 303, "gen-orphan", "orphaned")
+    state, registry = _exited_ready_state(tmp_path, identity)
+    monkeypatch.setattr(
+        jtt, "run_list_picker",
+        lambda *_args, **_kwargs: SimpleNamespace(cancelled=False, selected_key="remove"),
+    )
+    jtt._remove_card_reference(FakeScreen(), state)
+    recovery = next(item for item in state["jtt_store"].workspaces()
+                    if item["id"] == state["jtt_store"].RECOVERY_ID)
+    assert recovery["terminal_ids"] == [identity.session_id]
+
+    jtt._attach_choice(state, {"kind": "workspace", "id": state["jtt_store"].RECOVERY_ID})
+
+    jtt._remove_card_reference(FakeScreen(), state)
+
+    assert all(identity.session_id not in item["terminal_ids"]
+               for item in state["jtt_store"].workspaces())
+    assert [item.session_id for item in registry.list_sessions()] == [identity.session_id]
+    assert registry.stop_calls == []
+    assert "계속 실행 중일 수 있습니다" in state["jtt_notice"]
+
+
 def test_bare_navigation_n_does_not_create_and_prefix_n_creates_one_then_acquires_once(tmp_path):
     store = JTTWorkspaceStore(tmp_path / "jtt")
     registry = FakeRegistry([])
@@ -1455,6 +1671,13 @@ def test_prefix_x_never_offers_exited_card_cleanup_for_uncertain_states(
     assert registry.stop_calls == []
     if identity.state in {"orphaned", "stopping", "exited"} or registry_override:
         assert dialogs == []
+        if identity.state == "exited" and identity.renderer_state != "ready":
+            # The shell exit is recorded, but a renderer failure keeps Ctrl+G x
+            # on the conservative path; Settings can still move only this card
+            # reference to the recovery archive after explicit confirmation.
+            target = jtt._capture_card_reference_target(state)
+            assert target is not None
+            assert target["classification"] == "uncertain"
     else:
         # The existing running-session stop confirmation may remain, but it is
         # never presented as exited-card cleanup.

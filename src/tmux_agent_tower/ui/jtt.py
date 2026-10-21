@@ -260,9 +260,12 @@ class ManagedTerminalBinding:
         if self.shell_state not in {"running", "active"}:
             self.synced = False
             self._revoke()
-            if self.shell_state in {"exited", "dead", "stopped"}:
+            if self.shell_state == "exited":
                 self.terminal_view_state = "exited"
                 self.status = "셸 종료"
+            elif self.shell_state in {"dead", "stopped"}:
+                self.terminal_view_state = "orphaned"
+                self.status = "Supervisor/셸 종료 경계 미확정 · 입력 차단"
             else:
                 self.terminal_view_state = "session_unavailable"
                 self.status = "셸 상태 확인 불가 · 입력 차단"
@@ -531,9 +534,51 @@ def _basic_color_index(value) -> int | None:
     return names.get(name), bright
 
 
+def _terminal_identity_matches(first, second) -> bool:
+    """Match a connected client to the registry's current full identity."""
+    try:
+        return (
+            str(getattr(first, "session_id", "")) == str(getattr(second, "session_id", ""))
+            and str(getattr(first, "generation", "")) == str(getattr(second, "generation", ""))
+            and int(getattr(first, "shell_pid", -1)) == int(getattr(second, "shell_pid", -2))
+            and int(getattr(first, "supervisor_pid", -1))
+                == int(getattr(second, "supervisor_pid", -2))
+            and str(getattr(first, "supervisor_start", ""))
+                == str(getattr(second, "supervisor_start", ""))
+            and str(getattr(first, "shell_start", ""))
+                == str(getattr(second, "shell_start", ""))
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _terminal_identity_snapshot(identity) -> dict:
+    """Keep the full observed process identity as an in-memory reconnect guard."""
+    try:
+        return {
+            "session_id": str(identity.session_id),
+            "generation": str(identity.generation),
+            "shell_pid": int(identity.shell_pid),
+            "shell_start": str(identity.shell_start),
+            "supervisor_pid": int(identity.supervisor_pid),
+            "supervisor_start": str(identity.supervisor_start),
+        }
+    except (AttributeError, TypeError, ValueError):
+        return {}
+
+
+def _terminal_identity_matches_snapshot(identity, snapshot: dict) -> bool:
+    return bool(snapshot) and _terminal_identity_matches(
+        identity,
+        SimpleNamespace(**snapshot),
+    )
+
+
 def _session_rows(registry: TerminalRegistry, workspace: dict,
                  clients: dict[str, ManagedTerminalBinding], *, attach: bool = True,
-                 keybindings=DEFAULT_JTT_KEYBINDINGS) -> list[dict]:
+                 keybindings=DEFAULT_JTT_KEYBINDINGS,
+                 identity_guards: dict[str, dict] | None = None) -> list[dict]:
+    identity_guards = identity_guards if identity_guards is not None else {}
     lookup_failed = False
     try:
         identities = {str(item.session_id): item for item in registry.list_sessions()}
@@ -544,36 +589,121 @@ def _session_rows(registry: TerminalRegistry, workspace: dict,
     for session_id in workspace.get("terminal_ids", ()):
         identity = identities.get(str(session_id))
         if identity is None:
+            missing_state = "supervisor_connection_failed" if lookup_failed else "session_unavailable"
+            if not lookup_failed:
+                inspect = getattr(registry, "inspect_reference", None)
+                if callable(inspect):
+                    try:
+                        inspected = inspect(str(session_id))
+                    except (OSError, RuntimeError, ValueError, TypeError):
+                        inspected = "registry_unavailable"
+                    missing_state = {
+                        "identity_mismatch": "identity_mismatch",
+                        "orphaned": "orphaned",
+                        "registry_unavailable": "supervisor_connection_failed",
+                        "not_found": "session_unavailable",
+                        "exited": "exited",
+                    }.get(str(inspected), "session_unavailable")
+            status_label = {
+                "identity_mismatch": "터미널 신원 불일치",
+                "orphaned": "Supervisor/셸 상태 확인 필요",
+                "supervisor_connection_failed": "Supervisor 상태 확인 실패",
+                "session_unavailable": "터미널 세션 없음",
+                "exited": "종료 확인된 터미널",
+            }.get(missing_state, "터미널 상태 확인 불가")
             rows.append({
                 "kind": "pane", "key": str(session_id), "target_id": str(session_id),
-                "display_name": "터미널 상태 확인 불가", "agent": "Generic Terminal", "status": "UNKNOWN",
+                "display_name": status_label, "agent": "Generic Terminal",
+                "status": "DEAD" if missing_state == "exited" else "UNKNOWN",
                 "stale": True, "_live_stale": True, "live_lines": [],
                 "terminal_kind": "tower_managed", "managed_id": str(session_id),
                 "managed_identity": {"session_id": str(session_id)},
                 "terminal_shell_state": "unknown", "terminal_renderer_state": "unknown",
-                "terminal_view_state": "supervisor_connection_failed" if lookup_failed else "session_unavailable",
-                "terminal_preview": "세션 조회 불가",
+                "terminal_view_state": missing_state,
+                "terminal_preview": status_label,
             })
             continue
         binding = clients.get(str(session_id))
-        if attach and (binding is None or not binding.matches({
-            "managed_id": str(session_id),
-            "managed_identity": {"session_id": str(identity.session_id),
-                                 "generation": str(identity.generation),
-                                 "shell_pid": int(identity.shell_pid)},
-        })):
+        identity_conflict = str(session_id) in identity_guards
+        if binding is not None and not _terminal_identity_matches(
+                getattr(binding, "identity", None), identity):
+            observed = _terminal_identity_snapshot(getattr(binding, "identity", None))
+            if observed:
+                identity_guards.setdefault(str(session_id), observed)
+            identity_conflict = True
+            if clients.get(str(session_id)) is binding:
+                clients.pop(str(session_id), None)
+            try:
+                binding.close()
+            except (OSError, RuntimeError, ValueError):
+                pass
+            binding = None
+        elif binding is not None and binding.closed:
+            if clients.get(str(session_id)) is binding:
+                clients.pop(str(session_id), None)
+            binding = None
+        shell_state = str(getattr(identity, "state", "unknown")).lower()
+        if shell_state in {"orphaned", "identity_mismatch"} and binding is not None:
+            if shell_state == "identity_mismatch":
+                observed = _terminal_identity_snapshot(getattr(binding, "identity", None))
+                if observed:
+                    identity_guards.setdefault(str(session_id), observed)
+                identity_conflict = True
+            elif str(session_id) not in identity_guards:
+                observed = _terminal_identity_snapshot(
+                    getattr(binding, "identity", None)
+                )
+                if observed:
+                    identity_guards[str(session_id)] = observed
+            if clients.get(str(session_id)) is binding:
+                clients.pop(str(session_id), None)
+            try:
+                binding.close()
+            except (OSError, RuntimeError, ValueError):
+                pass
+            binding = None
+        if identity_conflict and binding is not None:
+            if clients.get(str(session_id)) is binding:
+                clients.pop(str(session_id), None)
+            try:
+                binding.close()
+            except (OSError, RuntimeError, ValueError):
+                pass
+            binding = None
+        if (attach and binding is None and not identity_conflict
+                and str(getattr(identity, "state", "unknown")).lower() in {"running", "exited"}):
             try:
                 client = registry.connect(str(session_id))
-                binding = ManagedTerminalBinding(client, client.identity, keybindings=keybindings)
-                clients[str(session_id)] = binding
+                connected = getattr(client, "identity", None)
+                same_identity = _terminal_identity_matches(connected, identity)
+                if same_identity:
+                    binding = ManagedTerminalBinding(client, connected, keybindings=keybindings)
+                    clients[str(session_id)] = binding
+                else:
+                    identity_conflict = True
+                    identity_guards.setdefault(
+                        str(session_id), _terminal_identity_snapshot(identity)
+                    )
+                    client.close()
             except (OSError, RuntimeError, ValueError):
                 binding = None
         if not attach:
             binding = None
         shell_state = str(getattr(identity, "state", "unknown")).lower()
         renderer_state = str(getattr(identity, "renderer_state", "unknown"))
-        if shell_state in {"exited", "dead", "stopped"}:
-            view_state = "exited"
+        exit_confirmed = (shell_state == "exited"
+                          and (getattr(identity, "exit_code", None) is not None
+                               or getattr(identity, "exit_signal", None) is not None))
+        if identity_conflict or shell_state == "identity_mismatch":
+            view_state = "identity_mismatch"
+        elif shell_state == "orphaned":
+            view_state = "orphaned"
+        elif shell_state == "exited":
+            view_state = "exited" if exit_confirmed else "identity_mismatch"
+        elif shell_state in {"dead", "stopped"}:
+            view_state = "orphaned"
+        elif shell_state == "stopping":
+            view_state = "stopping"
         elif not attach:
             view_state = "starting" if shell_state == "running" else "session_unavailable"
         elif binding is None:
@@ -586,19 +716,27 @@ def _session_rows(registry: TerminalRegistry, workspace: dict,
             view_state = "resyncing"
         else:
             view_state = "session_unavailable"
+        card_status = ("DEAD" if view_state == "exited" else
+                       "UNKNOWN" if view_state in {"identity_mismatch", "orphaned",
+                                                   "session_unavailable"} else
+                       "WORKING" if shell_state == "running" else "UNKNOWN")
         row = {
             "kind": "pane", "key": str(session_id), "target_id": str(session_id),
             "display_name": str(getattr(identity, "name", "") or "터미널"),
-            "agent": "Generic Terminal", "status": "WORKING" if shell_state == "running" else "DEAD",
+            "agent": "Generic Terminal", "status": card_status,
             "stale": shell_state != "running", "_live_stale": binding is None,
             "live_lines": [], "terminal_kind": "tower_managed", "managed_id": str(session_id),
             "managed_identity": {"session_id": str(identity.session_id),
                                  "generation": str(identity.generation),
-                                 "shell_pid": int(identity.shell_pid)},
+                                 "shell_pid": int(identity.shell_pid),
+                                 "shell_start": str(identity.shell_start),
+                                 "supervisor_pid": int(identity.supervisor_pid),
+                                 "supervisor_start": str(identity.supervisor_start)},
             "pane_id": str(session_id), "pane_pid": str(identity.shell_pid),
             "terminal_shell_state": shell_state,
             "terminal_renderer_state": renderer_state,
             "terminal_view_state": view_state,
+            "terminal_exit_confirmed": exit_confirmed,
             "terminal_preview": "터미널 화면 미리보기 없음",
         }
         if binding is not None and binding.synced and binding.screen is not None:
@@ -838,8 +976,10 @@ def _refresh_mini_live(state: dict, stdscr) -> None:
 def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
                 clients: dict[str, ManagedTerminalBinding] | None = None,
                 *, attach_default: bool = True,
-                keybindings: JTTKeybindings | None = None) -> dict:
+                keybindings: JTTKeybindings | None = None,
+                identity_guards: dict[str, dict] | None = None) -> dict:
     clients = clients if clients is not None else {}
+    identity_guards = identity_guards if identity_guards is not None else {}
     keybindings = keybindings or load_jtt_keybindings(store.root)
     workspaces = store.workspaces()
     work_kit_store = JTTWorkKitStore(store.root)
@@ -872,13 +1012,13 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
     selected = default
     rows_by_choice = {
         item["id"]: _session_rows(registry, item, clients, attach=False,
-                                  keybindings=keybindings)
+                                  keybindings=keybindings, identity_guards=identity_guards)
         for item in [default, *saved]
     }
     default_window = default_layout["windows"][0]
     active_ids = list(default_window["terminal_ids"])
     rows = _session_rows(registry, {**default, "terminal_ids": active_ids}, clients, attach=attach_default,
-                         keybindings=keybindings)
+                         keybindings=keybindings, identity_guards=identity_guards)
     rows_by_choice[default["id"]] = rows
     tower = SimpleNamespace(rows=[], visible_rows=[], selected=-1)
     panes = list(rows)
@@ -913,6 +1053,7 @@ def build_state(store: JTTWorkspaceStore, registry: TerminalRegistry,
         "last_size": (24, 80),
         "managed_cards": rows_by_choice,
         "managed_terminals": clients,
+        "managed_identity_guards": identity_guards,
         "jtt_store": store,
         "jtt_work_kit_store": work_kit_store,
         "jtt_work_kits": work_kits,
@@ -1163,6 +1304,7 @@ def _attach_choice(state: dict, choice: dict) -> None:
         state["jtt_registry"], {**workspace, "terminal_ids": default_window["terminal_ids"]},
         clients, attach=True,
         keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS),
+        identity_guards=state.get("managed_identity_guards"),
     )
     state["managed_cards"][workspace_id] = rows
     state["jtt_workspaces"] = workspaces
@@ -1245,6 +1387,7 @@ def _attach_layout_choice(state: dict, choice: dict) -> None:
     rows = _session_rows(
         state["jtt_registry"], {**workspace, "terminal_ids": ids}, state["managed_terminals"],
         attach=True, keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS),
+        identity_guards=state.get("managed_identity_guards"),
     )
     state["managed_cards"][workspace_id] = rows
     state["panes"] = [dict(row) for row in rows]
@@ -1273,7 +1416,8 @@ def _refresh_workspaces(state: dict, selected_id: str | None = None) -> None:
     old_window_id = str(state.get("selected_window_id") or "")
     refreshed = build_state(state["jtt_store"], state["jtt_registry"],
                             state["managed_terminals"], attach_default=False,
-                            keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS))
+                            keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS),
+                            identity_guards=state.get("managed_identity_guards"))
     refreshed["stdscr"] = stdscr
     refreshed["mini_live_sampler"] = mini_sampler
     workspaces = refreshed["jtt_store"].workspaces()
@@ -1409,8 +1553,9 @@ def _capture_card_reference_target(state: dict) -> dict | None:
     shell_state = str(row.get("terminal_shell_state") or "unknown").lower()
     view_state = str(row.get("terminal_view_state") or "")
     renderer_state = str(row.get("terminal_renderer_state") or "unknown")
-    confirmed_exited = (shell_state in {"exited", "dead", "stopped"}
-                        and view_state == "exited" and renderer_state == "ready")
+    confirmed_exited = (shell_state == "exited" and view_state == "exited"
+                        and renderer_state == "ready"
+                        and bool(row.get("terminal_exit_confirmed")))
     uncertain = (shell_state not in {"running", "active", "exited", "dead", "stopped"}
                  or view_state != "running_ready" or renderer_state != "ready"
                  or bool(row.get("stale")) or bool(row.get("_live_stale")))
@@ -1447,7 +1592,8 @@ def _capture_card_reference_target(state: dict) -> dict | None:
         if (set(identity) != {"session_id"} or signature is not None
                 or state.get("selected_signature") is not None
                 or shell_state != "unknown"
-                or view_state not in {"session_unavailable", "supervisor_connection_failed"}
+                or view_state not in {"session_unavailable", "supervisor_connection_failed",
+                                      "identity_mismatch", "orphaned"}
                 or not row.get("stale") or not row.get("_live_stale")):
             return None
         try:
@@ -1496,7 +1642,7 @@ def _capture_card_reference_target(state: dict) -> dict | None:
     if (str(getattr(registered, "generation", "")) != generation
             or registered_pid != shell_pid):
         return None
-    if confirmed_exited and registry_state not in {"exited", "dead", "stopped"}:
+    if confirmed_exited and registry_state != "exited":
         confirmed_exited = False
         uncertain = True
     binding = (state.get("managed_terminals") or {}).get(session_id)
@@ -1546,7 +1692,10 @@ def _remove_card_reference(stdscr, state: dict, *, confirmed_exited: bool = Fals
                      "셸·PTY·Supervisor는 종료하지 않습니다."),
         preamble=(
             ["세션 생존 여부는 확인되지 않았습니다.",
-             "다른 작업공간 참조는 유지됩니다. 마지막 참조는 기본/복구 작업공간으로 보관합니다."]
+             ("복구 보관함의 마지막 참조도 확인 후 카드에서 제거할 수 있습니다 · "
+              "JTT 카드 경로만 사라지며 프로세스와 세션 데이터는 종료·삭제되지 않습니다."
+              if target["workspace_id"] == JTTWorkspaceStore.RECOVERY_ID else
+              "다른 작업공간 참조는 유지됩니다. 마지막 참조는 기본/복구 작업공간으로 보관합니다.")]
             if target["classification"] == "uncertain" else
             ["다른 작업공간 참조는 유지됩니다. 마지막 참조는 기본/복구 작업공간으로 보관합니다."]
         ),
@@ -1565,19 +1714,97 @@ def _remove_card_reference(stdscr, state: dict, *, confirmed_exited: bool = Fals
         state["jtt_notice_until"] = 0.0
         return
     try:
-        state["jtt_store"].remove_terminal_reference(
+        result = state["jtt_store"].remove_terminal_reference(
             target["workspace_id"], target["session_id"],
             expected_snapshot=target["workspace_snapshot"],
         )
         _finish_card_reference_removal(state, target)
-        state["jtt_notice"] = "카드 참조만 제거했습니다 · 셸과 Supervisor는 종료하지 않았습니다."
+        if result.get("recovery_workspace_id"):
+            state["jtt_notice"] = (
+                "카드 참조만 이동했습니다 · 마지막 참조는 복구 보관함에 보관 · "
+                "셸과 Supervisor는 종료하지 않았습니다. 보관함에서 재확인하세요."
+            )
+        elif (target["workspace_id"] == JTTWorkspaceStore.RECOVERY_ID
+              and not result.get("preserved_elsewhere")):
+            state["jtt_notice"] = (
+                "복구 보관함 카드 참조를 제거했습니다 · 셸·PTY·Supervisor 데이터는 보존되며 "
+                "프로세스가 계속 실행 중일 수 있습니다. 이 작업공간 카드 경로는 제거됐습니다."
+            )
+        elif result.get("preserved_elsewhere"):
+            state["jtt_notice"] = (
+                "현재 작업공간 카드 참조만 제거했습니다 · 다른 작업공간 참조와 "
+                "셸/Supervisor는 유지됩니다."
+            )
+        else:
+            state["jtt_notice"] = (
+                "현재 작업공간 카드 참조만 제거했습니다 · 셸과 Supervisor는 종료하지 않았습니다."
+            )
     except WorkspaceStoreCommittedDurabilityError:
         _finish_card_reference_removal(state, target)
         state["jtt_notice"] = (
             "카드 참조 정리 반영됨 · 실행 상태는 바뀌지 않음 · 디렉터리 동기화 확인 필요"
         )
+    except WorkspaceStoreError as exc:
+        if "recovery archive" in str(exc).lower():
+            state["jtt_notice"] = (
+                "복구 보관함의 마지막 불확실 참조는 보존했습니다 · 먼저 재확인하고 "
+                "정상 종료가 확인된 경우에만 기록 정리를 선택하세요."
+            )
+        else:
+            state["jtt_notice"] = "카드를 안전하게 정리하지 못했습니다. 작업공간 상태를 다시 확인하세요."
     except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
         state["jtt_notice"] = "카드를 안전하게 정리하지 못했습니다. 작업공간 상태를 다시 확인하세요."
+    state["jtt_notice_until"] = 0.0
+
+
+def _confirm_and_forget_exited_card(stdscr, state: dict) -> None:
+    """Explicitly remove one workspace reference after exact normal-exit recheck."""
+    target = _capture_card_reference_target(state)
+    if target is None or target.get("classification") != "exited":
+        state["jtt_notice"] = "정상 종료와 세션 신원을 확인하지 못해 기록 정리를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    confirm = run_list_picker(
+        stdscr, "종료 터미널 기록 정리",
+        [("cancel", "취소"), ("forget", f"{target['display_name']} 참조 영구 제거")],
+        centered=True,
+        footer_hint="취소가 기본 선택입니다 · 셸, 프로세스, Supervisor 데이터는 삭제하지 않습니다.",
+        preamble=["이 작업공간의 카드 참조만 제거합니다.",
+                  "다른 작업공간의 같은 세션 참조와 종료 기록은 유지됩니다."],
+    )
+    if confirm.cancelled or confirm.selected_key != "forget":
+        return
+    current = _capture_card_reference_target(state)
+    if (not _same_card_reference_target(target, current)
+            or current.get("classification") != "exited"):
+        state["jtt_notice"] = "세션 상태나 선택이 바뀌어 기록 정리를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    clients = state.get("managed_terminals")
+    if not isinstance(clients, dict) or clients.get(target["session_id"]) is not target["binding"]:
+        state["jtt_notice"] = "터미널 연결 상태가 바뀌어 기록 정리를 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    try:
+        result = state["jtt_store"].forget_terminal_reference(
+            target["workspace_id"], target["session_id"],
+            expected_snapshot=target["workspace_snapshot"],
+        )
+        _finish_card_reference_removal(state, target)
+        if result.get("remaining_references", 0):
+            state["jtt_notice"] = (
+                "이 작업공간의 종료 카드 참조를 정리했습니다 · 다른 작업공간 참조와 "
+                "터미널 데이터는 유지됩니다."
+            )
+        else:
+            state["jtt_notice"] = (
+                "종료된 터미널 카드 참조를 정리했습니다 · 종료 기록과 Supervisor 데이터는 보존됩니다."
+            )
+    except WorkspaceStoreCommittedDurabilityError:
+        _finish_card_reference_removal(state, target)
+        state["jtt_notice"] = "종료 카드 참조 정리 반영됨 · 디렉터리 동기화 확인 필요"
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        state["jtt_notice"] = "종료 카드 참조를 안전하게 정리하지 못했습니다 · 상태를 다시 확인하세요."
     state["jtt_notice_until"] = 0.0
 
 
@@ -1867,8 +2094,11 @@ def _settings_menu(stdscr, state: dict) -> None:
     if state.get("work_kit_preview") is None:
         row = renderer._selected_row(state)
         if row and row.get("terminal_kind") == "tower_managed":
+            actions.append(("recheck", "선택한 터미널 상태 재확인·재연결"))
             if _capture_card_reference_target(state) is not None:
                 actions.append(("cleanup_card", "선택한 터미널 카드 참조 정리"))
+            if _capture_exited_card_target(state) is not None:
+                actions.append(("forget_exited", "종료 확인된 카드 기록 정리"))
             if _capture_stop_target(state) is not None:
                 actions.append(("stop", "선택한 터미널 종료"))
     result = run_list_picker(
@@ -1879,16 +2109,21 @@ def _settings_menu(stdscr, state: dict) -> None:
         return
     if result.selected_key == "layout":
         _layout_menu(stdscr, state)
+    elif result.selected_key == "recheck":
+        _recheck_selected_terminal(state)
     elif result.selected_key == "stop":
         _confirm_and_stop_selected_terminal(stdscr, state)
     elif result.selected_key == "cleanup_card":
         _remove_card_reference(stdscr, state)
+    elif result.selected_key == "forget_exited":
+        _confirm_and_forget_exited_card(stdscr, state)
     else:
         keys = state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS)
         show_message_screen(
             stdscr, "JTT 키 안내",
             ["탐색: Tab/Shift+Tab 패널 · Enter 입력 · q/Q/Esc는 JTT 유지",
              f"{keys.prefix} n: 새 터미널 · h/l: 카드 이동 · w: 작업공간",
+             f"{keys.prefix} r: 선택 터미널 상태 재확인·안전 재연결",
              f"{keys.prefix} x: 선택 터미널 종료 (취소가 기본 선택)",
              f"{keys.prefix} d: UI 연결 해제 (셸 유지) · ?: 도움",
              f"{keys.prefix} Esc: 접두 취소 · 대화상자 Esc: 닫기",
@@ -2288,6 +2523,12 @@ def _capture_exited_card_target(state: dict) -> dict | None:
 
 def _confirm_and_remove_exited_card(stdscr, state: dict) -> None:
     """Remove a confirmed-exited card through the recoverable ref-only path."""
+    target = _capture_exited_card_target(state)
+    if target is not None and target["workspace_id"] == JTTWorkspaceStore.RECOVERY_ID:
+        # The card is already in the one recovery collection; do not move it
+        # back to the default workspace and recreate an archive cycle.
+        _confirm_and_forget_exited_card(stdscr, state)
+        return
     _remove_card_reference(stdscr, state, confirmed_exited=True)
 
 
@@ -2296,8 +2537,10 @@ def _confirm_and_stop_selected_terminal(stdscr, state: dict) -> None:
 
     selected = renderer._selected_row(state)
     if (selected and selected.get("terminal_kind") == "tower_managed"
-            and (str(selected.get("terminal_shell_state") or "").lower() == "exited"
-                 or str(selected.get("terminal_view_state") or "") == "exited")):
+            and str(selected.get("terminal_shell_state") or "").lower() == "exited"
+            and str(selected.get("terminal_view_state") or "") == "exited"
+            and str(selected.get("terminal_renderer_state") or "") == "ready"
+            and bool(selected.get("terminal_exit_confirmed"))):
         _confirm_and_remove_exited_card(stdscr, state)
         return
     target = _capture_stop_target(state)
@@ -2359,6 +2602,228 @@ def _confirm_and_stop_selected_terminal(stdscr, state: dict) -> None:
             binding.close()
         _refresh_workspaces(state, workspace_id)
         state["jtt_notice"] = "선택한 터미널을 종료했습니다."
+    state["jtt_notice_until"] = 0.0
+
+
+def _recheck_selected_terminal(state: dict) -> None:
+    """Retry one card connection only after exact registry identity validation."""
+    row = renderer._selected_row(state)
+    if not row or row.get("terminal_kind") != "tower_managed":
+        state["jtt_notice"] = "다시 확인할 로컬 터미널 카드를 선택하세요."
+        state["jtt_notice_until"] = 0.0
+        return
+    renderer._release_managed_input(state)
+    state["jtt_pending_auto_acquire"] = None
+    session_id = str((row.get("managed_identity") or {}).get("session_id") or "")
+    if (not session_id or session_id != str(row.get("managed_id") or "")
+            or session_id != str(row.get("target_id") or "")
+            or session_id != str(state.get("selected_target_id") or "")):
+        state["jtt_notice"] = "카드 신원을 확인할 수 없어 재연결을 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    try:
+        workspaces = state["jtt_store"].workspaces()
+        workspace = next((item for item in workspaces
+                          if str(item.get("id")) == str(state.get("workspace_id") or "")), None)
+        if workspace is None or session_id not in workspace["terminal_ids"]:
+            raise WorkspaceStoreError("Card reference changed")
+        identities = [item for item in state["jtt_registry"].list_sessions()
+                      if str(getattr(item, "session_id", "")) == session_id]
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+        row.update(terminal_shell_state="unknown", terminal_view_state="supervisor_connection_failed",
+                   status="UNKNOWN", stale=True, _live_stale=True,
+                   terminal_preview="Supervisor 상태 확인 실패")
+        state["jtt_notice"] = "Supervisor 상태를 다시 확인하지 못했습니다 · 셸은 종료하지 않았습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+
+    if len(identities) != 1:
+        inspect = getattr(state["jtt_registry"], "inspect_reference", None)
+        try:
+            inspected = inspect(session_id) if callable(inspect) else "not_found"
+        except (OSError, RuntimeError, ValueError, TypeError):
+            inspected = "registry_unavailable"
+        view_state = {
+            "identity_mismatch": "identity_mismatch",
+            "orphaned": "orphaned",
+            "registry_unavailable": "supervisor_connection_failed",
+            "not_found": "session_unavailable",
+            "exited": "session_unavailable",
+        }.get(str(inspected), "session_unavailable")
+        row.update(terminal_shell_state="unknown", terminal_view_state=view_state,
+                   status="UNKNOWN", stale=True, _live_stale=True,
+                   terminal_preview=renderer._status(row))
+        state["jtt_notice"] = (
+            "등록된 Supervisor 세션을 찾지 못했습니다 · 참조는 보존했고 새 셸은 만들지 않았습니다."
+        )
+        state["jtt_notice_until"] = 0.0
+        return
+
+    identity = identities[0]
+    try:
+        shell_pid = int(getattr(identity, "shell_pid", -1))
+        supervisor_pid = int(getattr(identity, "supervisor_pid", -1))
+    except (TypeError, ValueError):
+        shell_pid = supervisor_pid = -1
+    generation = str(getattr(identity, "generation", ""))
+    prior = row.get("managed_identity") or {}
+    identity_guards = state.setdefault("managed_identity_guards", {})
+    has_identity_guard = session_id in identity_guards
+    guarded_identity = identity_guards.get(session_id)
+    expected_identity = guarded_identity if has_identity_guard else prior
+    prior_generation = str(expected_identity.get("generation") or "")
+    prior_has_pid = "shell_pid" in expected_identity
+    try:
+        prior_pid = int(expected_identity.get("shell_pid")) if prior_has_pid else None
+    except (TypeError, ValueError):
+        prior_pid = -1
+    current_snapshot = _terminal_identity_snapshot(identity)
+    expected_mismatch = (
+        (has_identity_guard and not guarded_identity)
+        or (has_identity_guard and not _terminal_identity_matches_snapshot(identity, guarded_identity))
+        or (prior_generation and prior_generation != generation)
+        or (prior_has_pid and prior_pid != shell_pid)
+        or any(
+            field in expected_identity
+            and str(expected_identity.get(field) or "") != str(current_snapshot.get(field) or "")
+            for field in ("shell_start", "supervisor_pid", "supervisor_start")
+        )
+    )
+    if expected_mismatch:
+        if not has_identity_guard:
+            observed = {
+                field: expected_identity[field]
+                for field in ("session_id", "generation", "shell_pid", "shell_start",
+                              "supervisor_pid", "supervisor_start")
+                if field in expected_identity
+            }
+            if observed:
+                identity_guards[session_id] = observed
+        old = state.get("managed_terminals", {}).pop(session_id, None)
+        if old is not None:
+            try:
+                old.close()
+            except (OSError, RuntimeError, ValueError):
+                pass
+        row.update(terminal_shell_state="identity_mismatch",
+                   terminal_view_state="identity_mismatch", status="UNKNOWN",
+                   stale=True, _live_stale=True,
+                   terminal_preview="세션 신원 불일치 · 입력 차단")
+        state["jtt_notice"] = "세션 신원 불일치: ID는 같지만 generation/PID가 바뀌어 연결을 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    identity_state = str(getattr(identity, "state", "unknown")).lower()
+    if (not generation or shell_pid <= 0 or supervisor_pid <= 0
+            or identity_state in {"identity_mismatch", "orphaned", "stopping"}):
+        view_state = identity_state if identity_state in {
+            "identity_mismatch", "orphaned", "stopping",
+        } else "identity_mismatch"
+        row.update(
+            managed_identity=current_snapshot,
+            pane_pid=str(shell_pid), terminal_shell_state=identity_state,
+            terminal_view_state=view_state,
+            status="UNKNOWN", stale=True, _live_stale=True,
+            terminal_preview=renderer._status({**row, "terminal_view_state": view_state}),
+        )
+        state["selected_signature"] = renderer._pane_signature(row)
+        state["jtt_notice"] = (
+            "Supervisor/셸 신원을 안전하게 확인할 수 없습니다 · 입력과 종료를 차단했습니다."
+        )
+        state["jtt_notice_until"] = 0.0
+        return
+    if identity_state == "exited":
+        if (getattr(identity, "exit_code", None) is None
+                and getattr(identity, "exit_signal", None) is None):
+            row.update(terminal_shell_state="identity_mismatch",
+                       terminal_view_state="identity_mismatch", status="UNKNOWN",
+                       stale=True, _live_stale=True,
+                       terminal_preview="종료 기록이 불완전해 입력/정리를 차단했습니다.")
+            state["jtt_notice"] = "종료 경계를 확인할 수 없어 세션 참조를 보존했습니다."
+            state["jtt_notice_until"] = 0.0
+            return
+        row.update(
+            managed_identity=current_snapshot,
+            pane_pid=str(shell_pid), terminal_shell_state="exited",
+            terminal_view_state="exited", status="DEAD", stale=True, _live_stale=True,
+            terminal_exit_confirmed=True,
+            terminal_preview="정상 종료 확인 · 셸은 실행 중이 아닙니다.",
+        )
+        state["selected_signature"] = renderer._pane_signature(row)
+        identity_guards.pop(session_id, None)
+        state["jtt_notice"] = "정상 종료를 확인했습니다 · 새 셸을 만들지 않았습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    if identity_state != "running":
+        row.update(terminal_shell_state="unknown", terminal_view_state="session_unavailable",
+                   status="UNKNOWN", stale=True, _live_stale=True)
+        state["jtt_notice"] = "세션이 입력 가능한 실행 상태가 아닙니다 · 새 셸은 만들지 않았습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+
+    try:
+        client = state["jtt_registry"].connect(session_id)
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError):
+        row.update(
+            managed_identity={"session_id": session_id, "generation": generation,
+                              "shell_pid": shell_pid},
+            pane_pid=str(shell_pid), terminal_shell_state="running",
+            terminal_view_state="supervisor_connection_failed", status="WORKING",
+            stale=True, _live_stale=True, terminal_preview="Supervisor 연결 실패 · 입력 차단",
+        )
+        state["selected_signature"] = renderer._pane_signature(row)
+        state["jtt_notice"] = "Supervisor 연결 재시도가 실패했습니다 · 셸과 참조는 유지됩니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    connected = getattr(client, "identity", None)
+    exact = _terminal_identity_matches(connected, identity)
+    if not exact:
+        identity_guards.setdefault(session_id, current_snapshot)
+        try:
+            client.close()
+        except (OSError, RuntimeError, ValueError):
+            pass
+        row.update(terminal_shell_state="identity_mismatch",
+                   terminal_view_state="identity_mismatch", status="UNKNOWN",
+                   stale=True, _live_stale=True,
+                   terminal_preview="재연결 응답 신원 불일치 · 입력 차단")
+        state["jtt_notice"] = "재연결 응답 신원 불일치 · ID/generation/PID가 달라 연결을 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+
+    # The previously observed identity conflict is cleared only after the
+    # explicit recheck has attached to the exact guarded process tuple.
+    identity_guards.pop(session_id, None)
+
+    clients = state.setdefault("managed_terminals", {})
+    old = clients.get(session_id)
+    binding = ManagedTerminalBinding(
+        client, connected, keybindings=state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS),
+    )
+    clients[session_id] = binding
+    if old is not None and old is not binding:
+        try:
+            old.close()
+        except (OSError, RuntimeError, ValueError):
+            pass
+    row.update(
+        managed_identity=current_snapshot,
+        pane_pid=str(shell_pid), terminal_shell_state="running",
+        terminal_renderer_state=str(getattr(identity, "renderer_state", "unknown")),
+    )
+    binding.refresh()
+    row.update(
+        terminal_view_state=binding.terminal_view_state,
+        terminal_renderer_state=binding.renderer_state,
+        terminal_shell_state=binding.shell_state,
+        terminal_exit_confirmed=binding.terminal_view_state == "exited",
+        status="WORKING" if binding.shell_state == "running" else "UNKNOWN",
+        stale=not binding.synced, _live_stale=not binding.synced,
+        terminal_preview=(_screen_preview(binding.screen)
+                          if binding.synced and binding.screen is not None
+                          else "터미널 화면 재동기화 중 · 입력 차단"),
+    )
+    state["selected_signature"] = renderer._pane_signature(row)
+    state["jtt_notice"] = "터미널 세션 신원(ID/generation/PID) 재검증 및 연결 완료."
     state["jtt_notice_until"] = 0.0
 
 
@@ -2505,6 +2970,9 @@ def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
             return False
         _confirm_and_stop_selected_terminal(stdscr, state)
         return False
+    if command == "r":
+        _recheck_selected_terminal(state)
+        return False
     if command == "d":
         renderer._release_managed_input(state)
         state["jtt_pending_auto_acquire"] = None
@@ -2522,6 +2990,7 @@ def _handle_prefix_command(stdscr, state: dict, command: str) -> bool:
             stdscr, "JTT 키 안내",
             [create_help,
              f"{keys.prefix} h/l: 이전/다음 카드 (입력 권한 해제)",
+             f"{keys.prefix} r: 선택 터미널 상태 재확인·안전 재연결",
              f"{keys.prefix} x: 선택 터미널 종료 (취소가 기본 선택)",
              f"{keys.prefix} w: 작업공간 패널", f"{keys.prefix} d: UI 연결 해제 (셸 유지)",
              f"종료된 셸은 {keys.prefix} x로 현재 작업공간 카드 참조만 제거합니다.",
@@ -2624,6 +3093,7 @@ def _refresh_and_resize(state: dict, stdscr) -> None:
                 terminal_shell_state=binding.shell_state,
                 terminal_renderer_state=binding.renderer_state,
                 terminal_view_state=binding.terminal_view_state,
+                terminal_exit_confirmed=binding.terminal_view_state == "exited",
                 terminal_preview=(_screen_preview(binding.screen)
                                   if binding.synced and binding.screen is not None
                                   else "터미널 화면 미리보기 없음"),

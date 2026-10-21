@@ -182,6 +182,51 @@ def test_remove_terminal_reference_preserves_shared_refs_and_recovers_final_defa
     assert not next(item for item in reopened if item["id"] == store.DEFAULT_ID)["terminal_ids"]
 
 
+def test_uncertain_cleanup_reuses_recovery_workspace_and_allows_reference_pruning(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "private")
+    store.set_terminal_ids(store.DEFAULT_ID, ["uncertain-1", "uncertain-2", "uncertain-3"])
+
+    for terminal_id in ("uncertain-1", "uncertain-2", "uncertain-3"):
+        default = next(item for item in store.workspaces() if item["id"] == store.DEFAULT_ID)
+        store.remove_terminal_reference(store.DEFAULT_ID, terminal_id, expected_snapshot=default)
+
+    workspaces = store.workspaces()
+    recovery = next(item for item in workspaces
+                    if item["id"] == store.RECOVERY_ID)
+    assert recovery["terminal_ids"] == ["uncertain-1", "uncertain-2", "uncertain-3"]
+    assert len([item for item in workspaces if item["id"] == store.RECOVERY_ID]) == 1
+
+    result = store.remove_terminal_reference(store.RECOVERY_ID, "uncertain-1",
+                                             expected_snapshot=recovery)
+    recovery = next(item for item in store.workspaces() if item["id"] == store.RECOVERY_ID)
+    assert recovery["terminal_ids"] == ["uncertain-2", "uncertain-3"]
+    assert result["recovery_workspace_id"] is None
+
+
+def test_forget_confirmed_exited_reference_only_removes_selected_workspace_ref(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "private")
+    store.set_terminal_ids(store.DEFAULT_ID, ["exited-shared", "exited-final"])
+    for terminal_id in ("exited-shared", "exited-final"):
+        default = next(item for item in store.workspaces() if item["id"] == store.DEFAULT_ID)
+        store.remove_terminal_reference(store.DEFAULT_ID, terminal_id, expected_snapshot=default)
+    store.set_terminal_ids(store.DEFAULT_ID, ["exited-shared"])
+    recovery = next(item for item in store.workspaces() if item["id"] == store.RECOVERY_ID)
+
+    store.forget_terminal_reference(store.RECOVERY_ID, "exited-shared",
+                                    expected_snapshot=recovery)
+
+    workspaces = {item["id"]: item for item in store.workspaces()}
+    assert workspaces[store.DEFAULT_ID]["terminal_ids"] == ["exited-shared"]
+    assert workspaces[store.RECOVERY_ID]["terminal_ids"] == ["exited-final"]
+
+    recovery = workspaces[store.RECOVERY_ID]
+    store.forget_terminal_reference(store.RECOVERY_ID, "exited-final",
+                                    expected_snapshot=recovery)
+    workspaces = {item["id"]: item for item in store.workspaces()}
+    assert workspaces[store.RECOVERY_ID]["terminal_ids"] == []
+    assert workspaces[store.DEFAULT_ID]["terminal_ids"] == ["exited-shared"]
+
+
 def test_remove_terminal_reference_is_atomic_on_replace_failure(tmp_path, monkeypatch):
     store = JTTWorkspaceStore(tmp_path / "private")
     saved = store.create_workspace("Saved")
