@@ -358,6 +358,8 @@ def _draw_box(stdscr, rect, title: str, active: bool = False, *, unicode: bool =
 
 
 def _status(row: dict) -> str:
+    if row.get("terminal_kind") == "work_kit_template":
+        return "템플릿 · 실행되지 않음"
     if row.get("terminal_kind") == "tower_managed":
         view_state = str(row.get("terminal_view_state") or "unknown")
         return {
@@ -382,6 +384,8 @@ def _status(row: dict) -> str:
 
 
 def _status_attr(row: dict) -> int:
+    if row.get("terminal_kind") == "work_kit_template":
+        return _color(_COLOR_WAITING, curses.A_DIM)
     if row.get("terminal_kind") == "tower_managed":
         view_state = str(row.get("terminal_view_state") or "unknown")
         if view_state in {"exited", "supervisor_connection_failed", "renderer_error"}:
@@ -407,36 +411,52 @@ def _draw_left(stdscr, rect, state: dict, active: bool) -> None:
                if item.get("group") == "windows" and item.get("kind") == "workspace"]
     remote = [(i, item) for i, item in enumerate(choices)
               if item.get("group") == "remote" and item.get("kind") in ("workspace", "info")]
+    work_kits = [(i, item) for i, item in enumerate(choices)
+                 if item.get("group") == "work_kits"]
     saved = [(i, item) for i, item in enumerate(choices)
              if item.get("group") == "saved" and item.get("kind") == "workspace"]
     actions = [(i, item) for i, item in enumerate(choices) if item.get("group") == "actions"]
 
     compact = ih < 30
     gap = 1
+    group_minimum = 3
+    windows_height = min(7 if compact else 14, max(3 if compact else 5, len(windows) + 2))
+    remote_height = min(4 if compact else 6, max(3, len(remote) + 2)) if remote else 0
+    kits_height = min(4 if compact else 9, max(3 if compact else 5, len(work_kits) + 2)) if work_kits else 0
+    saved_height = min(4 if compact else 9, max(3 if compact else 5, len(saved) + 2))
     action_height = 1 if compact else 3
-    windows_height = min(7 if compact else 14, max(4 if compact else 5, len(windows) + 2))
-    remote_height = min(3 if compact else 6, max(3, len(remote) + 2)) if remote else 0
-    saved_height = min(5 if compact else 9, max(3 if compact else 5, len(saved) + 2))
-    section_count = 2 + bool(remote) + len(actions)
-    total_height = (windows_height + remote_height + saved_height + action_height * len(actions)
-                    + gap * max(0, section_count - 1))
-    if total_height > ih:
-        windows_height = max(3, windows_height - (total_height - ih))
-        total_height = (windows_height + remote_height + saved_height + action_height * len(actions)
-                        + gap * max(0, section_count - 1))
-    cursor = iy + max(0, (ih - total_height) // 2)
-    windows_rect = (ix, cursor, iw, windows_height)
-    _draw_choice_group(stdscr, windows_rect,
-                       "작업공간" if state.get("runtime_mode") == "jtt" else "Windows",
-                       windows, state, active, unicode=unicode)
-    cursor += windows_height + gap
-    if remote:
-        remote_rect = (ix, cursor, iw, remote_height)
-        _draw_choice_group(stdscr, remote_rect, "원격 연결", remote, state, active, unicode=unicode)
-        cursor += remote_height + gap
-    saved_rect = (ix, cursor, iw, saved_height)
-    _draw_choice_group(stdscr, saved_rect, "저장한 작업", saved, state, active, unicode=unicode)
-    cursor += saved_height + gap
+    sections = [("windows", windows_height), ("remote", remote_height),
+                ("work_kits", kits_height), ("saved", saved_height)]
+    sections = [(key, height) for key, height in sections if height]
+    minimums = {"windows": group_minimum, "remote": group_minimum,
+                "work_kits": group_minimum, "saved": group_minimum}
+
+    def total_height() -> int:
+        return (sum(height for _key, height in sections) + action_height * len(actions)
+                + gap * max(0, len(sections) + len(actions) - 1))
+
+    for key in ("remote", "windows", "work_kits", "saved"):
+        while total_height() > ih:
+            for index, (section_key, section_height) in enumerate(sections):
+                if section_key == key and section_height > minimums[key]:
+                    sections[index] = (section_key, section_height - 1)
+                    break
+            else:
+                break
+    if total_height() > ih:
+        action_height = 1
+    cursor = iy + max(0, (ih - total_height()) // 2)
+    section_data = {
+        "windows": ("작업공간" if state.get("runtime_mode") == "jtt" else "Windows", windows),
+        "remote": ("원격 연결", remote),
+        "work_kits": ("Work Kit", work_kits),
+        "saved": ("저장한 작업", saved),
+    }
+    for section_key, section_height in sections:
+        title, items = section_data[section_key]
+        _draw_choice_group(stdscr, (ix, cursor, iw, section_height), title, items,
+                           state, active, unicode=unicode)
+        cursor += section_height + gap
     for index, item in actions:
         action_rect = (ix, cursor, iw, action_height)
         _draw_action_choice(stdscr, action_rect, index, item, state, active, unicode=unicode)
@@ -512,7 +532,9 @@ def _draw_card(stdscr, rect, row: dict, selected: bool, *, unicode: bool = False
         status = _status(row)
         _put(stdscr, y + 2, x + 1, width - 2, f"{agent}  ·  {status}", _status_attr(row))
     if height > 5:
-        if row.get("terminal_kind") == "tower_managed":
+        if row.get("terminal_kind") == "work_kit_template":
+            preview = "템플릿 · 셸 실행 전"
+        elif row.get("terminal_kind") == "tower_managed":
             preview = str(row.get("terminal_preview") or "터미널 화면 미리보기 없음")
         else:
             preview = ("연결 끊김" if row.get("_live_stale") or row.get("stale") else
@@ -522,26 +544,39 @@ def _draw_card(stdscr, rect, row: dict, selected: bool, *, unicode: bool = False
 
 
 def _draw_center(stdscr, rect, state: dict, active: bool) -> None:
-    center_title = "터미널 배치" if state.get("runtime_mode") == "jtt" else "Pane 배치"
+    is_kit_preview = state.get("work_kit_preview") is not None
+    center_title = ("Work Kit 미리보기" if is_kit_preview else
+                    "터미널 배치" if state.get("runtime_mode") == "jtt" else "Pane 배치")
     unicode = state.get("runtime_mode") == "jtt"
     inner = _draw_box(stdscr, rect, center_title, active, unicode=unicode)
     ix, iy, iw, ih = inner
     workspace_name = state.get("workspace_name") or "Windows"
     _put(stdscr, iy, ix + 1, max(1, iw - 2), workspace_name, curses.A_BOLD)
     panes = state["panes"]
+    if is_kit_preview and ih > 4:
+        description = str(state["work_kit_preview"].get("description") or "설명 없음")
+        _put(stdscr, iy + 1, ix + 1, max(0, iw - 2), description, curses.A_DIM)
+        _put(stdscr, iy + 2, ix + 1, max(0, iw - 2),
+             "템플릿 미리보기 · 실행된 터미널 없음", curses.A_DIM)
     if not panes:
         keybindings = state.get("jtt_keybindings", DEFAULT_JTT_KEYBINDINGS)
         empty = (f"이 작업공간에 터미널 없음 · {keybindings.prefix} n 새 터미널"
                  if unicode else "Pane 없음")
         _put(stdscr, iy + 2, ix + 1, max(0, iw - 2), empty, curses.A_DIM)
     else:
-        card_area = (ix + 1, iy + 2, max(1, iw - 2), max(1, ih - 5))
+        card_top = iy + (3 if is_kit_preview and ih > 4 else 2)
+        card_bottom_reserve = 4 if is_kit_preview else 5
+        card_area = (ix + 1, card_top, max(1, iw - 2), max(1, ih - card_bottom_reserve))
         cards = card_rectangles(len(panes), card_area, scroll_row=state["card_scroll"])
         for item in cards:
             pane_index, x, y, width, height = item
             _draw_card(stdscr, item, panes[pane_index], pane_index == state["pane_index"], unicode=unicode)
             _append_hit(state, (x, y, width, height), "pane", pane_index)
-    _draw_center_actions(stdscr, (ix + 1, iy + ih - 1, max(1, iw - 2), 1), state)
+    if is_kit_preview:
+        _put(stdscr, iy + ih - 1, ix + 1, max(0, iw - 2),
+             "미리보기 전용 · 실행하지 않음", curses.A_DIM)
+    else:
+        _draw_center_actions(stdscr, (ix + 1, iy + ih - 1, max(1, iw - 2), 1), state)
 
 
 def _draw_center_actions(stdscr, rect, state):
@@ -594,6 +629,24 @@ def _draw_right(stdscr, rect, state: dict, active: bool) -> None:
     right_title = "터미널" if state.get("runtime_mode") == "jtt" else "LIVE"
     unicode = state.get("runtime_mode") == "jtt"
     inner = _draw_box(stdscr, rect, f"{right_title} · {pane_name}", active, unicode=unicode)
+    if row and row.get("terminal_kind") == "work_kit_template":
+        ix, iy, iw, ih = inner
+        lines = [
+            "Work Kit 템플릿 미리보기",
+            "실행 중인 터미널이 아닙니다.",
+            f"역할: {row.get('agent') or '미지정'}",
+        ]
+        working_directory = row.get("working_directory")
+        if working_directory:
+            lines.append(f"작업 폴더(저장값): {working_directory}")
+        for offset, line in enumerate(lines[:max(0, ih - 1)]):
+            _put(stdscr, iy + offset, ix + 1, max(0, iw - 2), line,
+                 curses.A_DIM if offset else curses.A_BOLD)
+        if ih > 0:
+            _put(stdscr, iy + ih - 1, ix + 1, max(0, iw - 2),
+                 "템플릿 · 셸/명령 미실행", _color(_COLOR_WAITING, curses.A_DIM))
+        _append_hit(state, rect, "right", 0)
+        return
     if row and row.get("terminal_kind") == "tower_managed":
         binding = _managed_binding(state)
         if binding is not None:
@@ -744,23 +797,33 @@ def _draw_jtt_footer(stdscr, state: dict, width: int, height: int) -> None:
     if notice and now < float(state.get("jtt_notice_until") or 0.0):
         text = f"JTT — Ju0 Terminal Tower · {notice}"
     elif state.get("jtt_prefix_pending"):
-        text = (f"JTT — Ju0 Terminal Tower · {prefix} {timeout} 내: n 새 · h/l 카드 · w 작업공간 · "
-                f"x 종료 · d 분리 · ? 도움 · Esc 취소 · {prefix} {prefix}/{escape} 전송")
+        create_hint = "n 차단" if state.get("work_kit_preview") is not None else "n 새"
+        text = (f"JTT — Ju0 Terminal Tower · {prefix} {timeout} 내: {create_hint} · h/l 카드 · "
+                f"w 작업공간 · x 종료 · d 분리 · ? 도움 · Esc 취소 · {prefix} {prefix}/{escape} 전송")
     elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
         text = (f"JTT — Ju0 Terminal Tower · {escape} 탐색 복귀 · {prefix} 명령 대기({timeout}) · "
                 "q/Q/Esc 터미널 입력")
     else:
-        text = (f"JTT — Ju0 Terminal Tower · {prefix} 명령({timeout}) · Tab/Shift+Tab 패널 · "
-                f"Enter 입력 · {prefix} d 분리 · {prefix} x 종료 · q/Q/Esc 유지")
+        if state.get("work_kit_preview") is not None:
+            text = (f"JTT — Ju0 Terminal Tower · Work Kit 미리보기(실행 안 됨) · "
+                    "Tab/Shift+Tab 패널 · Enter 탐색")
+        else:
+            text = (f"JTT — Ju0 Terminal Tower · {prefix} 명령({timeout}) · Tab/Shift+Tab 패널 · "
+                    f"Enter 입력 · {prefix} d 분리 · {prefix} x 종료 · q/Q/Esc 유지")
     compact = f"JTT · {prefix}({timeout}) · Tab · Enter · {prefix} d 분리 · {prefix} x 종료"
     # _regions() switches to the compact single-panel layout below 110 cols;
     # keep the footer equally compact so the prefixed stop command stays visible.
     if width < 110:
         if state.get("jtt_prefix_pending"):
-            text = (f"JTT · {prefix} {timeout}: n 새 h/l 카드 w 작업 x 종료 d 분리 "
+            create_hint = "n 차단" if state.get("work_kit_preview") is not None else "n 새"
+            text = (f"JTT · {prefix} {timeout}: {create_hint} h/l 카드 w 작업 x 종료 d 분리 "
                     f"? 도움 Esc 취소 {prefix} {prefix}/{escape} 전송")
         elif _managed_binding(state) is not None and _managed_binding(state).input_mode:
             text = f"JTT · {escape} 탐색 · {prefix}({timeout}) 명령"
+        elif state.get("work_kit_preview") is not None and (
+            not notice or now >= float(state.get("jtt_notice_until") or 0.0)
+        ):
+            text = "JTT · Work Kit 미리보기(실행 안 됨) · Tab · Enter 탐색"
         elif not notice or now >= float(state.get("jtt_notice_until") or 0.0):
             text = compact
     _put(stdscr, height - 1, 1, max(1, width - 2), text, curses.A_DIM)
@@ -1038,9 +1101,18 @@ def _set_choice(state: dict, choice_index: int) -> None:
     if choice_index < 0 or choice_index >= len(state["choices"]):
         return
     choice = state["choices"][choice_index]
+    if choice.get("kind") == "work_kit" and state.get("runtime_mode") == "jtt":
+        _release_managed_input(state)
+        state["nav_index"] = choice_index
+        state["center_actions_focused"] = False
+        handler = state.get("jtt_work_kit_handler")
+        if callable(handler):
+            handler(state, choice)
+        return
     if choice.get("kind") != "workspace":
         return
     _release_managed_input(state)
+    state["work_kit_preview"] = None
     state["nav_index"] = choice_index
     state["workspace_id"] = choice["id"]
     state["workspace_name"] = choice["label"]
@@ -1072,7 +1144,7 @@ def _activate_choice(state: dict, choice_index: int) -> None:
         return
     choice = state["choices"][choice_index]
     state["nav_index"] = choice_index
-    if choice.get("kind") == "workspace":
+    if choice.get("kind") in ("workspace", "work_kit"):
         _set_choice(state, choice_index)
         state["active_panel"] = 1
     elif choice.get("kind") == "action":
@@ -1120,7 +1192,7 @@ def _hit_test(state: dict, x: int, y: int) -> str | None:
         if bx <= x < bx + width and by <= y < by + height:
             if kind == "left":
                 choice = state["choices"][index]
-                if choice.get("kind") == "workspace":
+                if choice.get("kind") in ("workspace", "work_kit"):
                     _set_choice(state, index)
                     state["active_panel"] = 0
                 else:
@@ -1149,6 +1221,10 @@ def _hit_test(state: dict, x: int, y: int) -> str | None:
                 elif state.get("runtime_mode") == "tower":
                     _handoff_selected(state)
             elif kind == "center_action":
+                if state.get("work_kit_preview") is not None:
+                    state["jtt_notice"] = "Work Kit 미리보기에서는 터미널 작업을 실행할 수 없습니다."
+                    state["jtt_notice_until"] = 0.0
+                    return kind
                 state["center_action_index"] = index
                 if state.get("runtime_mode") == "tower":
                     _activate_tower_center_action(state, index)
@@ -1859,21 +1935,21 @@ def _handle_key(stdscr, state: dict, key) -> bool:
         delta = -1 if key == curses.KEY_UP else 1
         if state["active_panel"] == 0:
             selectable = [i for i, item in enumerate(state["choices"])
-                          if item.get("kind") in ("workspace", "action")]
+                          if item.get("kind") in ("workspace", "work_kit", "action")]
             if selectable:
                 current = selectable.index(state["nav_index"]) if state["nav_index"] in selectable else 0
                 next_choice = selectable[max(0, min(len(selectable) - 1, current + delta))]
                 state["nav_index"] = next_choice
-                if state["choices"][next_choice].get("kind") == "workspace":
+                if state["choices"][next_choice].get("kind") in ("workspace", "work_kit"):
                     _set_choice(state, next_choice)
         elif state["active_panel"] == 1:
             if state.get("center_actions_focused"):
                 if delta < 0:
                     state["center_actions_focused"] = False
-            elif delta > 0 and (
+            elif (state.get("work_kit_preview") is None and delta > 0 and (
                 not state["panes"]
                 or state["pane_index"] >= max(0, len(state["panes"]) - 2)
-            ):
+            )):
                 state["center_actions_focused"] = True
             else:
                 _move_pane(state, delta * (2 if len(state["panes"]) >= 3 else 1), height, width)
@@ -1906,6 +1982,9 @@ def _handle_key(stdscr, state: dict, key) -> bool:
                 _activate_choice(state, state["nav_index"])
         elif state["active_panel"] == 1:
             if state.get("center_actions_focused"):
+                if state.get("work_kit_preview") is not None:
+                    state["center_actions_focused"] = False
+                    return False
                 if state.get("runtime_mode") == "tower":
                     _activate_tower_center_action(state, state.get("center_action_index", 0))
                 elif state.get("runtime_mode") == "jtt":
