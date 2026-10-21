@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+venv_dir="$repo_dir/.venv-jtt"
+python_bin="$venv_dir/bin/python"
+
+if [ ! -d "$venv_dir" ]; then
+    python3 -m venv "$venv_dir"
+elif [ ! -x "$python_bin" ]; then
+    printf '%s\n' "기존 .venv-jtt가 Python 가상환경이 아닙니다. 보존을 위해 자동 삭제하지 않았습니다." >&2
+    exit 2
+fi
+
+printf '%s\n' "JTT 전용 환경에 패키지를 설치합니다: $venv_dir" \
+    "이 명시적 명령은 패키지 인덱스에 접근할 수 있습니다. 전역 Python은 변경하지 않습니다."
+"$python_bin" -m pip install --editable "$repo_dir"
+env PYTHONNOUSERSITE=1 PYTHONPATH="$repo_dir/src" \
+    "$python_bin" - "$venv_dir" <<'PY'
+import importlib.metadata
+from pathlib import Path
+import sys
+
+venv = Path(sys.argv[1]).resolve()
+if Path(sys.prefix).resolve() != venv:
+    raise SystemExit("설치 확인 실패: Python이 .venv-jtt를 사용하지 않습니다.")
+import pyte
+package = Path(pyte.__file__).resolve()
+package.relative_to(venv)
+screen = pyte.Screen(4, 2)
+stream = pyte.Stream(screen)
+stream.feed("\x1b[H JTT")
+if "JTT" not in "".join(screen.display):
+    raise SystemExit("설치 확인 실패: VT 화면 초기화가 완료되지 않았습니다.")
+print("JTT 개발 환경 준비 완료 · Python {} · pyte {}".format(
+    sys.version.split()[0], importlib.metadata.version("pyte")))
+PY

@@ -48,6 +48,25 @@ def test_repo_launcher_uses_dev_python_and_not_path_tower():
     assert os.access(script, os.X_OK)
 
 
+def test_jtt_has_separate_entrypoint_dev_guard_and_pyte_license_notice():
+    root = Path(__file__).resolve().parents[1]
+    project = (root / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'tower = "tmux_agent_tower.main:cli"' in project
+    assert 'jtt = "tmux_agent_tower.jtt:cli"' in project
+    assert 'pyte>=0.8.2,<0.9' in project
+    assert '"share/licenses/tmux-agent-tower" = ["licenses/pyte-LGPL-3.0.txt"]' in project
+    assert (root / "licenses" / "pyte-LGPL-3.0.txt").is_file()
+
+    dev = (root / "scripts" / "jtt-dev").read_text(encoding="utf-8")
+    setup = (root / "scripts" / "jtt-setup-dev").read_text(encoding="utf-8")
+    assert 'venv_dir="$repo_dir/.venv-jtt"' in dev
+    assert 'python_bin="$venv_dir/bin/python"' in dev
+    assert "pyte" in dev and "exec \"$python_bin\" -m tmux_agent_tower.jtt" in dev
+    assert "pip install --editable" in setup
+    assert "패키지 인덱스" in setup
+    assert "pip install" not in dev
+
+
 def test_path_tower_from_another_checkout_is_not_called_the_same(tmp_path):
     script = tmp_path / "tower"
     script.write_text("#!/usr/bin/python3\n", encoding="utf-8")

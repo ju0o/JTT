@@ -5,10 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tmux-agent-tower"
 version = "0.3.0rc2"
-description = "A local-first TUI control tower for monitoring coding agents across tmux panes."
+description = "JTT, a local-first workspace for independent interactive PTY terminals."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
+dependencies = ["pyte>=0.8.2,<0.9"]
 authors = [{ name = "ju0o" }]
 keywords = [
     "tmux",
@@ -39,12 +40,16 @@ Issues = "https://github.com/ju0o/tmux-agent-tower/issues"
 
 [project.scripts]
 tower = "tmux_agent_tower.main:cli"
+jtt = "tmux_agent_tower.jtt:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
 tmux_agent_tower = ["resources/harnesses/*.md", "remote/*.js"]
+
+[tool.setuptools.data-files]
+"share/licenses/tmux-agent-tower" = ["licenses/pyte-LGPL-3.0.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

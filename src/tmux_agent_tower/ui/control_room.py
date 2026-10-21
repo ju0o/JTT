@@ -79,28 +79,30 @@ def _initial_navigation_collapsed(tower) -> set[tuple]:
     return result
 
 
-def _set_navigation_collapsed(tower, line: dict, collapsed: set[tuple], should_collapse: bool) -> bool:
+def _set_navigation_collapsed(tower, line: dict, collapsed: set[tuple], should_collapse: bool,
+                              *, persist: bool = True) -> bool:
     """Persist Folder/Project folds through their existing stores, then mirror locally."""
 
     key = tuple(line.get("node_key") or ())
     kind = str(line.get("kind") or "")
-    try:
-        if kind == "project_header":
-            store = _project_store(tower)
-            project_id = str(line.get("project_id") or "")
-            item = next((value for value in _project_values(tower)
-                         if str(value.get("project_id") or "") == project_id), None)
-            if store is not None and item is not None and bool(item.get("collapsed")) != should_collapse:
-                store.toggle_project(project_id)
-        elif kind == "folder_header":
-            store = getattr(tower, "folders", None)
-            folder_id = str(line.get("folder_id") or "")
-            item = next((value for value in (store.all() if store is not None else ())
-                         if str(value.get("folder_id") or "") == folder_id), None)
-            if store is not None and item is not None and bool(item.get("collapsed")) != should_collapse:
-                store.toggle_folder(folder_id)
-    except (OSError, KeyError, ValueError):
-        return False
+    if persist:
+        try:
+            if kind == "project_header":
+                store = _project_store(tower)
+                project_id = str(line.get("project_id") or "")
+                item = next((value for value in _project_values(tower)
+                             if str(value.get("project_id") or "") == project_id), None)
+                if store is not None and item is not None and bool(item.get("collapsed")) != should_collapse:
+                    store.toggle_project(project_id)
+            elif kind == "folder_header":
+                store = getattr(tower, "folders", None)
+                folder_id = str(line.get("folder_id") or "")
+                item = next((value for value in (store.all() if store is not None else ())
+                             if str(value.get("folder_id") or "") == folder_id), None)
+                if store is not None and item is not None and bool(item.get("collapsed")) != should_collapse:
+                    store.toggle_folder(folder_id)
+        except (OSError, KeyError, ValueError):
+            return False
     if should_collapse:
         collapsed.add(key)
     else:
@@ -880,13 +882,16 @@ def draw(stdscr, tower, selected_key: str, selected_identity: tuple | None,
          collapsed=None, focus_scroll: int = 0, layout: str = "grid-4",
          grid_rows_override: list[dict] | None = None, selected_window_ref: str = "",
          pane_scroll: int = 0, nav_scroll: int = 0,
-         hit_test_state: dict | None = None) -> bool:
+         hit_test_state: dict | None = None, read_only_preview: bool = False) -> bool:
     """Draw Window folders, that Window's Panes, and one selected Pane LIVE."""
 
     stdscr.erase()
     height, width = stdscr.getmaxyx()
     safe_add(stdscr, 0, 2, t("control_room.title"), curses.A_BOLD)
-    mode_label = t("control_room.read_only")
+    mode_label = (
+        "UX Preview · 가상 데이터 · 포커스/입력/복사 차단"
+        if read_only_preview else t("control_room.read_only")
+    )
     hidden_refs = _hidden_project_refs(tower)
     panes = [row for row in pane_rows(getattr(tower, "rows", ()))
              if str(row.get("window_ref") or "") not in hidden_refs]
@@ -1101,12 +1106,12 @@ def _focus_handoff_menu_available(tower, row: dict | None) -> bool:
     return (transport == "local" and not target) or (transport == "ssh" and bool(target))
 
 
-def _handoff_confirmation_lines(row: dict) -> list[str]:
+def _handoff_confirmation_lines(row: dict, *, read_only_preview: bool = False) -> list[str]:
     task = str(row.get("display_name") or row.get("task_name") or t("task.terminal"))
     agent = str(row.get("agent") or t("state.unknown"))
     computer = _host_label(row)
     window = str(row.get("window_name") or row.get("window_index") or t("state.unknown"))
-    return [
+    lines = [
         t("control_room.read_only"),
         t("control_room.handoff_target").format(
             task=task, agent=agent, computer=computer, window=window,
@@ -1114,9 +1119,12 @@ def _handoff_confirmation_lines(row: dict) -> list[str]:
         t("control_room.handoff_confirm_prompt"),
         t("control_room.handoff_return_hint"),
     ]
+    if read_only_preview:
+        lines.append("미리보기: 확인을 선택해도 실제 tmux 이동은 차단됩니다.")
+    return lines
 
 
-def _request_agent_handoff(stdscr, tower, row: dict):
+def _request_agent_handoff(stdscr, tower, row: dict, *, read_only_preview: bool = False):
     if row.get("remote") or row.get("transport") == "remote_tmux":
         show_message_screen(
             stdscr, t("control_room.handoff_title"),
@@ -1131,11 +1139,18 @@ def _request_agent_handoff(stdscr, tower, row: dict):
             ("confirm", t("control_room.handoff_confirm")),
         ],
         footer_hint=t("wizard.hint_list"),
-        preamble=_handoff_confirmation_lines(row),
+        preamble=_handoff_confirmation_lines(row, read_only_preview=read_only_preview),
         centered=True,
     )
     if pick.cancelled or pick.selected_key != "confirm":
         return None
+
+    if read_only_preview:
+        show_message_screen(
+            stdscr, t("control_room.handoff_title"),
+            ["미리보기에서는 실제 tmux 포커스 이동을 실행하지 않습니다."],
+        )
+        return control_actions.FocusHandoffStatus.FAILED
 
     result = control_actions.handoff_focus_target(tower, row)
     if result.status is control_actions.FocusHandoffStatus.FOCUSED:
@@ -1155,7 +1170,8 @@ def _request_agent_handoff(stdscr, tower, row: dict):
     return result.status
 
 
-def _request_right_handoff(stdscr, tower, row: dict, is_current: bool):
+def _request_right_handoff(stdscr, tower, row: dict, is_current: bool,
+                           *, read_only_preview: bool = False):
     """Use the same explicit, focus-only handoff from Right click and Enter."""
 
     if not is_current:
@@ -1176,7 +1192,7 @@ def _request_right_handoff(stdscr, tower, row: dict, is_current: bool):
             [t("control_room.handoff_rejected")],
         )
         return control_actions.FocusHandoffStatus.FAILED
-    return _request_agent_handoff(stdscr, tower, row)
+    return _request_agent_handoff(stdscr, tower, row, read_only_preview=read_only_preview)
 
 
 def _screen_confirm(stdscr, title: str, message: str) -> bool:
@@ -1259,6 +1275,12 @@ def _open_screen_menu(stdscr, tower, state: dict, current_panes, groups, nav_lin
         state.update(_saved_screen_state(view, tower, current_panes))
         return
     if choice == "save":
+        if len(state.get("view_rows") or ()) > 4:
+            show_message_screen(
+                stdscr, t("control_room.screens_title"),
+                ["현재 저장 화면 형식은 Pane 4개까지만 지원합니다."],
+            )
+            return
         name = prompt_text(stdscr, t("control_room.screens_name_prompt"))
         if not name:
             return
@@ -1573,11 +1595,11 @@ def _read_room_mouse(stdscr, key):
     return x, y
 
 
-def open_control_room(stdscr, tower) -> None:
+def open_control_room(stdscr, tower, *, read_only_preview: bool = False) -> None:
     """Open Window folders, Pane selection, and a single-pane LIVE observer."""
 
     panes = _visible_panes(tower)
-    screen_store = _screen_store(tower)
+    screen_store = None if read_only_preview else _screen_store(tower)
     try:
         last_view = screen_store.last_view() if screen_store is not None else None
     except (OSError, ValueError):
@@ -1634,18 +1656,18 @@ def open_control_room(stdscr, tower) -> None:
     if keypad:
         keypad(True)
     stdscr.timeout(25)
-    async_refresh = callable(getattr(tower, "start_background_refresh", None))
+    async_refresh = not read_only_preview and callable(getattr(tower, "start_background_refresh", None))
     last_refresh = time.monotonic()
     needs_draw = True
-    if async_refresh:
+    if async_refresh and not read_only_preview:
         live_view._start_refresh(tower)
     previous_mouse_mask = _enable_room_mouse()
     try:
         while True:
-            if async_refresh and live_view._apply_refresh(tower):
+            if async_refresh and not read_only_preview and live_view._apply_refresh(tower):
                 needs_draw = True
             now = time.monotonic()
-            if now - last_refresh >= live_view.REFRESH_SECONDS:
+            if not read_only_preview and now - last_refresh >= live_view.REFRESH_SECONDS:
                 live_view._start_refresh(tower)
                 last_refresh = now
             if needs_draw:
@@ -1681,6 +1703,7 @@ def open_control_room(stdscr, tower) -> None:
                     layout=layout, grid_rows_override=view_rows,
                     selected_window_ref=selected_window_ref, pane_scroll=pane_scroll,
                     nav_scroll=nav_scroll, hit_test_state=hit_test_state,
+                    read_only_preview=read_only_preview,
                 )
                 current_nav = window_navigation_lines(
                     tower, _visible_panes(tower), selected_window_ref, cursor_key, collapsed,
@@ -1778,7 +1801,10 @@ def open_control_room(stdscr, tower) -> None:
                             x, y, region_width, region_height = region
                             if (x <= mouse_x < x + region_width
                                     and y <= mouse_y < y + region_height):
-                                _request_right_handoff(stdscr, tower, selected, is_current)
+                                _request_right_handoff(
+                                    stdscr, tower, selected, is_current,
+                                    read_only_preview=read_only_preview,
+                                )
                 needs_draw = True
                 continue
 
@@ -1803,14 +1829,18 @@ def open_control_room(stdscr, tower) -> None:
                             focus_scroll = pane_scroll = 0
                     elif key == curses.KEY_RIGHT:
                         if nav_line and cursor_kind in {"folder_header", "project_header", "projects_root", "host_header"}:
-                            if not _set_navigation_collapsed(tower, nav_line, collapsed, False):
+                            if not _set_navigation_collapsed(
+                                tower, nav_line, collapsed, False, persist=not read_only_preview,
+                            ):
                                 show_message_screen(stdscr, t("project_manage.title"),
                                                     [t("project_manage.save_failed")])
                         elif cursor_kind in {"window", "window_hidden", "window_disconnected"}:
                             active_panel = 1
                     elif key == curses.KEY_LEFT and nav_line:
                         if cursor_kind in {"folder_header", "project_header", "projects_root", "host_header"}:
-                            if not _set_navigation_collapsed(tower, nav_line, collapsed, True):
+                            if not _set_navigation_collapsed(
+                                tower, nav_line, collapsed, True, persist=not read_only_preview,
+                            ):
                                 show_message_screen(stdscr, t("project_manage.title"),
                                                     [t("project_manage.save_failed")])
                     nav_scroll = max(0, nav_scroll)
@@ -1840,6 +1870,7 @@ def open_control_room(stdscr, tower) -> None:
                     if cursor_kind in {"folder_header", "project_header", "projects_root", "host_header"}:
                         if not _set_navigation_collapsed(
                             tower, nav_line or {}, collapsed, cursor_key not in collapsed,
+                            persist=not read_only_preview,
                         ):
                             show_message_screen(stdscr, t("project_manage.title"),
                                                 [t("project_manage.save_failed")])
@@ -1850,11 +1881,21 @@ def open_control_room(stdscr, tower) -> None:
                     # preserves the documented Tab → RIGHT → Enter fallback.
                     active_panel = 2
                 else:
-                    _request_right_handoff(stdscr, tower, selected, is_current)
+                    _request_right_handoff(
+                        stdscr, tower, selected, is_current,
+                        read_only_preview=read_only_preview,
+                    )
                 needs_draw = True
                 continue
 
             if key == " ":
+                if read_only_preview:
+                    show_message_screen(
+                        stdscr, "읽기 전용 Preview",
+                        ["가상 데이터 탐색만 지원합니다. 프로젝트·화면 설정은 저장되지 않습니다."],
+                    )
+                    needs_draw = True
+                    continue
                 room_state = {
                     "layout": layout, "layout_pinned": layout_pinned,
                     "view_rows": list(view_rows), "selected_row": dict(selected),
@@ -1916,7 +1957,9 @@ def open_control_room(stdscr, tower) -> None:
                 continue
 
             if key in ("y", "Y"):
-                if active_panel == 0 or not selected_identity:
+                if read_only_preview:
+                    message = "미리보기에서는 복사와 Clipboard 접근이 차단됩니다."
+                elif active_panel == 0 or not selected_identity:
                     message = t("control_room.copy_select_pane")
                 elif not is_current:
                     message = t("live.changed_output")
@@ -1932,7 +1975,7 @@ def open_control_room(stdscr, tower) -> None:
         _restore_room_mouse(previous_mouse_mask)
         stdscr.timeout(200)
         try:
-            store = _screen_store(tower)
+            store = None if read_only_preview else _screen_store(tower)
             if store is not None:
                 selected_for_save, _ = _resolve_selection(
                     _visible_panes(tower), selected_key, selected_identity, original,

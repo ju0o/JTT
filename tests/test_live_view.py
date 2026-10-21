@@ -558,7 +558,7 @@ def test_expanded_folder_hides_duplicate_counts_and_copy_hint(monkeypatch, heigh
 
 def test_tower_v_opens_navigator_and_l_opens_quiet_control_room(monkeypatch):
     from tmux_agent_tower.server import service
-    from tmux_agent_tower.ui import control_room, tower as tower_module
+    from tmux_agent_tower.ui import tower as tower_module
 
     class FakeTower:
         session = "isolated-test"
@@ -586,7 +586,7 @@ def test_tower_v_opens_navigator_and_l_opens_quiet_control_room(monkeypatch):
     monkeypatch.setattr(tower_module, "draw", lambda _screen, current, **_kwargs: events.append(("draw", current.navigator_mode)))
     monkeypatch.setattr(tower_module, "_remote_state", lambda: "stopped")
     monkeypatch.setattr(service, "maybe_autostart", lambda **_kwargs: None)
-    monkeypatch.setattr(control_room, "open_control_room", lambda _screen, current: events.append(("control_room", current.navigator_mode)))
+    monkeypatch.setattr(tower_module, "open_approved_control_room", lambda _screen, current: events.append(("control_room", current.navigator_mode)))
 
     tower_module._run_loop(screen, "isolated-test", "")
 
@@ -599,7 +599,7 @@ def test_tower_v_opens_navigator_and_l_opens_quiet_control_room(monkeypatch):
 
 def test_control_room_entry_is_independent_of_selected_group_type(monkeypatch):
     from tmux_agent_tower.server import service
-    from tmux_agent_tower.ui import control_room, tower as tower_module
+    from tmux_agent_tower.ui import tower as tower_module
 
     group = {"kind": "work_group", "group_id": "g1", "display_name": "ExampleProject"}
 
@@ -621,7 +621,7 @@ def test_control_room_entry_is_independent_of_selected_group_type(monkeypatch):
     monkeypatch.setattr(tower_module, "draw", lambda *_a, **_k: None)
     monkeypatch.setattr(tower_module, "_remote_state", lambda: "stopped")
     monkeypatch.setattr(service, "maybe_autostart", lambda **_k: None)
-    monkeypatch.setattr(control_room, "open_control_room", lambda _s, current: opened.append(current))
+    monkeypatch.setattr(tower_module, "open_approved_control_room", lambda _s, current: opened.append(current))
 
     tower_module._run_loop(Screen(), "isolated-test", "")
 
@@ -630,7 +630,7 @@ def test_control_room_entry_is_independent_of_selected_group_type(monkeypatch):
 
 def test_primary_navigation_and_result_keys_route_to_existing_flows(monkeypatch):
     from tmux_agent_tower.server import service
-    from tmux_agent_tower.ui import control_room, control_view, settings_menu, structure_menu, tower as tower_module, worksets
+    from tmux_agent_tower.ui import control_view, settings_menu, structure_menu, tower as tower_module, worksets
     from tmux_agent_tower.ui.widgets import show_message_screen
 
     pane = _row("%7")
@@ -657,7 +657,7 @@ def test_primary_navigation_and_result_keys_route_to_existing_flows(monkeypatch)
     monkeypatch.setattr(service, "maybe_autostart", lambda **_k: None)
     monkeypatch.setattr(worksets, "open_saved_collection", lambda *_a: events.append("saved"))
     monkeypatch.setattr(structure_menu, "open_create_hub", lambda *_a: events.append("create"))
-    monkeypatch.setattr(control_room, "open_control_room", lambda *_a: events.append("live"))
+    monkeypatch.setattr(tower_module, "open_approved_control_room", lambda *_a: events.append("live"))
     monkeypatch.setattr(settings_menu, "open_settings", lambda *_a: events.append("settings"))
     monkeypatch.setattr(control_view, "_copy_result", lambda *_a: events.append("copy") or "복사했습니다")
     monkeypatch.setattr(control_view, "_go", lambda *_a: events.append("terminal") or t("control.focused"))
