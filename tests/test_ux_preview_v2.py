@@ -61,6 +61,32 @@ def test_more_than_four_panes_scroll_as_two_column_cards():
     assert cards[0][1] < cards[1][1]
 
 
+def test_managed_terminal_card_draws_clipped_multiline_cell_snapshot():
+    from tmux_agent_tower.terminal import TerminalCell, TerminalScreen
+
+    screen = _Screen(height=24, width=80)
+    row = {
+        "terminal_kind": "tower_managed",
+        "display_name": "Mini PTY",
+        "agent": "Generic Terminal",
+        "terminal_view_state": "running_ready",
+        "mini_screen": TerminalScreen((
+            (TerminalCell("한", "red", "default", True, False, False,
+                          False, False, False),
+             TerminalCell("A", "default", "default", False, False, False,
+                          False, False, False)),
+            (TerminalCell("SECOND", "default", "default", False, False, False,
+                          False, False, False),),
+        ), 0, 0, True),
+    }
+    ux_preview_v2._draw_card(screen, (0, 0, 0, 16, 7), row, True, unicode=True)
+
+    writes = [(x, text) for _y, x, text, _attr in screen.writes]
+    assert any("SECOND" in text for _x, text in writes)
+    assert any(x == 2 and text == "한" for x, text in writes)
+    assert any(x == 4 and text == "A" for x, text in writes)
+
+
 def test_wide_panel_regions_and_narrow_tabbed_fallback():
     wide_120, is_wide_120 = ux_preview_v2._regions(120, 40, 0)
     wide, is_wide = ux_preview_v2._regions(160, 44, 0)

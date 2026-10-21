@@ -636,8 +636,9 @@ def test_work_kit_selection_and_prefix_new_never_touch_pty_or_workspace_data(tmp
     before_calls = (registry.created, tuple(registry.connected), tuple(registry.stopped),
                     tuple(registry.sent))
 
-    state["active_panel"] = 0
-    assert renderer._handle_key(FakeScreen(), state, curses.KEY_DOWN) is False
+    work_kit_choice = next(index for index, choice in enumerate(state["choices"])
+                           if choice.get("kind") == "work_kit" and choice.get("id") == kit["id"])
+    renderer._set_choice(state, work_kit_choice)
     assert state["choices"][state["nav_index"]]["id"] == kit["id"]
     assert state["panes"][0]["terminal_kind"] == "work_kit_template"
     assert state["panes"][0]["terminal_view_state"] == "not_running"
@@ -872,6 +873,11 @@ def test_saved_workspace_delete_is_confirmed_and_does_not_stop_terminal(tmp_path
     choice_index = next(index for index, item in enumerate(state["choices"])
                         if item.get("kind") == "workspace" and item.get("id") == saved["id"])
     renderer._set_choice(state, choice_index)
+    logical_window_index = next(index for index, item in enumerate(state["choices"])
+                                if item.get("kind") == "logical_window"
+                                and item.get("workspace_id") == saved["id"]
+                                and item.get("window_id") == "window-default")
+    renderer._set_choice(state, logical_window_index)
     saved_snapshot = next(item for item in store.workspaces() if item["id"] == saved["id"])
     captured = {}
 
