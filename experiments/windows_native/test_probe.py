@@ -21,7 +21,11 @@ def wait_text(client, expected):
         if expected in snapshot["text"]:
             return snapshot
         time.sleep(0.02)
-    raise AssertionError("synthetic terminal marker not observed")
+    raise AssertionError(
+        "synthetic terminal marker not observed; "
+        f"non_ascii_codepoints={sorted(set(ord(c) for c in snapshot['text'] if ord(c) > 127))}; "
+        f"question_marks={snapshot['text'].count('?')}; sequence={snapshot['sequence']}"
+    )
 
 
 @pytest.mark.parametrize("shell_exits_first", [False, True])
@@ -58,6 +62,15 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         assert first["owner_only_acl"]
         assert client.call("input", identity=identity, text="forbidden") == {"error": "input_denied"}
         assert client.call("acquire", identity=identity)["ok"]
+        client.call("input", identity=identity,
+                    text="[Console]::WriteLine(('CP='+[Console]::OutputEncoding.CodePage))\r")
+        encoding_snapshot = wait_text(client, "CP=")
+        import re
+        deadline = time.monotonic() + 10
+        while not re.search(r"CP=\d+", encoding_snapshot["text"]):
+            assert time.monotonic() < deadline, "console code page response missing"
+            encoding_snapshot = client.call("snapshot")
+        print("console_output_code_page=" + re.search(r"CP=(\d+)", encoding_snapshot["text"]).group(1))
         for malformed in (b"not-json", b"[]"):
             win32file.WriteFile(client.pipe, malformed)
             assert json.loads(win32file.ReadFile(client.pipe, 65536)[1]) == {"error": "invalid_request"}
