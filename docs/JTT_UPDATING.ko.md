@@ -30,13 +30,25 @@ JTT GitHub Release에서만 설치합니다. Draft PR, 소스 브랜치와 기�
 공개 Release까지 별도로 검증합니다. 확인에 실패하면 설치를 거부합니다.
 
 ```sh
-JTT_TAG=jtt-v0.3.0-rc3
-JTT_REPO=https://github.com/ju0o/tmux-agent-tower.git
-git ls-remote --exit-code --tags "$JTT_REPO" "refs/tags/$JTT_TAG" >/dev/null \
-  || { printf 'JTT release tag %s is not available\n' "$JTT_TAG" >&2; exit 1; }
-git clone --branch "$JTT_TAG" --depth 1 "$JTT_REPO" jtt-release
-cd jtt-release
-./scripts/jtt-install-release
+if (
+  set -eu
+  JTT_TAG=jtt-v0.3.0-rc3
+  JTT_REPO=https://github.com/ju0o/tmux-agent-tower.git
+  if ! git ls-remote --exit-code --tags "$JTT_REPO" "refs/tags/$JTT_TAG" >/dev/null; then
+    printf 'Cannot verify JTT tag %s (tag unavailable or network error); nothing installed.\n' "$JTT_TAG" >&2
+    exit 1
+  fi
+  if ! git clone --branch "$JTT_TAG" --depth 1 "$JTT_REPO" jtt-release; then
+    printf 'Clone failed; the installer was not run.\n' >&2
+    exit 1
+  fi
+  cd jtt-release || exit 1
+  ./scripts/jtt-install-release
+); then
+  :
+else
+  printf 'JTT installation did not complete; this shell remains open.\n' >&2
+fi
 ```
 
 JTT 태그는 제품 접두어를 사용합니다. Stable은 `jtt-v주버전.부버전.수정버전`,

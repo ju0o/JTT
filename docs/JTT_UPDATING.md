@@ -31,13 +31,25 @@ checks for the RC3 tag; the bootstrap independently requires the corresponding
 published Release and fails closed if verification does not succeed:
 
 ```sh
-JTT_TAG=jtt-v0.3.0-rc3
-JTT_REPO=https://github.com/ju0o/tmux-agent-tower.git
-git ls-remote --exit-code --tags "$JTT_REPO" "refs/tags/$JTT_TAG" >/dev/null \
-  || { printf 'JTT release tag %s is not available\n' "$JTT_TAG" >&2; exit 1; }
-git clone --branch "$JTT_TAG" --depth 1 "$JTT_REPO" jtt-release
-cd jtt-release
-./scripts/jtt-install-release
+if (
+  set -eu
+  JTT_TAG=jtt-v0.3.0-rc3
+  JTT_REPO=https://github.com/ju0o/tmux-agent-tower.git
+  if ! git ls-remote --exit-code --tags "$JTT_REPO" "refs/tags/$JTT_TAG" >/dev/null; then
+    printf 'Cannot verify JTT tag %s (tag unavailable or network error); nothing installed.\n' "$JTT_TAG" >&2
+    exit 1
+  fi
+  if ! git clone --branch "$JTT_TAG" --depth 1 "$JTT_REPO" jtt-release; then
+    printf 'Clone failed; the installer was not run.\n' >&2
+    exit 1
+  fi
+  cd jtt-release || exit 1
+  ./scripts/jtt-install-release
+); then
+  :
+else
+  printf 'JTT installation did not complete; this shell remains open.\n' >&2
+fi
 ```
 
 JTT tags use a product namespace: `jtt-vMAJOR.MINOR.PATCH` for stable and
