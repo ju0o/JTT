@@ -592,10 +592,14 @@ def test_official_bootstrap_installs_only_verified_release_sidecar(tmp_path, mon
 def test_mocked_official_bootstrap_checks_exact_jtt_tag_and_package_metadata(tmp_path):
     source = tmp_path / "tagged-source"
     source.mkdir(mode=0o700)
-    (source / "pyproject.toml").write_text("[project]\nname='tmux-agent-tower'\nversion='0.3.0rc2'\n", encoding="utf-8")
+    candidate_tag = "jtt-v0.3.0-rc3"
+    candidate_version = jtt_update.__version__
+    (source / "pyproject.toml").write_text(
+        f"[project]\nname='tmux-agent-tower'\nversion='{candidate_version}'\n", encoding="utf-8",
+    )
     package = source / "src" / "tmux_agent_tower"
     package.mkdir(parents=True)
-    (package / "__init__.py").write_text("__version__ = '0.3.0rc2'\n", encoding="utf-8")
+    (package / "__init__.py").write_text(f"__version__ = '{candidate_version}'\n", encoding="utf-8")
     (package / "jtt.py").write_text("def cli(): return 0\n", encoding="utf-8")
     git_env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
     subprocess.run(["git", "-C", str(source), "init", "--quiet"], check=True, env=git_env)
@@ -605,39 +609,39 @@ def test_mocked_official_bootstrap_checks_exact_jtt_tag_and_package_metadata(tmp
         "user.email=jtt-fixture@example.invalid", "commit", "--quiet", "-m", "fixture",
     ], check=True, env=git_env)
     subprocess.run([
-        "git", "-C", str(source), "-c", "tag.gpgSign=false", "tag", "jtt-v0.3.0-rc2",
+        "git", "-C", str(source), "-c", "tag.gpgSign=false", "tag", candidate_tag,
     ], check=True, env=git_env)
     commit = subprocess.run(
         ["git", "-C", str(source), "rev-parse", "HEAD"], check=True, capture_output=True, text=True, env=git_env,
     ).stdout.strip()
     legacy = _published("v0.3.0-rc2", True)
-    jtt_release = _published("jtt-v0.3.0-rc2", True)
+    jtt_release = _published(candidate_tag, True)
     records = [legacy, jtt_release]
 
     def fetch(path):
         if path == "/releases?per_page=100":
             return records
-        if path == "/git/ref/tags/jtt-v0.3.0-rc2":
-            return {"ref": "refs/tags/jtt-v0.3.0-rc2", "object": {"type": "commit", "sha": commit}}
+        if path == f"/git/ref/tags/{candidate_tag}":
+            return {"ref": f"refs/tags/{candidate_tag}", "object": {"type": "commit", "sha": commit}}
         raise AssertionError("unexpected mocked GitHub request")
 
     def install_source(_checkout, site_dir, _python):
         site_dir.mkdir(parents=True, mode=0o700)
         pkg = site_dir / "tmux_agent_tower"
         pkg.mkdir(mode=0o700)
-        (pkg / "__init__.py").write_text("__version__ = '0.3.0rc2'\n", encoding="utf-8")
+        (pkg / "__init__.py").write_text(f"__version__ = '{candidate_version}'\n", encoding="utf-8")
 
     result = jtt_update.install_release_checkout(
         source, fetch_json=fetch, confirm=lambda _prompt: "yes", output=io.StringIO(),
         error=io.StringIO(), home=tmp_path / "isolated-home", python=sys_executable(),
         path_lookup=lambda _name: None, install_source=install_source,
         verify_package=lambda _site, _python, release: (
-            pytest.fail("bootstrap selected the Tower release") if release.tag != "jtt-v0.3.0-rc2" else None
+            pytest.fail("bootstrap selected the Tower release") if release.tag != candidate_tag else None
         ),
         run_version=lambda *_args, **_kwargs: True,
     )
 
-    assert result["release"].tag == "jtt-v0.3.0-rc2"
+    assert result["release"].tag == candidate_tag
     assert result["release"].commit_sha == commit
     assert result["launcher"].is_file()
 
