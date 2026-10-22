@@ -12,8 +12,10 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import zlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -222,6 +224,284 @@ def test_registry_does_not_treat_exit_without_wait_status_as_normal(tmp_path, mo
 
     identity, = manager.TerminalRegistry(root).list_sessions()
     assert identity.state == "identity_mismatch"
+
+
+def _state_fixture_worker(tmp_path):
+    owner = object.__new__(_worker.PtyOwner)
+    owner.child = type("Child", (), {"pid": 456, "poll": lambda self: 0})()
+    owner.metadata = {
+        "protocol": _worker.PROTOCOL,
+        "session_id": "e" * 32,
+        "generation": "generation-state-fixture",
+        "supervisor_pid": 123,
+        "supervisor_start": "supervisor-start",
+        "shell_pid": 456,
+        "shell_start": "shell-start",
+        "shell_path": "/bin/bash",
+        "name": "state fixture",
+        "state": "running",
+    }
+    owner.metadata_path = tmp_path / "session.json"
+    owner.session_id = "e" * 32
+    owner.generation = "generation-state-fixture"
+    owner.supervisor_start = "supervisor-start"
+    owner.shell_start = "shell-start"
+    owner.shell_path = "/bin/bash"
+    owner.name = "state fixture"
+    owner.created_at = 1
+    owner.columns = 80
+    owner.lines = 24
+    owner.screen = object()
+    owner.screen_error = False
+    owner.renderer_state = "ready"
+    owner.lease_owner = "active-input-client"
+    owner.lease_deadline = 123.0
+    _worker._atomic_metadata(owner.metadata_path, owner.metadata)
+    return owner
+
+
+def test_worker_does_not_report_exit_before_metadata_commit(tmp_path, monkeypatch):
+    owner = _state_fixture_worker(tmp_path)
+    original_atomic_metadata = _worker._atomic_metadata
+    commit_started = threading.Event()
+    allow_commit = threading.Event()
+    state_returned = threading.Event()
+    result = {}
+
+    def delayed_commit(path, metadata):
+        if metadata.get("state") == "exited":
+            commit_started.set()
+            if not allow_commit.wait(timeout=3):
+                raise OSError("fixture metadata commit gate timed out")
+        original_atomic_metadata(path, metadata)
+
+    def read_state():
+        result["state"] = owner._state()
+        state_returned.set()
+
+    monkeypatch.setattr(_worker, "_atomic_metadata", delayed_commit)
+    thread = threading.Thread(target=read_state, daemon=True)
+    thread.start()
+    try:
+        assert commit_started.wait(timeout=2), (
+            "state read reported the exited child without attempting metadata commit"
+        )
+        assert not state_returned.is_set()
+        assert owner.metadata["state"] == "running"
+        assert _worker._read_metadata(owner.metadata_path)["state"] == "running"
+    finally:
+        allow_commit.set()
+        thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert result["state"] == "exited"
+    assert owner.metadata["state"] == "exited"
+    assert _worker._read_metadata(owner.metadata_path)["state"] == "exited"
+    assert owner.metadata["exit_code"] == 0
+    assert owner.lease_owner is None
+    assert owner.lease_deadline == 0.0
+
+
+def test_worker_keeps_in_memory_state_when_metadata_commit_fails(tmp_path, monkeypatch):
+    owner = _state_fixture_worker(tmp_path)
+    previous = dict(owner.metadata)
+
+    def fail_commit(*_args, **_kwargs):
+        raise OSError("fixture metadata commit failure")
+
+    monkeypatch.setattr(_worker, "_atomic_metadata", fail_commit)
+    with pytest.raises(OSError, match="fixture metadata commit failure"):
+        owner._store_state("exited", exit_code=0)
+
+    assert owner.metadata == previous
+    assert _worker._read_metadata(owner.metadata_path) == previous
+
+
+def _stop_transition_session(tmp_path, *, generation="stop-generation"):
+    import tmux_agent_tower.terminal.manager as manager
+
+    root = tmp_path / "private-jtt" / "terminals"
+    manager._ensure_private_root(root)
+    session_id = "f" * 32
+    session_dir = root / session_id
+    session_dir.mkdir(mode=0o700)
+    metadata = {
+        "protocol": manager.PROTOCOL,
+        "session_id": session_id,
+        "generation": generation,
+        "supervisor_pid": 123,
+        "supervisor_start": "supervisor-start",
+        "shell_pid": 456,
+        "shell_start": "shell-start",
+        "shell_path": "/bin/bash",
+        "name": "stop transition fixture",
+        "state": "running",
+    }
+    manager._atomic_metadata(session_dir / manager.SESSION_META, metadata)
+    return manager, root, session_id, session_dir, metadata
+
+
+def _patch_verified_stop_snapshot(monkeypatch, manager, *, shell_status=None):
+    monkeypatch.setattr(manager, "_proc_start", lambda pid: {
+        123: "supervisor-start",
+    }.get(pid))
+    monkeypatch.setattr(manager, "_worker_identity_status", lambda *_args: "verified")
+    monkeypatch.setattr(manager, "_worker_is_same_process", lambda *_args: True)
+    monkeypatch.setattr(
+        manager, "_stop_shell_process_status",
+        shell_status or (lambda _pid: ("absent", None)),
+    )
+
+
+def test_registry_stop_waits_for_same_worker_to_commit_shell_exit(
+        tmp_path, monkeypatch):
+    manager, root, session_id, session_dir, metadata = _stop_transition_session(tmp_path)
+    registry = manager.TerminalRegistry(root)
+    _patch_verified_stop_snapshot(monkeypatch, manager)
+    monkeypatch.setattr(
+        manager, "_validate_identity",
+        lambda *_args: (_ for _ in ()).throw(
+            manager.TerminalError("terminal shell identity is stale")
+        ),
+    )
+    requested = []
+    connected_after_commit = []
+    worker_alive = [True]
+
+    def publish_exit_on_wait(_seconds):
+        updated = dict(metadata)
+        updated.update(state="exited", exit_code=0, exit_signal=None)
+        manager._atomic_metadata(session_dir / manager.SESSION_META, updated)
+        metadata.clear()
+        metadata.update(updated)
+
+    monkeypatch.setattr(manager.time, "sleep", publish_exit_on_wait)
+
+    def connect_after_commit(_session):
+        current = manager._read_metadata(session_dir / manager.SESSION_META)
+        connected_after_commit.append(current["state"])
+        identity = manager._identity(current)
+
+        def request(operation):
+            requested.append(operation)
+            worker_alive[0] = False
+
+        return SimpleNamespace(
+            identity=identity,
+            _request=request,
+            close=lambda: None,
+        )
+
+    monkeypatch.setattr(registry, "connect", connect_after_commit)
+    monkeypatch.setattr(
+        manager, "_worker_is_same_process", lambda *_args: worker_alive[0]
+    )
+    registry.stop(session_id, expected_generation="stop-generation", expected_shell_pid=456)
+
+    assert connected_after_commit == ["exited"]
+    assert requested == ["stop"]
+    assert not session_dir.exists()
+
+
+def test_registry_stop_timeout_leaves_unconfirmed_session_unchanged(
+        tmp_path, monkeypatch):
+    manager, root, session_id, session_dir, _metadata = _stop_transition_session(tmp_path)
+    registry = manager.TerminalRegistry(root)
+    _patch_verified_stop_snapshot(monkeypatch, manager)
+    monkeypatch.setattr(manager, "STOP_EXIT_CONFIRM_TIMEOUT", 0.0)
+    monkeypatch.setattr(
+        manager, "_validate_identity",
+        lambda *_args: (_ for _ in ()).throw(
+            manager.TerminalError("terminal shell identity is stale")
+        ),
+    )
+    before = (session_dir / manager.SESSION_META).read_bytes()
+    connected = []
+    monkeypatch.setattr(registry, "connect", lambda *_args: connected.append(True))
+
+    with pytest.raises(manager.TerminalError,
+                       match="timed out; no stop was sent"):
+        registry.stop(session_id, expected_generation="stop-generation",
+                      expected_shell_pid=456)
+
+    assert connected == []
+    assert (session_dir / manager.SESSION_META).read_bytes() == before
+    assert manager._read_metadata(session_dir / manager.SESSION_META)["state"] == "running"
+
+
+def test_registry_stop_rejects_generation_change_during_exit_confirmation(
+        tmp_path, monkeypatch):
+    manager, root, session_id, session_dir, metadata = _stop_transition_session(tmp_path)
+    registry = manager.TerminalRegistry(root)
+    _patch_verified_stop_snapshot(monkeypatch, manager)
+    monkeypatch.setattr(manager, "STOP_EXIT_CONFIRM_TIMEOUT", 1.0)
+    monkeypatch.setattr(
+        manager, "_validate_identity",
+        lambda *_args: (_ for _ in ()).throw(
+            manager.TerminalError("terminal shell identity is stale")
+        ),
+    )
+
+    def replace_generation(_seconds):
+        updated = dict(metadata)
+        updated.update(generation="replacement-generation", state="exited",
+                       exit_code=0, exit_signal=None)
+        manager._atomic_metadata(session_dir / manager.SESSION_META, updated)
+
+    monkeypatch.setattr(manager.time, "sleep", replace_generation)
+    connected = []
+    monkeypatch.setattr(registry, "connect", lambda *_args: connected.append(True))
+
+    with pytest.raises(manager.TerminalError, match="identity changed during exit confirmation"):
+        registry.stop(session_id, expected_generation="stop-generation", expected_shell_pid=456)
+
+    assert connected == []
+
+
+def test_registry_stop_rejects_reused_shell_pid_during_exit_confirmation(
+        tmp_path, monkeypatch):
+    manager, root, session_id, _session_dir, _metadata = _stop_transition_session(tmp_path)
+    registry = manager.TerminalRegistry(root)
+    _patch_verified_stop_snapshot(
+        monkeypatch, manager, shell_status=lambda _pid: ("live", "replacement-start")
+    )
+    monkeypatch.setattr(
+        manager, "_validate_identity",
+        lambda *_args: (_ for _ in ()).throw(
+            manager.TerminalError("terminal shell identity is stale")
+        ),
+    )
+    connected = []
+    monkeypatch.setattr(registry, "connect", lambda *_args: connected.append(True))
+
+    with pytest.raises(manager.TerminalError, match="identity changed during stop"):
+        registry.stop(session_id, expected_generation="stop-generation", expected_shell_pid=456)
+
+    assert connected == []
+
+
+def test_registry_stop_rejects_changed_supervisor_during_exit_confirmation(
+        tmp_path, monkeypatch):
+    manager, root, session_id, _session_dir, _metadata = _stop_transition_session(tmp_path)
+    registry = manager.TerminalRegistry(root)
+    _patch_verified_stop_snapshot(monkeypatch, manager)
+    monkeypatch.setattr(
+        manager, "_worker_identity_status", lambda *_args: "start_mismatch"
+    )
+    monkeypatch.setattr(manager, "_worker_is_same_process", lambda *_args: False)
+    monkeypatch.setattr(
+        manager, "_validate_identity",
+        lambda *_args: (_ for _ in ()).throw(
+            manager.TerminalError("terminal shell identity is stale")
+        ),
+    )
+    connected = []
+    monkeypatch.setattr(registry, "connect", lambda *_args: connected.append(True))
+
+    with pytest.raises(manager.TerminalError, match="supervisor identity is stale"):
+        registry.stop(session_id, expected_generation="stop-generation", expected_shell_pid=456)
+
+    assert connected == []
 
 
 def test_registry_inspect_reference_does_not_conflate_missing_and_malformed(tmp_path):
