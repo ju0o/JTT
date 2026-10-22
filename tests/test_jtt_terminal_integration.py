@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,69 @@ pytestmark = [pytest.mark.skipif(not Path("/bin/bash").exists(),
                                  reason="bash fixture requires /bin/bash")]
 
 
+def _drain_pty_until_eof(fd: int, consume, timeout: float) -> tuple[int, bool]:
+    """Collect bytes queued on a PTY master until its slave closes."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    total = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return total, False
+        try:
+            ready, _, _ = select.select([fd], [], [], min(0.05, remaining))
+        except InterruptedError:
+            continue
+        if not ready:
+            continue
+        try:
+            data = os.read(fd, 65536)
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                return total, True
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                continue
+            raise
+        if not data:
+            return total, True
+        consume(data)
+        total += len(data)
+
+
+def _assert_output_drain_complete(ui) -> None:
+    assert ui.output_drain_complete, (
+        "JTT exited but PTY output did not reach EOF within the drain deadline: "
+        f"exit_status={ui.exit_status}, captured_bytes={len(ui.raw)}, "
+        f"bytes_after_reap={ui.output_bytes_after_exit}"
+    )
+
+
+def test_pty_drain_collects_final_bytes_after_child_exit():
+    """Bytes queued before exit remain readable after waitpid reaps the child."""
+    master_fd, slave_fd = pty.openpty()
+    expected = b"queued-before-exit:\x1b[?1049l"
+    chunks = []
+    pid = os.fork()
+    if pid == 0:
+        os.close(master_fd)
+        try:
+            os.write(slave_fd, expected)
+        finally:
+            os.close(slave_fd)
+        os._exit(0)
+
+    os.close(slave_fd)
+    try:
+        waited, status = os.waitpid(pid, 0)
+        assert waited == pid
+        assert os.waitstatus_to_exitcode(status) == 0
+        drained, reached_eof = _drain_pty_until_eof(master_fd, chunks.append, 1.0)
+        assert reached_eof
+        assert drained == len(expected)
+        assert b"".join(chunks) == expected
+    finally:
+        os.close(master_fd)
+
+
 class _Screen:
     def getmaxyx(self):
         return (45, 160)
@@ -46,6 +110,10 @@ class _UIProcess:
 
         self.pid, self.fd = pty.fork()
         self.raw = bytearray()
+        self.exit_status: int | None = None
+        self.output_bytes_at_exit: int | None = None
+        self.output_bytes_after_exit = 0
+        self.output_drain_complete = False
         if self.pid == 0:
             env = {
                 "PATH": os.defpath,
@@ -54,7 +122,7 @@ class _UIProcess:
                 "LANG": "C.UTF-8",
                 "LC_ALL": "C.UTF-8",
                 "TERM": "xterm",
-                "PYTHONPATH": os.pathsep.join((str(pyte_root), str(source_root))),
+                "PYTHONPATH": os.pathsep.join((str(source_root), str(pyte_root))),
                 "ESCDELAY": "25",
             }
             try:
@@ -77,24 +145,45 @@ class _UIProcess:
             return
         try:
             data = os.read(self.fd, 65536)
-        except OSError:
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                self.output_drain_complete = True
+                return
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return
+            raise
+        if not data:
+            self.output_drain_complete = True
             return
-        if data:
-            self.raw.extend(data)
-            self.stream.feed(data.decode("utf-8", errors="replace"))
+        self.raw.extend(data)
+        self.stream.feed(data.decode("utf-8", errors="replace"))
 
     def text(self) -> str:
         return "\n".join(self.screen.display)
 
-    def exit(self, timeout: float = 5.0) -> int:
+    def exit(self, timeout: float = 5.0, drain_timeout: float = 1.0) -> int:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            self.pump()
+            self.pump(min(0.05, max(0.0, deadline - time.monotonic())))
             waited, status = os.waitpid(self.pid, os.WNOHANG)
             if waited:
+                self.output_bytes_at_exit = len(self.raw)
+                self.exit_status = os.waitstatus_to_exitcode(status)
                 self.pid = -1
-                return os.waitstatus_to_exitcode(status)
-        raise AssertionError("JTT curses process did not exit")
+                break
+        if self.exit_status is None:
+            raise AssertionError(
+                "JTT curses process did not exit before timeout: "
+                f"pid={self.pid}, timeout={timeout:.2f}s, captured_bytes={len(self.raw)}"
+            )
+        if not self.output_drain_complete:
+            self.output_bytes_after_exit, self.output_drain_complete = _drain_pty_until_eof(
+                self.fd,
+                lambda data: (self.raw.extend(data),
+                              self.stream.feed(data.decode("utf-8", errors="replace"))),
+                drain_timeout,
+            )
+        return self.exit_status
 
     def terminate(self) -> None:
         if self.pid > 0:
@@ -121,6 +210,10 @@ class _RawUIProcess:
     def __init__(self, runtime_root: Path, source_root: Path, *, height: int, width: int):
         self.pid, self.fd = pty.fork()
         self.raw = bytearray()
+        self.exit_status: int | None = None
+        self.output_bytes_at_exit: int | None = None
+        self.output_bytes_after_exit = 0
+        self.output_drain_complete = False
         if self.pid == 0:
             env = {
                 "PATH": os.defpath,
@@ -150,23 +243,41 @@ class _RawUIProcess:
             return
         try:
             data = os.read(self.fd, 65536)
-        except OSError:
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                self.output_drain_complete = True
+                return
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return
+            raise
+        if not data:
+            self.output_drain_complete = True
             return
-        if data:
-            self.raw.extend(data)
+        self.raw.extend(data)
 
     def text(self) -> str:
         return self.raw.decode("utf-8", errors="replace")
 
-    def exit(self, timeout: float = 5.0) -> int:
+    def exit(self, timeout: float = 5.0, drain_timeout: float = 1.0) -> int:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            self.pump()
+            self.pump(min(0.05, max(0.0, deadline - time.monotonic())))
             waited, status = os.waitpid(self.pid, os.WNOHANG)
             if waited:
+                self.output_bytes_at_exit = len(self.raw)
+                self.exit_status = os.waitstatus_to_exitcode(status)
                 self.pid = -1
-                return os.waitstatus_to_exitcode(status)
-        raise AssertionError("JTT curses process did not exit")
+                break
+        if self.exit_status is None:
+            raise AssertionError(
+                "JTT curses process did not exit before timeout: "
+                f"pid={self.pid}, timeout={timeout:.2f}s, captured_bytes={len(self.raw)}"
+            )
+        if not self.output_drain_complete:
+            self.output_bytes_after_exit, self.output_drain_complete = _drain_pty_until_eof(
+                self.fd, self.raw.extend, drain_timeout
+            )
+        return self.exit_status
 
     def terminate(self) -> None:
         if self.pid > 0:
@@ -202,7 +313,7 @@ def _set_private_process_environment(monkeypatch, root: Path, source_root: Path,
     monkeypatch.setenv("LANG", "C.UTF-8")
     monkeypatch.setenv("LC_ALL", "C.UTF-8")
     monkeypatch.setenv("TERM", "xterm")
-    python_path = (os.pathsep.join((str(pyte_root), str(source_root)))
+    python_path = (os.pathsep.join((str(source_root), str(pyte_root)))
                    if pyte_root is not None else str(source_root))
     monkeypatch.setenv("PYTHONPATH", python_path)
     monkeypatch.setenv("JTT_HOME", str(root / "state"))
@@ -231,7 +342,34 @@ def _wait_for_ui_text(ui: _UIProcess, expected: str, timeout: float = 5.0) -> No
         ui.pump()
         if expected in ui.text():
             return
-    raise AssertionError("JTT curses UI did not render the expected terminal marker")
+    observed = ui.text()
+    diagnostic = [line.strip() for line in observed.splitlines()
+                  if any(marker in line for marker in
+                         ("Fixture", "셸", "Supervisor", "입력", "화면", "Ctrl+"))]
+    raise AssertionError(
+        f"JTT curses UI did not render {expected!r}; observed={diagnostic!r}"
+    )
+
+
+def _active_ui_panel(ui: _UIProcess) -> int | None:
+    regions, wide = renderer._regions(ui.screen.columns, ui.screen.lines, 0)
+    if not wide:
+        return None
+    active = []
+    for panel, (x, y, _width, _height) in regions.items():
+        cell = ui.screen.buffer[y][x + 1]
+        if cell.bold:
+            active.append(panel)
+    return active[0] if len(active) == 1 else None
+
+
+def _wait_for_active_ui_panel(ui: _UIProcess, expected: int, timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        ui.pump()
+        if _active_ui_panel(ui) == expected:
+            return
+    raise AssertionError(f"JTT curses UI did not focus panel {expected}")
 
 
 def _wait_for_raw_ui_text(ui: _RawUIProcess, expected: str, timeout: float = 5.0) -> None:
@@ -358,7 +496,16 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
         ui = _UIProcess(root, source_root, pyte_root)
         try:
             _wait_for_ui_text(ui, "Fixture A")
-            ui.send(b"\t\t\n")  # LEFT -> CENTER -> RIGHT -> input mode.
+            # Send and observe each navigation redraw instead of relying on
+            # a burst of bytes being consumed before curses repaints.
+            for _ in range(3):
+                if _active_ui_panel(ui) == 2:
+                    break
+                expected_panel = (_active_ui_panel(ui) + 1) % 3
+                ui.send(b"\t")
+                _wait_for_active_ui_panel(ui, expected_panel)
+            assert _active_ui_panel(ui) == 2
+            ui.send(b"\n")  # RIGHT -> input mode.
             _wait_for_ui_text(ui, "Ctrl+]")
             right_marker = "JTT_RIGHT_" + uuid.uuid4().hex[:8]
             ui.send(("printf '%s\\n' '" + right_marker + "'\n").encode("ascii"))
@@ -372,6 +519,7 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
             ui.send(b"\x1b")  # Close the help dialog, not the JTT UI.
             ui.send(b"\x07d")  # Only the explicit prefix command detaches.
             assert ui.exit() == 0
+            _assert_output_drain_complete(ui)
             assert b"\x1b[?1049l" in ui.raw
         finally:
             ui.terminate()
@@ -390,6 +538,7 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
             assert "Fixture B" in ui.text()
             ui.send(b"\x07d")
             assert ui.exit() == 0
+            _assert_output_drain_complete(ui)
             assert b"\x1b[?1049l" in ui.raw
         finally:
             ui.terminate()
@@ -465,13 +614,16 @@ def test_read_only_observe_keeps_two_pty_screens_distinct_and_does_not_take_leas
 
 
 @pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash fixture requires /bin/bash")
+@pytest.mark.skipif(not renderer_available(), reason="early-worker fixture requires the VT renderer")
 def test_supervisor_early_exit_does_not_persist_a_failed_workspace_card(monkeypatch, tmp_path):
     """An explicit create failure leaves the isolated workspace reference-free."""
     root = tmp_path / "isolated-jtt"
     root.mkdir(mode=0o700)
     root.chmod(0o700)
     source_root = Path(__file__).resolve().parents[1] / "src"
-    _set_private_process_environment(monkeypatch, root, source_root)
+    import pyte
+    pyte_root = Path(pyte.__file__).resolve().parent.parent
+    _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
     store = JTTWorkspaceStore(root / "state")
     registry = TerminalRegistry(root=root / "state" / "terminals")
     state = jtt.build_state(store, registry)
@@ -490,7 +642,9 @@ def test_supervisor_early_exit_does_not_persist_a_failed_workspace_card(monkeypa
     monkeypatch.setattr(terminal_manager.subprocess, "Popen", exit_worker)
     jtt._create_terminal(_Screen(), state)
 
-    assert len(started) == 1 and started[0].poll() == 23
+    assert len(started) == 1 and started[0].poll() == 23, (
+        f"worker not launched or unexpected exit; notice={state['jtt_notice']!r}"
+    )
     assert store.workspaces()[0]["terminal_ids"] == []
     assert registry.list_sessions() == ()
     assert "exited during startup" in state["jtt_notice"]
@@ -518,6 +672,7 @@ def test_real_curses_launch_and_prefix_detach_does_not_autostart_a_shell(monkeyp
         assert not (root / "state").exists()
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         assert b"\x1b[?1049l" in ui.raw
         assert not (root / "state").exists()
         ui.terminate()
@@ -563,6 +718,7 @@ def test_real_curses_flat_window_create_and_archive_route_create_no_pty(
         ui.pump(0.05)
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         assert b"\x1b[?1049l" in ui.raw
         assert registry.list_sessions() == ()
     finally:
@@ -623,6 +779,7 @@ def test_real_curses_work_kit_archive_create_and_preview_never_starts_shells(mon
 
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         assert b"\x1b[?1049l" in ui.raw
         assert registry.list_sessions() == ()
     finally:
@@ -673,6 +830,7 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
         _wait_for_ui_text(ui, "관찰 중")
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         ui = None
         assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
             (session_id, shell_pid)
@@ -692,6 +850,7 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
         # Prefix detach releases only the UI client and leaves the shell alive.
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         ui = None
         assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
             (session_id, shell_pid)
@@ -706,6 +865,7 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
         ]
         ui.send(b"\x07d")
         assert ui.exit() == 0
+        _assert_output_drain_complete(ui)
         ui = None
         assert [(item.session_id, item.shell_pid) for item in registry.list_sessions()] == [
             (session_id, shell_pid)
@@ -839,13 +999,13 @@ def test_vim_alternate_screen_unicode_keys_resize_and_shell_return(monkeypatch):
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux fixture is unavailable")
 @pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")
-def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monkeypatch):
+def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monkeypatch, tmux_test_safety):
     """Exercise a real nested tmux TUI only in a fresh JTT-owned PTY."""
 
     if Path(pwd.getpwuid(os.getuid()).pw_shell).resolve() != Path("/bin/bash").resolve():
         pytest.skip("fixture deliberately exercises the account's /bin/bash login shell")
 
-    tmux = shutil.which("tmux")
+    tmux = tmux_test_safety.binary
     assert tmux is not None
     root = Path(tempfile.mkdtemp(prefix="jtt-private-tmux-it-"))
     root.chmod(0o700)
@@ -853,7 +1013,7 @@ def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monk
     import pyte
     pyte_root = Path(pyte.__file__).resolve().parent.parent
     _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
-    socket_path = root / "tmux-test.sock"
+    socket_path = tmux_test_safety.socket_path
     assert not socket_path.exists()
     registry = TerminalRegistry(root=root / "state" / "terminals")
     client = None
@@ -861,9 +1021,9 @@ def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monk
     shell_pid = None
 
     def private_tmux(*args: str) -> subprocess.CompletedProcess[str]:
-        # -S always names the unique fixture socket; -f bypasses user tmux config.
-        return subprocess.run(
-            [tmux, "-S", str(socket_path), "-f", "/dev/null", *args],
+        # The helper validates this exact private socket and adds explicit -S.
+        return tmux_test_safety.run(
+            *args,
             env={
                 "PATH": os.defpath,
                 "HOME": str(root / "shell-home"),
@@ -874,7 +1034,6 @@ def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monk
             capture_output=True,
             text=True,
             timeout=5.0,
-            check=False,
         )
 
     try:
@@ -953,11 +1112,13 @@ def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monk
         while probe.returncode == 0 and time.monotonic() < deadline:
             time.sleep(0.02)
             probe = private_tmux("list-sessions")
-        assert probe.returncode != 0 and "no server running" in probe.stderr.lower()
-        # tmux may leave the unlinked server's filesystem socket node behind;
-        # TemporaryDirectory cleanup below removes this private fixture node.
-        if socket_path.exists():
-            assert stat.S_ISSOCK(socket_path.lstat().st_mode)
+        assert probe.returncode != 0 and any(
+            marker in probe.stderr.lower()
+            for marker in ("no server running", "no such file or directory")
+        )
+        # The guarded helper removes only this verified private socket after
+        # the exact test server has exited.
+        assert not socket_path.exists()
     finally:
         if client is not None:
             client.close()

@@ -5,26 +5,27 @@ the TUI calls. No window name is used as a write target.
 """
 
 import os
-import subprocess
+import shutil
 
 import pytest
 
 from tmux_agent_tower.state.bindings import ProjectBindingStore
 from tmux_agent_tower.state.overrides import OverrideStore
 from tmux_agent_tower.tmux import structure
+from tmux_test_safety import run_isolated_tmux
 from workspace_fixture import make_three_level_git_workspace
 
 
 def _tmux(*args):
-    return subprocess.run(["tmux", *args], capture_output=True, text=True, check=False)
+    return run_isolated_tmux(*args)
 
 
 def _have_tmux():
-    return _tmux("-V").returncode == 0
+    return shutil.which("tmux") is not None
 
 
 @pytest.mark.skipif(not _have_tmux(), reason="tmux is not installed")
-def test_empty_to_working_without_manual_tmux_commands(tmp_path):
+def test_empty_to_working_without_manual_tmux_commands(tmp_path, tmux_test_safety):
     session = f"tower-dogfood-{os.getpid()}"
     created = _tmux("new-session", "-d", "-s", session, "-n", "tower")
     assert created.returncode == 0, created.stderr
@@ -127,7 +128,7 @@ def _select_named(tree, name: str) -> None:
 
 
 @pytest.mark.skipif(not _have_tmux(), reason="tmux is not installed")
-def test_tree_choice_builds_and_rearranges_a_workspace(tmp_path):
+def test_tree_choice_builds_and_rearranges_a_workspace(tmp_path, tmux_test_safety):
     """The empty-session path: tree, shell, split, move, break, rename, close.
 
     The harness only creates the isolated session. Later writes go through
@@ -142,9 +143,6 @@ def test_tree_choice_builds_and_rearranges_a_workspace(tmp_path):
     repo = str(repo_path)
     root = str(root_path)
     session = f"tower-struct-{os.getpid()}"
-    user = _tmux("list-windows", "-t", "0", "-F", "#{window_id}")
-    user_before = user.stdout.split() if user.returncode == 0 else None
-
     created = _tmux("new-session", "-d", "-s", session, "-n", "tower")
     assert created.returncode == 0, created.stderr
     try:
@@ -247,6 +245,3 @@ def test_tree_choice_builds_and_rearranges_a_workspace(tmp_path):
         assert structure.current_window_id(session) == tower_window
     finally:
         _tmux("kill-session", "-t", session)
-        if user_before is not None:
-            user_after = _tmux("list-windows", "-t", "0", "-F", "#{window_id}").stdout.split()
-            assert user_after == user_before

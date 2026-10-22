@@ -1,6 +1,4 @@
 import shutil
-import subprocess
-import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +14,7 @@ from tmux_agent_tower.ui import folder_tree
 from tmux_agent_tower.ui import control_view
 from tmux_agent_tower.ui.tower import Tower
 from tmux_agent_tower.ui import structure_menu
+from tmux_test_safety import run_isolated_tmux
 
 
 def _row(target, *, name=None, role=None, status="IDLE", attention="none", result="none", pane=None):
@@ -442,13 +441,11 @@ def test_group_layout_saves_to_saved_work_only_not_template(tmp_path, monkeypatc
 
 
 @pytest.mark.skipif(not shutil.which("tmux"), reason="tmux is not installed")
-def test_work_group_lifecycle_against_isolated_tmux_server(tmp_path, monkeypatch):
+def test_work_group_lifecycle_against_isolated_tmux_server(tmp_path, monkeypatch, tmux_test_safety):
     from tmux_agent_tower.ui import tower as tower_module
 
-    socket = "tower-wbs03-" + uuid.uuid4().hex[:8]
-
     def tmux(*args):
-        return subprocess.run(["tmux", "-L", socket, *args], check=True, text=True, capture_output=True).stdout.strip()
+        return run_isolated_tmux(*args, check=True).stdout.strip()
 
     try:
         tmux("new-session", "-d", "-x", "160", "-y", "60", "-s", "wbs03", "-n", "isolated", "sleep 600")
@@ -506,4 +503,4 @@ def test_work_group_lifecycle_against_isolated_tmux_server(tmp_path, monkeypatch
         assert tmux("list-panes", "-s", "-t", "wbs03", "-F", "#{pane_id}:#{pane_pid}:#{window_id}:#{pane_left}:#{pane_top}:#{pane_width}:#{pane_height}").splitlines() == before
         assert tmux("list-windows", "-a", "-F", "#{session_name}:#{window_id}:#{window_name}:#{window_layout}").splitlines() == windows_before
     finally:
-        subprocess.run(["tmux", "-L", socket, "kill-server"], capture_output=True, check=False)
+        run_isolated_tmux("kill-server", check=False)

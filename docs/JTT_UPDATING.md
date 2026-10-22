@@ -34,6 +34,16 @@ cd jtt-release
 ./scripts/jtt-install-release
 ```
 
+JTT tags use a product namespace: `jtt-vMAJOR.MINOR.PATCH` for stable and
+`jtt-vMAJOR.MINOR.PATCH-rcN` for an RC (for example, the tag payload
+`v0.3.0-rc2` maps to Python package version `0.3.0rc2`). The legacy Tower tag
+`v0.3.0-rc2` is not a JTT Release candidate. This repository currently builds
+both commands from the `tmux-agent-tower` distribution, so the numeric package
+version may overlap across products; the full JTT identity is the `jtt-` tag
+namespace, matching package version, JTT console entry point, and private
+`product: jtt` install record. The installer and updater reject a legacy Tower
+tag even when its version is newer.
+
 The bootstrap verifies a clean exact Git tag, a matching published GitHub
 Release, and the tag's resolved commit before it asks for confirmation. It
 installs into a new versioned directory under `${XDG_DATA_HOME:-~/.local/share}/jtt/`
@@ -56,9 +66,11 @@ hint and leaves persistent shell settings to the user.
 | `jtt rollback` | Requires interactive confirmation before restoring the retained older Release. |
 
 `--channel stable` and `--channel rc` select a track explicitly; `auto` follows
-the installed version track. Draft releases, arbitrary branches, tags without
-a published Release, malformed versions, and tags that cannot be resolved to a
-verified commit are rejected. The updater downloads source only for the
+the installed version track. Only published JTT Releases in the `jtt-v...`
+namespace are considered. Draft releases, legacy Tower tags, arbitrary
+branches, tags without a published Release, malformed versions, channel/tag
+mismatches, and tags that cannot be resolved to a verified commit are rejected.
+The updater downloads source only for the
 verified Release commit. Python runtime dependencies are resolved by pip from
 the configured package index during the explicitly confirmed installation;
 if this fails, the current launcher remains active. Offline check or download

@@ -132,7 +132,8 @@ def test_live_supervisor_argv_mismatch_is_reported_separately(tmp_path, monkeypa
     import tmux_agent_tower.terminal.manager as manager
 
     _safe_test_home(monkeypatch, tmp_path)
-    monkeypatch.setattr(manager, "SUPERVISOR_STARTUP_TIMEOUT", 0.3)
+    # Use the production startup budget so a cold venv import does not race
+    # the identity-mismatch assertion on slower CI/WSL hosts.
     monkeypatch.setattr(manager, "_worker_identity_status",
                         lambda *_args, **_kwargs: "argv_mismatch")
     registry = TerminalRegistry(root=tmp_path / "jtt" / "terminals")
