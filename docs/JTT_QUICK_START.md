@@ -7,6 +7,8 @@ The RC3 UI uses Korean menu labels; their English meanings appear below.
 Install using the [README's guarded official installer](../README.md#install-official-rc3).
 Then run `jtt --version`, `jtt doctor`, and `jtt`.
 
+[Watch the 75-second walkthrough](../media/jtt-rc3-intro.mp4) or read its [text alternative](JTT_MEDIA.md). It uses actual RC3 PTY output and synthetic data with edited timing, not a native Windows Terminal recording. Follow the steps below at your own pace.
+
 ## 1. Create and type
 
 Opening JTT alone starts no shell. Select a LEFT Window, then press Ctrl+G followed by n within four seconds.

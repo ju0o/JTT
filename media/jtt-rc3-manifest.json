@@ -1,0 +1,71 @@
+{
+  "product": "JTT RC3",
+  "source_tag": "jtt-v0.3.0-rc3",
+  "source_commit": "2a4480178b500fbd3044d9e0bb152a98dbc12a63",
+  "truth_level": "REAL_UI_SYNTHETIC_DATA",
+  "presentation": "Edited independent takes of real PTY cells; labeled detail crops and editorial detach title",
+  "native_windows_terminal": "PENDING",
+  "isolated_pty_160x44": "PASS",
+  "isolated_pty_80x24": "PASS",
+  "source_frames_scanned": 335,
+  "privacy_check": "Bounded keyword/IP scans plus representative visual review",
+  "runtime_unchanged": true,
+  "files": [
+    {
+      "file": "jtt-rc3-showcase.gif",
+      "bytes": 1747726,
+      "sha256": "699a35378044a4a37440431d38c5d1b0ee88cf8f5877cbff2f4671cc2f805a85",
+      "seconds": 18,
+      "width": 1280,
+      "height": 800,
+      "stored_frames": 32
+    },
+    {
+      "file": "jtt-rc3-intro.mp4",
+      "bytes": 671786,
+      "sha256": "e92343b90d0af892cbc227cfd3121766e7851542e110987d97cea8bd24175f76",
+      "seconds": 75,
+      "width": 1920,
+      "height": 1200,
+      "fps": 5,
+      "frames": 375
+    },
+    {
+      "file": "jtt-rc3-thumbnail.png",
+      "bytes": 91679,
+      "sha256": "3e9061cffd410c72b19410b07b20ae32766cb445a1efdc12b19f579081bb2d6a",
+      "width": 1280,
+      "height": 640
+    },
+    {
+      "file": "jtt-rc3-intro.en.srt",
+      "bytes": 978,
+      "sha256": "2a026be58a8ff137cb1894a9c28868595876293733f6e3351cc075098c7e1760"
+    },
+    {
+      "file": "jtt-rc3-intro.ko.srt",
+      "bytes": 1093,
+      "sha256": "d660d3dc5577274279c63adde24cd99fee52bf110cd0fb515c5c43f1e929c2b7"
+    },
+    {
+      "file": "showcase-source/captures.json.gz",
+      "bytes": 864006,
+      "sha256": "89f454c0e4442c13136b2926a140f7c1f7bfbee7dc950ede94d765590f4c4f88"
+    },
+    {
+      "file": "showcase-source/timeline.json",
+      "bytes": 3593,
+      "sha256": "bf1788dec65532ad918a879cd130a68d798b72d84c7a2270b5fc419594ba1c5a"
+    },
+    {
+      "file": "showcase-source/capture-evidence.json",
+      "bytes": 1484,
+      "sha256": "b4dcc770c77581bc2a7a16ec7e5a35f5ea36005fe8459feff3c5b0ddce689130"
+    },
+    {
+      "file": "showcase-source/render.py",
+      "bytes": 8620,
+      "sha256": "52624756b0774f76f1dbfea2c928c890117e99eed5757b69cc92e7a23d35e6a5"
+    }
+  ]
+}

@@ -6,12 +6,18 @@
 
 독립 셸을 만들고 전환하며, UI를 닫아도 실행을 유지하고 같은 세션에 재연결합니다. 클라우드 서버, 모델 API, Agent 계정 관리 또는 필수 tmux 서버는 없습니다.
 
-[공식 RC3 프리릴리스](https://github.com/ju0o/tmux-agent-tower/releases/tag/jtt-v0.3.0-rc3) · [빠른 시작](docs/JTT_QUICK_START.ko.md) · [시연 스토리보드](docs/JTT_SHOWCASE.md)
+기존 tmux Pane을 관찰하는 Legacy Tower와 달리 JTT는 자체 로컬 터미널을 유지합니다. 그 안에서 실행할 프로그램은 사용자가 선택합니다.
+
+[공식 RC3 프리릴리스](https://github.com/ju0o/tmux-agent-tower/releases/tag/jtt-v0.3.0-rc3) · [빠른 시작](docs/JTT_QUICK_START.ko.md) · [75초 사용 영상](media/jtt-rc3-intro.mp4)
 
 ## 사용 흐름
 
+![합성 데이터를 사용한 JTT RC3 PTY 편집 시연: 로컬 터미널 생성, RIGHT 입력, 카드 전환, UI 분리와 재연결.](media/jtt-rc3-showcase.gif)
+
 생성 → RIGHT 입력 → 터미널 전환 → UI 분리 → 재연결.
-[촬영 계획](docs/JTT_SHOWCASE.md)은 실제 RC3 화면과 합성 시연 데이터를 사용합니다. 15~20초 GIF와 60~90초 영상은 **아직 촬영하지 않았습니다**. 기존 Tower GIF를 JTT 시연으로 사용하지 않습니다.
+실제 RC3 curses/PTY 출력을 렌더링한 **합성 데이터 기반 편집 시연**이며 Windows Terminal 창을 직접 녹화한 영상은 아닙니다. 시간 흐름을 편집했으며 성능 측정 자료가 아닙니다. Windows Terminal 네이티브 화면 검증은 아직 대기 상태입니다.
+
+[영상·썸네일](docs/JTT_MEDIA.md) · [영문 자막](media/jtt-rc3-intro.en.srt) · [한국어 자막](media/jtt-rc3-intro.ko.srt) · [텍스트 설명·검증 범위](docs/JTT_MEDIA.md)
 
 ## 공식 RC3 설치
 
@@ -88,7 +94,7 @@ JTT의 `jtt-v0.3.0-rc3`는 기존 Tower `v0.3.0-rc2`와 다릅니다. 두 명령
 - [빠른 시작](docs/JTT_QUICK_START.ko.md) · [English Quick Start](docs/JTT_QUICK_START.md)
 - [터미널 호환성·키보드 정책·데이터 안전](docs/JTT_TERMINAL_SUPPORT.md)
 - [Work Kit](docs/JTT_WORK_KITS.md) · [업데이트·롤백](docs/JTT_UPDATING.ko.md)
-- [시연 제작 계획](docs/JTT_SHOWCASE.md)
+- [시연과 촬영 경계](docs/JTT_SHOWCASE.md) · [접근성용 미디어 설명](docs/JTT_MEDIA.md)
 - [기존 Tower 설치·사용 안내](docs/TOWER_LEGACY.ko.md) · [Legacy Tower English](docs/TOWER_LEGACY.md)
 
 개발 체크아웃의 **DEV** 설치는 `./scripts/jtt-setup-dev`, `./scripts/jtt-install-dev`를 명시적으로 실행합니다. 전용 환경에 의존성을 설치할 수 있지만 일반 시작 시 몰래 설치하지 않습니다. DEV에서는 공식 업데이트를 적용하지 않습니다.
