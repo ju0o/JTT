@@ -326,6 +326,71 @@ def _binding_text(binding) -> str:
     return "\n".join("".join(cell.text for cell in row) for row in screen.rows)
 
 
+def _wait_for_vim_dimensions(client, columns=100, lines=30, timeout=4.0):
+    """Observe Vim's answer, not the lifetime of its transient message row.
+
+    The caller sends an expression, not the literal answer, so terminal input
+    echo cannot satisfy this check. Only output polled after that query counts.
+    A subsequent redraw may erase the answer before a screen snapshot arrives.
+    """
+    expected = f"JTT_VIM_SIZE={lines}x{columns}".encode("ascii")
+    started = time.monotonic()
+    output = bytearray()
+    update = None
+    while time.monotonic() - started < timeout:
+        update = client.poll()
+        assert not update.gap, "Vim dimension response has an output gap"
+        output.extend(update.output)
+        if (expected in output and update.synced and not update.more
+                and update.columns == columns and update.lines == lines
+                and update.screen is not None and len(update.screen.rows) == lines):
+            return update, bytes(output)
+        time.sleep(0.02)
+    raise AssertionError(
+        "Vim dimension response not confirmed: "
+        f"expected={columns}x{lines}, elapsed={time.monotonic() - started:.3f}s, "
+        f"answer_seen={expected in output}, bytes={len(output)}, "
+        f"dimensions={None if update is None else (update.columns, update.lines)}, "
+        f"synced={None if update is None else update.synced}"
+    )
+
+
+def test_vim_dimension_response_survives_split_output_and_redrawn_snapshot():
+    from types import SimpleNamespace
+
+    screen = SimpleNamespace(rows=[[] for _ in range(30)])
+    updates = iter(SimpleNamespace(output=chunk, gap=False, synced=True,
+                                   more=False, columns=100, lines=30, screen=screen)
+                   for chunk in (b"JTT_VIM_SI", b"ZE=30x100\r\x1b[2J"))
+    client = SimpleNamespace(poll=lambda: next(updates))
+    update, output = _wait_for_vim_dimensions(client)
+    assert b"JTT_VIM_SIZE=30x100" in output
+    assert "JTT_VIM_SIZE=30x100" not in _binding_text(update)
+
+
+@pytest.mark.parametrize("fault", ["missing_answer", "input_echo", "wrong_vim_size",
+                                  "wrong_size", "unsynced", "backlog", "gap"])
+def test_vim_dimension_response_rejects_unconfirmed_state(monkeypatch, fault):
+    from types import SimpleNamespace
+
+    ticks = iter(index / 100 for index in range(100))
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    output = {
+        "missing_answer": b"",
+        "input_echo": b":echo 'JTT_VIM_SIZE=' . &lines . 'x' . &columns\r",
+        "wrong_vim_size": b"JTT_VIM_SIZE=24x80",
+    }.get(fault, b"JTT_VIM_SIZE=30x100")
+    update = SimpleNamespace(
+        output=output,
+        gap=fault == "gap", synced=fault != "unsynced", more=fault == "backlog",
+        columns=80 if fault == "wrong_size" else 100, lines=30,
+        screen=SimpleNamespace(rows=[[] for _ in range(30)]),
+    )
+    with pytest.raises(AssertionError, match="response"):
+        _wait_for_vim_dimensions(SimpleNamespace(poll=lambda: update), timeout=0.05)
+
+
 def _wait_for_marker(binding, marker: str, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -916,7 +981,8 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
 
 @pytest.mark.skipif(shutil.which("vim") is None, reason="interactive Vim TUI is unavailable")
 @pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")
-def test_vim_alternate_screen_unicode_keys_resize_and_shell_return(monkeypatch):
+@pytest.mark.parametrize("redraw_after_echo", [False, True])
+def test_vim_alternate_screen_unicode_keys_resize_and_shell_return(monkeypatch, redraw_after_echo):
     """Exercise an installed, no-config TUI only inside a fresh JTT PTY."""
 
     if Path(pwd.getpwuid(os.getuid()).pw_shell).resolve() != Path("/bin/bash").resolve():
@@ -991,16 +1057,15 @@ def test_vim_alternate_screen_unicode_keys_resize_and_shell_return(monkeypatch):
         assert update.screen is not None and len(update.screen.rows) == 30
 
         # Ask the running TUI itself to report the dimensions it observed.
-        assert client.send(b":echo 'JTT_VIM_SIZE=' . &lines . 'x' . &columns\r") > 0
-        deadline = time.monotonic() + 4.0
-        while time.monotonic() < deadline:
-            update = client.poll()
-            tui_output.extend(update.output)
-            if (update.synced and not update.more
-                    and "JTT_VIM_SIZE=30x100" in _binding_text(update)):
-                break
-            time.sleep(0.02)
-        assert "JTT_VIM_SIZE=30x100" in _binding_text(update)
+        query = b":echo 'JTT_VIM_SIZE=' . &lines . 'x' . &columns"
+        if redraw_after_echo:
+            # Deterministic equivalent of a pending SIGWINCH redraw: Vim emits
+            # its answer, then clears the message before the next snapshot.
+            query += b" | redraw!"
+        assert client.send(query + b"\r") > 0
+        update, response = _wait_for_vim_dimensions(client)
+        tui_output.extend(response)
+        assert b"JTT_VIM_SIZE=30x100" in response
 
         assert client.send(b":q!\r") == 4
         deadline = time.monotonic() + 4.0
