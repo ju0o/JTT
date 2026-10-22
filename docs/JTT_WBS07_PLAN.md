@@ -117,6 +117,22 @@ codepoints and exactly two question marks, matching that local reproduction.
 The fixture shell now explicitly sets UTF-8 input/output encoding; user/system
 code pages are untouched. CI remains a separate gate from local results.
 
+### Initial gate result: PARTIAL, Windows product adoption NO-GO
+
+Final local native run: 3 passed (5.17s), CP65001. Linux/WSL Python 3.14.4
+full regression: 1974 passed, 1 skipped (199.89s).
+
+Hosted Windows run `39815386508` at `f2f189f` now passes the first Korean
+output check and shell-reported `SIZE=80`, but both lifecycle cases fail to
+find contiguous `입력` in the rendered snapshot after resize and direct Korean
+input. Diagnostic codepoints contain both characters (47141, 51077), with zero
+question marks. This is distinct from the fixed CP437 encoding loss; its exact
+cause (console input/redraw versus screen reconstruction) is **not established**.
+The same sequence passes on the local Windows 11 host. Keep the assertion and
+failed CI evidence; do not infer full Unicode/resize compatibility or adopt
+this renderer/backend combination as production-ready. The hosted failure is
+the next bounded investigation gate, not a reason to fall back to WSL.
+
 Textual headless runs at 160×44 and 80×24 pass, but do not prove native Windows
 Terminal visual acceptance, cursor/color fidelity or the complete approved UI.
 Window/Work Kit product logic is unchanged, not ported by this prototype.

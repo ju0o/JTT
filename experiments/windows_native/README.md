@@ -37,6 +37,12 @@ handle; malformed requests are rejected without terminating the worker.
 Textual `run_test` validates only headless 160×44 and 80×24 layout; it does not
 prove native Windows Terminal visual UX or integrate the approved JTT UI.
 
+**Hosted Windows limitation:** run `39815386508` passes initial UTF-8 Korean
+output and resize width, but the subsequent Korean input/snapshot assertion
+fails. Both characters exist in diagnostic codepoints but not as the expected
+contiguous screen string. Local Windows 11 passes. Cause is not yet isolated;
+Windows product readiness remains NO-GO. Assertions are deliberately retained.
+
 ## Explicit limitations / follow-up gates
 
 - Windows 10 and macOS not tested. Windows CI is a server runner, not a desktop.
