@@ -1,0 +1,53 @@
+{
+  "source_tag": "jtt-v0.3.0-rc3",
+  "source_commit": "2a4480178b500fbd3044d9e0bb152a98dbc12a63",
+  "published_wheel_sha256": "bd153158e32573850ca447f0f8ae80f62dee20a81df74569260419cf32409ab5",
+  "privacy": "bounded keyword/IP scans and visual review; synthetic data only",
+  "sources": [
+    {
+      "name": "original",
+      "frames": 205,
+      "raw_frames_sha256": "a59e258e1c72e44dd8a8d7ee7933f2c1f75ef0f7389cc7b4655f148ff195e8c6",
+      "identity_fields_verified": [
+        "session_id",
+        "generation",
+        "shell_pid",
+        "shell_start",
+        "supervisor_pid",
+        "supervisor_start"
+      ],
+      "session_count": 2,
+      "cleanup_confirmed": true
+    },
+    {
+      "name": "wide",
+      "frames": 72,
+      "raw_frames_sha256": "d572b227e368ffed4c48bc8aac6ef1bc34bfb5521d5c1a8afee7cb7d525a4383",
+      "identity_fields_verified": [
+        "session_id",
+        "generation",
+        "shell_pid",
+        "shell_start",
+        "supervisor_pid",
+        "supervisor_start"
+      ],
+      "session_count": 2,
+      "cleanup_confirmed": true
+    },
+    {
+      "name": "narrow",
+      "frames": 58,
+      "raw_frames_sha256": "f88a1362481edfdc16374669804229a3a9cd033a64b05567f21f93de3e5e2533",
+      "identity_fields_verified": [
+        "session_id",
+        "generation",
+        "shell_pid",
+        "shell_start",
+        "supervisor_pid",
+        "supervisor_start"
+      ],
+      "session_count": 2,
+      "cleanup_confirmed": true
+    }
+  ]
+}

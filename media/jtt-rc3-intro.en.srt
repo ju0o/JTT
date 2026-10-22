@@ -1,0 +1,51 @@
+1
+00:00:00,000 --> 00:00:05,000
+JTT: local terminals, one workspace
+
+2
+00:00:05,000 --> 00:00:13,000
+Ctrl+G n, then type directly in RIGHT
+
+3
+00:00:13,000 --> 00:00:19,000
+Actual shell output, not an Agent simulation
+
+4
+00:00:19,000 --> 00:00:27,000
+Create another independent terminal
+
+5
+00:00:27,000 --> 00:00:33,000
+Two sessions continue independently
+
+6
+00:00:33,000 --> 00:00:38,000
+Ctrl+G h: select a card without restarting it
+
+7
+00:00:38,000 --> 00:00:44,000
+A new Window is an empty logical group
+
+8
+00:00:44,000 --> 00:00:49,000
+Archive: saved session references and templates
+
+9
+00:00:49,000 --> 00:00:57,000
+Preconfigured Work Kit: preview only, never execution
+
+10
+00:00:57,000 --> 00:01:00,000
+Ctrl+G d: detach the UI, not the shells
+
+11
+00:01:00,000 --> 00:01:06,000
+Reopen: exact session identity and PID verified
+
+12
+00:01:06,000 --> 00:01:09,000
+80x24: Tab selects the CENTER panel
+
+13
+00:01:09,000 --> 00:01:15,000
+80x24: actual RIGHT input and Korean output

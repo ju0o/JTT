@@ -5,6 +5,8 @@
 Linux/WSL2의 공식 `jtt-v0.3.0-rc3` / 패키지 `0.3.0rc3` 기준입니다.
 [README의 보호된 공식 설치 명령](../README.ko.md#공식-rc3-설치)으로 설치한 뒤 `jtt --version`, `jtt doctor`, `jtt`를 실행하세요.
 
+[75초 사용 영상](../media/jtt-rc3-intro.mp4) 또는 [텍스트 대체 설명](JTT_MEDIA.md)을 참고하세요. 실제 RC3 PTY 출력과 합성 데이터의 시간 흐름을 편집한 시연이며 Windows Terminal 직접 녹화는 아닙니다. 아래 단계는 각자 속도에 맞춰 진행하면 됩니다.
+
 ## 1. 생성과 입력
 
 UI를 여는 것만으로 셸은 실행되지 않습니다. LEFT Window를 선택하고 Ctrl+G 다음 n을 4초 안에 누릅니다.

@@ -6,12 +6,18 @@ Your local terminal workspace: **Windows on the left, terminal cards in the cent
 
 Create independent shells, switch between them, detach the UI and reconnect to the same running sessions. No cloud service, model API, Agent account management, or required tmux server.
 
-[Official RC3 prerelease](https://github.com/ju0o/tmux-agent-tower/releases/tag/jtt-v0.3.0-rc3) · [Quick Start](docs/JTT_QUICK_START.md) · [Demo storyboard](docs/JTT_SHOWCASE.md)
+Unlike legacy Tower, which observes existing tmux panes, JTT owns its local terminals. You choose what to run inside them.
+
+[Official RC3 prerelease](https://github.com/ju0o/tmux-agent-tower/releases/tag/jtt-v0.3.0-rc3) · [Quick Start](docs/JTT_QUICK_START.md) · [75-second walkthrough](media/jtt-rc3-intro.mp4)
 
 ## See the workflow
 
+![JTT RC3 edited PTY demonstration with synthetic data: create local terminals, type in RIGHT, switch cards, detach the UI and reconnect.](media/jtt-rc3-showcase.gif)
+
 Create → type in RIGHT → switch terminals → detach → reconnect.
-The [capture plan](docs/JTT_SHOWCASE.md) uses actual RC3 output with synthetic demo data. The 15–20 second GIF and 60–90 second video are **not yet recorded**. The legacy Tower GIF is not a JTT demo.
+Actual RC3 curses/PTY output, rendered as an **edited demonstration with synthetic data**; this is not a native Windows Terminal recording. Timing is edited, not a performance benchmark. Native Windows Terminal visual verification remains pending.
+
+[Video / thumbnail](docs/JTT_MEDIA.md) · [English subtitles](media/jtt-rc3-intro.en.srt) · [한국어 자막](media/jtt-rc3-intro.ko.srt) · [Text alternative and verification](docs/JTT_MEDIA.md)
 
 ## Install official RC3
 
@@ -88,7 +94,7 @@ Ordinary `q`, `n`, Tab and Esc go to the terminal in input mode. Navigation `q` 
 - [Quick Start](docs/JTT_QUICK_START.md) · [한국어 빠른 시작](docs/JTT_QUICK_START.ko.md)
 - [Terminal compatibility, keyboard policy and data safety](docs/JTT_TERMINAL_SUPPORT.md)
 - [Work Kits](docs/JTT_WORK_KITS.md) · [Updates / rollback](docs/JTT_UPDATING.md)
-- [Showcase production plan](docs/JTT_SHOWCASE.md)
+- [Showcase and capture boundary](docs/JTT_SHOWCASE.md) · [Accessible media description](docs/JTT_MEDIA.md)
 - [Legacy Tower installation and usage](docs/TOWER_LEGACY.md) · [기존 Tower 한국어](docs/TOWER_LEGACY.ko.md)
 
 For a checkout-pinned **DEV** installation, explicitly run `./scripts/jtt-setup-dev` then `./scripts/jtt-install-dev`. Setup may install dependencies into a private environment; ordinary startup does not install packages. DEV installations do not apply official updates.
