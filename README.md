@@ -35,14 +35,32 @@ does not install packages.
 
 ### Official Release
 
-JTT is currently under **Release HOLD**. Do not treat a Draft PR or a source
-branch as an installable Release. After a JTT version has been published, use
-its exact tag in a clean checkout and run the verified bootstrap installer:
+Install JTT only from a published JTT GitHub Release whose product tag and
+package metadata match. A Draft PR, source branch, or legacy Tower Release is
+not an install source. The command below checks that the JTT tag exists; the
+bootstrap then verifies the matching published Release and commit and fails
+closed if those checks do not pass:
 
 ```sh
-git clone --branch <published-JTT-tag> --depth 1 https://github.com/ju0o/tmux-agent-tower.git jtt-release
-cd jtt-release
-./scripts/jtt-install-release
+if (
+  set -eu
+  JTT_TAG=jtt-v0.3.0-rc3
+  JTT_REPO=https://github.com/ju0o/tmux-agent-tower.git
+  if ! git ls-remote --exit-code --tags "$JTT_REPO" "refs/tags/$JTT_TAG" >/dev/null; then
+    printf 'Cannot verify JTT tag %s (tag unavailable or network error); nothing installed.\n' "$JTT_TAG" >&2
+    exit 1
+  fi
+  if ! git clone --branch "$JTT_TAG" --depth 1 "$JTT_REPO" jtt-release; then
+    printf 'Clone failed; the installer was not run.\n' >&2
+    exit 1
+  fi
+  cd jtt-release || exit 1
+  ./scripts/jtt-install-release
+); then
+  :
+else
+  printf 'JTT installation did not complete; this shell remains open.\n' >&2
+fi
 ```
 
 JTT will use product-specific tags: `jtt-vMAJOR.MINOR.PATCH` for stable and
@@ -52,17 +70,18 @@ distribution and their numeric package versions can overlap. JTT verification
 requires the namespaced tag, matching package metadata, and its `jtt` entry
 point; the installed sidecar is also recorded as `product: jtt`.
 
-The RC3 candidate metadata is package version `0.3.0rc3`, tag
-`jtt-v0.3.0-rc3`, and proposed Release title
-`JTT — Ju0 Terminal Tower 0.3.0 RC3`. This candidate is not published; Release
-and installation remain on HOLD until separately approved.
+The JTT RC3 release identity is package version `0.3.0rc3`, tag
+`jtt-v0.3.0-rc3`, and title `JTT — Ju0 Terminal Tower 0.3.0 RC3`. The tag,
+published Release, resolved commit, package version, and JTT entry point must
+match before installation is accepted. The legacy Tower RC2 tag
+`v0.3.0-rc2` is not this JTT RC3 release.
 
 The installer verifies that the clean checkout is exactly the commit attached
 to a published GitHub Release, asks before writing, and refuses an existing
 `jtt` PATH command. It does not modify Tower's `tower` launcher, shell
 profiles, JTT workspaces, or running sessions. See
 [`docs/JTT_UPDATING.md`](docs/JTT_UPDATING.md) for the update and rollback
-contract. The current release process has not been performed.
+contract.
 
 Opening JTT does not create a shell. Use the explicit new-terminal action when
 one is wanted.

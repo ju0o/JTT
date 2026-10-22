@@ -33,14 +33,31 @@ jtt
 
 ### 공식 Release
 
-현재 JTT는 **Release HOLD** 상태입니다. Draft PR이나 소스 브랜치를 공식 설치본으로
-취급하지 마세요. JTT Release가 공개된 뒤 정확한 공개 태그의 깨끗한 체크아웃에서
-검증 부트스트랩을 실행합니다.
+JTT는 제품 태그·패키지 메타데이터가 일치하는 공개 GitHub Release에서만 설치합니다.
+Draft PR, 소스 브랜치 또는 기존 Tower Release는 설치 소스가 아닙니다. 아래 명령은
+JTT 태그 존재를 확인하며, 부트스트랩은 일치하는 공개 Release와 커밋까지 검증합니다.
+검증에 실패하면 설치를 진행하지 않습니다.
 
 ```sh
-git clone --branch <공개된-JTT-태그> --depth 1 https://github.com/ju0o/tmux-agent-tower.git jtt-release
-cd jtt-release
-./scripts/jtt-install-release
+if (
+  set -eu
+  JTT_TAG=jtt-v0.3.0-rc3
+  JTT_REPO=https://github.com/ju0o/tmux-agent-tower.git
+  if ! git ls-remote --exit-code --tags "$JTT_REPO" "refs/tags/$JTT_TAG" >/dev/null; then
+    printf 'Cannot verify JTT tag %s (tag unavailable or network error); nothing installed.\n' "$JTT_TAG" >&2
+    exit 1
+  fi
+  if ! git clone --branch "$JTT_TAG" --depth 1 "$JTT_REPO" jtt-release; then
+    printf 'Clone failed; the installer was not run.\n' >&2
+    exit 1
+  fi
+  cd jtt-release || exit 1
+  ./scripts/jtt-install-release
+); then
+  :
+else
+  printf 'JTT installation did not complete; this shell remains open.\n' >&2
+fi
 ```
 
 JTT는 Stable에 `jtt-v주버전.부버전.수정버전`, RC에
@@ -48,15 +65,16 @@ JTT는 Stable에 `jtt-v주버전.부버전.수정버전`, RC에
 `v0.3.0-rc2`는 JTT Release가 아닙니다. 두 명령이 현재 같은 Python 배포 패키지에서
 빌드되어 숫자 버전이 겹칠 수 있지만, JTT 설치 검증은 제품 태그, 일치하는 패키지
 메타데이터, `jtt` 진입점 및 `product: jtt` 설치 기록을 함께 확인합니다.
-RC3 후보 정보는 패키지 버전 `0.3.0rc3`, 태그 `jtt-v0.3.0-rc3`, 제안 Release명
-`JTT — Ju0 Terminal Tower 0.3.0 RC3`입니다. 아직 공개되지 않은 후보이며 별도 승인 전까지
-Release와 설치는 HOLD입니다.
+JTT RC3의 Release 식별자는 패키지 버전 `0.3.0rc3`, 태그 `jtt-v0.3.0-rc3`,
+제목 `JTT — Ju0 Terminal Tower 0.3.0 RC3`입니다. 설치 전 태그, 공개 Release,
+대상 커밋, 패키지 버전 및 JTT 진입점이 모두 일치해야 합니다. 기존 Tower RC2 태그
+`v0.3.0-rc2`는 이 JTT RC3 Release가 아닙니다.
 
 설치기는 체크아웃이 공개 GitHub Release의 정확한 커밋인지 확인하고, 파일을 쓰기
 전에 사용자 확인을 받습니다. PATH에 이미 `jtt` 명령이 있으면 덮어쓰지 않습니다.
 기존 `tower` 런처, 셸 설정 파일, JTT 작업공간이나 실행 중인 세션도 변경하지
 않습니다. 업데이트·롤백 계약은 [`docs/JTT_UPDATING.ko.md`](docs/JTT_UPDATING.ko.md)를
-참고하세요. 현재 공식 설치나 Release 배포는 수행하지 않았습니다.
+참고하세요.
 
 JTT를 열기만 해서는 셸이 생성되지 않으며, 새 터미널 동작을 명시적으로 선택해야
 합니다.

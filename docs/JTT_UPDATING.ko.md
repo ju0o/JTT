@@ -24,14 +24,31 @@ Release 확인이나 자동 적용을 거부합니다. `scripts/jtt-dev`와
 
 ## 공식 설치
 
-현재 JTT Release는 **HOLD** 상태입니다. 개발 CI는 Release, 설치 또는 런처 전환을
-수행하지 않습니다. JTT 버전이 공개되면 정확한 태그의 깨끗한 체크아웃에서
-설치기를 실행합니다.
+제품 네임스페이스 태그, 대상 커밋, 패키지 버전 및 `jtt` 진입점이 일치하는 공개
+JTT GitHub Release에서만 설치합니다. Draft PR, 소스 브랜치와 기존 Tower Release는
+설치 소스가 아닙니다. 아래 명령은 RC3 태그 존재를 확인하고, 부트스트랩은 대응하는
+공개 Release까지 별도로 검증합니다. 확인에 실패하면 설치를 거부합니다.
 
 ```sh
-git clone --branch <공개된-JTT-태그> --depth 1 https://github.com/ju0o/tmux-agent-tower.git jtt-release
-cd jtt-release
-./scripts/jtt-install-release
+if (
+  set -eu
+  JTT_TAG=jtt-v0.3.0-rc3
+  JTT_REPO=https://github.com/ju0o/tmux-agent-tower.git
+  if ! git ls-remote --exit-code --tags "$JTT_REPO" "refs/tags/$JTT_TAG" >/dev/null; then
+    printf 'Cannot verify JTT tag %s (tag unavailable or network error); nothing installed.\n' "$JTT_TAG" >&2
+    exit 1
+  fi
+  if ! git clone --branch "$JTT_TAG" --depth 1 "$JTT_REPO" jtt-release; then
+    printf 'Clone failed; the installer was not run.\n' >&2
+    exit 1
+  fi
+  cd jtt-release || exit 1
+  ./scripts/jtt-install-release
+); then
+  :
+else
+  printf 'JTT installation did not complete; this shell remains open.\n' >&2
+fi
 ```
 
 JTT 태그는 제품 접두어를 사용합니다. Stable은 `jtt-v주버전.부버전.수정버전`,
@@ -42,9 +59,10 @@ RC는 `jtt-v주버전.부버전.수정버전-rc번호` 형식입니다. 예를 �
 겹칠 수 있습니다. JTT의 전체 식별은 `jtt-` 태그 접두어, 일치하는 패키지 버전,
 JTT console entry point, 비공개 설치 기록의 `product: jtt` 조합입니다.
 설치기와 업데이트기는 버전이 더 높아도 기존 Tower 태그를 거부합니다.
-준비 중인 RC3 후보는 패키지 버전 `0.3.0rc3`, 태그 `jtt-v0.3.0-rc3`, 제안 Release명
-`JTT — Ju0 Terminal Tower 0.3.0 RC3`입니다. 아직 공개 Release가 아니며 별도 승인 전까지
-공개 Release와 설치는 HOLD입니다.
+JTT RC3의 Release 식별자는 패키지 버전 `0.3.0rc3`, 태그 `jtt-v0.3.0-rc3`,
+제목 `JTT — Ju0 Terminal Tower 0.3.0 RC3`입니다. 기존 Tower RC2 태그
+`v0.3.0-rc2`는 이 JTT RC3 Release가 아닙니다. 설치 전 태그, 공개 Release, 대상 커밋,
+패키지 버전 및 JTT 진입점이 모두 일치해야 합니다.
 
 부트스트랩은 태그 체크아웃이 깨끗한지, GitHub에 실제 공개된 Release와 일치하는지,
 태그가 가리키는 커밋이 같은지 확인한 다음 사용자 확인을 받습니다. 설치는
@@ -94,8 +112,8 @@ socket 경로 길이, `jtt`와 `tower` PATH 충돌 여부를 표시합니다. �
 실행 중 상태는 로컬 registry의 PID/시작 시각 확인 결과이며 실제 TUI 조작 검증은
 아닙니다.
 
-## Release 상태
+## Release 검증 기준
 
-Draft PR과 실제 Windows Terminal/WSL2 사용자 경험을 검수할 때까지 Release HOLD를
-유지합니다. 가짜 GitHub Release 응답을 이용한 코드 테스트는 공개 Release나 실제
-사용자 설치가 아닙니다.
+검증된 JTT 태그와 커밋에 일치하는 실제 공개 GitHub Release만 설치 가능한 Release입니다.
+가짜 GitHub Release 응답을 이용한 코드는 검증 경로일 뿐 실제 공개 Release나 사용자
+설치가 아닙니다. 기존 Tower RC2 Release와 JTT RC3 식별자는 서로 구분됩니다.

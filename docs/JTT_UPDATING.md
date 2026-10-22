@@ -24,14 +24,32 @@ checkout. `scripts/jtt-dev` and `scripts/jtt-setup-dev` remain available.
 
 ## Official installation
 
-The JTT release is currently on **HOLD**. No release, installation, or runtime
-switch is performed as part of development CI. After a JTT version is
-published, start from a clean checkout at that exact tag:
+Install only from a published JTT GitHub Release with a matching JTT-namespaced
+tag, resolved commit, package version, and `jtt` entry point. Draft PRs, source
+branches, and legacy Tower Releases are not install sources. The command below
+checks for the RC3 tag; the bootstrap independently requires the corresponding
+published Release and fails closed if verification does not succeed:
 
 ```sh
-git clone --branch <published-JTT-tag> --depth 1 https://github.com/ju0o/tmux-agent-tower.git jtt-release
-cd jtt-release
-./scripts/jtt-install-release
+if (
+  set -eu
+  JTT_TAG=jtt-v0.3.0-rc3
+  JTT_REPO=https://github.com/ju0o/tmux-agent-tower.git
+  if ! git ls-remote --exit-code --tags "$JTT_REPO" "refs/tags/$JTT_TAG" >/dev/null; then
+    printf 'Cannot verify JTT tag %s (tag unavailable or network error); nothing installed.\n' "$JTT_TAG" >&2
+    exit 1
+  fi
+  if ! git clone --branch "$JTT_TAG" --depth 1 "$JTT_REPO" jtt-release; then
+    printf 'Clone failed; the installer was not run.\n' >&2
+    exit 1
+  fi
+  cd jtt-release || exit 1
+  ./scripts/jtt-install-release
+); then
+  :
+else
+  printf 'JTT installation did not complete; this shell remains open.\n' >&2
+fi
 ```
 
 JTT tags use a product namespace: `jtt-vMAJOR.MINOR.PATCH` for stable and
@@ -44,10 +62,11 @@ namespace, matching package version, JTT console entry point, and private
 `product: jtt` install record. The installer and updater reject a legacy Tower
 tag even when its version is newer.
 
-The prepared RC3 candidate is package version `0.3.0rc3` with tag
-`jtt-v0.3.0-rc3` and proposed Release title
-`JTT — Ju0 Terminal Tower 0.3.0 RC3`. It is not a published Release; the
-public Release and installation path remain on HOLD until separately approved.
+The JTT RC3 release identity is package version `0.3.0rc3`, tag
+`jtt-v0.3.0-rc3`, and title `JTT — Ju0 Terminal Tower 0.3.0 RC3`. The legacy
+Tower RC2 tag `v0.3.0-rc2` is not a JTT RC3 release. Installation is accepted
+only when the JTT tag, published Release, resolved commit, package version, and
+JTT entry point agree.
 
 The bootstrap verifies a clean exact Git tag, a matching published GitHub
 Release, and the tag's resolved commit before it asks for confirmation. It
@@ -103,8 +122,10 @@ directories or probe a live Supervisor socket. A reported running process is
 based on the local registry's PID/start identity check, not an interactive
 terminal test.
 
-## Release status
+## Release verification
 
-Release remains on HOLD until the Draft PR and the actual Windows Terminal/WSL2
-user experience are reviewed. A code test using synthetic GitHub Release
-responses is not a public Release or a user installation.
+Only an actual published GitHub Release matching the verified JTT tag and
+commit is an installable release. Tests using synthetic GitHub Release
+responses verify code paths; they are not a public Release or a user
+installation. The repository's legacy Tower RC2 Release remains distinct from
+the JTT RC3 identity.
