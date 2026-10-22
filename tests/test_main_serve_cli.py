@@ -43,7 +43,7 @@ def test_no_subcommand_still_runs_normal_ui(monkeypatch):
 def test_version_flag_still_works(monkeypatch, capsys):
     main.cli(["--version"])
     out = capsys.readouterr().out
-    assert out.strip() == "tower 0.3.0rc2"
+    assert out.strip() == "tower 0.3.0rc3"
 
 
 class _FakeServer:

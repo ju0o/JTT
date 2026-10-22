@@ -42,6 +42,9 @@ RC는 `jtt-v주버전.부버전.수정버전-rc번호` 형식입니다. 예를 �
 겹칠 수 있습니다. JTT의 전체 식별은 `jtt-` 태그 접두어, 일치하는 패키지 버전,
 JTT console entry point, 비공개 설치 기록의 `product: jtt` 조합입니다.
 설치기와 업데이트기는 버전이 더 높아도 기존 Tower 태그를 거부합니다.
+준비 중인 RC3 후보는 패키지 버전 `0.3.0rc3`, 태그 `jtt-v0.3.0-rc3`, 제안 Release명
+`JTT — Ju0 Terminal Tower 0.3.0 RC3`입니다. 아직 공개 Release가 아니며 별도 승인 전까지
+공개 Release와 설치는 HOLD입니다.
 
 부트스트랩은 태그 체크아웃이 깨끗한지, GitHub에 실제 공개된 Release와 일치하는지,
 태그가 가리키는 커밋이 같은지 확인한 다음 사용자 확인을 받습니다. 설치는

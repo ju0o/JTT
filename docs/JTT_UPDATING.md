@@ -44,6 +44,11 @@ namespace, matching package version, JTT console entry point, and private
 `product: jtt` install record. The installer and updater reject a legacy Tower
 tag even when its version is newer.
 
+The prepared RC3 candidate is package version `0.3.0rc3` with tag
+`jtt-v0.3.0-rc3` and proposed Release title
+`JTT — Ju0 Terminal Tower 0.3.0 RC3`. It is not a published Release; the
+public Release and installation path remain on HOLD until separately approved.
+
 The bootstrap verifies a clean exact Git tag, a matching published GitHub
 Release, and the tag's resolved commit before it asks for confirmation. It
 installs into a new versioned directory under `${XDG_DATA_HOME:-~/.local/share}/jtt/`

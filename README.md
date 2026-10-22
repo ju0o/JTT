@@ -52,6 +52,11 @@ distribution and their numeric package versions can overlap. JTT verification
 requires the namespaced tag, matching package metadata, and its `jtt` entry
 point; the installed sidecar is also recorded as `product: jtt`.
 
+The RC3 candidate metadata is package version `0.3.0rc3`, tag
+`jtt-v0.3.0-rc3`, and proposed Release title
+`JTT — Ju0 Terminal Tower 0.3.0 RC3`. This candidate is not published; Release
+and installation remain on HOLD until separately approved.
+
 The installer verifies that the clean checkout is exactly the commit attached
 to a published GitHub Release, asks before writing, and refuses an existing
 `jtt` PATH command. It does not modify Tower's `tower` launcher, shell
