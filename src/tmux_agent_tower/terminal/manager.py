@@ -37,6 +37,8 @@ SESSION_META = "session.json"
 SOCKET_NAME = "s"
 MAX_UNIX_SOCKET_PATH_BYTES = 107  # Linux sockaddr_un.sun_path, excluding NUL.
 SUPERVISOR_STARTUP_TIMEOUT = 5.0
+STOP_EXIT_CONFIRM_TIMEOUT = 2.0
+STOP_EXIT_CONFIRM_INTERVAL = 0.02
 WORKER = Path(__file__).with_name("_worker.py")
 
 
@@ -475,6 +477,114 @@ def _validate_identity(root: Path, session_id: str) -> Tuple[Path, Dict[str, Any
     return session_dir, metadata
 
 
+def _terminal_identity_key(identity: TerminalIdentity) -> Tuple[Any, ...]:
+    """Fields that must remain fixed while a stop request is authorized."""
+
+    return (
+        getattr(identity, "session_id", None),
+        getattr(identity, "generation", None),
+        getattr(identity, "supervisor_pid", None),
+        getattr(identity, "supervisor_start", None),
+        getattr(identity, "shell_pid", None),
+        getattr(identity, "shell_start", None),
+    )
+
+
+def _stop_shell_process_status(pid: int) -> Tuple[str, Optional[str]]:
+    """Read a shell PID without conflating procfs errors with process exit."""
+
+    if pid <= 0:
+        return "unknown", None
+    try:
+        raw = Path("/proc/{}/stat".format(pid)).read_text(encoding="ascii")
+        fields = raw.rsplit(")", 1)[1].split()
+        state = fields[0]
+        start = fields[19]
+    except FileNotFoundError:
+        return "absent", None
+    except (OSError, IndexError, ValueError):
+        return "unknown", None
+    if state in ("Z", "X"):
+        return "exited", start
+    return "live", start
+
+
+def _verified_stop_snapshot(root: Path, session_id: str
+                            ) -> Tuple[Path, Dict[str, Any], TerminalIdentity]:
+    """Read one private session snapshot with the same strict worker identity."""
+
+    _check_root_components(root, require_leaf=True)
+    if not SESSION_ID_RE.fullmatch(session_id):
+        raise TerminalError("invalid terminal session id")
+    session_dir = root / session_id
+    _private_stat(session_dir, directory=True)
+    metadata = _read_metadata(session_dir / SESSION_META)
+    if (metadata.get("protocol") != PROTOCOL
+            or metadata.get("session_id") != session_id
+            or not isinstance(metadata.get("generation"), str)
+            or not metadata.get("generation")):
+        raise TerminalError("terminal identity does not match the requested session")
+    identity = _identity(metadata)
+    if (identity.shell_pid <= 0 or not identity.shell_start
+            or identity.supervisor_pid <= 0 or not identity.supervisor_start):
+        raise TerminalError("terminal identity is incomplete")
+    if (_proc_start(identity.supervisor_pid) != identity.supervisor_start
+            or not _worker_is_same_process(
+                identity.supervisor_pid, identity.supervisor_start,
+                session_dir, session_id, identity.generation)):
+        raise TerminalError("terminal supervisor identity is stale")
+    return session_dir, metadata, identity
+
+
+def _wait_for_confirmed_shell_exit(
+    root: Path,
+    session_id: str,
+    *,
+    expected_generation: Optional[str],
+    expected_shell_pid: Optional[int],
+    baseline: Optional[TerminalIdentity] = None,
+) -> Tuple[Path, Dict[str, Any], TerminalIdentity]:
+    """Wait only for this verified worker to publish a verifiable shell exit."""
+
+    deadline = time.monotonic() + STOP_EXIT_CONFIRM_TIMEOUT
+    fixed_identity = baseline
+    while True:
+        session_dir, metadata, identity = _verified_stop_snapshot(root, session_id)
+        if fixed_identity is None:
+            fixed_identity = identity
+        elif _terminal_identity_key(identity) != _terminal_identity_key(fixed_identity):
+            raise TerminalError("terminal identity changed during exit confirmation")
+        if (expected_generation is not None
+                and identity.generation != str(expected_generation)):
+            raise TerminalError("terminal identity changed before stop")
+        if (expected_shell_pid is not None
+                and identity.shell_pid != int(expected_shell_pid)):
+            raise TerminalError("terminal identity changed before stop")
+
+        process_status, process_start = _stop_shell_process_status(identity.shell_pid)
+        if process_start is not None and process_start != identity.shell_start:
+            raise TerminalError("terminal shell identity changed during stop")
+        if process_status == "unknown":
+            raise TerminalError("terminal shell exit state is unavailable")
+        if identity.state == "exited":
+            if identity.exit_code is None and identity.exit_signal is None:
+                raise TerminalError("terminal exit status is not confirmed")
+            if process_status == "live":
+                raise TerminalError("terminal shell is live despite exited metadata")
+            return session_dir, metadata, identity
+        if identity.state != "running":
+            raise TerminalError("terminal shell exit state is not confirmable")
+        if process_status == "live":
+            raise TerminalError("terminal shell is live during exit confirmation")
+
+        now = time.monotonic()
+        if now >= deadline:
+            raise TerminalError(
+                "terminal exit state confirmation timed out; no stop was sent"
+            )
+        time.sleep(min(STOP_EXIT_CONFIRM_INTERVAL, deadline - now))
+
+
 class TerminalRegistry:
     """Create and reconnect to private local shell sessions.
 
@@ -771,16 +881,50 @@ class TerminalRegistry:
         session id while a confirmation dialog was open.
         """
 
-        session_dir, metadata = _validate_identity(self.root, session_id)
-        ident = _identity(metadata)
+        try:
+            session_dir, metadata = _validate_identity(self.root, session_id)
+        except TerminalError as exc:
+            if str(exc) != "terminal shell identity is stale":
+                raise
+            session_dir, metadata, ident = _wait_for_confirmed_shell_exit(
+                self.root,
+                session_id,
+                expected_generation=expected_generation,
+                expected_shell_pid=expected_shell_pid,
+            )
+        else:
+            ident = _identity(metadata)
+            if ident.state == "exited":
+                session_dir, metadata, ident = _wait_for_confirmed_shell_exit(
+                    self.root,
+                    session_id,
+                    expected_generation=expected_generation,
+                    expected_shell_pid=expected_shell_pid,
+                    baseline=ident,
+                )
         if (expected_generation is not None
                 and ident.generation != str(expected_generation)):
             raise TerminalError("terminal identity changed before stop")
         if (expected_shell_pid is not None
                 and ident.shell_pid != int(expected_shell_pid)):
             raise TerminalError("terminal identity changed before stop")
-        client = self.connect(session_id)
+
         try:
+            client = self.connect(session_id)
+        except TerminalError as exc:
+            if str(exc) != "terminal shell identity is stale":
+                raise
+            session_dir, metadata, ident = _wait_for_confirmed_shell_exit(
+                self.root,
+                session_id,
+                expected_generation=expected_generation,
+                expected_shell_pid=expected_shell_pid,
+                baseline=ident,
+            )
+            client = self.connect(session_id)
+        try:
+            if _terminal_identity_key(client.identity) != _terminal_identity_key(ident):
+                raise TerminalError("terminal identity changed before stop")
             if (expected_generation is not None
                     and client.identity.generation != str(expected_generation)):
                 raise TerminalError("terminal identity changed before stop")
