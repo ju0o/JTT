@@ -109,6 +109,14 @@ returned `process_exited`), then passed after allowing **identity-validated** st
 on the retained owned Job after shell exit. Assignment-failure cleanup is also
 tested with a retained handle. These changes are experiment-only, not product fixes.
 
+The first hosted Windows run failed the Korean output assertion while local
+Windows (OEM CP949) passed. An isolated encoding experiment reproduced Korean
+replacement as two question marks at CP437 and correct output at CP65001.
+Hosted diagnostic run `39815092957` confirmed CP437, zero non-ASCII output
+codepoints and exactly two question marks, matching that local reproduction.
+The fixture shell now explicitly sets UTF-8 input/output encoding; user/system
+code pages are untouched. CI remains a separate gate from local results.
+
 Textual headless runs at 160×44 and 80×24 pass, but do not prove native Windows
 Terminal visual acceptance, cursor/color fidelity or the complete approved UI.
 Window/Work Kit product logic is unchanged, not ported by this prototype.

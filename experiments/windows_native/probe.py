@@ -91,6 +91,9 @@ def worker(address, root, session, generation):
     }
     terminal = PTY(100, 30, backend=Backend.ConPTY)
     argv = ["-NoLogo", "-NoProfile", "-NoExit", "-Command",
+            "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); "
+            "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); "
+            "$OutputEncoding = [Console]::OutputEncoding; "
             "Remove-Module PSReadLine -ErrorAction SilentlyContinue; function prompt { 'JTT> ' }"]
     job = win32job.CreateJobObject(attributes, "jtt-poc-job-" + uuid.uuid4().hex)
     if win32api.GetLastError() == 183:

@@ -70,7 +70,9 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         while not re.search(r"CP=\d+", encoding_snapshot["text"]):
             assert time.monotonic() < deadline, "console code page response missing"
             encoding_snapshot = client.call("snapshot")
-        print("console_output_code_page=" + re.search(r"CP=(\d+)", encoding_snapshot["text"]).group(1))
+        code_page = re.search(r"CP=(\d+)", encoding_snapshot["text"]).group(1)
+        print("console_output_code_page=" + code_page)
+        assert code_page == "65001", "fixture shell must use UTF-8, not locale-dependent OEM encoding"
         for malformed in (b"not-json", b"[]"):
             win32file.WriteFile(client.pipe, malformed)
             assert json.loads(win32file.ReadFile(client.pipe, 65536)[1]) == {"error": "invalid_request"}

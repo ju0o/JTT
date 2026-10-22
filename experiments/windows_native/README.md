@@ -13,6 +13,9 @@ tmux, Agent, SSH, existing JTT registry, or user-profile import. Environment
 variables passed to the shell are a small allowlist with temporary HOME,
 USERPROFILE, APPDATA, LOCALAPPDATA, TEMP and JTT_HOME. This is configuration
 isolation, **not an OS sandbox denying access to the account's files**.
+Only the new fixture PowerShell sets its console input/output encodings to UTF-8;
+no global code page or user profile is changed. Windows PowerShell's OEM default
+can replace Korean with question marks on an English-language runner.
 
 The separate worker owns the ConPTY and a Windows Job Object. Clients use a
 local-only named pipe with an explicit current-user SID DACL, verified after
