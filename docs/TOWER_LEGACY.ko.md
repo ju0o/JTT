@@ -573,4 +573,3 @@ OpenCode를 제외한 입력대기 판정)은 실제로 그 CLI를 띄워 관찰
 ## 라이선스
 
 MIT -- [`LICENSE`](../LICENSE) 참고.
-

@@ -539,4 +539,3 @@ prompt. It does not create or close windows.
 ## License
 
 MIT -- see [`LICENSE`](../LICENSE).
-
