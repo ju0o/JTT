@@ -411,7 +411,8 @@ class PtyOwner:
         self.selector.register(self.listener, selectors.EVENT_READ, "listener")
 
     def _store_state(self, state: str, **extra) -> None:
-        self.metadata.update({
+        updated_metadata = dict(self.metadata)
+        updated_metadata.update({
             "protocol": PROTOCOL,
             "session_id": self.session_id,
             "generation": self.generation,
@@ -428,8 +429,12 @@ class PtyOwner:
             "renderer_state": self.renderer_state,
             "created_at": self.created_at,
         })
-        self.metadata.update(extra)
-        _atomic_metadata(self.metadata_path, self.metadata)
+        updated_metadata.update(extra)
+        # Keep the in-memory view behind the durable state boundary. If the
+        # atomic write fails, the next event-loop pass can retry without
+        # believing that an uncommitted transition already happened.
+        _atomic_metadata(self.metadata_path, updated_metadata)
+        self.metadata = updated_metadata
 
     def _accept(self) -> None:
         conn, _address = self.listener.accept()
@@ -542,6 +547,11 @@ class PtyOwner:
         if op == "resize":
             return self._resize(client_id, request), False
         if op == "stop":
+            # A stop request can arrive after the PTY shell exits but before
+            # the next event-loop iteration. Persist its wait status before
+            # cleanup so that an unconfirmed exit never authorizes signalling
+            # the remaining process session.
+            self._check_child()
             if self.child is not None:
                 self._store_state("stopping", termination="requested")
                 self._terminate_child()
@@ -567,8 +577,14 @@ class PtyOwner:
 
     def _state(self) -> str:
         if self.child is None:
-            return "exited"
-        return "running" if self.child.poll() is None else "exited"
+            metadata = getattr(self, "metadata", {})
+            return str(metadata.get("state", "exited"))
+        if self.child.poll() is None:
+            return "running"
+        self._check_child()
+        if self.metadata.get("state") != "exited":
+            raise TerminalError("terminal exit state is not durably confirmed")
+        return "exited"
 
     def _screen_payload(self):
         payload, renderer_state = self._serialize_screen()
@@ -811,12 +827,12 @@ class PtyOwner:
         code = self.child.poll()
         if code is None or self.metadata.get("state") == "exited":
             return
-        self.lease_owner = None
-        self.lease_deadline = 0.0
         if code < 0:
             self._store_state("exited", exit_code=None, exit_signal=-code)
         else:
             self._store_state("exited", exit_code=code, exit_signal=None)
+        self.lease_owner = None
+        self.lease_deadline = 0.0
 
     def run(self) -> None:
         try:
