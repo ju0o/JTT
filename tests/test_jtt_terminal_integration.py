@@ -378,7 +378,10 @@ def _wait_for_raw_ui_text(ui: _RawUIProcess, expected: str, timeout: float = 5.0
         ui.pump()
         if expected in ui.text():
             return
-    raise AssertionError("JTT curses PTY did not emit the expected UI text")
+    raise AssertionError(
+        f"JTT curses PTY did not emit the expected UI text {expected!r}; "
+        f"tail={ui.text()[-1200:]!r}"
+    )
 
 
 def _wait_for_raw_ui_occurrence(ui: _RawUIProcess, expected: str, minimum: int,
@@ -388,7 +391,11 @@ def _wait_for_raw_ui_occurrence(ui: _RawUIProcess, expected: str, minimum: int,
         ui.pump()
         if ui.text().count(expected) >= minimum:
             return
-    raise AssertionError("JTT curses PTY did not redraw the expected navigation state")
+    raise AssertionError(
+        "JTT curses PTY did not redraw the expected navigation state; "
+        f"expected {expected!r} at least {minimum} times, "
+        f"tail={ui.text()[-1000:]!r}"
+    )
 
 
 def _wait_for_created_terminal(ui: _UIProcess, registry: TerminalRegistry,
@@ -727,8 +734,10 @@ def test_real_curses_flat_window_create_and_archive_route_create_no_pty(
         shutil.rmtree(root, ignore_errors=True)
 
 
-def test_real_curses_work_kit_archive_create_and_preview_never_starts_shells(monkeypatch):
-    """Exercise Work Kit creation and preview through the Archive curses flow."""
+@pytest.mark.parametrize(("height", "width"), [(24, 80), (44, 160)])
+def test_real_curses_visual_work_kit_create_and_preview_never_starts_shells(
+        monkeypatch, height, width):
+    """Exercise the visual archive/editor at compact and wide terminal sizes."""
     root = Path(tempfile.mkdtemp(prefix="jtt-work-kit-pty-"))
     root.chmod(0o700)
     source_root = Path(__file__).resolve().parents[1] / "src"
@@ -737,21 +746,24 @@ def test_real_curses_work_kit_archive_create_and_preview_never_starts_shells(mon
     ui = None
     try:
         assert registry.list_sessions() == ()
-        ui = _RawUIProcess(root, source_root, height=44, width=160)
+        ui = _RawUIProcess(root, source_root, height=height, width=width)
         _wait_for_raw_ui_text(ui, "Window 1")
         assert registry.list_sessions() == ()
 
-        # Flat LEFT: Window 1, new Window, Archive. Open Archive and choose
-        # its fifth action (create Work Kit), then enter one template.
+        # Open the archive, switch to the Work Kit tab, then choose card-based create.
         ui.send(b"\x1bOB\x1bOB\n")
-        _wait_for_raw_ui_text(ui, "보관함")
-        ui.send(b"\x1bOB\x1bOB\x1bOB\x1bOB\n")
-        _wait_for_raw_ui_text(ui, "Work Kit 이름:")
-        ui.send("Integration Kit\nTemplate preview only\n1\nShell\nLocal command line\n\n".encode("utf-8"))
+        _wait_for_raw_ui_text(ui, "[ 저장한 작업 ]")
+        ui.send(b"\t\t\x1bOC\n\t\x1bOB\x1bOB\x1bOB\x1bOB\n")
+        _wait_for_raw_ui_text(ui, "새 Work Kit")
+        # Enter the name and description as fields; add/remove a card before save.
+        ui.send(b"\t\t\n")
+        ui.send("Integration Kit\n".encode("utf-8"))
+        ui.send(b"\t\t\t\n")
+        ui.send("Template preview only\n".encode("utf-8"))
+        ui.send(b"ar\ts")
 
-        _wait_for_raw_ui_text(
-            ui, "Integration Kit Work Kit 저장 완료 · 터미널 1개 구성 · 아직 실행되지 않음",
-        )
+        _wait_for_raw_ui_text(ui, "Work Kit 템플릿")
+        _wait_for_raw_ui_text(ui, "Integration Kit")
         assert registry.list_sessions() == ()
         kits = JTTWorkKitStore(root / "state").kits()
         assert len(kits) == 1
@@ -759,17 +771,38 @@ def test_real_curses_work_kit_archive_create_and_preview_never_starts_shells(mon
         assert kits[0]["layout"] == "single"
         assert not (root / "state" / "workspaces.json").exists()
 
-        # Saving does not auto-preview. Reopen Archive and preview by explicit
-        # action, then return to the concrete Window without starting a shell.
+        # Creation returns to the archive with the new Kit selected. Edit its
+        # terminal card in curses, then save back to the selected preview.
+        ui.send(b"\n\x1bOB\n")
+        _wait_for_raw_ui_text(ui, "Work Kit 편집")
         ui.send(b"\n")
-        _wait_for_raw_ui_text(ui, "보관함")
-        ui.send(b"\x1bOB\x1bOB\x1bOB\x1bOB\x1bOB\n\n")
+        # The field picker title can wrap at 80 columns. Select the role field
+        # by navigation and choose a preset so this E2E does not depend on a
+        # terminal-specific Backspace encoding for replacing the name.
+        ui.send(b"\x1bOB\n")
+        _wait_for_raw_ui_text(ui, "역할 선택")
+        ui.send(b"\x1bOB\n")
+        _wait_for_raw_ui_text(ui, "터미널 1  · 개발")
+        prior_template_previews = ui.text().count("Work Kit 템플릿")
+        ui.send(b"\t\x1bOC\x1bOC\n")
+        # Saving returns to the archive with this kit selected and previewed.
+        _wait_for_raw_ui_occurrence(ui, "Work Kit 템플릿", prior_template_previews + 1)
+        edited_terminal = JTTWorkKitStore(root / "state").kits()[0]["terminals"][0]
+        assert edited_terminal["name"] == "터미널 1"
+        assert edited_terminal["role"] == "개발"
+        assert registry.list_sessions() == ()
+
+        # Explicit preview still projects only a template and never starts a shell.
+        ui.send(b"\x1b")
+        ui.send(b"\n")
+        _wait_for_raw_ui_occurrence(ui, "[ 저장한 작업 ]", 2)
+        ui.send(b"\t\t\x1bOC\n\n\n")
         _wait_for_raw_ui_text(ui, "Work Kit 미리보기")
-        _wait_for_raw_ui_text(ui, "▶ Shell")
-        _wait_for_raw_ui_text(ui, "Local command line")
-        _wait_for_raw_ui_text(ui, "터미널 · Shell")
-        _wait_for_raw_ui_text(ui, "템플릿 · 셸/명령 미실행")
-        assert "실행 중인 터미널이 아닙니다." in ui.text()
+        _wait_for_raw_ui_text(ui, "터미널 1")
+        _wait_for_raw_ui_text(ui, "일반 터미널")
+        if width >= 110:
+            _wait_for_raw_ui_text(ui, "템플릿 · 셸/명령 미실행")
+            assert "실행 중인 터미널이 아닙니다." in ui.text()
         assert registry.list_sessions() == ()
 
         window_one_count = ui.text().count("Window 1")

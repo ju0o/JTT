@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import curses
+import copy
 import locale
 import os
 import queue
@@ -35,6 +36,7 @@ from ..state.jtt_workspaces import (
     WorkspaceStoreError,
 )
 from ..terminal import TerminalRegistry, TerminalScreen
+from ..launcher.browse import list_local_children, parent_path, validate_local_path
 from . import ux_preview_v2 as renderer
 from .render import display_width, truncate_to_width
 from .widgets import (
@@ -1148,116 +1150,442 @@ def _preview_work_kit(state: dict, choice: dict) -> None:
     state["jtt_notice_until"] = 0.0
 
 
-def _refresh_work_kit_choices(state: dict) -> None:
-    work_kits = state["jtt_work_kit_store"].kits()
-    state["jtt_work_kits"] = work_kits
-    state["jtt_work_kit_error"] = False
-
-
 def _create_work_kit(stdscr, state: dict) -> None:
-    if state.get("jtt_work_kit_error"):
-        state["jtt_notice"] = "Work Kit 저장 데이터 오류로 생성을 막았습니다. 기존 파일은 변경하지 않았습니다."
-        state["jtt_notice_until"] = 0.0
-        return
-    name = prompt_text(stdscr, "Work Kit 이름: ")
-    if not name:
-        state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
-        state["jtt_notice_until"] = 0.0
-        return
-    description = prompt_text(stdscr, "한 줄 설명 (선택): ")
-    if description is None:
-        state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
-        state["jtt_notice_until"] = 0.0
-        return
-    count_text = prompt_text(
-        stdscr, "터미널 개수 (1–4): ",
-        context_lines=["Work Kit은 템플릿만 저장합니다. 셸이나 명령은 실행되지 않습니다."],
-    )
-    if count_text is None:
-        state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
-        state["jtt_notice_until"] = 0.0
-        return
-    try:
-        count = int(count_text)
-        terminals = []
-        if count not in (1, 2, 3, 4):
-            raise ValueError
-        for index in range(count):
-            terminal_name = prompt_text(stdscr, f"터미널 {index + 1} 이름: ")
-            if not terminal_name:
-                state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
-                state["jtt_notice_until"] = 0.0
-                return
-            role = prompt_text(stdscr, f"터미널 {index + 1} 역할: ")
-            if not role:
-                state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
-                state["jtt_notice_until"] = 0.0
-                return
-            working_directory = _prompt_working_directory(
-                stdscr, f"터미널 {index + 1} 작업 폴더 (선택): "
-            )
-            if working_directory is None:
-                state["jtt_notice"] = "Work Kit 생성 취소 · 터미널은 실행되지 않았습니다."
-                state["jtt_notice_until"] = 0.0
-                return
-            terminals.append({
-                "name": terminal_name,
-                "role": role,
-                "working_directory": working_directory or None,
-            })
-        kit = state["jtt_work_kit_store"].create_kit(name, description, terminals)
-        _refresh_work_kit_choices(state)
-        terminal_count = len(kit["terminals"])
-        state["jtt_notice"] = (
-            f"{kit['name']} Work Kit 저장 완료 · 터미널 {terminal_count}개 구성 · 아직 실행되지 않음"
-        )
-        state["jtt_notice_until"] = 0.0
-    except WorkKitStoreCommittedDurabilityError:
-        _refresh_work_kit_choices(state)
-        state["jtt_notice"] = (
-            f"Work Kit 저장 완료 · 터미널 {len(terminals)}개 구성 · "
-            "디렉터리 동기화 확인 필요 · 아직 실행되지 않음"
-        )
-        state["jtt_notice_until"] = 0.0
-    except (ValueError, WorkKitStoreError):
-        state["jtt_notice"] = "Work Kit 저장 상태를 확인할 수 없습니다 · 저장 데이터를 다시 확인하세요."
-        state["jtt_notice_until"] = 0.0
+    _edit_work_kit(stdscr, state, original=None)
 
 
-def _prompt_working_directory(stdscr, label: str) -> str | None:
-    """Collect optional path text verbatim; never inspect or normalize it."""
-    height, width = stdscr.getmaxyx()
-    y = min(height - 2, 3)
-    chars = []
-    curses.curs_set(1)
-    stdscr.timeout(-1)
+_WORK_KIT_ROLES = ("일반 터미널", "개발", "코드 리뷰", "테스트", "문서", "서버 관리")
+
+
+def _archive_visual_screen(stdscr, saved: list[dict], kits: list[dict], *,
+                           kit_error: bool = False,
+                           return_default: bool = False, initial_tab: int = 0,
+                           selected_id: str | None = None) -> tuple[str | None, str | None]:
+    """Visual two-pane archive with independent saved-workspace and template tabs."""
+    if stdscr is None or not hasattr(stdscr, "get_wch"):
+        # Non-interactive unit fixtures use this adapter; the real TUI always
+        # takes the visual curses path below.
+        labels = ([*( [("return_default", "내 작업공간으로 돌아가기")] if return_default else []),
+                   ("save", "현재 터미널 구성 저장"),
+                   ("load_workspace", "저장한 작업공간 불러오기"),
+                   ("rename_workspace", "저장한 작업공간 이름 변경"),
+                   ("delete_workspace", "저장한 작업공간 삭제"),
+                   *([] if kit_error else [("create_kit", "Work Kit 템플릿 만들기"),
+                                          ("preview_kit", "Work Kit 미리보기"),
+                                          ("rename_kit", "Work Kit 이름 변경"),
+                                          ("edit_kit", "Work Kit 편집"),
+                                          ("delete_kit", "Work Kit 삭제")])])
+        result = run_list_picker(stdscr, "보관함", labels, centered=True)
+        if result.cancelled or result.selected_key is None:
+            return None, None
+        action = result.selected_key
+        if action in {"load_workspace", "rename_workspace", "delete_workspace"}:
+            record_id = _pick_archive_record(stdscr, "저장한 작업공간", saved)
+        elif action in {"preview_kit", "rename_kit", "edit_kit", "delete_kit"}:
+            record_id = _pick_archive_record(stdscr, "Work Kit", kits)
+        else:
+            record_id = None
+        return action, record_id
+    tab = 1 if initial_tab else 0
+    focus = "list"
+    selected = [0, 0]
+    initial_records = kits if tab else saved
+    if selected_id is not None:
+        selected[tab] = next((index for index, record in enumerate(initial_records)
+                              if str(record.get("id") or "") == selected_id), 0)
+    action_index = 0
+    hit_boxes = []
+    stdscr.timeout(200)
     try:
         while True:
+            height, width = stdscr.getmaxyx()
+            narrow = width < 110 or height < 28
+            records = saved if tab == 0 else kits
+            actions = ([*( [("return_default", "내 작업공간") ] if return_default else []),
+                        ("load_workspace", "불러오기"), ("rename_workspace", "이름 변경"),
+                        ("delete_workspace", "삭제"), ("save", "현재 구성 저장")] if tab == 0 else
+                       [("preview_kit", "미리보기"), ("edit_kit", "편집"),
+                        ("rename_kit", "이름 변경"), ("delete_kit", "삭제"),
+                        ("create_kit", "새 Work Kit")])
+            if tab == 1 and kit_error:
+                actions = [("blocked", "저장 오류 · 변경 차단")]
+            selected[tab] = min(selected[tab], max(0, len(records) - 1))
+            action_index = min(action_index, len(actions) - 1)
+            chosen = records[selected[tab]] if records else None
             stdscr.erase()
-            safe_add(stdscr, y, 0, label + "".join(chars), curses.A_BOLD)
-            cursor = display_width(label + "".join(chars))
-            try:
-                stdscr.move(y, min(max(0, width - 1), cursor))
-            except curses.error:
-                pass
+            safe_add(stdscr, 0, 2, "보관함", curses.A_BOLD)
+            safe_add(stdscr, 1, 2,
+                     ("[ 저장한 작업 ]" if tab == 0 else "  저장한 작업  ") +
+                     "   " + ("[ Work Kit ]" if tab == 1 else "  Work Kit  "),
+                     curses.A_BOLD)
+            hit_boxes = [(2, 1, 17, 1, "tab", 0), (22, 1, 12, 1, "tab", 1)]
+            if narrow:
+                list_top, list_bottom = 3, max(4, min(height - 13, 9))
+                safe_add(stdscr, list_top, 2, "항목", curses.A_UNDERLINE)
+                visible_count = max(1, list_bottom - list_top - 1)
+                start = max(0, selected[tab] - visible_count + 1)
+                for index in range(start, min(len(records), start + visible_count)):
+                    record = records[index]
+                    y = list_top + 1 + index - start
+                    label = _archive_record_name(records, record)
+                    if tab == 0:
+                        label += f"  · 터미널 {len(record.get('terminal_ids', []))}개"
+                    else:
+                        label += f"  · 템플릿 {len(record.get('terminals', []))}개"
+                    safe_add(stdscr, y, 2, ("▶ " if index == selected[tab] else "  ") + label,
+                             curses.A_REVERSE if focus == "list" and index == selected[tab] else 0)
+                    hit_boxes.append((2, y, max(1, width - 4), 1, "record", index))
+                preview_y = list_bottom + 1
+                safe_add(stdscr, preview_y, 2, "구성 미리보기", curses.A_UNDERLINE)
+                details = _archive_preview_lines(tab, chosen)
+                for offset, line in enumerate(details[:max(0, height - preview_y - 7)]):
+                    safe_add(stdscr, preview_y + 1 + offset, 2, line, curses.A_DIM)
+                action_y = max(preview_y + 2, height - 5)
+                columns = max(1, min(4, (width - 4) // 22))
+                cell_width = max(1, (width - 4) // columns)
+                for index, (_action, label) in enumerate(actions):
+                    row, column = divmod(index, columns)
+                    x = 2 + column * cell_width
+                    y = action_y + row
+                    button = truncate_to_width(f"[{label}]", max(1, cell_width - 1))
+                    safe_add(stdscr, y, x, button,
+                             curses.A_REVERSE if focus == "actions" and index == action_index else 0)
+                    rendered_width = min(display_width(button), max(0, width - x))
+                    if rendered_width:
+                        hit_boxes.append((x, y, rendered_width, 1, "action", index))
+            else:
+                left_width = max(30, min(48, width // 3))
+                safe_add(stdscr, 2, 2, "항목", curses.A_UNDERLINE)
+                safe_add(stdscr, 2, left_width + 3, "구성 미리보기", curses.A_UNDERLINE)
+                visible_count = max(1, height - 13)
+                start = max(0, selected[tab] - visible_count + 1)
+                for index in range(start, min(len(records), start + visible_count)):
+                    record = records[index]
+                    y = 3 + index - start
+                    count = len(record.get("terminal_ids", [])) if tab == 0 else len(record.get("terminals", []))
+                    safe_add(stdscr, y, 2, f"{'▶' if index == selected[tab] else ' '} "
+                             f"{_archive_record_name(records, record)}  · {count}개",
+                             curses.A_REVERSE if focus == "list" and index == selected[tab] else 0)
+                    hit_boxes.append((2, y, left_width, 1, "record", index))
+                details = _archive_preview_lines(tab, chosen)
+                for offset, line in enumerate(details[:height - 6]):
+                    safe_add(stdscr, 3 + offset, left_width + 3, line,
+                             curses.A_DIM if offset else curses.A_NORMAL)
+                for index, (_action, label) in enumerate(actions):
+                    x = 2 + index * max(12, min(25, (width - 4) // max(1, len(actions))))
+                    safe_add(stdscr, height - 4, x, f"[{label}]",
+                             curses.A_REVERSE if focus == "actions" and index == action_index else 0)
+                    hit_boxes.append((x, height - 4, display_width(label) + 2, 1, "action", index))
+            safe_add(stdscr, height - 1, 2,
+                     "Tab 영역 이동 · ↑↓ 선택 · Enter 실행 · Esc 닫기  |  Work Kit은 템플릿만 저장",
+                     curses.A_DIM)
             stdscr.refresh()
             key = read_key(stdscr)
-            if is_escape(key):
-                return None
-            if is_enter(key):
-                return "".join(chars)
-            if is_backspace(key):
-                if chars:
-                    chars.pop()
+            if key == -1:
                 continue
-            if isinstance(key, str) and key.isprintable():
-                chars.append(key)
+            if is_escape(key):
+                return None, None
+            if key == "\t":
+                focus = {"list": "actions", "actions": "tabs", "tabs": "list"}[focus]
+            elif key == curses.KEY_BTAB:
+                focus = {"list": "tabs", "tabs": "actions", "actions": "list"}[focus]
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT) and focus == "tabs":
+                tab = 1 - tab
+                selected[tab] = min(selected[tab], max(0, len(kits if tab else saved) - 1))
+            elif key in (curses.KEY_UP, curses.KEY_DOWN):
+                delta = -1 if key == curses.KEY_UP else 1
+                if focus == "actions":
+                    action_index = (action_index + delta) % len(actions)
+                elif focus == "list" and records:
+                    selected[tab] = min(len(records) - 1, max(0, selected[tab] + delta))
+            elif is_enter(key):
+                if focus == "tabs":
+                    focus = "list"
+                elif focus == "list":
+                    if records:
+                        focus = "actions"
+                else:
+                    return actions[action_index][0], (str(chosen["id"]) if chosen else None)
+            elif isinstance(key, str) and key.lower() == "s" and tab == 0:
+                return "save", None
+            elif key == curses.KEY_MOUSE:
+                try:
+                    _mouse_id, mx, my, _z, button = curses.getmouse()
+                except curses.error:
+                    continue
+                if button & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                    for x, y, w, h, kind, index in hit_boxes:
+                        if x <= mx < x + w and y <= my < y + h:
+                            if kind == "tab":
+                                tab, focus = index, "list"
+                            elif kind == "record":
+                                selected[tab], focus = index, "list"
+                            elif kind == "action":
+                                action_index, focus = index, "actions"
+                                chosen = records[selected[tab]] if records else None
+                                return actions[index][0], (str(chosen["id"]) if chosen else None)
+                            break
     finally:
-        try:
-            curses.curs_set(0)
-        except curses.error:
-            pass
         stdscr.timeout(200)
+
+
+def _archive_preview_lines(tab: int, record: dict | None) -> list[str]:
+    if record is None:
+        return ["선택 항목 없음", "Work Kit 탭에서 새 템플릿을 만들 수 있습니다."]
+    if tab == 0:
+        ids = list(record.get("terminal_ids", []))
+        return [f"저장된 작업공간 · {record.get('name', '')}",
+                f"터미널 참조 {len(ids)}개", *[f"· {item}" for item in ids[:8]],
+                "불러오기는 기존 세션 참조를 연결합니다."]
+    terminals = list(record.get("terminals", []))
+    return [f"Work Kit 템플릿 · {record.get('name', '')}",
+            str(record.get("description") or "설명 없음"),
+            f"카드 {len(terminals)}개 · 실제 실행 없음",
+            *[f"· {t['name']}  |  {t['role']}  |  {t.get('working_directory') or '폴더 미지정'}"
+              for t in terminals[:8]],
+            "선택·편집·미리보기는 PTY를 만들지 않습니다."]
+
+
+def _archive_record_name(records: list[dict], record: dict) -> str:
+    name = str(record.get("name") or "이름 없음")
+    duplicate = sum(str(item.get("name") or "").casefold() == name.casefold()
+                    for item in records) > 1
+    return f"{name} · {str(record.get('id') or '')[-4:]}" if duplicate else name
+
+
+def _edit_work_kit(stdscr, state: dict, original: dict | None) -> None:
+    """Edit a private draft; commit only on explicit Save after store revalidation."""
+    state.pop("jtt_archive_selected_kit_id", None)
+    state["jtt_archive_editor_finished"] = False
+    if state.get("jtt_work_kit_error"):
+        state["jtt_notice"] = "Work Kit 저장 데이터 오류 · 편집을 차단했습니다."
+        state["jtt_notice_until"] = 0.0
+        return
+    draft = copy.deepcopy(original) if original is not None else {
+        "id": None, "name": "", "description": "", "terminals": [{
+            "name": "터미널 1", "role": "일반 터미널", "working_directory": None,
+        }],
+    }
+    state["jtt_notice"] = ""
+    selected = 0
+    action_index = 0
+    focus = "cards"
+    height, width = stdscr.getmaxyx() if stdscr is not None else (44, 160)
+    while True:
+        if stdscr is not None:
+            height, width = stdscr.getmaxyx()
+            stdscr.erase()
+            safe_add(stdscr, 0, 2, "Work Kit 편집" if original else "새 Work Kit", curses.A_BOLD)
+            safe_add(stdscr, 2, 2, f"이름: {draft['name'] or '이름 입력'}", curses.A_REVERSE if focus == "name" else 0)
+            safe_add(stdscr, 3, 2, f"설명: {draft['description'] or '선택 입력'}", curses.A_REVERSE if focus == "description" else 0)
+            safe_add(stdscr, 5, 2, f"터미널 카드 ({len(draft['terminals'])}/4)", curses.A_UNDERLINE)
+            max_cards = max(1, min(4, (height - 11) // 3))
+            start = max(0, selected - max_cards + 1)
+            hit_boxes = [(2, 2, width - 4, 1, "name", 0), (2, 3, width - 4, 1, "description", 0)]
+            for index, terminal in enumerate(draft["terminals"][start:start + max_cards], start):
+                y = 6 + (index - start) * 3
+                attr = curses.A_REVERSE if focus == "cards" and index == selected else 0
+                safe_add(stdscr, y, 2, f"{'▶' if index == selected else ' '} {terminal['name']}  · {terminal['role']}", attr)
+                safe_add(stdscr, y + 1, 5, f"작업 폴더: {terminal.get('working_directory') or '미지정'}", curses.A_DIM)
+                safe_add(stdscr, y + 2, 5, "Enter 필드 편집 · b 폴더 탐색", curses.A_DIM)
+                hit_boxes.append((2, y, width - 4, 3, "card", index))
+            action_y = max(7, height - 4)
+            buttons = ["＋ 카드", "－ 카드", "저장", "취소"]
+            action_index = min(action_index, len(buttons) - 1)
+            for index, label in enumerate(buttons):
+                x = 2 + index * 16
+                safe_add(stdscr, action_y, x, f"[{label}]", curses.A_REVERSE if focus == "actions" and action_index == index else 0)
+                hit_boxes.append((x, action_y, 14, 1, "action", index))
+            if state.get("jtt_notice"):
+                safe_add(stdscr, height - 2, 2, state["jtt_notice"], curses.A_BOLD)
+            safe_add(stdscr, height - 1, 2, "↑↓ 카드 · Tab 이동 · Enter 편집/선택 · Esc 변경 취소 · 셸/명령은 실행되지 않음", curses.A_DIM)
+            stdscr.refresh()
+            key = read_key(stdscr)
+        else:
+            # Kept only for non-interactive test callers; never writes on implicit cancel.
+            return
+        if key == -1:
+            continue
+        if is_escape(key):
+            operation = "Work Kit 편집" if original is not None else "Work Kit 생성"
+            state["jtt_notice"] = (f"{operation} 취소 · 변경사항은 저장하지 않았습니다 · "
+                                   "터미널은 실행되지 않았습니다.")
+            state["jtt_notice_until"] = 0.0
+            state["jtt_archive_editor_finished"] = True
+            if original is not None:
+                state["jtt_archive_selected_kit_id"] = original["id"]
+            return
+        if key == "\t":
+            focus = {"cards": "actions", "actions": "name", "name": "description",
+                     "description": "cards"}.get(focus, "cards")
+            continue
+        if key == curses.KEY_BTAB:
+            focus = {"cards": "description", "description": "name", "name": "actions",
+                     "actions": "cards"}.get(focus, "cards")
+            continue
+        if key in (curses.KEY_UP, curses.KEY_DOWN) and focus == "cards":
+            selected = min(len(draft["terminals"]) - 1,
+                           max(0, selected + (-1 if key == curses.KEY_UP else 1)))
+            continue
+        if key in (curses.KEY_LEFT, curses.KEY_RIGHT) and focus == "actions":
+            action_index = (action_index + (-1 if key == curses.KEY_LEFT else 1)) % 4
+            continue
+        if key == curses.KEY_MOUSE:
+            try:
+                _mid, mx, my, _z, button = curses.getmouse()
+            except curses.error:
+                continue
+            if button & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
+                for x, y, w, h, kind, index in hit_boxes:
+                    if x <= mx < x + w and y <= my < y + h:
+                        if kind == "card":
+                            selected, focus = index, "cards"
+                            key = "\n"
+                        elif kind == "action":
+                            focus, action_index = "actions", index
+                            key = "\n"
+                        else:
+                            focus, key = kind, "\n"
+                        break
+        if focus in {"name", "description"} and is_enter(key):
+            field = focus
+            value = prompt_text(stdscr, "Work Kit 이름: " if field == "name" else "한 줄 설명: ",
+                                initial=str(draft[field]))
+            if value is not None:
+                draft[field] = value
+            focus = "cards"
+            continue
+        if focus == "cards" and (is_enter(key) or (isinstance(key, str) and key.lower() == "e")):
+            _edit_work_kit_card(stdscr, draft["terminals"][selected])
+            continue
+        if focus == "cards" and isinstance(key, str) and key.lower() == "b":
+            draft["terminals"][selected]["working_directory"] = _browse_working_directory(
+                stdscr, draft["terminals"][selected].get("working_directory"),
+            )
+            continue
+        if focus == "actions" and is_enter(key):
+            action = action_index
+        elif focus == "cards" and isinstance(key, str) and key.lower() == "a":
+            action = 0
+        elif focus == "cards" and isinstance(key, str) and key.lower() == "r":
+            action = 1
+        elif focus == "actions" and isinstance(key, str) and key.lower() in {"a", "r", "s", "c"}:
+            action = {"a": 0, "r": 1, "s": 2, "c": 3}[key.lower()]
+        else:
+            continue
+        if action == 0 and len(draft["terminals"]) < 4:
+            draft["terminals"].append({"name": f"터미널 {len(draft['terminals']) + 1}",
+                                       "role": "일반 터미널", "working_directory": None})
+            selected = len(draft["terminals"]) - 1
+            focus = "cards"
+        elif action == 1 and len(draft["terminals"]) > 1:
+            draft["terminals"].pop(selected)
+            selected = min(selected, len(draft["terminals"]) - 1)
+            focus = "cards"
+        elif action == 2:
+            name = str(draft.get("name") or "").strip()
+            if not name:
+                state["jtt_notice"] = "Work Kit 이름을 입력하세요 · 저장되지 않았습니다."
+                state["jtt_notice_until"] = 0.0
+                focus = "name"
+                continue
+            try:
+                store = state["jtt_work_kit_store"]
+                if original is None:
+                    kit = store.create_kit(name, draft.get("description", ""), draft["terminals"])
+                else:
+                    kit = store.update_kit(original["id"], name, draft.get("description", ""),
+                                           draft["terminals"], expected_snapshot=original)
+                state["jtt_work_kits"] = store.kits()
+                state["jtt_archive_selected_kit_id"] = kit["id"]
+                state["jtt_notice"] = (f"{kit['name']} Work Kit 저장 완료 · 터미널 "
+                                        f"{len(kit['terminals'])}개 구성 · 아직 실행되지 않음")
+            except WorkKitStoreCommittedDurabilityError as exc:
+                state["jtt_work_kits"] = state["jtt_work_kit_store"].kits()
+                state["jtt_archive_selected_kit_id"] = exc.record_id
+                state["jtt_notice"] = "Work Kit 저장 완료 · 디렉터리 동기화 확인 필요 · 아직 실행되지 않음"
+            except (OSError, ValueError, WorkKitStoreError):
+                state["jtt_notice"] = "Work Kit 저장 실패 · 기존 템플릿을 다시 확인하세요."
+                state["jtt_notice_until"] = 0.0
+                continue
+            state["jtt_notice_until"] = 0.0
+            state["jtt_archive_editor_finished"] = True
+            return
+        elif action == 3:
+            operation = "Work Kit 편집" if original is not None else "Work Kit 생성"
+            state["jtt_notice"] = f"{operation} 취소 · 변경사항은 저장하지 않았습니다."
+            state["jtt_notice_until"] = 0.0
+            state["jtt_archive_editor_finished"] = True
+            if original is not None:
+                state["jtt_archive_selected_kit_id"] = original["id"]
+            return
+
+
+def _edit_work_kit_card(stdscr, terminal: dict) -> None:
+    fields = ["이름", "역할", "작업 폴더"]
+    result = run_list_picker(stdscr, "터미널 카드 편집", [(field, field) for field in fields],
+                             centered=True, footer_hint="역할은 목록 또는 직접 입력 · 폴더 탐색 가능")
+    if result.cancelled or result.selected_key is None:
+        return
+    field = result.selected_key
+    key = {"이름": "name", "역할": "role", "작업 폴더": "working_directory"}[field]
+    if field == "역할":
+        roles = [(role, role) for role in _WORK_KIT_ROLES] + [("custom", "사용자 지정…")]
+        selected = run_list_picker(stdscr, "역할 선택", roles, centered=True,
+                                  footer_hint="Esc 취소 · 사용자 지정 역할 가능")
+        if selected.cancelled:
+            return
+        value = (prompt_text(stdscr, "사용자 지정 역할: ") if selected.selected_key == "custom"
+                 else selected.selected_key)
+    elif field == "작업 폴더":
+        value = _browse_working_directory(stdscr, terminal.get(key))
+    else:
+        value = prompt_text(stdscr, "터미널 이름: ", initial=str(terminal.get(key) or ""))
+    if value is not None:
+        terminal[key] = value or None if key == "working_directory" else value
+
+
+def _browse_working_directory(stdscr, current: str | None) -> str | None:
+    """Read-only local directory picker backed by the bounded launcher browser."""
+    if stdscr is None:
+        return current
+    from pathlib import Path
+    path = str(Path(current).expanduser()) if current else str(Path.home())
+    selected = 0
+    while True:
+        checked = validate_local_path(path)
+        if not checked.ok or checked.entry is None:
+            show_message_screen(stdscr, "폴더를 열 수 없습니다", ["읽을 수 있는 디렉터리가 아닙니다."])
+            return current
+        path = checked.entry.path
+        page = list_local_children(path)
+        entries = [("choose", "현재 폴더 선택"), ("none", "폴더 지정 안 함"),
+                   ("parent", "상위 폴더")]
+        entries.extend((child.path, child.name) for child in page.children)
+        entries.append(("typed", "경로 직접 입력…"))
+        selected = min(selected, len(entries) - 1)
+        result = run_list_picker(stdscr, "작업 폴더 탐색", entries, centered=True,
+                                 footer_hint=path)
+        if result.cancelled or result.selected_key is None:
+            return current
+        key = result.selected_key
+        if key == "choose":
+            return path
+        if key == "none":
+            return None
+        if key == "parent":
+            path = parent_path(path)
+        elif key == "typed":
+            raw = prompt_text(stdscr, "폴더 경로: ", initial=path)
+            if raw is None:
+                continue
+            checked = validate_local_path(raw)
+            if checked.ok and checked.entry:
+                path = checked.entry.path
+            else:
+                show_message_screen(stdscr, "폴더 경로 확인", ["존재하고 읽을 수 있는 폴더를 선택하세요."])
+        else:
+            path = str(key)
 
 
 def _attach_choice(state: dict, choice: dict) -> None:
@@ -1898,54 +2226,56 @@ def _archive_menu(stdscr, state: dict) -> None:
         state["jtt_notice"] = "Work Kit 미리보기 중입니다 · Window를 선택하면 작업공간으로 돌아갑니다."
         state["jtt_notice_until"] = 0.0
         return
-    workspace_read_ok = True
-    try:
-        saved = [item for item in state["jtt_store"].workspaces()
-                 if item["id"] != JTTWorkspaceStore.DEFAULT_ID and item.get("saved")]
-    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
-        saved = []
-        workspace_read_ok = False
-        state["jtt_notice"] = "저장 작업공간을 읽을 수 없습니다 · 기존 데이터는 변경하지 않았습니다."
-        state["jtt_notice_until"] = 0.0
-    if not workspace_read_ok:
-        return
-    kit_read_ok = True
-    try:
-        kits = state["jtt_work_kit_store"].kits()
-        state["jtt_work_kits"] = kits
-        state["jtt_work_kit_error"] = False
-    except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkKitStoreError):
-        kits = []
-        kit_read_ok = False
-        state["jtt_work_kit_error"] = True
+    preferred_tab = 0
+    preferred_id = None
+    while True:
+        try:
+            saved = [item for item in state["jtt_store"].workspaces()
+                     if item["id"] != JTTWorkspaceStore.DEFAULT_ID and item.get("saved")]
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkspaceStoreError):
+            state["jtt_notice"] = "저장 작업공간을 읽을 수 없습니다 · 기존 데이터는 변경하지 않았습니다."
+            state["jtt_notice_until"] = 0.0
+            return
+        kit_read_ok = True
+        try:
+            kits = state["jtt_work_kit_store"].kits()
+            state["jtt_work_kits"] = kits
+            state["jtt_work_kit_error"] = False
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError, WorkKitStoreError):
+            kits = []
+            kit_read_ok = False
+            state["jtt_work_kit_error"] = True
 
-    active_workspace_id = str(state.get("workspace_id") or "")
-    active_saved_workspace = next((item for item in saved
-                                   if str(item.get("id") or "") == active_workspace_id), None)
-    actions = []
-    if active_saved_workspace is not None:
-        actions.append(("return_default", "내 작업공간으로 돌아가기"))
-    actions.extend([
-        ("save", "현재 터미널 구성 저장"),
-        ("load_workspace", "저장한 작업공간 불러오기"),
-        ("rename_workspace", "저장한 작업공간 이름 변경"),
-        ("delete_workspace", "저장한 작업공간 삭제"),
-    ])
-    if kit_read_ok:
-        actions.append(("create_kit", "Work Kit 템플릿 만들기"))
-    if kits:
-        actions.extend([
-            ("preview_kit", "Work Kit 미리보기"),
-            ("rename_kit", "Work Kit 이름 변경"),
-            ("delete_kit", "Work Kit 삭제"),
-        ])
-    result = run_list_picker(
-        stdscr, "보관함", actions, centered=True,
-        footer_hint="저장 구성은 세션 참조 · Work Kit은 실행되지 않는 템플릿입니다",
-    )
-    if result.cancelled or result.selected_key is None:
-        return
-    action = result.selected_key
+        active_workspace_id = str(state.get("workspace_id") or "")
+        active_saved_workspace = next((item for item in saved
+                                       if str(item.get("id") or "") == active_workspace_id), None)
+        action, selected_id = _archive_visual_screen(
+            stdscr, saved, kits, kit_error=not kit_read_ok,
+            return_default=active_saved_workspace is not None,
+            initial_tab=preferred_tab, selected_id=preferred_id,
+        )
+        preferred_id = None
+        if action is None:
+            return
+        if action == "create_kit":
+            _create_work_kit(stdscr, state)
+            selected = state.pop("jtt_archive_selected_kit_id", None)
+            editor_finished = state.pop("jtt_archive_editor_finished", False)
+            if editor_finished:
+                preferred_tab, preferred_id = 1, selected
+                continue
+            return
+        if action == "edit_kit" and selected_id is not None:
+            target = next((item for item in kits if item["id"] == selected_id), None)
+            if target is not None:
+                _edit_work_kit(stdscr, state, original=target)
+                selected = state.pop("jtt_archive_selected_kit_id", None)
+                editor_finished = state.pop("jtt_archive_editor_finished", False)
+                if editor_finished:
+                    preferred_tab, preferred_id = 1, selected
+                    continue
+            return
+        break
     if action == "return_default":
         try:
             current_workspaces = state["jtt_store"].workspaces()
@@ -1969,16 +2299,10 @@ def _archive_menu(stdscr, state: dict) -> None:
     if action == "save":
         _save_configuration(stdscr, state)
         return
-    if action == "create_kit":
-        _create_work_kit(stdscr, state)
-        return
     if action in {"load_workspace", "rename_workspace", "delete_workspace"}:
-        if not saved:
-            state["jtt_notice"] = "저장된 작업공간이 없습니다."
-            state["jtt_notice_until"] = 0.0
-            return
-        selected_id = _pick_archive_record(stdscr, "저장한 작업공간", saved)
         if selected_id is None:
+            state["jtt_notice"] = "먼저 저장한 작업공간을 선택하세요."
+            state["jtt_notice_until"] = 0.0
             return
         target = next((item for item in saved if item["id"] == selected_id), None)
         if target is None:
@@ -2012,13 +2336,14 @@ def _archive_menu(stdscr, state: dict) -> None:
         else:
             _confirm_and_delete_workspace(stdscr, state, selected_id)
         return
-    if action in {"preview_kit", "rename_kit", "delete_kit"}:
+    if action in {"preview_kit", "edit_kit", "rename_kit", "delete_kit"}:
         if state.get("jtt_work_kit_error"):
             state["jtt_notice"] = "Work Kit 저장 데이터 오류 · 기존 파일은 변경하지 않았습니다."
             state["jtt_notice_until"] = 0.0
             return
-        selected_id = _pick_archive_record(stdscr, "Work Kit", kits)
         if selected_id is None:
+            state["jtt_notice"] = "먼저 Work Kit 템플릿을 선택하세요."
+            state["jtt_notice_until"] = 0.0
             return
         target = next((item for item in kits if item["id"] == selected_id), None)
         if target is None:

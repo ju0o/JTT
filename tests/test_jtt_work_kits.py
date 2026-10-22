@@ -81,6 +81,24 @@ class FakeScreen:
         return "\n".join(value for _y, _x, value in self.writes)
 
 
+class FakeCursesScreen(FakeScreen):
+    def __init__(self, keys, height=44, width=160):
+        super().__init__(height, width)
+        self.keys = iter(keys)
+
+    def get_wch(self):
+        return next(self.keys)
+
+    def erase(self):
+        self.writes = []
+
+    def refresh(self):
+        pass
+
+    def timeout(self, _value):
+        pass
+
+
 def _specs(count):
     return [{"name": f"터미널 {index + 1}", "role": f"역할 {index + 1}",
              "working_directory": "~/not-probed" if index == 0 else None}
@@ -127,6 +145,41 @@ def test_work_kit_store_is_read_only_until_explicit_create_and_round_trips(tmp_p
     assert stat.S_IMODE(store.root.stat().st_mode) == 0o700
     assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
     assert store.path.stat().st_nlink == 1
+
+
+def test_update_kit_preserves_kit_and_existing_template_ids_and_allocates_new_id(tmp_path):
+    store = JTTWorkKitStore(tmp_path / "state")
+    kit = store.create_kit("Original", "Description", _specs(2))
+    other = store.create_kit("Other", "", _specs(1))
+    workspace_store = JTTWorkspaceStore(store.root)
+    workspace = workspace_store.workspaces()[0]
+    before_workspace = (workspace_store.path.read_bytes()
+                        if workspace_store.path.exists() else None)
+    edited = store.update_kit(
+        kit["id"], "Renamed", "Updated description", [
+            {**kit["terminals"][0], "name": "API", "role": "개발"},
+            {"name": "Tests", "role": "검증", "working_directory": None},
+        ], expected_snapshot=kit,
+    )
+    assert edited["id"] == kit["id"]
+    assert edited["terminals"][0]["id"] == kit["terminals"][0]["id"]
+    assert edited["terminals"][1]["id"] not in {
+        terminal["id"] for terminal in other["terminals"]
+    }
+    assert edited["layout"] == "split_horizontal"
+    assert store.kits() == [edited, other]
+    assert (workspace_store.path.read_bytes() if workspace_store.path.exists() else None) == before_workspace
+    assert workspace["terminal_ids"] == []
+
+
+def test_update_kit_rejects_stale_snapshot_without_writing(tmp_path):
+    store = JTTWorkKitStore(tmp_path / "state")
+    kit = store.create_kit("Original", "", _specs(1))
+    store.rename_kit(kit["id"], "Externally renamed", expected_snapshot=kit)
+    before = store.path.read_bytes()
+    with pytest.raises(WorkKitStoreError, match="changed before edit"):
+        store.update_kit(kit["id"], "Lost update", "", _specs(1), expected_snapshot=kit)
+    assert store.path.read_bytes() == before
 
 
 @pytest.mark.parametrize("count,layout", [
@@ -434,6 +487,7 @@ def test_duplicate_json_keys_are_rejected(tmp_path):
 def test_invalid_optional_work_kit_data_does_not_block_workspaces_or_overwrite(
         tmp_path, monkeypatch, failure):
     workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+    workspace_store.set_terminal_ids(workspace_store.DEFAULT_ID, [])
     saved = workspace_store.create_workspace("Saved")
     workspace_store.set_terminal_ids(saved["id"], ["session-valid"])
     workspace_bytes = workspace_store.path.read_bytes()
@@ -489,27 +543,182 @@ def test_invalid_optional_work_kit_data_does_not_block_workspaces_or_overwrite(
     assert registry.connected == ["session-valid"]
 
 
-def test_ui_create_flow_persists_only_work_kit_file(tmp_path, monkeypatch):
+def test_visual_work_kit_editor_adds_cards_and_saves_only_on_explicit_save(tmp_path, monkeypatch):
+    workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+    workspace = workspace_store.workspaces()[0]
+    workspace_store.set_terminal_ids(workspace["id"], [])
+    workspace_bytes = workspace_store.path.read_bytes()
+    state = jtt.build_state(workspace_store, FakeRegistry())
+    screen = FakeCursesScreen([
+        "a", "\t", "\t", "\n",  # add card, edit name
+        "\t", "s",  # save
+    ])
+    monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: "Visual Kit")
+
+    jtt._create_work_kit(screen, state)
+
+    kit = state["jtt_work_kit_store"].kits()[0]
+    assert kit["name"] == "Visual Kit"
+    assert len(kit["terminals"]) == 2
+    assert kit["terminals"][0]["role"] == "일반 터미널"
+    assert kit["terminals"][1]["working_directory"] is None
+    assert workspace_store.path.read_bytes() == workspace_bytes
+    assert state["jtt_registry"].created == 0
+    assert "아직 실행되지 않음" in state["jtt_notice"]
+
+
+def test_visual_work_kit_editor_escape_discards_draft_without_storage_write(tmp_path):
+    workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+    kit_store = JTTWorkKitStore(workspace_store.root)
+    kit = kit_store.create_kit("Original", "Keep", _specs(1))
+    before = kit_store.path.read_bytes()
+    state = jtt.build_state(workspace_store, FakeRegistry())
+    screen = FakeCursesScreen(["\x1b"])
+
+    jtt._edit_work_kit(screen, state, kit)
+
+    assert kit_store.path.read_bytes() == before
+    assert kit_store.kits() == [kit]
+    assert "변경사항은 저장하지 않았습니다" in state["jtt_notice"]
+
+
+def test_visual_work_kit_editor_mouse_add_name_and_save(tmp_path, monkeypatch):
+    workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+    state = jtt.build_state(workspace_store, FakeRegistry())
+    screen = FakeCursesScreen([curses.KEY_MOUSE, curses.KEY_MOUSE, curses.KEY_MOUSE])
+    coordinates = iter(((0, 3, 40, 0, curses.BUTTON1_CLICKED),
+                        (0, 3, 2, 0, curses.BUTTON1_CLICKED),
+                        (0, 35, 40, 0, curses.BUTTON1_CLICKED)))
+    monkeypatch.setattr(curses, "getmouse", lambda: next(coordinates))
+    prompts = []
+
+    def prompt(_screen, label, **_kwargs):
+        prompts.append(label)
+        return "Mouse Kit"
+
+    monkeypatch.setattr(jtt, "prompt_text", prompt)
+    jtt._create_work_kit(screen, state)
+
+    kit = state["jtt_work_kit_store"].kits()[0]
+    assert len(kit["terminals"]) == 2
+    assert kit["name"] == "Mouse Kit"
+    assert prompts == ["Work Kit 이름: "]
+    assert state["jtt_registry"].created == 0
+
+
+def test_visual_work_kit_edit_uses_snapshot_and_preserves_template_identity(tmp_path, monkeypatch):
     workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
     workspace_store.set_terminal_ids(workspace_store.DEFAULT_ID, [])
-    workspaces_before = workspace_store.path.read_bytes()
-    registry = FakeRegistry()
-    state = jtt.build_state(workspace_store, registry)
-    responses = iter(["Dev Kit", "개발용", "2", "API", "백엔드", "  ~/not-probed  ",
-                      "Tests", "검증", ""])
-    monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: next(responses))
-    monkeypatch.setattr(jtt, "_prompt_working_directory", lambda *_args, **_kwargs: next(responses))
+    kit_store = JTTWorkKitStore(workspace_store.root)
+    kit = kit_store.create_kit("Editable", "Role fixture", _specs(1))
+    workspace_bytes = workspace_store.path.read_bytes()
+    state = jtt.build_state(workspace_store, FakeRegistry())
+    screen = FakeCursesScreen(["\n", "\t", "s"])
+    selections = iter(("역할", "개발"))
+    picker_items = []
 
-    jtt._create_work_kit(None, state)
+    def pick(_screen, title, items, **_kwargs):
+        picker_items.append((title, items))
+        return SimpleNamespace(cancelled=False, selected_key=next(selections))
 
-    kits = state["jtt_work_kit_store"].kits()
-    assert len(kits) == 1
-    assert kits[0]["name"] == "Dev Kit"
-    assert kits[0]["terminals"][0]["working_directory"] == "  ~/not-probed  "
-    assert workspace_store.path.read_bytes() == workspaces_before
-    assert state["work_kit_preview"] is None
-    assert registry.created == 0
-    assert state["jtt_notice"] == "Dev Kit Work Kit 저장 완료 · 터미널 2개 구성 · 아직 실행되지 않음"
+    monkeypatch.setattr(jtt, "run_list_picker", pick)
+    jtt._edit_work_kit(screen, state, kit)
+
+    updated = kit_store.kits()[0]
+    assert updated["id"] == kit["id"]
+    assert updated["terminals"][0]["id"] == kit["terminals"][0]["id"]
+    assert updated["terminals"][0]["role"] == "개발"
+    assert picker_items[0][0] == "터미널 카드 편집"
+    assert "사용자 지정…" in dict(picker_items[1][1]).values()
+    assert workspace_store.path.read_bytes() == workspace_bytes
+    assert state["jtt_registry"].created == 0
+
+
+def test_visual_work_kit_editor_shift_tab_moves_backward_and_escape_discards(
+        tmp_path, monkeypatch):
+    workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+    kit_store = JTTWorkKitStore(workspace_store.root)
+    kit = kit_store.create_kit("Editable", "Original description", _specs(1))
+    before = kit_store.path.read_bytes()
+    state = jtt.build_state(workspace_store, FakeRegistry())
+    screen = FakeCursesScreen([curses.KEY_BTAB, "\n", "\x1b"])
+    prompts = []
+
+    def prompt(_screen, label, **_kwargs):
+        prompts.append(label)
+        return "Edited description"
+
+    monkeypatch.setattr(jtt, "prompt_text", prompt)
+    jtt._edit_work_kit(screen, state, kit)
+
+    assert prompts == ["한 줄 설명: "]
+    assert kit_store.path.read_bytes() == before
+    assert kit_store.kits() == [kit]
+    assert state["jtt_registry"].created == 0
+
+
+def test_work_kit_directory_browser_uses_safe_local_listing_and_validation(tmp_path, monkeypatch):
+    root = tmp_path / "folders"
+    child = root / "project"
+    child.mkdir(parents=True)
+    screen = FakeScreen()
+    observed = {}
+
+    def pick(_screen, title, entries, **kwargs):
+        observed["title"] = title
+        observed["entries"] = entries
+        observed["footer"] = kwargs.get("footer_hint")
+        return SimpleNamespace(cancelled=False, selected_key="choose")
+
+    monkeypatch.setattr(jtt, "run_list_picker", pick)
+    selected = jtt._browse_working_directory(screen, str(root))
+
+    assert selected == str(root.resolve())
+    assert observed["title"] == "작업 폴더 탐색"
+    assert (str(child.resolve()), "project") in observed["entries"]
+    assert ("typed", "경로 직접 입력…") in observed["entries"]
+    assert str(root) == observed["footer"]
+
+
+def test_archive_visual_tabs_selection_and_mouse_action(tmp_path, monkeypatch):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    kits = JTTWorkKitStore(store.root)
+    kit = kits.create_kit("Mouse preview", "No execution", _specs(1))
+    screen = FakeCursesScreen([curses.KEY_MOUSE, curses.KEY_MOUSE])
+    coordinates = iter(((0, 23, 1, 0, curses.BUTTON1_CLICKED),
+                        (0, 3, 40, 0, curses.BUTTON1_CLICKED)))
+    monkeypatch.setattr(curses, "getmouse", lambda: next(coordinates))
+
+    result = jtt._archive_visual_screen(screen, [], [kit])
+
+    assert result == ("preview_kit", kit["id"])
+    assert "[ Work Kit ]" in screen.text()
+    assert "No execution" in screen.text()
+
+
+def test_archive_narrow_fifth_workspace_action_has_matching_mouse_hitbox(monkeypatch, tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt")
+    screen = FakeCursesScreen(
+        [curses.KEY_MOUSE], height=24, width=80,
+    )
+    # At 80 columns the fifth action is rendered in row 2, column 2.
+    # Click inside its visible label, not the former off-screen position.
+    monkeypatch.setattr(
+        curses, "getmouse",
+        lambda: (0, 28, 20, 0, curses.BUTTON1_CLICKED),
+    )
+
+    result = jtt._archive_visual_screen(
+        screen, [], [], return_default=True,
+    )
+
+    assert result == ("save", None)
+    assert any(y == 20 and x == 27 and text == "[현재 구성 저장]"
+               for y, x, text in screen.writes)
+    # The visible fifth button and its click box occupy the same row/column.
+    # The action selection above would not occur if the hit box were detached
+    # from the rendered cell.
+    assert store.workspaces()[0]["id"] == store.DEFAULT_ID
 
 
 def test_work_kit_create_reports_committed_when_directory_sync_fails(tmp_path, monkeypatch):
@@ -517,12 +726,11 @@ def test_work_kit_create_reports_committed_when_directory_sync_fails(tmp_path, m
     workspace_store.set_terminal_ids(workspace_store.DEFAULT_ID, [])
     workspace_before = workspace_store.path.read_bytes()
     state = jtt.build_state(workspace_store, FakeRegistry())
-    responses = iter(["Committed Kit", "Description", "1", "Shell", "Terminal role"])
-    monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: next(responses))
-    monkeypatch.setattr(jtt, "_prompt_working_directory", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: "Committed Kit")
+    screen = FakeCursesScreen(["\t", "\t", "\n", "\t", "s"])
     _fail_directory_fsync(monkeypatch)
 
-    jtt._create_work_kit(None, state)
+    jtt._create_work_kit(screen, state)
 
     kits = state["jtt_work_kit_store"].kits()
     assert [kit["name"] for kit in kits] == ["Committed Kit"]
@@ -643,23 +851,23 @@ def test_work_kit_creation_cancel_and_store_failure_report_without_pty(monkeypat
     state = jtt.build_state(workspace_store, registry)
     monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: None)
 
-    jtt._create_work_kit(None, state)
+    jtt._create_work_kit(FakeCursesScreen(["\x1b"]), state)
 
     assert "생성 취소" in state["jtt_notice"]
     assert "터미널은 실행되지 않았습니다" in state["jtt_notice"]
     assert not state["jtt_work_kit_store"].path.exists()
     assert registry.created == 0
 
-    responses = iter(["Kit", "Description", "1", "Shell", "Terminal role"])
-    monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: next(responses))
-    monkeypatch.setattr(jtt, "_prompt_working_directory", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(jtt, "prompt_text", lambda *_args, **_kwargs: "Kit")
 
     def fail_create(*_args, **_kwargs):
         raise WorkKitStoreError("fixture store failure")
 
     monkeypatch.setattr(state["jtt_work_kit_store"], "create_kit", fail_create)
-    jtt._create_work_kit(None, state)
-    assert "저장 상태를 확인할 수 없습니다" in state["jtt_notice"]
+    screen = FakeCursesScreen(["\t", "\t", "\n", "\t", "s", "\x1b"])
+    jtt._create_work_kit(screen, state)
+    assert "Work Kit 저장 실패" in screen.text()
+    assert "변경사항은 저장하지 않았습니다" in state["jtt_notice"]
     assert registry.created == 0
 
 
