@@ -9,7 +9,7 @@ import subprocess
 
 import pytest
 
-from tmux_agent_tower import jtt, jtt_diagnostics, jtt_install, jtt_update, update_manager
+from tmux_agent_tower import JTT_VERSION, jtt, jtt_diagnostics, jtt_install, jtt_update, update_manager
 
 
 def _release(tag="jtt-v0.3.1-rc0", version="0.3.1rc0", sha="a" * 40, prerelease=True):
@@ -35,13 +35,15 @@ def _fake_release_api(releases):
     return fetch
 
 
-def test_cli_version_reports_dev_and_tower_command_remains_separate(monkeypatch, capsys):
+def test_cli_version_reports_dev_and_candidate_distribution_has_only_jtt(monkeypatch, capsys):
     monkeypatch.setattr(jtt_install, "installation_kind", lambda: "DEV")
     assert jtt.cli(["--version"]) == 0
     assert "[DEV]" in capsys.readouterr().out
     project = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'tower = "tmux_agent_tower.main:cli"' in project
-    assert 'jtt = "tmux_agent_tower.jtt:cli"' in project
+    assert 'name = "ju0-terminal-tower"' in project
+    assert 'version = "0.3.1rc0"' in project
+    assert 'jtt = "ju0_terminal_tower.bootstrap:main"' in project
+    assert '\ntower = ' not in project
 
 
 def test_jtt_version_does_not_import_posix_terminal_ui():
@@ -135,6 +137,24 @@ def test_dev_update_refuses_before_release_network(monkeypatch, capsys):
     assert result == 2
     assert called == []
     assert "DEV install" in capsys.readouterr().err
+
+
+def test_package_manager_owned_update_refuses_before_release_network(monkeypatch):
+    called = []
+    monkeypatch.setattr(jtt_update, "_current_is_dev", lambda: False)
+    monkeypatch.setattr(jtt_update, "installation_kind", lambda: "PACKAGE_MANAGER")
+    output = io.StringIO()
+    error = io.StringIO()
+    result = jtt_update.run_update_cli(
+        "check",
+        installation={"managed": False, "reason": "The package manager owns this install."},
+        fetch_json=lambda *_args: called.append(True),
+        output=output,
+        error=error,
+    )
+    assert result == 2
+    assert called == []
+    assert "PACKAGE_MANAGER_OWNED" in error.getvalue()
 
 
 def test_release_channel_selection_skips_drafts_and_resolves_tag_commit():
@@ -316,7 +336,7 @@ def _managed_launcher(tmp_path, version="0.3.0rc2"):
 
 def _fake_installer(archive, site_dir, _python):
     site_dir.mkdir(mode=0o700, parents=True)
-    package = site_dir / "tmux_agent_tower"
+    package = site_dir / "ju0_terminal_tower"
     package.mkdir(mode=0o700)
     (package / "__init__.py").write_text("__version__='0.3.1rc0'\n", encoding="utf-8")
 
@@ -324,7 +344,7 @@ def _fake_installer(archive, site_dir, _python):
 def _versioned_fake_installer(version):
     def install(_source, site_dir, _python):
         site_dir.mkdir(mode=0o700, parents=True)
-        package = site_dir / "tmux_agent_tower"
+        package = site_dir / "ju0_terminal_tower"
         package.mkdir(mode=0o700)
         (package / "__init__.py").write_text(f"__version__={version!r}\n", encoding="utf-8")
 
@@ -456,15 +476,15 @@ def test_jtt_release_validation_requires_namespaced_tag():
         jtt_update._validate_release(noncanonical_jtt_release)
 
 
-def _synthetic_release_site(tmp_path, *, module_version="0.3.1rc0", metadata_version="0.3.1rc0", entry="tmux_agent_tower.jtt:cli"):
+def _synthetic_release_site(tmp_path, *, module_version="0.3.1rc0", metadata_version="0.3.1rc0", entry="ju0_terminal_tower.bootstrap:main"):
     site = tmp_path / "site"
-    package = site / "tmux_agent_tower"
+    package = site / "ju0_terminal_tower"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text(f"__version__ = {module_version!r}\n", encoding="utf-8")
-    dist = site / f"tmux_agent_tower-{metadata_version}.dist-info"
+    dist = site / f"ju0_terminal_tower-{metadata_version}.dist-info"
     dist.mkdir()
     (dist / "METADATA").write_text(
-        f"Metadata-Version: 2.1\nName: tmux-agent-tower\nVersion: {metadata_version}\n\n",
+        f"Metadata-Version: 2.1\nName: ju0-terminal-tower\nVersion: {metadata_version}\n\n",
         encoding="utf-8",
     )
     (dist / "entry_points.txt").write_text(f"[console_scripts]\njtt = {entry}\n", encoding="utf-8")
@@ -483,7 +503,7 @@ def test_release_package_identity_requires_version_metadata_and_jtt_entrypoint(t
         jtt_update._verify_package(mismatched_site, sys_executable(), release)
 
     wrong_entry_site = _synthetic_release_site(
-        tmp_path / "wrong-entry", entry="tmux_agent_tower.main:cli",
+        tmp_path / "wrong-entry", entry="ju0_terminal_tower.main:cli",
     )
     with pytest.raises(jtt_update.JTTUpdateError, match="verified JTT version and entry point"):
         jtt_update._verify_package(wrong_entry_site, sys_executable(), release)
@@ -656,7 +676,7 @@ def test_official_bootstrap_installs_only_verified_release_sidecar(tmp_path, mon
         install_source=_versioned_fake_installer(selected.package_version),
         verify_package=lambda site, _python, expected: (
             pytest.fail("staged package version mismatch")
-            if f"__version__={expected.package_version!r}" not in (site / "tmux_agent_tower" / "__init__.py").read_text(encoding="utf-8")
+            if f"__version__={expected.package_version!r}" not in (site / "ju0_terminal_tower" / "__init__.py").read_text(encoding="utf-8")
             else None
         ),
         run_version=lambda *_args, **_kwargs: True,
@@ -676,10 +696,10 @@ def test_official_bootstrap_installs_only_verified_release_sidecar(tmp_path, mon
 def test_mocked_official_bootstrap_checks_exact_jtt_tag_and_package_metadata(tmp_path):
     source = tmp_path / "tagged-source"
     source.mkdir(mode=0o700)
-    candidate_tag = "jtt-v0.3.0-rc3"
-    candidate_version = jtt_update.__version__
+    candidate_tag = "jtt-v0.3.1-rc0"
+    candidate_version = JTT_VERSION
     (source / "pyproject.toml").write_text(
-        f"[project]\nname='tmux-agent-tower'\nversion='{candidate_version}'\n", encoding="utf-8",
+        f"[project]\nname='ju0-terminal-tower'\nversion='{candidate_version}'\n", encoding="utf-8",
     )
     package = source / "src" / "tmux_agent_tower"
     package.mkdir(parents=True)
@@ -711,7 +731,7 @@ def test_mocked_official_bootstrap_checks_exact_jtt_tag_and_package_metadata(tmp
 
     def install_source(_checkout, site_dir, _python):
         site_dir.mkdir(parents=True, mode=0o700)
-        pkg = site_dir / "tmux_agent_tower"
+        pkg = site_dir / "ju0_terminal_tower"
         pkg.mkdir(mode=0o700)
         (pkg / "__init__.py").write_text(f"__version__ = '{candidate_version}'\n", encoding="utf-8")
 

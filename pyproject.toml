@@ -3,8 +3,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tmux-agent-tower"
-version = "0.3.0rc3"
+name = "ju0-terminal-tower"
+version = "0.3.1rc0"
 description = "JTT, a local-first workspace for independent interactive PTY terminals."
 readme = "README.md"
 license = { text = "MIT" }
@@ -35,21 +35,17 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ju0o/tmux-agent-tower"
-Issues = "https://github.com/ju0o/tmux-agent-tower/issues"
+Homepage = "https://github.com/ju0o/JTT"
+Issues = "https://github.com/ju0o/JTT/issues"
 
 [project.scripts]
-tower = "tmux_agent_tower.main:cli"
-jtt = "tmux_agent_tower.jtt:cli"
-
-[tool.setuptools.packages.find]
-where = ["src"]
+jtt = "ju0_terminal_tower.bootstrap:main"
 
 [tool.setuptools.package-data]
-tmux_agent_tower = ["resources/harnesses/*.md", "remote/*.js"]
+ju0_terminal_tower = ["resources/harnesses/*.md", "remote/*.js"]
 
 [tool.setuptools.data-files]
-"share/licenses/tmux-agent-tower" = ["licenses/pyte-LGPL-3.0.txt"]
+"share/licenses/ju0-terminal-tower" = ["licenses/pyte-LGPL-3.0.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 import uuid
 from typing import Callable
 
-from . import __version__
+from . import DISTRIBUTION_NAME, JTT_VERSION
 from .release_support import ReleaseAPI
 from .jtt_install import OFFICIAL_MARKER, installation_kind, inspect_official_launcher, source_checkout_root
 
@@ -225,7 +225,7 @@ def _launcher_text(python: str, site_dir: Path, release: releases.Release, launc
         f"export JTT_RELEASE_SITE={shlex.quote(str(site_dir))}\n"
         f"export JTT_LAUNCHER_PATH={shlex.quote(str(launcher))}\n"
         f"export PYTHONPATH={shlex.quote(str(site_dir))}\n"
-        f"exec {shlex.quote(python)} -m tmux_agent_tower.jtt \"$@\"\n"
+        f"exec {shlex.quote(python)} -m ju0_terminal_tower.bootstrap \"$@\"\n"
     )
 
 
@@ -243,10 +243,10 @@ def _run_launcher_version(path: Path, version: str, *, python: str | None = None
 
 def _verify_package(site_dir: Path, python: str, release: releases.Release) -> None:
     code = (
-        "import importlib.metadata as m, json, os, tmux_agent_tower as p; "
-        "d=m.distribution('tmux-agent-tower'); "
+        "import importlib.metadata as m, json, os, ju0_terminal_tower as p; "
+        f"d=m.distribution({DISTRIBUTION_NAME!r}); "
         "e=[x.value for x in d.entry_points if x.group=='console_scripts' and x.name=='jtt']; "
-        "print(json.dumps({'version':p.__version__,'metadata':m.version('tmux-agent-tower'),"
+        f"print(json.dumps({{'version':p.__version__,'metadata':m.version({DISTRIBUTION_NAME!r}),"
         "'source':os.path.realpath(p.__file__),'jtt_entry':e}))"
     )
     env = os.environ.copy()
@@ -255,7 +255,18 @@ def _verify_package(site_dir: Path, python: str, release: releases.Release) -> N
     env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONPATH"] = str(site_dir)
     try:
-        result = subprocess.run([python, "-c", code], capture_output=True, text=True, timeout=20, env=env, check=False)
+        # Restrict import and metadata discovery to the staged sidecar. The
+        # current checkout, user site, or an installed legacy distribution
+        # must not satisfy this verification on behalf of the candidate.
+        result = subprocess.run(
+            [python, "-S", "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=env,
+            cwd=str(site_dir),
+            check=False,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         raise JTTUpdateError("VERIFY_FAILED", "The staged JTT package could not be inspected.") from exc
     if result.returncode != 0:
@@ -267,7 +278,7 @@ def _verify_package(site_dir: Path, python: str, release: releases.Release) -> N
     if (
         facts.get("version") != release.package_version
         or facts.get("metadata") != release.package_version
-        or facts.get("jtt_entry") != ["tmux_agent_tower.jtt:cli"]
+        or facts.get("jtt_entry") != ["ju0_terminal_tower.bootstrap:main"]
         or not releases._inside(Path(facts.get("source", "/")), site_dir)
     ):
         raise JTTUpdateError("VERIFY_FAILED", "The staged package is not the verified JTT version and entry point.")
@@ -728,6 +739,9 @@ def run_update_cli(
     if _current_is_dev():
         print("DEV install detected: official updates are disabled for source checkouts; no Release request or file change was made.", file=error)
         return 2
+    if installation_kind() == "PACKAGE_MANAGER":
+        print("PACKAGE_MANAGER_OWNED: update or remove JTT with pipx or uv; no Release request or file change was made.", file=error)
+        return 2
     installation = installation or inspect_official_launcher()
     if not installation.get("managed"):
         print(f"UPDATE_REFUSED: {installation.get('reason', 'Install an official JTT Release first.')}", file=error)
@@ -735,7 +749,7 @@ def run_update_cli(
     if requested_channel not in ("auto", "stable", "rc"):
         print("INVALID_CHANNEL: choose auto, stable, or rc.", file=error)
         return 2
-    current_version = (current_facts or {}).get("version", __version__)
+    current_version = (current_facts or {}).get("version", JTT_VERSION)
     try:
         status = check_for_updates(current_version, requested_channel, fetch_json)
     except releases.UpdateError as exc:
@@ -783,7 +797,7 @@ def run_update_cli(
 
 def rollback_target(root: Path | None = None, current_version: str | None = None) -> dict | None:
     try:
-        current = releases.parse_version(current_version or __version__)
+        current = releases.parse_version(current_version or JTT_VERSION)
     except releases.UpdateError:
         return None
     for record in managed_releases(root):
@@ -813,7 +827,7 @@ def rollback_to_previous(
         ):
             raise JTTUpdateError("LAUNCHER_CHANGED", "The active JTT Release identity changed before rollback.")
         snapshot = _private_launcher_snapshot(launcher)
-        target = rollback_target(store, current_version or __version__)
+        target = rollback_target(store, current_version or JTT_VERSION)
         if not target:
             raise JTTUpdateError("NO_ROLLBACK_TARGET", "No older verified JTT version is retained.")
         release = releases.Release(
@@ -835,11 +849,14 @@ def run_rollback_cli(*, dry_run: bool = False, confirm: Callable | None = None, 
     if _current_is_dev():
         print("DEV install detected: rollback is disabled for source checkouts; no files changed.", file=error)
         return 2
+    if installation_kind() == "PACKAGE_MANAGER":
+        print("PACKAGE_MANAGER_OWNED: downgrade or remove JTT with pipx or uv; no file changes were made.", file=error)
+        return 2
     installation = installation or inspect_official_launcher()
     if not installation.get("managed"):
         print(f"ROLLBACK_REFUSED: {installation.get('reason', 'Install an official JTT Release first.')}", file=error)
         return 2
-    target = rollback_target(root or data_root(), current_version or __version__)
+    target = rollback_target(root or data_root(), current_version or JTT_VERSION)
     if not target:
         print("NO_ROLLBACK_TARGET: no older verified JTT version is retained.", file=error)
         return 1
@@ -884,7 +901,7 @@ def install_release_checkout(
     root = Path(source_root).resolve()
     if sys.version_info < (3, 9):
         raise JTTUpdateError("UNSUPPORTED_PYTHON", "Official JTT installation requires Python 3.9 or newer; no files were changed.")
-    version = __version__
+    version = JTT_VERSION
     releases_list = fetch_json("/releases?per_page=100")
     if not isinstance(releases_list, list):
         raise JTTUpdateError("INVALID_GITHUB_RESPONSE", "GitHub Releases response is not a list.")

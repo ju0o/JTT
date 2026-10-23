@@ -59,6 +59,10 @@ Expect version `0.3.0rc3` and `OFFICIAL`. This is a **prerelease**, not stable.
 JTT's `jtt-v0.3.0-rc3` is distinct from legacy Tower's `v0.3.0-rc2`, though both commands share a Python distribution.
 The installer validates the published JTT Release, commit, metadata and entry point. It does not change `tower` or shell startup files.
 See [updates and rollback](docs/JTT_UPDATING.md) for existing installations.
+The proposed post-RC3 package identity and manual side-by-side transition are
+documented in [JTT package transition](docs/JTT_PACKAGE_MIGRATION.md). The
+`ju0-terminal-tower` candidate is not published to PyPI; the official RC3
+installation instructions above remain the current public install path.
 
 ## First terminal
 

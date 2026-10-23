@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__
+from . import JTT_VERSION
 
 
 def cli(argv: list[str] | None = None) -> int:
@@ -26,7 +26,7 @@ def cli(argv: list[str] | None = None) -> int:
     if args.version:
         from .jtt_install import installation_kind
 
-        print(f"jtt {__version__} [{installation_kind().upper()}]")
+        print(f"jtt {JTT_VERSION} [{installation_kind().upper()}]")
         return 0
     if args.command == "doctor":
         from .jtt_diagnostics import run_doctor

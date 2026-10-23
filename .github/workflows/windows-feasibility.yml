@@ -22,6 +22,6 @@ jobs:
       - name: Install JTT package for the platform-neutral CLI smoke
         run: python -m pip install --no-deps -e .
       - name: Confirm JTT version command avoids the POSIX terminal runtime
-        run: python -m tmux_agent_tower.jtt --version
+        run: jtt --version
       - name: Native ConPTY and Textual headless probe
         run: python -m pytest -q -s experiments/windows_native/test_probe.py
