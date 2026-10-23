@@ -37,11 +37,33 @@ handle; malformed requests are rejected without terminating the worker.
 Textual `run_test` validates only headless 160×44 and 80×24 layout; it does not
 prove native Windows Terminal visual UX or integrate the approved JTT UI.
 
-**Hosted Windows limitation:** run `39815386508` passes initial UTF-8 Korean
-output and resize width, but the subsequent Korean input/snapshot assertion
-fails. Both characters exist in diagnostic codepoints but not as the expected
-contiguous screen string. Local Windows 11 passes. Cause is not yet isolated;
-Windows product readiness remains NO-GO. Assertions are deliberately retained.
+**Hosted Windows investigation:** run `39815386508` passed initial UTF-8 Korean
+output and shell-reported resize width, then failed the generic `입력` snapshot
+assertion. Its codepoint-only timeout diagnostic was ambiguous: those code
+points could have come from the echoed PowerShell source (`'입'+'력'`) rather
+than the command's result, so that run did not establish that PowerShell emitted
+the expected response or that pyte misplaced it.
+
+The revised test creates a nonce-bearing `JTT_DIAG_<nonce>_한글_END` and
+`JTT_DIAG_<nonce>_입력_END` only when PowerShell evaluates concatenated Korean
+literal fragments. The complete marker is asserted absent from the submitted
+command, preventing terminal echo from satisfying the result assertion. The
+worker records only bounded diagnostic evidence for these synthetic markers:
+the `pywinpty.PTY.read()` Python string before `pyte.Stream.feed`, UTF-8
+round-trip bytes/codepoints, read sequence, resize sequence/dimensions, and
+pyte display/cell coordinates. No general terminal body is retained in those
+diagnostic records.
+
+On local Windows 11 the marker appears in a single pywinpty read sequence and
+as contiguous pyte display text. In the 80-column post-resize case, the two
+wide Korean cells are at columns 18 and 20 (width 2 each); the echoed source
+characters are separately located at columns 51 and 58 on the preceding row.
+This demonstrates why codepoint presence alone was insufficient evidence. The
+pinned pywinpty API returns `str`; it does **not** expose the underlying
+ConPTY pipe bytes, so the UTF-8 hex is a round-trip of the returned string, not
+a capture of raw pipe bytes. Hosted CI must pass with this unambiguous marker
+test before the Windows failure is classified as resolved. Windows product
+readiness remains NO-GO meanwhile; assertions are retained.
 
 ## Explicit limitations / follow-up gates
 
@@ -51,6 +73,10 @@ Windows product readiness remains NO-GO. Assertions are deliberately retained.
   request deadlines, durable state, or reconnect discovery policy yet.
 - Job assignment occurs after shell spawn. A production backend must close the
   spawn-to-job assignment gap (suspended creation / atomic job assignment).
+- This PoC does not prove a lease expiry for a client that remains connected,
+  real concurrent-user SID denial, a forced-kill race, or behavior with
+  multiple client attempts. Its one-instance pipe and disconnect lease test do
+  not establish production multi-client safety.
 - ACL structure and same-user peer validation tested; a real different-user
   access attempt remains untested. No users or system ACLs are modified.
 - Process handle retention protects this instance; reboot/restart recovery and

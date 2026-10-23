@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from importlib.metadata import version
 
 import pytest
@@ -25,6 +26,36 @@ def wait_text(client, expected):
         "synthetic terminal marker not observed; "
         f"non_ascii_codepoints={sorted(set(ord(c) for c in snapshot['text'] if ord(c) > 127))}; "
         f"question_marks={snapshot['text'].count('?')}; sequence={snapshot['sequence']}"
+    )
+
+
+def wait_synthetic_marker(client, expected):
+    """Wait for a generated result not present contiguously in echoed input."""
+    deadline = time.monotonic() + 15
+    snapshot = client.call("snapshot")
+    while time.monotonic() < deadline:
+        if expected in snapshot["text"]:
+            events = [
+                event for event in snapshot["diagnostics"]["synthetic_marker_events"]
+                if event["marker"] == expected
+            ]
+            assert events, (
+                "screen displayed the synthetic result but the pywinpty API trace did not; "
+                + json.dumps(snapshot["diagnostics"], ensure_ascii=False)
+            )
+            return snapshot, events[-1]
+        snapshot = client.call("snapshot")
+        time.sleep(0.02)
+    raise AssertionError(
+        "generated Korean result marker not observed; command echo is not accepted as output; "
+        + json.dumps({
+            "expected_marker": expected,
+            "marker_codepoints": [ord(char) for char in expected],
+            "sequence": snapshot["sequence"],
+            "columns": snapshot["columns"],
+            "lines": snapshot["lines"],
+            "diagnostics": snapshot["diagnostics"],
+        }, ensure_ascii=False)
     )
 
 
@@ -81,10 +112,32 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         wrong = dict(identity, generation="stale")
         assert client.call("stop", identity=wrong) == {"error": "identity_mismatch"}
         assert client.call("input", identity=wrong, text="forbidden") == {"error": "identity_mismatch"}
-        command = "[Console]::WriteLine(('JTT_'+'NATIVE_OK')); [Console]::WriteLine([char]0xD55C+[string][char]0xAE00)\r"
+        for stale_field, stale_value in (("pid", identity["pid"] + 1),
+                                        ("created", identity["created"] + "-stale")):
+            stale_identity = dict(identity, **{stale_field: stale_value})
+            assert client.call("stop", identity=stale_identity) == {"error": "identity_mismatch"}
+            assert client.call("input", identity=stale_identity, text="forbidden") == {
+                "error": "identity_mismatch",
+            }
+        first_nonce = uuid.uuid4().hex[:8]
+        first_marker = f"JTT_DIAG_{first_nonce}_한글_END"
+        first_command = (
+            f"[Console]::WriteLine(('JTT_DIAG_{first_nonce}_' + '한' + '글' + '_END'))\r"
+        )
+        assert first_marker not in first_command, "the result marker must not occur in command echo"
+        assert client.call("observe_marker", identity=identity, marker=first_marker) == {
+            "ok": True, "synthetic_marker_only": True,
+        }
+        command = first_command
         assert client.call("input", identity=identity, text=command)["ok"]
-        shown = wait_text(client, "JTT_NATIVE_OK")
-        shown = wait_text(client, "한글")
+        shown, first_evidence = wait_synthetic_marker(client, first_marker)
+        assert first_evidence["same_string_fed_to_pyte"]
+        assert first_evidence["api_marker_codepoints"] == [ord(char) for char in first_marker]
+        first_row = next(row for row in first_evidence["screen_rows"] if row["exact_marker_on_display"])
+        assert first_row["marker_cells_contiguous"]
+        first_korean_cells = [cell for cell in first_row["marker_cell_positions"] if cell["char"] in "한글"]
+        assert [cell["width"] for cell in first_korean_cells] == [2, 2]
+        print("resize_phase=before " + json.dumps(first_evidence, ensure_ascii=False))
         client.close()
         client = None
         assert process.poll() is None
@@ -105,11 +158,37 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         assert client.call("input", identity=identity, text="forbidden") == {"error": "input_denied"}
         assert client.call("acquire", identity=identity)["ok"]
         assert client.call("resize", identity=identity, columns=80, lines=24)["ok"]
-        assert client.call("snapshot")["columns"] == 80
+        resize_snapshot = client.call("snapshot")
+        assert resize_snapshot["columns"] == 80
+        resize_event = resize_snapshot["diagnostics"]["resize_events"][-1]
+        assert resize_event["requested_columns"] == 80
+        assert resize_event["screen_columns_after"] == 80
         assert client.call("input", identity=identity,
-                           text="[Console]::WriteLine(('SIZE='+[Console]::WindowWidth)); Write-Output ('입'+'력')\r")["ok"]
+                           text="[Console]::WriteLine(('SIZE='+[Console]::WindowWidth))\r")["ok"]
         wait_text(client, "SIZE=80")
-        wait_text(client, "입력")
+        resize_nonce = uuid.uuid4().hex[:8]
+        resize_marker = f"JTT_DIAG_{resize_nonce}_입력_END"
+        resize_command = (
+            f"[Console]::WriteLine(('JTT_DIAG_{resize_nonce}_' + '입' + '력' + '_END'))\r"
+        )
+        assert resize_marker not in resize_command, "the result marker must not occur in command echo"
+        assert client.call("observe_marker", identity=identity, marker=resize_marker) == {
+            "ok": True, "synthetic_marker_only": True,
+        }
+        assert client.call("input", identity=identity, text=resize_command)["ok"]
+        resized_snapshot, resize_evidence = wait_synthetic_marker(client, resize_marker)
+        assert resize_evidence["same_string_fed_to_pyte"]
+        assert resize_evidence["api_marker_codepoints"] == [ord(char) for char in resize_marker]
+        resize_row = next(row for row in resize_evidence["screen_rows"] if row["exact_marker_on_display"])
+        assert resize_row["marker_cells_contiguous"]
+        resize_korean_cells = [cell for cell in resize_row["marker_cell_positions"] if cell["char"] in "입력"]
+        assert [cell["width"] for cell in resize_korean_cells] == [2, 2]
+        assert resize_evidence["last_read_sequence"] >= resize_event["sequence_after"]
+        print("resize_phase=after " + json.dumps({
+            "resize": resize_event,
+            "result": resize_evidence,
+            "observed_korean_reads": resized_snapshot["diagnostics"]["read_chunks_with_diagnostic_characters"],
+        }, ensure_ascii=False))
 
         # UI-framework feasibility only, not the approved JTT UI or native WT visual QA.
         class ProbeUI(App):

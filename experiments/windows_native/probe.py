@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
@@ -15,6 +16,79 @@ import time
 import uuid
 
 MAX_MESSAGE = 65536
+DIAGNOSTIC_MARKER = re.compile(r"JTT_DIAG_[0-9a-f]{8}_(?:한글|입력)_END\Z")
+MAX_DIAGNOSTIC_EVENTS = 32
+DIAGNOSTIC_CHARS = frozenset("한글입력")
+
+
+def _screen_diagnostic_cells(screen):
+    from pyte.screens import wcwidth
+
+    cells = []
+    for y in range(screen.lines):
+        x = 0
+        row = screen.buffer[y]
+        while x < screen.columns:
+            value = row[x].data
+            if value:
+                width = max(0, wcwidth(value[0]))
+                for char in value:
+                    if char in DIAGNOSTIC_CHARS:
+                        cells.append({"char": char, "codepoint": ord(char), "column": x,
+                                      "row": y, "width": width})
+                x += max(width, 1)
+            else:
+                x += 1
+    return cells
+
+
+def _marker_screen_evidence(screen, marker):
+    """Return evidence for one synthetic marker, never a general screen dump."""
+    from pyte.screens import wcwidth
+
+    suffix_match = re.search(r"(?:한글|입력)_END\Z", marker)
+    prefix = marker[:suffix_match.start()]
+    rows = []
+    for y, line in enumerate(screen.display):
+        start = line.find(prefix)
+        if start < 0:
+            continue
+        end = min(len(line), start + len(marker) + 12)
+        snippet = line[max(0, start - 8):end]
+        # pyte.display omits the stub cell after a width-2 character. Map its
+        # displayed codepoints back to physical cell columns to expose gaps.
+        mapped = []
+        x = 0
+        buffer_line = screen.buffer[y]
+        while x < screen.columns:
+            cell = buffer_line[x].data
+            if cell:
+                width = max(0, wcwidth(cell[0]))
+                for char in cell:
+                    mapped.append({"char": char, "column": x, "width": width})
+                x += max(width, 1)
+            else:
+                mapped.append({"char": " ", "column": x, "width": 1})
+                x += 1
+        marker_at = line.find(marker)
+        marker_cells = mapped[marker_at:marker_at + len(marker)] if marker_at >= 0 else []
+        input_cells = [
+            {**cell, "display_index": index}
+            for index, cell in enumerate(mapped)
+            if cell["char"] in "한글입력" and max(0, start - 8) <= index < end
+        ]
+        rows.append({
+            "row": y,
+            "display_excerpt": snippet,
+            "exact_marker_on_display": marker_at >= 0,
+            "marker_cell_positions": marker_cells,
+            "marker_cells_contiguous": bool(marker_cells) and all(
+                nxt["column"] == prev["column"] + max(prev["width"], 1)
+                for prev, nxt in zip(marker_cells, marker_cells[1:])
+            ),
+            "input_character_cells": input_cells,
+        })
+    return rows
 
 
 def assign_owned_job(job, handle):
@@ -121,6 +195,10 @@ def worker(address, root, session, generation):
         lock = threading.Lock()
         sequence = 0
         renderer_failed = False
+        marker_states = {}
+        diagnostic_events = []
+        read_diagnostics = []
+        resize_events = []
 
         def read_output():
             nonlocal sequence, renderer_failed
@@ -129,8 +207,72 @@ def worker(address, root, session, generation):
                     data = terminal.read(blocking=False)
                     if data:
                         with lock:
-                            stream.feed(data)
                             sequence += 1
+                            # pywinpty's public read boundary returns Python
+                            # str, not the underlying ConPTY pipe bytes. Keep
+                            # only evidence for explicitly registered synthetic
+                            # markers; never retain general terminal output.
+                            api_utf8 = data.encode("utf-8", errors="strict")
+                            stream.feed(data)
+                            api_chars = []
+                            byte_offset = 0
+                            for index, char in enumerate(data):
+                                char_bytes = char.encode("utf-8")
+                                if char in DIAGNOSTIC_CHARS:
+                                    api_chars.append({
+                                        "index": index, "utf8_byte_offset": byte_offset,
+                                        "char": char, "codepoint": ord(char),
+                                        "utf8_hex": char_bytes.hex(),
+                                    })
+                                byte_offset += len(char_bytes)
+                            if api_chars:
+                                read_diagnostics.append({
+                                    "sequence": sequence,
+                                    "api_return_type": type(data).__name__,
+                                    "utf8_byte_length": len(api_utf8),
+                                    "korean_characters_at_pywinpty_api": api_chars,
+                                    "pyte_screen_cells_after_feed": _screen_diagnostic_cells(screen),
+                                })
+                                read_diagnostics[:] = read_diagnostics[-MAX_DIAGNOSTIC_EVENTS:]
+                            for marker, state in tuple(marker_states.items()):
+                                if state["reported"]:
+                                    continue
+                                previous = state["tail"]
+                                combined = previous + data
+                                marker_at = combined.find(marker)
+                                if marker_at >= 0:
+                                    start_sequence = (
+                                        state["first_sequence"]
+                                        if marker_at < len(previous) and state["first_sequence"] is not None
+                                        else sequence
+                                    )
+                                    diagnostic_events.append({
+                                        "marker": marker,
+                                        "api_boundary": "pywinpty.PTY.read() str before pyte.Stream.feed",
+                                        "api_return_type": type(data).__name__,
+                                        "api_utf8_roundtrip_hex": marker.encode("utf-8").hex(),
+                                        "api_marker_codepoints": [ord(char) for char in marker],
+                                        "same_string_fed_to_pyte": True,
+                                        "first_read_sequence": start_sequence,
+                                        "last_read_sequence": sequence,
+                                        "spanned_read_chunks": start_sequence != sequence,
+                                        "screen_rows": _marker_screen_evidence(screen, marker),
+                                    })
+                                    state["reported"] = True
+                                    diagnostic_events[:] = diagnostic_events[-MAX_DIAGNOSTIC_EVENTS:]
+                                else:
+                                    # Keep at most a marker-sized prefix suffix
+                                    # in memory so read-chunk boundaries are
+                                    # observable without retaining the stream.
+                                    overlap = min(len(marker) - 1, len(combined))
+                                    while overlap and not marker.startswith(combined[-overlap:]):
+                                        overlap -= 1
+                                    state["tail"] = combined[-overlap:] if overlap else ""
+                                    state["first_sequence"] = (
+                                        state["first_sequence"]
+                                        if overlap and len(combined) - overlap < len(previous)
+                                        else sequence if overlap else None
+                                    )
                     else:
                         stop_reader.wait(0.01)
             except Exception:
@@ -189,9 +331,27 @@ def worker(address, root, session, generation):
                             response = {"error": "resize_denied"}
                         else:
                             with lock:
+                                before_sequence = sequence
                                 terminal.set_size(cols, rows)
                                 screen.resize(lines=rows, columns=cols)
+                                resize_events.append({
+                                    "requested_columns": cols,
+                                    "requested_lines": rows,
+                                    "sequence_before": before_sequence,
+                                    "sequence_after": sequence,
+                                    "screen_columns_after": screen.columns,
+                                    "screen_lines_after": screen.lines,
+                                })
                             response = {"ok": True}
+                    elif op == "observe_marker":
+                        marker = request.get("marker")
+                        if not isinstance(marker, str) or not DIAGNOSTIC_MARKER.fullmatch(marker):
+                            response = {"error": "invalid_diagnostic_marker"}
+                        else:
+                            marker_states[marker] = {
+                                "tail": "", "first_sequence": None, "reported": False,
+                            }
+                            response = {"ok": True, "synthetic_marker_only": True}
                     elif op == "stop":
                         win32job.TerminateJobObject(job, 0)
                         if win32event.WaitForSingleObject(handle, 5000) != win32con.WAIT_OBJECT_0:
@@ -204,7 +364,13 @@ def worker(address, root, session, generation):
                                             text="\n".join(screen.display),
                                             cursor=[screen.cursor.x, screen.cursor.y],
                                             columns=screen.columns, lines=screen.lines,
-                                            renderer_failed=renderer_failed, owner_only_acl=True)
+                                            renderer_failed=renderer_failed, owner_only_acl=True,
+                                            diagnostics={
+                                                "pywinpty_api": "PTY.read() returns str; underlying pipe bytes are not exposed",
+                                                "read_chunks_with_diagnostic_characters": list(read_diagnostics),
+                                                "synthetic_marker_events": list(diagnostic_events),
+                                                "resize_events": list(resize_events[-MAX_DIAGNOSTIC_EVENTS:]),
+                                            })
                     else:
                         response = {"error": "unknown_operation"}
                     win32file.WriteFile(pipe, json.dumps(response, ensure_ascii=False).encode("utf-8"))
