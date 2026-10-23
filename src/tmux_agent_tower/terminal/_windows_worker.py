@@ -270,11 +270,12 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
             assign_owned_job(job, shell_handle, win32job, win32api,
                              win32event, win32con)
             shell_in_job = True
-            _set_stage("publish_running")
+            _set_stage("publish_running_gate")
             win32event.SetEvent(gate)
             with state_lock:
                 state = "running"
                 metadata["state"] = state
+                _set_stage("publish_running_metadata")
                 runtime._atomic_metadata(metadata_path, metadata)
 
             def read_output():
@@ -617,9 +618,18 @@ def main(argv=None):
                 metadata_path = session_dir / runtime.SESSION_META
                 metadata = runtime._read_metadata(metadata_path)
                 if metadata.get("state") == "starting":
-                    metadata["startup_failure"] = {
+                    failure = {
                         "stage": _STAGE, "exception": type(exc).__name__,
                     }
+                    diagnostic = getattr(exc, "diagnostic", None)
+                    if (isinstance(diagnostic, dict)
+                            and isinstance(diagnostic.get("stage"), str)
+                            and diagnostic["stage"].isidentifier()
+                            and isinstance(diagnostic.get("exception"), str)
+                            and diagnostic["exception"].isidentifier()):
+                        failure["cause_stage"] = diagnostic["stage"]
+                        failure["cause"] = diagnostic["exception"]
+                    metadata["startup_failure"] = failure
                     runtime._atomic_metadata(metadata_path, metadata)
             except Exception:
                 pass

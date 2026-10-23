@@ -45,6 +45,7 @@ PIPE_PREFIX = r"\\.\pipe\jtt-"
 MAX_PIPE_NAME_CHARS = 240
 LEASE_SECONDS = 15.0
 OUTPUT_BUFFER_BYTES = 256 * 1024
+METADATA_REPLACE_TIMEOUT = 1.0
 STARTUP_TIMEOUT = 12.0
 STOP_TIMEOUT = 8.0
 WORKER = Path(__file__).with_name("_windows_worker.py")
@@ -175,10 +176,17 @@ def _private_acl(path: Path, *, directory: bool, apply: bool = False) -> None:
             win32security.ACL_REVISION, flags, _win32con.GENERIC_ALL, sid
         )
         descriptor = win32security.SECURITY_DESCRIPTOR()
+        # Elevated Windows runners can otherwise assign the Administrators
+        # group as owner even when the DACL is user-only. Pin the owner to the
+        # same user SID as the sole allowed ACE before validating the result.
+        descriptor.SetSecurityDescriptorOwner(sid, False)
         descriptor.SetSecurityDescriptorDacl(True, acl, False)
         protected = getattr(win32security, "PROTECTED_DACL_SECURITY_INFORMATION", 0x80000000)
         win32security.SetFileSecurity(
-            str(path), win32security.DACL_SECURITY_INFORMATION | protected, descriptor
+            str(path),
+            win32security.OWNER_SECURITY_INFORMATION
+            | win32security.DACL_SECURITY_INFORMATION | protected,
+            descriptor,
         )
     try:
         descriptor = win32security.GetFileSecurity(
@@ -188,12 +196,31 @@ def _private_acl(path: Path, *, directory: bool, apply: bool = False) -> None:
         owner = descriptor.GetSecurityDescriptorOwner()
         acl = descriptor.GetSecurityDescriptorDacl()
     except Exception as exc:
-        raise TerminalError("terminal path security could not be inspected") from exc
-    if owner != sid or acl is None or acl.GetAceCount() != 1:
-        raise TerminalError("terminal path is not private to the current Windows user")
+        raise TerminalError(
+            "terminal path security could not be inspected",
+            diagnostic={"stage": "private_acl", "exception": "inspection_failed"},
+        ) from exc
+    if owner != sid:
+        raise TerminalError(
+            "terminal path owner is not the current Windows user",
+            diagnostic={"stage": "private_acl", "exception": "owner_mismatch"},
+        )
+    if acl is None:
+        raise TerminalError(
+            "terminal path has no Windows access-control list",
+            diagnostic={"stage": "private_acl", "exception": "dacl_missing"},
+        )
+    if acl.GetAceCount() != 1:
+        raise TerminalError(
+            "terminal path is not private to the current Windows user",
+            diagnostic={"stage": "private_acl", "exception": "dacl_entry_count"},
+        )
     ace = acl.GetAce(0)
     if ace[0][0] != win32security.ACCESS_ALLOWED_ACE_TYPE or ace[2] != sid:
-        raise TerminalError("terminal path has an unsafe Windows DACL")
+        raise TerminalError(
+            "terminal path has an unsafe Windows DACL",
+            diagnostic={"stage": "private_acl", "exception": "dacl_identity_or_type"},
+        )
 
 
 def _check_no_reparse_components(path: Path) -> None:
@@ -248,7 +275,10 @@ def _read_metadata(path: Path) -> dict[str, Any]:
         if not stat.S_ISREG(info.st_mode) or info.st_size > 16 * 1024:
             raise TerminalError("terminal metadata is invalid")
         _private_acl(path, directory=False)
-        value = json.loads(path.read_text(encoding="utf-8"))
+        if _WINDOWS:
+            value = json.loads(_read_windows_metadata_text(path))
+        else:
+            value = json.loads(path.read_text(encoding="utf-8"))
     except TerminalError:
         raise
     except (OSError, ValueError, UnicodeError) as exc:
@@ -256,6 +286,75 @@ def _read_metadata(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TerminalError("terminal metadata is invalid")
     return value
+
+
+def _read_windows_metadata_text(path: Path) -> str:
+    """Read one metadata generation with delete sharing for atomic replacement.
+
+    The registry writer replaces metadata with ``os.replace``. A default
+    Python text handle on Windows can deny delete sharing, making the writer
+    fail with ERROR_ACCESS_DENIED while another JTT process validates a
+    session. Keep the read bound and allow the old generation to remain
+    readable through the retained file handle.
+    """
+    import win32con
+    import win32file
+
+    share = (win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE
+             | win32con.FILE_SHARE_DELETE)
+    try:
+        handle = win32file.CreateFile(
+            str(path), win32con.GENERIC_READ, share, None,
+            win32con.OPEN_EXISTING, win32con.FILE_ATTRIBUTE_NORMAL, None,
+        )
+    except Exception as exc:
+        raise TerminalError("terminal metadata is unavailable or invalid") from exc
+    try:
+        data = bytearray()
+        while len(data) <= 16 * 1024:
+            _status, chunk = win32file.ReadFile(
+                handle, min(4096, 16 * 1024 + 1 - len(data))
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > 16 * 1024:
+            raise TerminalError("terminal metadata is invalid")
+        return bytes(data).decode("utf-8")
+    except TerminalError:
+        raise
+    except Exception as exc:
+        raise TerminalError("terminal metadata is unavailable or invalid") from exc
+    finally:
+        handle.Close()
+
+
+def _replace_metadata(source: Path, destination: Path) -> None:
+    """Atomically replace metadata after brief Windows reader contention.
+
+    Windows can report ERROR_ACCESS_DENIED when another process has the old
+    file open, even when that reader allowed delete sharing. Retry only the
+    two sharing/contention errors and only for a bounded interval; permanent
+    ACL failures still fail closed.
+    """
+    deadline = time.monotonic() + METADATA_REPLACE_TIMEOUT
+    delay = 0.005
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as exc:
+            code = getattr(exc, "winerror", None)
+            if code is None and getattr(exc, "args", ()):
+                try:
+                    code = int(exc.args[0])
+                except (TypeError, ValueError):
+                    code = None
+            if code not in (5, 32) or time.monotonic() >= deadline:
+                raise
+            remaining = deadline - time.monotonic()
+            time.sleep(min(delay, max(0.0, remaining)))
+            delay = min(delay * 2, 0.05)
 
 
 def _atomic_metadata(path: Path, value: dict[str, Any]) -> None:
@@ -266,7 +365,7 @@ def _atomic_metadata(path: Path, value: dict[str, Any]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         _private_acl(temp, directory=False, apply=True)
-        os.replace(temp, path)
+        _replace_metadata(temp, path)
         _private_acl(path, directory=False)
     except Exception as exc:
         try:
@@ -274,11 +373,30 @@ def _atomic_metadata(path: Path, value: dict[str, Any]) -> None:
         except OSError:
             pass
         if isinstance(exc, TerminalError):
-            raise
-        raise TerminalError("terminal metadata could not be saved") from exc
+            if exc.diagnostic is not None:
+                raise
+            raise TerminalError(
+                "terminal metadata could not be saved",
+                diagnostic={"stage": "metadata_write", "exception": "terminal_error"},
+            ) from exc
+        code = getattr(exc, "winerror", None)
+        if code is None and getattr(exc, "args", ()):
+            try:
+                code = int(exc.args[0])
+            except (TypeError, ValueError):
+                code = None
+        category = {5: "access_denied", 32: "sharing_violation",
+                    80: "already_exists", 183: "already_exists"}.get(
+                        code, "metadata_io_error"
+                    )
+        raise TerminalError(
+            "terminal metadata could not be saved",
+            diagnostic={"stage": "metadata_write", "exception": category},
+        ) from exc
 
 
-def _process_facts(pid: int) -> tuple[str, str, bool]:
+def _process_facts(pid: int, *, expected_start: Optional[str] = None,
+                   verify_image: bool = True) -> tuple[str, str, bool]:
     """Return (creation time, image, alive) using a retained query handle.
 
     A process that cannot be inspected raises instead of being reported as
@@ -312,6 +430,16 @@ def _process_facts(pid: int) -> tuple[str, str, bool]:
         if wait_result != win32con.WAIT_TIMEOUT:
             raise TerminalError("terminal process identity could not be verified")
         times = win32process.GetProcessTimes(handle)
+        created = str(times["CreationTime"])
+        if expected_start is not None and created != str(expected_start):
+            # This is a different process after PID reuse. Its image is not
+            # relevant to the expected identity and must not be treated as it.
+            return created, "", True
+        if not verify_image:
+            # Used only after the session identity and pipe were validated
+            # before sending its stop request. Creation time on this retained
+            # query handle is enough to observe that exact process exiting.
+            return created, "", True
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         query_image = kernel32.QueryFullProcessImageNameW
         query_image.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
@@ -321,9 +449,27 @@ def _process_facts(pid: int) -> tuple[str, str, bool]:
         image_length = ctypes.c_uint32(len(image_buffer))
         if not query_image(ctypes.c_void_p(int(handle)), 0, image_buffer,
                            ctypes.byref(image_length)):
-            raise TerminalError("terminal process image could not be verified")
+            # The retained handle still names the same process. If it became
+            # signaled between the initial wait and this query, report it as
+            # exited; otherwise a query failure remains an unknown identity.
+            wait_result = win32event.WaitForSingleObject(handle, 0)
+            if wait_result == win32con.WAIT_OBJECT_0:
+                return "", "", False
+            if wait_result != win32con.WAIT_TIMEOUT:
+                raise TerminalError(
+                    "terminal process identity could not be verified",
+                    diagnostic={"stage": "process_exit_confirmation",
+                                "exception": "wait_result_invalid"},
+                )
+            error_code = ctypes.get_last_error()
+            category = ("image_query_winerror_{}".format(error_code)
+                        if error_code else "image_query_failed")
+            raise TerminalError(
+                "terminal process image could not be verified",
+                diagnostic={"stage": "process_image_query", "exception": category},
+            )
         image = image_buffer.value
-        return str(times["CreationTime"]), os.path.normcase(os.path.abspath(image)), True
+        return created, os.path.normcase(os.path.abspath(image)), True
     except TerminalError:
         raise
     except Exception as exc:
@@ -416,7 +562,7 @@ def _identity_matches_process(identity: TerminalIdentity) -> tuple[bool, bool]:
 def _process_identity_mismatch(
     pid: int, expected_start: str, expected_image: Optional[str] = None
 ) -> Optional[str]:
-    created, image, alive = _process_facts(pid)
+    created, image, alive = _process_facts(pid, expected_start=expected_start)
     if not alive:
         return "process_unavailable"
     if created != expected_start:
@@ -611,6 +757,11 @@ class TerminalRegistry:
                 exception = startup_failure.get("exception")
                 if (isinstance(stage, str) and stage.isidentifier()
                         and isinstance(exception, str) and exception.isidentifier()):
+                    cause_stage = startup_failure.get("cause_stage")
+                    cause = startup_failure.get("cause")
+                    if (isinstance(cause_stage, str) and cause_stage.isidentifier()
+                            and isinstance(cause, str) and cause.isidentifier()):
+                        exception = cause_stage + "_" + cause
                     diagnostic = {"stage": stage, "exception": exception}
             if diagnostic is None and metadata.get("state") == "running":
                 diagnostic = {
@@ -665,8 +816,14 @@ class TerminalRegistry:
             client.close()
         deadline = time.monotonic() + STOP_TIMEOUT
         while time.monotonic() < deadline:
-            worker_created, _worker_image, worker_alive = _process_facts(identity.supervisor_pid)
-            shell_created, _shell_image, shell_alive = _process_facts(identity.shell_pid)
+            worker_created, _worker_image, worker_alive = _process_facts(
+                identity.supervisor_pid, expected_start=identity.supervisor_start,
+                verify_image=False,
+            )
+            shell_created, _shell_image, shell_alive = _process_facts(
+                identity.shell_pid, expected_start=identity.shell_start,
+                verify_image=False,
+            )
             if (not worker_alive or worker_created != identity.supervisor_start):
                 if shell_alive and shell_created == identity.shell_start:
                     raise TerminalError("owned PowerShell did not exit; registry retained")

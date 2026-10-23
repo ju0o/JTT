@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -227,6 +228,158 @@ def test_process_access_denied_preserves_session_registry(tmp_path, monkeypatch)
                           expected_shell_pid=identity.shell_pid)
         except Exception:
             pass
+
+
+def test_windows_metadata_reader_allows_atomic_replace_while_open(tmp_path, monkeypatch):
+    import ju0_terminal_tower  # noqa: F401
+    import win32file
+
+    from tmux_agent_tower.terminal.windows_manager import (
+        _atomic_metadata,
+        _ensure_private_directory,
+        _read_metadata,
+    )
+    from tmux_agent_tower.terminal import windows_manager
+
+    root = tmp_path / "isolated-jtt" / "terminals"
+    _ensure_private_directory(root)
+    path = root / "session.json"
+    _atomic_metadata(path, {"generation": "old"})
+    original_read = win32file.ReadFile
+    opened = threading.Event()
+    resume = threading.Event()
+    replace_denied = threading.Event()
+    results = []
+    failures = []
+    original_replace = windows_manager.os.replace
+
+    def blocking_read(handle, size):
+        opened.set()
+        if not resume.wait(5):
+            raise AssertionError("metadata reader release timed out")
+        return original_read(handle, size)
+
+    def reader():
+        try:
+            results.append(_read_metadata(path))
+        except Exception as exc:  # captured for assertion on the test thread
+            failures.append(type(exc).__name__)
+
+    def observed_replace(source, destination):
+        try:
+            return original_replace(source, destination)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 5:
+                replace_denied.set()
+            raise
+
+    def writer():
+        try:
+            _atomic_metadata(path, {"generation": "new"})
+        except Exception as exc:  # captured for assertion on the test thread
+            failures.append(type(exc).__name__)
+
+    monkeypatch.setattr(win32file, "ReadFile", blocking_read)
+    monkeypatch.setattr(windows_manager.os, "replace", observed_replace)
+    thread = threading.Thread(target=reader, daemon=True)
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    try:
+        assert opened.wait(5), "metadata reader did not open the file"
+        writer_thread.start()
+        assert replace_denied.wait(5), "held metadata reader did not block replacement"
+    finally:
+        resume.set()
+        thread.join(5)
+        if writer_thread.ident is not None:
+            writer_thread.join(5)
+    assert not writer_thread.is_alive(), "metadata writer did not finish after reader closed"
+    assert not thread.is_alive(), "metadata reader thread did not finish"
+    assert failures == []
+    assert results == [{"generation": "old"}]
+    assert _read_metadata(path) == {"generation": "new"}
+
+
+@pytest.mark.parametrize("process_signaled_after_query", [True, False])
+def test_process_image_query_race_fails_closed_unless_handle_is_signaled(
+    monkeypatch, process_signaled_after_query
+):
+    import ju0_terminal_tower  # noqa: F401
+    import win32api
+    import win32con
+    import win32event
+    import win32process
+
+    from tmux_agent_tower.terminal import TerminalError
+    from tmux_agent_tower.terminal import windows_manager
+
+    class FakeHandle:
+        closed = False
+
+        def __int__(self):
+            return 1234
+
+        def Close(self):
+            self.closed = True
+
+    handle = FakeHandle()
+    second_wait = (win32con.WAIT_OBJECT_0 if process_signaled_after_query
+                   else win32con.WAIT_TIMEOUT)
+    waits = iter((win32con.WAIT_TIMEOUT, second_wait))
+    monkeypatch.setattr(win32api, "OpenProcess", lambda *_args, **_kwargs: handle)
+    monkeypatch.setattr(
+        win32event, "WaitForSingleObject", lambda *_args: next(waits)
+    )
+    monkeypatch.setattr(win32process, "GetProcessTimes", lambda _handle: {
+        "CreationTime": "fixture-start",
+    })
+
+    class Kernel32:
+        @staticmethod
+        def QueryFullProcessImageNameW(*_args):
+            return 0
+
+    monkeypatch.setattr(windows_manager.ctypes, "WinDLL", lambda *_args, **_kwargs: Kernel32())
+    if not process_signaled_after_query:
+        with pytest.raises(TerminalError, match="process image could not be verified"):
+            windows_manager._process_facts(1234)
+    else:
+        assert windows_manager._process_facts(1234) == ("", "", False)
+    assert handle.closed
+
+
+def test_process_facts_skips_image_query_for_reused_pid(monkeypatch):
+    import ju0_terminal_tower  # noqa: F401
+    import win32api
+    import win32con
+    import win32event
+    import win32process
+
+    from tmux_agent_tower.terminal import windows_manager
+
+    class FakeHandle:
+        def Close(self):
+            self.closed = True
+
+    handle = FakeHandle()
+    handle.closed = False
+    monkeypatch.setattr(win32api, "OpenProcess", lambda *_args, **_kwargs: handle)
+    monkeypatch.setattr(
+        win32event, "WaitForSingleObject",
+        lambda *_args: win32con.WAIT_TIMEOUT,
+    )
+    monkeypatch.setattr(win32process, "GetProcessTimes", lambda _handle: {
+        "CreationTime": "new-process-start",
+    })
+
+    def unexpected_image_query(*_args, **_kwargs):
+        raise AssertionError("a reused PID must not be image-queried as the old process")
+
+    monkeypatch.setattr(windows_manager.ctypes, "WinDLL", unexpected_image_query)
+    assert windows_manager._process_facts(
+        1234, expected_start="old-process-start"
+    ) == ("new-process-start", "", True)
+    assert handle.closed
 
 
 def test_native_shell_exit_remains_listed_until_explicit_owned_cleanup(tmp_path, monkeypatch):
