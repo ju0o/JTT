@@ -121,7 +121,11 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
             }
         first_nonce = uuid.uuid4().hex[:8]
         first_marker = f"JTT_DIAG_{first_nonce}_한글_END"
-        first_command = f"Write-Output ('JTT_DIAG_{first_nonce}_' + '한' + '글' + '_END')"
+        first_command = (
+            f"Write-Output ('JTT_DIAG_{first_nonce}_' + "
+            "[char]0xD55C + [char]0xAE00 + '_END')"
+        )
+        assert first_command.isascii(), "the shell response, not command echo, must supply Korean"
         assert first_marker not in first_command, "the result marker must not occur in command echo"
         assert client.call("observe_marker", identity=identity, marker=first_marker) == {
             "ok": True, "synthetic_marker_only": True,
@@ -135,7 +139,7 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         print("enter_phase=before " + json.dumps({
             "sequence": echo_snapshot["sequence"],
             "complete_command_echo": first_command in echo_snapshot["text"],
-            "echo_codepoints": [ord(char) for char in first_command if char in "한글"],
+            "command_echo_ascii_only": first_command.isascii(),
             "result_marker_visible": first_marker in echo_snapshot["text"],
         }, ensure_ascii=True))
         assert client.call("input", identity=identity, text="\r")["ok"]
@@ -177,7 +181,11 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         wait_text(client, "SIZE=80")
         resize_nonce = uuid.uuid4().hex[:8]
         resize_marker = f"JTT_DIAG_{resize_nonce}_입력_END"
-        resize_command = f"Write-Output ('JTT_DIAG_{resize_nonce}_' + '입' + '력' + '_END')"
+        resize_command = (
+            f"Write-Output ('JTT_DIAG_{resize_nonce}_' + "
+            "[char]0xC785 + [char]0xB825 + '_END')"
+        )
+        assert resize_command.isascii(), "the shell response, not command echo, must supply Korean"
         assert resize_marker not in resize_command, "the result marker must not occur in command echo"
         assert client.call("observe_marker", identity=identity, marker=resize_marker) == {
             "ok": True, "synthetic_marker_only": True,
@@ -188,7 +196,7 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         print("resize_enter_phase=before " + json.dumps({
             "sequence": resize_echo["sequence"],
             "complete_command_echo": resize_command in resize_echo["text"],
-            "echo_codepoints": [ord(char) for char in resize_command if char in "입력"],
+            "command_echo_ascii_only": resize_command.isascii(),
             "result_marker_visible": resize_marker in resize_echo["text"],
         }, ensure_ascii=True))
         assert client.call("input", identity=identity, text="\r")["ok"]
