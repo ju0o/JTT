@@ -1,0 +1,1014 @@
+{
+  "base": "e06291bebbdaadcc96d8690cc0054da489af3fb1",
+  "note": "Planning inventory only. No file deletion authorized by this classification; mixed/dynamic imports need extraction and regression proof first.",
+  "files": [
+    {
+      "path": ".github/ISSUE_TEMPLATE/bug_report.md",
+      "action": "UPDATE_ONLY_IN_LATER_PRODUCT_PR"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/feature_request.md",
+      "action": "UPDATE_ONLY_IN_LATER_PRODUCT_PR"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "action": "UPDATE_ONLY_IN_LATER_PRODUCT_PR"
+    },
+    {
+      "path": "README.ko.md",
+      "action": "UPDATE_ONLY_IN_LATER_PRODUCT_PR"
+    },
+    {
+      "path": "README.md",
+      "action": "UPDATE_ONLY_IN_LATER_PRODUCT_PR"
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "action": "PRESERVE_AS_HISTORICAL_DOC"
+    },
+    {
+      "path": "docs/JTT_MEDIA.md",
+      "action": "KEEP_JTT_OR_SAFETY_HISTORY"
+    },
+    {
+      "path": "docs/JTT_QUICK_START.ko.md",
+      "action": "KEEP_JTT_OR_SAFETY_HISTORY"
+    },
+    {
+      "path": "docs/JTT_QUICK_START.md",
+      "action": "KEEP_JTT_OR_SAFETY_HISTORY"
+    },
+    {
+      "path": "docs/JTT_SHOWCASE.md",
+      "action": "KEEP_JTT_OR_SAFETY_HISTORY"
+    },
+    {
+      "path": "docs/JTT_TERMINAL_SUPPORT.md",
+      "action": "KEEP_JTT_OR_SAFETY_HISTORY"
+    },
+    {
+      "path": "docs/JTT_UPDATING.ko.md",
+      "action": "KEEP_JTT_OR_SAFETY_HISTORY"
+    },
+    {
+      "path": "docs/JTT_UPDATING.md",
+      "action": "KEEP_JTT_OR_SAFETY_HISTORY"
+    },
+    {
+      "path": "docs/JTT_WORK_KITS.md",
+      "action": "KEEP_JTT_OR_SAFETY_HISTORY"
+    },
+    {
+      "path": "docs/OPENCODE_SESSION_BINDING.md",
+      "action": "PRESERVE_AS_HISTORICAL_DOC"
+    },
+    {
+      "path": "docs/RC_SAFETY_INCIDENT_WBS0506B.md",
+      "action": "KEEP_JTT_OR_SAFETY_HISTORY"
+    },
+    {
+      "path": "docs/REMOTE.md",
+      "action": "PRESERVE_AS_HISTORICAL_DOC"
+    },
+    {
+      "path": "docs/ROADMAP.md",
+      "action": "PRESERVE_AS_HISTORICAL_DOC"
+    },
+    {
+      "path": "docs/STATUS_ENGINE.md",
+      "action": "PRESERVE_AS_HISTORICAL_DOC"
+    },
+    {
+      "path": "docs/TOWER_LEGACY.ko.md",
+      "action": "PRESERVE_AS_HISTORICAL_DOC"
+    },
+    {
+      "path": "docs/TOWER_LEGACY.md",
+      "action": "PRESERVE_AS_HISTORICAL_DOC"
+    },
+    {
+      "path": "docs/UPDATING.md",
+      "action": "PRESERVE_AS_HISTORICAL_DOC"
+    },
+    {
+      "path": "docs/WBS04_V1_QUIET_LIVE_CONTROL.md",
+      "action": "PRESERVE_AS_HISTORICAL_DOC"
+    },
+    {
+      "path": "pyproject.toml",
+      "action": "UPDATE_ONLY_IN_LATER_PRODUCT_PR"
+    },
+    {
+      "path": "scripts/dev-python",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "scripts/doctor.sh",
+      "action": "REVIEW_LEGACY_OR_EXPERIMENT_SCRIPT"
+    },
+    {
+      "path": "scripts/install.sh",
+      "action": "REVIEW_LEGACY_OR_EXPERIMENT_SCRIPT"
+    },
+    {
+      "path": "scripts/jtt-dev",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "scripts/jtt-install-dev",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "scripts/jtt-install-release",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "scripts/jtt-setup-dev",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "scripts/migrate-update.sh",
+      "action": "REVIEW_LEGACY_OR_EXPERIMENT_SCRIPT"
+    },
+    {
+      "path": "scripts/tower",
+      "action": "REVIEW_LEGACY_OR_EXPERIMENT_SCRIPT"
+    },
+    {
+      "path": "scripts/uninstall.sh",
+      "action": "REVIEW_LEGACY_OR_EXPERIMENT_SCRIPT"
+    },
+    {
+      "path": "src/tmux_agent_tower/__init__.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/access_context.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/adapters/__init__.py",
+      "action": "REVIEW_PACKAGE_BOUNDARY"
+    },
+    {
+      "path": "src/tmux_agent_tower/adapters/base.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/adapters/claude.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/adapters/codex.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/adapters/cursor.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/adapters/grok.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/adapters/opencode.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/adapters/shell.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/clipboard.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/clipboard_bridge.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/clipboard_dest.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/connect.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/control/__init__.py",
+      "action": "REVIEW_PACKAGE_BOUNDARY"
+    },
+    {
+      "path": "src/tmux_agent_tower/control/actions.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/__init__.py",
+      "action": "REVIEW_PACKAGE_BOUNDARY"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/attention.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/identity.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/interaction.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/process.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/project.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/providers.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/result.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/sshdest.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/status.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/detection/topology.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/hostreg.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/i18n/__init__.py",
+      "action": "EXTRACT_SHARED_JTT_PARTS"
+    },
+    {
+      "path": "src/tmux_agent_tower/i18n/en.py",
+      "action": "EXTRACT_SHARED_JTT_PARTS"
+    },
+    {
+      "path": "src/tmux_agent_tower/i18n/ko.py",
+      "action": "EXTRACT_SHARED_JTT_PARTS"
+    },
+    {
+      "path": "src/tmux_agent_tower/jtt.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/jtt_diagnostics.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/jtt_install.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/jtt_update.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/launcher/__init__.py",
+      "action": "REVIEW_PACKAGE_BOUNDARY"
+    },
+    {
+      "path": "src/tmux_agent_tower/launcher/browse.py",
+      "action": "EXTRACT_SHARED_JTT_PARTS"
+    },
+    {
+      "path": "src/tmux_agent_tower/launcher/config.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/launcher/discovery.py",
+      "action": "EXTRACT_SHARED_JTT_PARTS"
+    },
+    {
+      "path": "src/tmux_agent_tower/launcher/plan.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/launcher/presets.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/launcher/spawn.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/launcher/treeview.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/launcher/workflows.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/launcher/workset_launch.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/main.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/notify.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/paths.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/remote/__init__.py",
+      "action": "REVIEW_PACKAGE_BOUNDARY"
+    },
+    {
+      "path": "src/tmux_agent_tower/remote/collector.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/remote/opencode.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/remote/opencode_session_binding.js",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/resources/harnesses/builder.md",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/resources/harnesses/dogfood.md",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/resources/harnesses/e2e.md",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/resources/harnesses/orchestrator.md",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/resources/harnesses/planner.md",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/resources/harnesses/qa.md",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/resources/harnesses/reviewer.md",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/role_harness.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/server/__init__.py",
+      "action": "REVIEW_PACKAGE_BOUNDARY"
+    },
+    {
+      "path": "src/tmux_agent_tower/server/auth.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/server/httpapi.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/server/netutil.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/server/service.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/server/tailscale.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/server/webui.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/__init__.py",
+      "action": "REVIEW_PACKAGE_BOUNDARY"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/bindings.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/control_screens.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/environments.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/folders.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/jtt_keys.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/jtt_layouts.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/jtt_store_lock.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/jtt_work_kits.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/jtt_workspaces.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/overrides.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/projects.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/visits.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/work_groups.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/workflow_runs.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/state/worksets.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/terminal/__init__.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/terminal/_worker.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/terminal/manager.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/tmux/__init__.py",
+      "action": "REVIEW_PACKAGE_BOUNDARY"
+    },
+    {
+      "path": "src/tmux_agent_tower/tmux/capture.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/tmux/discovery.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/tmux/keybind.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/tmux/navigation.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/tmux/registration.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/tmux/structure.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/__init__.py",
+      "action": "REVIEW_PACKAGE_BOUNDARY"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/control_room.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/control_view.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/folder_tree.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/jtt.py",
+      "action": "KEEP_AND_PORT_JTT"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/launcher_wizard.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/live_view.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/palette.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/perf_trace.py",
+      "action": "EXTRACT_SHARED_JTT_PARTS"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/projects.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/prompt_composer.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/remote_menu.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/render.py",
+      "action": "EXTRACT_SHARED_JTT_PARTS"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/settings_menu.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/structure_menu.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/tower.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/ux_preview.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/ux_preview_v2.py",
+      "action": "EXTRACT_SHARED_JTT_PARTS"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/widgets.py",
+      "action": "EXTRACT_SHARED_JTT_PARTS"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/work_groups.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/workflow_presets.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/worksets.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/workspace_browser.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/ui/workspace_presets.py",
+      "action": "LEGACY_EXCLUDE_AFTER_EXTRACTION"
+    },
+    {
+      "path": "src/tmux_agent_tower/update_manager.py",
+      "action": "EXTRACT_SHARED_JTT_PARTS"
+    },
+    {
+      "path": "tests/conftest.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/remote_fixtures.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_access_context.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_activity.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_adapters.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_attention.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_capture.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_clipboard.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_clipboard_bridge.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_clipboard_dest.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_connect.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_control_actions.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_control_room.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_control_room_menu_layout.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_control_screens.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_conversation_surface.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_discovery_parsing.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_environments.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_focus_handoff.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_focus_target_identity.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_folders.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_grok_native.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_harnesses.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_host_topology.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_i18n.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_i18n_config.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_identity.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_input_latency.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_input_transport.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_interaction.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_jtt_cli_update.py",
+      "action": "KEEP_JTT_REGRESSION"
+    },
+    {
+      "path": "tests/test_jtt_keyboard_compat.py",
+      "action": "KEEP_JTT_REGRESSION"
+    },
+    {
+      "path": "tests/test_jtt_layouts.py",
+      "action": "KEEP_JTT_REGRESSION"
+    },
+    {
+      "path": "tests/test_jtt_release_candidate_metadata.py",
+      "action": "KEEP_JTT_REGRESSION"
+    },
+    {
+      "path": "tests/test_jtt_terminal_integration.py",
+      "action": "KEEP_JTT_REGRESSION"
+    },
+    {
+      "path": "tests/test_jtt_ui.py",
+      "action": "KEEP_JTT_REGRESSION"
+    },
+    {
+      "path": "tests/test_jtt_work_kits.py",
+      "action": "KEEP_JTT_REGRESSION"
+    },
+    {
+      "path": "tests/test_jtt_workspaces.py",
+      "action": "KEEP_JTT_REGRESSION"
+    },
+    {
+      "path": "tests/test_keybind.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_launcher_config.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_launcher_discovery.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_launcher_spawn.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_live_view.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_main_serve_cli.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_main_serve_tailscale.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_main_update_cli.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_navigator.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_notify.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_onboarding.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_opencode_ssh_result.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_opencode_tui_plugin_contract.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_overrides.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_palette.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_paths.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_project.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_project_binding.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_projects.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_prompt_composer.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_registration.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_remote_collector.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_remote_grok_actions.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_remote_grok_binding.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_remote_service.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_remote_session_binding.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_remote_session_integration.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_render.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_result.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_runtime_source.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_server_auth.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_server_httpapi.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_server_lifecycle.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_server_livepane.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_server_tailscale.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_stale_override.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_status_engine.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_structure.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_structure_dogfood.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_task_flows.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_task_name_sync.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_terminal_engine.py",
+      "action": "KEEP_JTT_REGRESSION"
+    },
+    {
+      "path": "tests/test_tmux_test_safety.py",
+      "action": "KEEP_ISOLATION_GUARD_DURING_TRANSITION"
+    },
+    {
+      "path": "tests/test_unified_identity.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_update_manager.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_ux_polish.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_ux_preview.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_ux_preview_v2.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_visits.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_widgets_keys.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_widgets_prompt.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_work_groups.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_workflow_presets.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_workflow_runs.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_workset_launch.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_worksets.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_workspace_browser.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_workspace_dogfood.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_workspace_presets.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/test_workspace_tree.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    },
+    {
+      "path": "tests/tmux_test_safety.py",
+      "action": "KEEP_ISOLATION_GUARD_DURING_TRANSITION"
+    },
+    {
+      "path": "tests/workspace_fixture.py",
+      "action": "REVIEW_SHARED_VS_LEGACY_TEST"
+    }
+  ]
+}

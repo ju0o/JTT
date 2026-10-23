@@ -1,0 +1,21 @@
+name: Windows native feasibility
+on:
+  pull_request:
+    paths:
+      - 'experiments/windows_native/**'
+      - '.github/workflows/windows-feasibility.yml'
+permissions:
+  contents: read
+jobs:
+  conpty:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install isolated feasibility dependencies
+        run: python -m pip install -r experiments/windows_native/requirements.txt
+      - name: Native ConPTY and Textual headless probe
+        run: python -m pytest -q -s experiments/windows_native/test_probe.py
