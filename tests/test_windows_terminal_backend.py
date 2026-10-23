@@ -361,6 +361,57 @@ def test_windows_observer_capacity_is_bounded_and_disconnect_frees_slot(
             pass
 
 
+def test_windows_repeated_observer_connect_disconnect_preserves_session(
+    tmp_path, monkeypatch
+):
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalRegistry
+
+    work = tmp_path / "isolated-work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    registry = TerminalRegistry(tmp_path / "isolated-jtt" / "terminals")
+    controller = registry.create("Repeated observer churn")
+    identity = controller.identity
+    try:
+        assert _process_same(identity.shell_pid, identity.shell_start)
+        assert controller.observe().synced
+
+        # Exercise the real named-pipe accept/worker/finally path repeatedly.
+        # Every connection is an observer; no reconnect acquires the lease.
+        for _ in range(32):
+            observer = registry.connect(identity.session_id, timeout=5)
+            try:
+                observation = observer.observe()
+                assert observation.synced
+                assert observation.session_id == identity.session_id
+                assert observation.generation == identity.generation
+                assert observation.shell_pid == identity.shell_pid
+                assert not observer.lease
+            finally:
+                observer.close()
+            assert _process_same(identity.shell_pid, identity.shell_start)
+
+        assert controller.observe().synced
+        assert _process_same(identity.shell_pid, identity.shell_start)
+        registry.stop(identity.session_id,
+                      expected_generation=identity.generation,
+                      expected_shell_pid=identity.shell_pid)
+        assert not _process_same(identity.shell_pid, identity.shell_start)
+        assert registry.list_sessions() == ()
+    finally:
+        try:
+            controller.close()
+        except Exception:
+            pass
+        try:
+            registry.stop(identity.session_id,
+                          expected_generation=identity.generation,
+                          expected_shell_pid=identity.shell_pid)
+        except Exception:
+            pass
+
+
 def test_process_access_denied_preserves_session_registry(tmp_path, monkeypatch):
     import pywintypes
     import win32api

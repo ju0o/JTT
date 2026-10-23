@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 import zlib
 
 
@@ -79,6 +80,60 @@ def _cancel_synchronous_io(thread):
         return bool(cancel_io(handle))
     finally:
         close_handle(handle)
+
+
+class _ClientThreadRegistry:
+    """Track only active pipe workers and serialize admission with shutdown."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        # Weak references cannot retain completed Thread objects if a caller
+        # outlives their worker. The accept loop separately enforces the live
+        # named-pipe client limit using client_handles under state_lock.
+        self._threads = {}
+        self._closing = False
+
+    def _active_locked(self):
+        active = []
+        for key, reference in list(self._threads.items()):
+            thread = reference()
+            if thread is None or not thread.is_alive():
+                if self._threads.get(key) is reference:
+                    self._threads.pop(key, None)
+            else:
+                active.append(thread)
+        return tuple(active)
+
+    def start(self, target, *, args=(), name="jtt-named-pipe-client"):
+        """Start one worker, unless shutdown has closed admission."""
+        with self._lock:
+            if self._closing:
+                return None, "closing"
+            self._active_locked()
+            thread = threading.Thread(
+                target=target, args=args, name=name, daemon=True
+            )
+            key = id(thread)
+            reference = weakref.ref(thread)
+            self._threads[key] = reference
+            try:
+                thread.start()
+            except BaseException:
+                if self._threads.get(key) is reference:
+                    self._threads.pop(key, None)
+                raise
+            return thread, None
+
+    def begin_shutdown(self, stop_event):
+        """Atomically stop admission, signal shutdown, and snapshot active workers."""
+        with self._lock:
+            self._closing = True
+            stop_event.set()
+            return self._active_locked()
+
+    def snapshot(self):
+        with self._lock:
+            return self._active_locked()
 
 
 def _screen_payload(pyte, screen):
@@ -240,7 +295,7 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
         # own hello, while the lease below remains exclusive to one connection.
         clients = {}
         client_handles = {}
-        client_threads = []
+        client_threads = _ClientThreadRegistry()
         client_changed = threading.Event()
         connection_counter = 0
 
@@ -440,7 +495,7 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                             payload = b'{"ok":false,"error":"response_too_large"}'
                         win32file.WriteFile(client_pipe, payload)
                         if response.get("stopping"):
-                            stop_worker.set()
+                            client_threads.begin_shutdown(stop_worker)
                             break
                 except Exception as exc:
                     pipe_error.append(type(exc).__name__)
@@ -691,14 +746,39 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                             listener.Close()
                             client_changed.set()
                             continue
-                        thread = threading.Thread(
-                            target=serve_client,
-                            args=(listener, connection_id),
-                            name="jtt-named-pipe-client",
-                            daemon=True,
-                        )
-                        client_threads.append(thread)
-                        thread.start()
+                        try:
+                            thread, rejection = client_threads.start(
+                                serve_client,
+                                args=(listener, connection_id),
+                            )
+                        except Exception:
+                            with state_lock:
+                                clients.pop(connection_id, None)
+                                client_handles.pop(connection_id, None)
+                            try:
+                                win32pipe.DisconnectNamedPipe(listener)
+                            except Exception:
+                                pass
+                            try:
+                                listener.Close()
+                            except Exception:
+                                pass
+                            raise
+                        if rejection is not None:
+                            with state_lock:
+                                clients.pop(connection_id, None)
+                                client_handles.pop(connection_id, None)
+                            try:
+                                win32pipe.DisconnectNamedPipe(listener)
+                            except Exception:
+                                pass
+                            try:
+                                listener.Close()
+                            except Exception:
+                                pass
+                            client_changed.set()
+                            if rejection == "closing":
+                                break
                 except Exception as exc:
                     pipe_error.append(type(exc).__name__)
                     failure = {
@@ -719,7 +799,7 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                             runtime._atomic_metadata(metadata_path, metadata)
                     except Exception:
                         pass
-                    stop_worker.set()
+                    client_threads.begin_shutdown(stop_worker)
                 finally:
                     if pipe is not None:
                         try:
@@ -735,12 +815,16 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
             accept_thread.start()
             while not stop_worker.wait(0.05):
                 pass
+            # Admission and shutdown share the registry lock: after this call,
+            # accept can no longer publish a client worker outside this set.
+            client_threads.begin_shutdown(stop_worker)
             shutdown_deadline = time.monotonic() + 3.0
             _cancel_synchronous_io(accept_thread)
-            for thread in tuple(client_threads):
+            active_client_threads = client_threads.snapshot()
+            for thread in active_client_threads:
                 _cancel_synchronous_io(thread)
             accept_thread.join(timeout=max(0.0, shutdown_deadline - time.monotonic()))
-            for thread in tuple(client_threads):
+            for thread in client_threads.snapshot():
                 thread.join(timeout=max(0.0, shutdown_deadline - time.monotonic()))
             stop_reader.set()
             reader.join(timeout=1)

@@ -5,6 +5,7 @@ on:
       - 'experiments/windows_native/**'
       - 'src/tmux_agent_tower/terminal/**'
       - 'tests/test_windows_terminal_backend.py'
+      - 'tests/test_windows_worker_threads.py'
       - 'pyproject.toml'
       - '.github/workflows/windows-feasibility.yml'
       - 'src/tmux_agent_tower/jtt.py'
@@ -30,3 +31,5 @@ jobs:
         run: python -m pytest -q -s experiments/windows_native/test_probe.py
       - name: Native JTT Windows terminal backend
         run: python -m pytest -q -s tests/test_windows_terminal_backend.py
+      - name: Windows client worker thread lifecycle
+        run: python -m pytest -q tests/test_windows_worker_threads.py
