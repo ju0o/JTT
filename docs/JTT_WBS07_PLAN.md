@@ -152,8 +152,9 @@ test-fixture correction, not a product workaround. Local Windows 11 Python
 show Korean at the pywinpty returned-string boundary before pyte feed and
 contiguous screen cells: pre-resize `한`/`글` at columns 18/20 (width 2 each),
 post-resize `입`/`력` at columns 18/20 (width 2 each). The post-resize output
-read sequence was 27 after resize sequence 16. Linux matrix run
-`39896251538` must complete before the PR CI gate is reported complete.
+read sequence was 27 after resize sequence 16. Linux matrix runs
+`39896251538` and `39896445854` both completed successfully across Python
+3.9/3.11/3.13.
 
 pywinpty's public API returns text and does not expose underlying raw ConPTY
 pipe bytes. Therefore API-string UTF-8 hex is not raw-pipe evidence. Microsoft
