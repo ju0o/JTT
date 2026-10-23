@@ -8,14 +8,11 @@ import os
 import re
 import shutil
 import site
-import socket
 import stat
 import subprocess
 import sys
 import tempfile
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,46 +20,35 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .paths import APP_HOME_ISOLATED, DATA_DIR
+from .release_support import (
+    Release,
+    ReleaseAPI,
+    UpdateError,
+    UpdateStatus,
+    Version,
+    _SHA_RE,
+    checkout_dirty as _checkout_dirty,
+    default_channel,
+    directory_chain as _directory_chain,
+    ensure_directory_chain as _ensure_directory_chain,
+    git_value as _git_value,
+    inside as _inside,
+    install_archive as _install_archive,
+    parse_version,
+)
 
 REPOSITORY = "ju0o/tmux-agent-tower"
-API_ROOT = f"https://api.github.com/repos/{REPOSITORY}"
-_TAG_RE = re.compile(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc(0|[1-9][0-9]*))?$")
-_PACKAGE_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:rc(0|[1-9][0-9]*))?$")
-_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _MARKER = "# TOWER_UPDATE_MANAGER_V1"
-_TIMEOUT = 10
-_MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 
 
-class UpdateError(RuntimeError):
-    def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
-
-
-@dataclass(frozen=True)
-class Version:
-    package: str
-    key: tuple
-    prerelease: bool
-
-
-@dataclass(frozen=True)
-class Release:
-    tag: str
-    package_version: str
-    prerelease: bool
-    key: tuple
-    commit_sha: str = ""
-
-
-@dataclass(frozen=True)
-class UpdateStatus:
-    current: Version
-    channel: str
-    latest: Release
-    available: bool
-    releases: tuple
+_TOWER_RELEASES = ReleaseAPI(
+    REPOSITORY,
+    user_agent="Tmux-Agent-Tower-Update-Manager",
+)
+API_ROOT = f"https://api.github.com/repos/{REPOSITORY}"
+_api_json = _TOWER_RELEASES._api_json
+_tag_commit = _TOWER_RELEASES._tag_commit
+_download_archive = _TOWER_RELEASES._download_archive
 
 
 @dataclass(frozen=True)
@@ -75,20 +61,6 @@ class InstallInfo:
     module_source: str
     version: str
     source_root: Optional[Path] = None
-
-
-def parse_version(value: str, *, tag: bool = False) -> Version:
-    match = (_TAG_RE if tag else _PACKAGE_RE).fullmatch(value or "")
-    if not match:
-        raise UpdateError("UNSUPPORTED_VERSION", f"Unsupported version/tag format: {value!r}")
-    major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
-    rc = int(match.group(4)) if match.group(4) is not None else None
-    package = f"{major}.{minor}.{patch}" + (f"rc{rc}" if rc is not None else "")
-    return Version(package, (major, minor, patch, 0 if rc is not None else 1, rc or 0), rc is not None)
-
-
-def default_channel(version: str) -> str:
-    return "rc" if parse_version(version).prerelease else "stable"
 
 
 def _parse_release_item(item: dict) -> Optional[Release]:
@@ -135,55 +107,6 @@ def select_release(releases, channel: str) -> Release:
 def _installed_channel(current_version: str) -> str:
     # A stable-shaped installed version must not move to an RC based on mutable Release metadata.
     return default_channel(current_version)
-
-
-def _api_json(path: str):
-    request = urllib.request.Request(
-        API_ROOT + path,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "Tmux-Agent-Tower-Update-Manager",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-            final_url = urllib.parse.urlparse(response.geturl())
-            if final_url.scheme != "https" or final_url.hostname not in ("api.github.com", "github.com"):
-                raise UpdateError("UNTRUSTED_GITHUB_HOST", "GitHub API redirected to an unexpected URL.")
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise UpdateError("GITHUB_HTTP", f"GitHub API returned HTTP {exc.code}.") from exc
-    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
-        raise UpdateError("OFFLINE", "Could not reach GitHub; check your network and try again.") from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise UpdateError("INVALID_GITHUB_RESPONSE", "GitHub returned invalid JSON.") from exc
-
-
-def _tag_commit(tag: str, fetch_json: Callable = _api_json) -> str:
-    path = "/git/ref/tags/" + urllib.parse.quote(tag, safe="")
-    ref = fetch_json(path)
-    if not isinstance(ref, dict) or ref.get("ref") != f"refs/tags/{tag}":
-        raise UpdateError("UNVERIFIED_TAG", f"Could not verify the Git tag {tag}.")
-    obj = ref.get("object")
-    if not isinstance(obj, dict):
-        raise UpdateError("UNVERIFIED_TAG", f"GitHub returned no object for {tag}.")
-    seen = set()
-    while obj.get("type") == "tag":
-        sha = obj.get("sha")
-        if not isinstance(sha, str) or not _SHA_RE.fullmatch(sha) or sha in seen or len(seen) >= 16:
-            raise UpdateError("UNVERIFIED_TAG", f"Invalid annotated tag object for {tag}.")
-        seen.add(sha)
-        tagged = fetch_json(f"/git/tags/{sha}")
-        if not isinstance(tagged, dict) or tagged.get("sha") != sha:
-            raise UpdateError("UNVERIFIED_TAG", f"GitHub returned a different annotated tag object for {tag}.")
-        obj = tagged.get("object")
-        if not isinstance(obj, dict):
-            raise UpdateError("UNVERIFIED_TAG", f"Could not resolve annotated tag {tag}.")
-    sha = obj.get("sha") if obj.get("type") == "commit" else ""
-    if not isinstance(sha, str) or not _SHA_RE.fullmatch(sha):
-        raise UpdateError("UNVERIFIED_TAG", f"Tag {tag} does not resolve to a commit.")
-    return sha
 
 
 def check_for_updates(current_version: str, requested_channel: str = "auto", fetch_json: Callable = _api_json) -> UpdateStatus:
@@ -295,24 +218,6 @@ def _looks_like_tower_script(path: Path) -> bool:
     return text.startswith("#!") and "tmux_agent_tower.main" in text and "cli" in text
 
 
-def _checkout_dirty(root: Path) -> Optional[bool]:
-    if not (root / ".git").exists():
-        return None
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    return bool(result.stdout.strip())
-
-
 def _official_checkout(root: Path) -> bool:
     try:
         result = subprocess.run(
@@ -340,53 +245,6 @@ def _official_checkout(root: Path) -> bool:
     if parsed.scheme == "https":
         return not parsed.username and not parsed.password
     return parsed.scheme == "ssh" and parsed.username in (None, "git") and not parsed.password
-
-
-def _inside(path: Path, parent: Path) -> bool:
-    try:
-        return os.path.commonpath([str(path.resolve()), str(parent.resolve())]) == str(parent.resolve())
-    except (OSError, ValueError):
-        return False
-
-
-def _directory_chain(path: Path) -> tuple:
-    current = Path(os.path.abspath(path))
-    chain = []
-    writable_by_others = stat.S_IWGRP | stat.S_IWOTH
-    while True:
-        try:
-            info = current.lstat()
-        except OSError as exc:
-            raise UpdateError("UNSAFE_PATH", f"Cannot inspect update path directory: {current}.") from exc
-        if not stat.S_ISDIR(info.st_mode):
-            raise UpdateError("UNSAFE_PATH", "Update paths cannot pass through symlinks or non-directory components.")
-        if info.st_mode & writable_by_others and not (
-            info.st_mode & stat.S_ISVTX and info.st_uid in (0, os.getuid())
-        ):
-            raise UpdateError("UNSAFE_PATH", "An update path ancestor is writable by other users.")
-        chain.append((str(current), info.st_dev, info.st_ino, info.st_uid, info.st_mode))
-        if current.parent == current:
-            break
-        current = current.parent
-    return tuple(reversed(chain))
-
-
-def _ensure_directory_chain(path: Path) -> None:
-    current = Path(os.path.abspath(path))
-    missing = []
-    while True:
-        try:
-            current.lstat()
-            break
-        except FileNotFoundError:
-            missing.append(current)
-            if current.parent == current:
-                raise UpdateError("UNSAFE_PATH", "Cannot find a safe parent for the update directory.")
-            current = current.parent
-    _directory_chain(current)
-    for directory in reversed(missing):
-        directory.mkdir(mode=0o700, exist_ok=True)
-    _directory_chain(path)
 
 
 def classify_installation(path_info: dict, *, invoked_from_path: bool = True) -> InstallInfo:
@@ -626,63 +484,6 @@ def newer_managed_release(version: str, root: Optional[Path] = None) -> Optional
     return None
 
 
-def _download_archive(commit_sha: str, destination: Path) -> None:
-    if not _SHA_RE.fullmatch(commit_sha):
-        raise UpdateError("UNVERIFIED_TAG", "Cannot download a source archive for an unverified commit.")
-    url = f"{API_ROOT}/tarball/{commit_sha}"
-    request = urllib.request.Request(
-        url,
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "Tmux-Agent-Tower-Update-Manager"},
-    )
-    total = 0
-    try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-            final_url = urllib.parse.urlparse(response.geturl())
-            if final_url.scheme != "https" or final_url.hostname not in (
-                "api.github.com", "github.com", "codeload.github.com", "objects.githubusercontent.com"
-            ):
-                raise UpdateError("UNTRUSTED_ARCHIVE_HOST", "GitHub redirected the archive request to an unexpected host.")
-            with destination.open("wb") as output:
-                while True:
-                    block = response.read(64 * 1024)
-                    if not block:
-                        break
-                    total += len(block)
-                    if total > _MAX_ARCHIVE_BYTES:
-                        raise UpdateError("ARCHIVE_TOO_LARGE", "Release source archive exceeded the size limit.")
-                    output.write(block)
-    except urllib.error.HTTPError as exc:
-        raise UpdateError("GITHUB_HTTP", f"GitHub archive returned HTTP {exc.code}.") from exc
-    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
-        raise UpdateError("OFFLINE", "Could not download the official GitHub source archive.") from exc
-    if total == 0:
-        raise UpdateError("EMPTY_ARCHIVE", "GitHub returned an empty source archive.")
-
-
-def _install_archive(archive: Path, site_dir: Path, python: str) -> None:
-    result = subprocess.run(
-        [
-            python,
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--no-warn-script-location",
-            "--no-cache-dir",
-            "--target",
-            str(site_dir),
-            str(archive),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=300,
-        check=False,
-        env={**os.environ, "PIP_NO_INPUT": "1"},
-    )
-    if result.returncode != 0:
-        raise UpdateError("INSTALL_FAILED", "pip could not install the verified Release into the isolated version directory.")
-
-
 def _verify_package(site_dir: Path, python: str, release: Release) -> None:
     code = (
         "import importlib.metadata as m, json, os, tmux_agent_tower as p; "
@@ -894,19 +695,6 @@ def apply_update(
             except FileNotFoundError:
                 pass
     return {"launcher": str(launcher), "site": str(site_dir), "backup": str(backup), "version": release.package_version}
-
-
-def _git_value(root: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(root), *args],
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise UpdateError("BOOTSTRAP_NOT_VERIFIED", "The migration checkout is not a clean, exact published Git tag.")
-    return result.stdout.strip()
 
 
 def verify_bootstrap(root: Path, version: str, releases, fetch_json: Callable = _api_json) -> Release:

@@ -12,7 +12,7 @@ import subprocess
 import sys
 import uuid
 
-from . import update_manager as tower_updates
+from . import release_support as releases
 
 
 DEV_MARKER = "# JTT_DEV_LAUNCHER_V1"
@@ -118,7 +118,7 @@ def inspect_official_launcher(argv0: str | None = None, *, source: Path | None =
     commit_sha = sha_line.partition("=")[2]
     python = python_line.partition("=")[2]
     try:
-        parsed = tower_updates.parse_version(version)
+        parsed = releases.parse_version(version)
         marker = site_dir.parent / "release.json"
         marker_info = marker.lstat()
         if (
@@ -155,11 +155,11 @@ def inspect_official_launcher(argv0: str | None = None, *, source: Path | None =
             or record.get("commit_sha") != commit_sha
             or record.get("python") != python
             or record.get("site") != str(site_dir)
-            or not tower_updates._SHA_RE.fullmatch(commit_sha)
+            or not releases._SHA_RE.fullmatch(commit_sha)
             or not _inside(source_path, site_dir)
         ):
             raise ValueError
-    except (OSError, ValueError, KeyError, TypeError, tower_updates.UpdateError):
+    except (OSError, ValueError, KeyError, TypeError, releases.UpdateError):
         return {"managed": False, "reason": "JTT Release metadata does not match the imported package."}
     return {
         "managed": True,
@@ -256,10 +256,10 @@ def install_dev_launcher(
     if found and os.path.realpath(found) != os.path.realpath(target):
         raise JTTInstallError("Another jtt command is already on PATH; it was left unchanged.")
     try:
-        tower_updates._ensure_directory_chain(target.parent)
-        tower_updates._directory_chain(target.parent)
+        releases.ensure_directory_chain(target.parent)
+        releases.directory_chain(target.parent)
         parent = target.parent.lstat()
-    except (OSError, tower_updates.UpdateError) as exc:
+    except (OSError, releases.UpdateError) as exc:
         raise JTTInstallError("The user jtt bin directory is not a safe owned path.") from exc
     if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or parent.st_mode & 0o022:
         raise JTTInstallError("The user jtt bin directory has unsafe ownership or permissions.")

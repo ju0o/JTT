@@ -65,6 +65,69 @@ def test_jtt_version_does_not_import_posix_terminal_ui():
     assert "[DEV]" in result.stdout
 
 
+def test_jtt_install_and_update_do_not_import_legacy_tower_updater():
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            "-c",
+            "import sys; import tmux_agent_tower.jtt_install; import tmux_agent_tower.jtt_update; "
+            "assert 'tmux_agent_tower.release_support' in sys.modules; "
+            "assert 'tmux_agent_tower.update_manager' not in sys.modules",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(root / "src"), "PYTHONNOUSERSITE": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_jtt_and_legacy_updaters_keep_distinct_release_sources(monkeypatch, tmp_path):
+    from tmux_agent_tower import release_support
+
+    urls = []
+
+    class Response:
+        def __init__(self, request):
+            self.request = request
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def geturl(self):
+            return self.request.full_url
+
+        def read(self, *_args):
+            if self.request.full_url.endswith("/releases?per_page=100"):
+                return b"[]"
+            if not hasattr(self, "archive_sent"):
+                self.archive_sent = True
+                return b"fixture archive"
+            return b""
+
+    def open_url(request, timeout):
+        urls.append((request.full_url, timeout))
+        return Response(request)
+
+    monkeypatch.setattr(release_support.urllib.request, "urlopen", open_url)
+    assert jtt_update.releases._api_json("/releases?per_page=100") == []
+    assert update_manager._api_json("/releases?per_page=100") == []
+    jtt_archive = tmp_path / "jtt-source.tar.gz"
+    tower_archive = tmp_path / "tower-source.tar.gz"
+    jtt_update.releases._download_archive("a" * 40, jtt_archive)
+    update_manager._download_archive("b" * 40, tower_archive)
+    assert [url for url, _timeout in urls] == [
+        "https://api.github.com/repos/ju0o/JTT/releases?per_page=100",
+        "https://api.github.com/repos/ju0o/tmux-agent-tower/releases?per_page=100",
+        "https://api.github.com/repos/ju0o/JTT/tarball/" + "a" * 40,
+        "https://api.github.com/repos/ju0o/tmux-agent-tower/tarball/" + "b" * 40,
+    ]
+
+
 def test_dev_update_refuses_before_release_network(monkeypatch, capsys):
     called = []
     monkeypatch.setattr(jtt_update, "_current_is_dev", lambda: True)
@@ -125,8 +188,8 @@ def test_jtt_release_channel_flag_must_match_namespaced_tag():
 def test_jtt_bootstrap_requires_product_namespaced_tag(monkeypatch, tmp_path):
     root = tmp_path / "checkout"
     root.mkdir()
-    monkeypatch.setattr(update_manager, "_checkout_dirty", lambda _root: False)
-    monkeypatch.setattr(update_manager, "_git_value", lambda _root, *args: "v0.3.0-rc2" if args[0] == "describe" else "a" * 40)
+    monkeypatch.setattr(jtt_update.releases, "_checkout_dirty", lambda _root: False)
+    monkeypatch.setattr(jtt_update.releases, "_git_value", lambda _root, *args: "v0.3.0-rc2" if args[0] == "describe" else "a" * 40)
 
     with pytest.raises(jtt_update.JTTUpdateError) as error:
         jtt_update.verify_bootstrap(
@@ -143,9 +206,9 @@ def test_jtt_bootstrap_accepts_matching_jtt_tag_not_neighboring_tower_tag(monkey
     records = [_published("v0.3.0-rc2", True), _published("jtt-v0.3.0-rc2", True)]
     fetch = _fake_release_api(records)
     selected_sha = "b" * 40
-    monkeypatch.setattr(update_manager, "_checkout_dirty", lambda _root: False)
+    monkeypatch.setattr(jtt_update.releases, "_checkout_dirty", lambda _root: False)
     monkeypatch.setattr(
-        update_manager, "_git_value",
+        jtt_update.releases, "_git_value",
         lambda _root, *args: "jtt-v0.3.0-rc2" if args[0] == "describe" else selected_sha,
     )
     fetch = lambda path: (
@@ -169,9 +232,9 @@ def test_jtt_bootstrap_rejects_package_version_that_differs_from_tag(monkeypatch
         {"ref": "refs/tags/jtt-v0.3.1-rc0", "object": {"type": "commit", "sha": selected_sha}}
         if path == "/git/ref/tags/jtt-v0.3.1-rc0" else records if path == "/releases?per_page=100" else None
     )
-    monkeypatch.setattr(update_manager, "_checkout_dirty", lambda _root: False)
+    monkeypatch.setattr(jtt_update.releases, "_checkout_dirty", lambda _root: False)
     monkeypatch.setattr(
-        update_manager, "_git_value",
+        jtt_update.releases, "_git_value",
         lambda _root, *args: "jtt-v0.3.1-rc0" if args[0] == "describe" else selected_sha,
     )
 

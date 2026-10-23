@@ -23,11 +23,13 @@ from datetime import datetime, timezone
 import uuid
 from typing import Callable
 
-from . import __version__, update_manager as releases
+from . import __version__
+from .release_support import ReleaseAPI
 from .jtt_install import OFFICIAL_MARKER, installation_kind, inspect_official_launcher, source_checkout_root
 
 JTT_RELEASE_NAMESPACE = "jtt-"
 JTT_RELEASE_TAG_PREFIX = "jtt-v"
+releases = ReleaseAPI("ju0o/JTT", user_agent="Ju0-Terminal-Tower-Update-Manager")
 
 
 class JTTUpdateError(RuntimeError):
