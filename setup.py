@@ -6,12 +6,12 @@ path for development and Legacy Tower tests. Wheels expose the same code as
 the published ``tmux-agent-tower`` package.
 """
 
-from setuptools import find_packages, setup
+from setuptools import find_namespace_packages, setup
 
 
 SOURCE_PACKAGE = "tmux_agent_tower"
 DIST_PACKAGE = "ju0_terminal_tower"
-source_packages = find_packages(
+source_packages = find_namespace_packages(
     where="src",
     include=[SOURCE_PACKAGE, SOURCE_PACKAGE + ".*"],
 )
