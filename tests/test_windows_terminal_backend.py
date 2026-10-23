@@ -101,10 +101,17 @@ def test_native_powershell_create_io_resize_detach_reconnect_stop(tmp_path, monk
         marker = _generated_marker(client, "CREATE")
         assert marker
 
-        # The server permits one connected input channel. A second connection
-        # is rejected by the single-instance pipe rather than sharing a lease.
-        with pytest.raises(Exception):
-            registry.connect(identity.session_id, timeout=0.1)
+        # A second client may observe the same live screen but cannot steal the
+        # controller's exclusive input lease.
+        second = registry.connect(identity.session_id)
+        observed = second.observe()
+        assert observed.synced
+        assert marker in _screen_text(observed.screen)
+        assert not second.acquire()
+        with pytest.raises(Exception, match="input_lease_required"):
+            second.send(b"observer-must-not-write")
+        second.close()
+        second = None
 
         client.resize(80, 24)
         _generated_marker(client, "RESIZE")
@@ -181,6 +188,222 @@ def test_native_powershell_create_io_resize_detach_reconnect_stop(tmp_path, monk
             second.close()
         # Only the session created by this test is named here; identity-checked
         # stop is attempted to prevent leaving its worker behind on assertion.
+        try:
+            registry.stop(identity.session_id,
+                          expected_generation=identity.generation,
+                          expected_shell_pid=identity.shell_pid)
+        except Exception:
+            pass
+
+
+def test_windows_multi_observer_lease_is_atomic_and_disconnect_releases(tmp_path, monkeypatch):
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalError, TerminalRegistry
+
+    work = tmp_path / "isolated-work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    registry = TerminalRegistry(tmp_path / "isolated-jtt" / "terminals")
+    controller = registry.create("Multi-client observers")
+    identity = controller.identity
+    first = second = None
+    try:
+        assert _process_same(identity.shell_pid, identity.shell_start)
+        assert controller.acquire()
+        initial_marker = _generated_marker(controller, "MULTI_INITIAL")
+        first = registry.connect(identity.session_id)
+        second = registry.connect(identity.session_id)
+        for observer in (first, second):
+            observation = observer.observe()
+            assert observation.synced
+            assert observation.session_id == identity.session_id
+            assert observation.generation == identity.generation
+            assert initial_marker in _screen_text(observation.screen)
+
+        # Concurrent acquisition requests must serialize to one lease owner.
+        controller.release()
+        gate = threading.Barrier(3)
+        acquired = []
+        failures = []
+
+        def contend(client):
+            try:
+                gate.wait(timeout=5)
+                acquired.append((client, client.acquire()))
+            except Exception as exc:
+                failures.append(exc)
+
+        workers = [threading.Thread(target=contend, args=(client,))
+                   for client in (first, second)]
+        for thread in workers:
+            thread.start()
+        gate.wait(timeout=5)
+        for thread in workers:
+            thread.join(timeout=8)
+            assert not thread.is_alive(), "concurrent lease request did not finish"
+        assert failures == []
+        owners = [client for client, result in acquired if result]
+        non_owners = [client for client, result in acquired if not result]
+        assert len(owners) == 1
+        assert len(non_owners) == 1
+        owner, observer = owners[0], non_owners[0]
+        with pytest.raises(Exception, match="input_lease_required"):
+            observer.send(b"concurrent-observer-must-not-write")
+
+        owner_marker = _generated_marker(owner, "MULTI_OWNER")
+        observed = _wait(observer, lambda update: update.screen is not None
+                         and owner_marker in _screen_text(update.screen))
+        assert observed.synced
+        assert owner_marker in _screen_text(observed.screen)
+        assert _process_same(identity.shell_pid, identity.shell_start)
+
+        # The lease is connection-scoped and is released when its owner leaves.
+        owner.close()
+        if owner is first:
+            first = None
+        else:
+            second = None
+        assert observer.acquire()
+        transferred_marker = _generated_marker(observer, "MULTI_TRANSFER")
+        visible = _wait(controller, lambda update: update.screen is not None
+                        and transferred_marker in _screen_text(update.screen))
+        assert visible.synced
+        assert _process_same(identity.shell_pid, identity.shell_start)
+
+        # The original observing connection still cannot acquire while the
+        # transferred lease is held.
+        assert not controller.acquire()
+        with pytest.raises(Exception, match="input_lease_required"):
+            controller.send(b"stale-observer-must-not-write")
+
+        # Keep the former controller connected as a read-only observer while
+        # stopping the session. The stop request uses its own short-lived
+        # authenticated connection and must close idle pipe reads safely.
+        observer.release()
+        assert not observer.lease
+
+        registry.stop(identity.session_id,
+                      expected_generation=identity.generation,
+                      expected_shell_pid=identity.shell_pid)
+        assert not _process_same(identity.shell_pid, identity.shell_start)
+        with pytest.raises(TerminalError, match="terminal supervisor connection failed"):
+            observer.observe()
+        assert registry.list_sessions() == ()
+    finally:
+        for client in (controller, first, second):
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        try:
+            registry.stop(identity.session_id,
+                          expected_generation=identity.generation,
+                          expected_shell_pid=identity.shell_pid)
+        except Exception:
+            pass
+
+
+def test_windows_observer_capacity_is_bounded_and_disconnect_frees_slot(
+    tmp_path, monkeypatch
+):
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalError, TerminalRegistry
+    from tmux_agent_tower.terminal import _windows_worker
+
+    work = tmp_path / "isolated-work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    registry = TerminalRegistry(tmp_path / "isolated-jtt" / "terminals")
+    controller = registry.create("Bounded observers")
+    identity = controller.identity
+    clients = [controller]
+    try:
+        for _ in range(_windows_worker.MAX_PIPE_CLIENTS - 1):
+            clients.append(registry.connect(identity.session_id))
+        for client in clients:
+            assert client.observe().synced
+
+        with pytest.raises(TerminalError) as saturated:
+            registry.connect(identity.session_id, timeout=0.5)
+        assert str(saturated.value) in {
+            "terminal supervisor connection failed",
+            "named pipe server process could not be verified",
+        }
+        assert registry.list_sessions()
+        for client in clients:
+            assert client.observe().synced
+
+        released = clients.pop()
+        released.close()
+        replacement = registry.connect(identity.session_id, timeout=3)
+        clients.append(replacement)
+        assert replacement.observe().synced
+
+        for client in clients:
+            client.close()
+        clients.clear()
+        registry.stop(identity.session_id,
+                      expected_generation=identity.generation,
+                      expected_shell_pid=identity.shell_pid)
+        assert registry.list_sessions() == ()
+    finally:
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+        try:
+            registry.stop(identity.session_id,
+                          expected_generation=identity.generation,
+                          expected_shell_pid=identity.shell_pid)
+        except Exception:
+            pass
+
+
+def test_windows_repeated_observer_connect_disconnect_preserves_session(
+    tmp_path, monkeypatch
+):
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalRegistry
+
+    work = tmp_path / "isolated-work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    registry = TerminalRegistry(tmp_path / "isolated-jtt" / "terminals")
+    controller = registry.create("Repeated observer churn")
+    identity = controller.identity
+    try:
+        assert _process_same(identity.shell_pid, identity.shell_start)
+        assert controller.observe().synced
+
+        # Exercise the real named-pipe accept/worker/finally path repeatedly.
+        # Every connection is an observer; no reconnect acquires the lease.
+        for _ in range(32):
+            observer = registry.connect(identity.session_id, timeout=5)
+            try:
+                observation = observer.observe()
+                assert observation.synced
+                assert observation.session_id == identity.session_id
+                assert observation.generation == identity.generation
+                assert observation.shell_pid == identity.shell_pid
+                assert not observer.lease
+            finally:
+                observer.close()
+            assert _process_same(identity.shell_pid, identity.shell_start)
+
+        assert controller.observe().synced
+        assert _process_same(identity.shell_pid, identity.shell_start)
+        registry.stop(identity.session_id,
+                      expected_generation=identity.generation,
+                      expected_shell_pid=identity.shell_pid)
+        assert not _process_same(identity.shell_pid, identity.shell_start)
+        assert registry.list_sessions() == ()
+    finally:
+        try:
+            controller.close()
+        except Exception:
+            pass
         try:
             registry.stop(identity.session_id,
                           expected_generation=identity.generation,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 from collections import deque
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 import zlib
 
 
@@ -25,6 +27,8 @@ MAX_REQUEST = 96 * 1024
 MAX_POLL_BYTES = 128 * 1024
 OUTPUT_BUFFER_BYTES = 256 * 1024
 LEASE_SECONDS = 15.0
+MAX_PIPE_CLIENTS = 8
+MAX_PIPE_INSTANCES = MAX_PIPE_CLIENTS + 1  # connected clients plus one listener
 MAX_COLUMNS = 300
 MAX_LINES = 120
 BOOTSTRAP_WAIT_MS = 30_000
@@ -48,6 +52,88 @@ def _load_runtime():
 
 def _current_process_start(win32api, win32process):
     return str(win32process.GetProcessTimes(win32api.GetCurrentProcess())["CreationTime"])
+
+
+def _cancel_synchronous_io(thread):
+    """Cancel a blocking synchronous pipe operation owned by our worker thread."""
+    if not thread.is_alive():
+        return False
+    native_id = getattr(thread, "native_id", None)
+    if not isinstance(native_id, int) or native_id <= 0:
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_thread = kernel32.OpenThread
+    open_thread.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    open_thread.restype = ctypes.c_void_p
+    cancel_io = kernel32.CancelSynchronousIo
+    cancel_io.argtypes = (ctypes.c_void_p,)
+    cancel_io.restype = ctypes.c_int
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    handle = open_thread(0x0001, False, native_id)  # THREAD_TERMINATE
+    if not handle:
+        return False
+    try:
+        # ERROR_NOT_FOUND simply means this thread no longer has synchronous
+        # I/O pending; shutdown still joins it using the common deadline.
+        return bool(cancel_io(handle))
+    finally:
+        close_handle(handle)
+
+
+class _ClientThreadRegistry:
+    """Track only active pipe workers and serialize admission with shutdown."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        # Weak references cannot retain completed Thread objects if a caller
+        # outlives their worker. The accept loop separately enforces the live
+        # named-pipe client limit using client_handles under state_lock.
+        self._threads = {}
+        self._closing = False
+
+    def _active_locked(self):
+        active = []
+        for key, reference in list(self._threads.items()):
+            thread = reference()
+            if thread is None or not thread.is_alive():
+                if self._threads.get(key) is reference:
+                    self._threads.pop(key, None)
+            else:
+                active.append(thread)
+        return tuple(active)
+
+    def start(self, target, *, args=(), name="jtt-named-pipe-client"):
+        """Start one worker, unless shutdown has closed admission."""
+        with self._lock:
+            if self._closing:
+                return None, "closing"
+            self._active_locked()
+            thread = threading.Thread(
+                target=target, args=args, name=name, daemon=True
+            )
+            key = id(thread)
+            reference = weakref.ref(thread)
+            self._threads[key] = reference
+            try:
+                thread.start()
+            except BaseException:
+                if self._threads.get(key) is reference:
+                    self._threads.pop(key, None)
+                raise
+            return thread, None
+
+    def begin_shutdown(self, stop_event):
+        """Atomically stop admission, signal shutdown, and snapshot active workers."""
+        with self._lock:
+            self._closing = True
+            stop_event.set()
+            return self._active_locked()
+
+    def snapshot(self):
+        with self._lock:
+            return self._active_locked()
 
 
 def _screen_payload(pyte, screen):
@@ -162,21 +248,33 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
     attributes = pywintypes.SECURITY_ATTRIBUTES()
     attributes.SECURITY_DESCRIPTOR = descriptor
     pipe_name = runtime._planned_socket_path(session_dir, session_id)
-    pipe = win32pipe.CreateNamedPipe(
-        pipe_name,
-        win32pipe.PIPE_ACCESS_DUPLEX | 0x00080000,  # FIRST_PIPE_INSTANCE
-        win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
-        1, MAX_MESSAGE, MAX_REQUEST, 3000, attributes,
-    )
-    try:
-        actual = win32security.GetSecurityInfo(
-            pipe, win32security.SE_KERNEL_OBJECT,
-            win32security.DACL_SECURITY_INFORMATION,
-        ).GetSecurityDescriptorDacl()
-        if (actual is None or actual.GetAceCount() != 1
-                or actual.GetAce(0)[2] != owner_sid):
-            raise RuntimeError("owner-only named pipe ACL validation failed")
 
+    def create_server_pipe(first_instance=False):
+        access = win32pipe.PIPE_ACCESS_DUPLEX
+        if first_instance:
+            access |= 0x00080000  # FILE_FLAG_FIRST_PIPE_INSTANCE
+        server_pipe = win32pipe.CreateNamedPipe(
+            pipe_name, access,
+            win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE
+            | win32pipe.PIPE_WAIT,
+            MAX_PIPE_INSTANCES, MAX_MESSAGE, MAX_REQUEST, 3000, attributes,
+        )
+        try:
+            actual = win32security.GetSecurityInfo(
+                server_pipe, win32security.SE_KERNEL_OBJECT,
+                win32security.DACL_SECURITY_INFORMATION,
+            ).GetSecurityDescriptorDacl()
+            if (actual is None or actual.GetAceCount() != 1
+                    or actual.GetAce(0)[0][0] != win32security.ACCESS_ALLOWED_ACE_TYPE
+                    or actual.GetAce(0)[2] != owner_sid):
+                raise RuntimeError("owner-only named pipe ACL validation failed")
+            return server_pipe
+        except Exception:
+            server_pipe.Close()
+            raise
+
+    pipe = create_server_pipe(first_instance=True)
+    try:
         _set_stage("renderer_init")
         pyte_screen = pyte.Screen(100, 30)
         stream = pyte.Stream(pyte_screen)
@@ -193,8 +291,12 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
         exit_code = None
         lease_owner = None
         lease_deadline = 0.0
-        active_client = None
-        active_client_id = None
+        # A bounded set of connected observers. Each client must complete its
+        # own hello, while the lease below remains exclusive to one connection.
+        clients = {}
+        client_handles = {}
+        client_threads = _ClientThreadRegistry()
+        client_changed = threading.Event()
         connection_counter = 0
 
         _set_stage("shell_resolution")
@@ -341,36 +443,24 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
             _set_stage("serve_pipe")
             reader = threading.Thread(target=read_output, name="jtt-conpty-reader", daemon=True)
             reader.start()
-            ready_event = threading.Event()
             pipe_error = []
 
-            def serve_client():
-                nonlocal lease_owner, lease_deadline, active_client, active_client_id
-                nonlocal connection_counter
-                try:
-                    try:
-                        win32pipe.ConnectNamedPipe(pipe, None)
-                    except pywintypes.error as exc:
-                        if exc.winerror != 535:
-                            raise
-                except Exception as exc:
-                    pipe_error.append(type(exc).__name__)
-                    ready_event.set()
-                    return
-                with state_lock:
-                    connection_counter += 1
-                    connection_id = connection_counter
+            def serve_client(client_pipe, connection_id):
+                nonlocal lease_owner, lease_deadline
                 try:
                     while not stop_worker.is_set():
                         try:
-                            _status, request_bytes = win32file.ReadFile(pipe, MAX_REQUEST)
+                            _status, request_bytes = win32file.ReadFile(
+                                client_pipe, MAX_REQUEST
+                            )
                             if len(request_bytes) > MAX_REQUEST:
                                 raise ValueError("request too large")
                         except pywintypes.error as exc:
-                            if exc.winerror in (109, 232, 233):
+                            if (exc.winerror in (109, 232, 233)
+                                    or (stop_worker.is_set() and exc.winerror == 995)):
                                 break
                             raise
-                        win32security.ImpersonateNamedPipeClient(pipe)
+                        win32security.ImpersonateNamedPipeClient(client_pipe)
                         try:
                             token = win32security.OpenThreadToken(
                                 win32api.GetCurrentThread(), win32con.TOKEN_QUERY, True
@@ -391,49 +481,64 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                                 raise ValueError("object request required")
                         except (ValueError, UnicodeError):
                             response = {"ok": False, "error": "invalid_request"}
+                            request = None
                         else:
                             response = dispatch(request, connection_id)
+                        with state_lock:
+                            response["lease"] = (
+                                isinstance(request, dict)
+                                and lease_owner == (connection_id, request.get("client_id"))
+                            )
                         payload = json.dumps(response, separators=(",", ":"),
                                              ensure_ascii=True).encode("utf-8")
                         if len(payload) > MAX_MESSAGE:
                             payload = b'{"ok":false,"error":"response_too_large"}'
-                        win32file.WriteFile(pipe, payload)
+                        win32file.WriteFile(client_pipe, payload)
                         if response.get("stopping"):
-                            stop_worker.set()
+                            client_threads.begin_shutdown(stop_worker)
                             break
                 except Exception as exc:
                     pipe_error.append(type(exc).__name__)
                 finally:
                     with state_lock:
-                        if active_client == connection_id:
-                            active_client = None
-                            active_client_id = None
+                        clients.pop(connection_id, None)
+                        client_handles.pop(connection_id, None)
                         if lease_owner is not None and lease_owner[0] == connection_id:
                             lease_owner = None
                             lease_deadline = 0.0
+                    if not stop_worker.is_set():
+                        try:
+                            win32pipe.DisconnectNamedPipe(client_pipe)
+                        except Exception:
+                            pass
                     try:
-                        win32pipe.DisconnectNamedPipe(pipe)
+                        client_pipe.Close()
                     except Exception:
                         pass
-                    ready_event.set()
+                    client_changed.set()
 
             def dispatch(request, connection_id):
-                nonlocal active_client, active_client_id, lease_owner, lease_deadline, state
+                with state_lock:
+                    return dispatch_locked(request, connection_id)
+
+            def dispatch_locked(request, connection_id):
+                nonlocal lease_owner, lease_deadline, state
                 client_id = request.get("client_id")
                 op = request.get("op")
                 if not isinstance(client_id, str) or len(client_id) != 32:
                     return base(error="invalid_client")
                 if op == "hello":
-                    if active_client not in (None, connection_id):
+                    if connection_id not in clients:
                         return base(error="client_busy")
                     if request.get("identity") != identity:
                         return base(error="stale_identity")
-                    active_client = connection_id
-                    active_client_id = client_id
+                    if clients[connection_id] not in (None, client_id):
+                        return base(error="stale_identity")
+                    clients[connection_id] = client_id
                     return base(ok=True, lease=False)
-                if active_client != connection_id:
+                if clients.get(connection_id) != client_id:
                     return base(error="hello_required")
-                if active_client_id != client_id or request.get("identity") != identity:
+                if request.get("identity") != identity:
                     return base(error="stale_identity")
                 now = time.monotonic()
                 if lease_owner is not None and now >= lease_deadline:
@@ -590,18 +695,139 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                     "snapshot_revision": current_sequence, "screen_z": payload,
                 }
 
-            # Queue one client at a time. Disconnect releases its lease before
-            # the next client can attach; simultaneous pipe clients fail closed.
-            while not stop_worker.is_set():
-                ready_event.clear()
-                server_thread = threading.Thread(target=serve_client, daemon=True)
-                server_thread.start()
-                ready_event.wait()
-                server_thread.join(timeout=1)
-                if stop_worker.is_set():
-                    break
+            accept_done = threading.Event()
+
+            def accept_clients():
+                nonlocal pipe, connection_counter, state
+                try:
+                    while not stop_worker.is_set():
+                        if pipe is None:
+                            try:
+                                pipe = create_server_pipe()
+                            except pywintypes.error as exc:
+                                if exc.winerror not in (231, 232):
+                                    raise
+                                client_changed.wait(0.05)
+                                client_changed.clear()
+                                continue
+                        listener = pipe
+                        pipe = None
+                        try:
+                            win32pipe.ConnectNamedPipe(listener, None)
+                        except pywintypes.error as exc:
+                            if exc.winerror != 535:  # ERROR_PIPE_CONNECTED
+                                if stop_worker.is_set():
+                                    try:
+                                        listener.Close()
+                                    except Exception:
+                                        pass
+                                    break
+                                raise
+                        if stop_worker.is_set():
+                            try:
+                                win32pipe.DisconnectNamedPipe(listener)
+                            except Exception:
+                                pass
+                            listener.Close()
+                            break
+                        with state_lock:
+                            if len(client_handles) >= MAX_PIPE_CLIENTS:
+                                connection_id = None
+                            else:
+                                connection_counter += 1
+                                connection_id = connection_counter
+                                clients[connection_id] = None
+                                client_handles[connection_id] = listener
+                        if connection_id is None:
+                            try:
+                                win32pipe.DisconnectNamedPipe(listener)
+                            except Exception:
+                                pass
+                            listener.Close()
+                            client_changed.set()
+                            continue
+                        try:
+                            thread, rejection = client_threads.start(
+                                serve_client,
+                                args=(listener, connection_id),
+                            )
+                        except Exception:
+                            with state_lock:
+                                clients.pop(connection_id, None)
+                                client_handles.pop(connection_id, None)
+                            try:
+                                win32pipe.DisconnectNamedPipe(listener)
+                            except Exception:
+                                pass
+                            try:
+                                listener.Close()
+                            except Exception:
+                                pass
+                            raise
+                        if rejection is not None:
+                            with state_lock:
+                                clients.pop(connection_id, None)
+                                client_handles.pop(connection_id, None)
+                            try:
+                                win32pipe.DisconnectNamedPipe(listener)
+                            except Exception:
+                                pass
+                            try:
+                                listener.Close()
+                            except Exception:
+                                pass
+                            client_changed.set()
+                            if rejection == "closing":
+                                break
+                except Exception as exc:
+                    pipe_error.append(type(exc).__name__)
+                    failure = {
+                        "stage": "pipe_accept",
+                        "exception": type(exc).__name__,
+                    }
+                    winerror = getattr(exc, "winerror", None)
+                    if isinstance(winerror, int):
+                        failure["cause_stage"] = "pipe_accept"
+                        failure["cause"] = "winerror_{}".format(winerror)
+                    try:
+                        with state_lock:
+                            metadata["worker_failure"] = failure
+                            if state == "running":
+                                state = "unavailable"
+                                metadata["state"] = state
+                                metadata["renderer_state"] = "error"
+                            runtime._atomic_metadata(metadata_path, metadata)
+                    except Exception:
+                        pass
+                    client_threads.begin_shutdown(stop_worker)
+                finally:
+                    if pipe is not None:
+                        try:
+                            pipe.Close()
+                        except Exception:
+                            pass
+                        pipe = None
+                    accept_done.set()
+
+            accept_thread = threading.Thread(
+                target=accept_clients, name="jtt-named-pipe-accept", daemon=True
+            )
+            accept_thread.start()
+            while not stop_worker.wait(0.05):
+                pass
+            # Admission and shutdown share the registry lock: after this call,
+            # accept can no longer publish a client worker outside this set.
+            client_threads.begin_shutdown(stop_worker)
+            shutdown_deadline = time.monotonic() + 3.0
+            _cancel_synchronous_io(accept_thread)
+            active_client_threads = client_threads.snapshot()
+            for thread in active_client_threads:
+                _cancel_synchronous_io(thread)
+            accept_thread.join(timeout=max(0.0, shutdown_deadline - time.monotonic()))
+            for thread in client_threads.snapshot():
+                thread.join(timeout=max(0.0, shutdown_deadline - time.monotonic()))
             stop_reader.set()
-            reader.join(timeout=2)
+            reader.join(timeout=1)
         finally:
             try:
                 if not shell_in_job and abort_gate is not None:
@@ -628,7 +854,8 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                 abort_gate.Close()
                 job.Close()
     finally:
-        pipe.Close()
+        if pipe is not None:
+            pipe.Close()
 
 
 def main(argv=None):
