@@ -44,6 +44,27 @@ def test_cli_version_reports_dev_and_tower_command_remains_separate(monkeypatch,
     assert 'jtt = "tmux_agent_tower.jtt:cli"' in project
 
 
+def test_jtt_version_does_not_import_posix_terminal_ui():
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            "-c",
+            "import sys; from tmux_agent_tower.jtt import cli; "
+            "code = cli(['--version']); "
+            "assert 'tmux_agent_tower.ui.jtt' not in sys.modules; "
+            "assert 'tmux_agent_tower.terminal.manager' not in sys.modules; "
+            "raise SystemExit(code)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(root / "src"), "PYTHONNOUSERSITE": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "[DEV]" in result.stdout
+
+
 def test_dev_update_refuses_before_release_network(monkeypatch, capsys):
     called = []
     monkeypatch.setattr(jtt_update, "_current_is_dev", lambda: True)

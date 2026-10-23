@@ -6,8 +6,6 @@ import argparse
 import sys
 
 from . import __version__
-from .ui.jtt import run_jtt_ui
-from .jtt_install import installation_kind
 
 
 def cli(argv: list[str] | None = None) -> int:
@@ -26,6 +24,8 @@ def cli(argv: list[str] | None = None) -> int:
     if args.version and args.command:
         parser.error("--version cannot be combined with a command")
     if args.version:
+        from .jtt_install import installation_kind
+
         print(f"jtt {__version__} [{installation_kind().upper()}]")
         return 0
     if args.command == "doctor":
@@ -45,6 +45,8 @@ def cli(argv: list[str] | None = None) -> int:
         print("JTT는 대화형 터미널에서 실행해야 합니다.", file=sys.stderr)
         return 2
     try:
+        from .ui.jtt import run_jtt_ui
+
         return run_jtt_ui()
     except KeyboardInterrupt:
         return 130
