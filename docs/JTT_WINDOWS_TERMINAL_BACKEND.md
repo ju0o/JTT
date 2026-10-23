@@ -53,9 +53,11 @@ connecting this backend to the full three-panel application.
   checks the pipe caller SID, and the client verifies the named-pipe server
   PID. This separates Windows users; it does not isolate processes running as
   the same Windows user.
-- A single pipe client is accepted at a time. Disconnect releases that
-  connection's input lease. Simultaneous read-only Mini LIVE plus RIGHT input
-  clients are not supported by this experimental implementation.
+- Up to eight clients may observe a terminal concurrently. Each connection
+  completes its own identity handshake, and a worker lock serializes state
+  changes. Only one connection may own the input/resize lease at a time;
+  observers cannot write or resize. Disconnect releases that connection's
+  lease. Every owner-SID pipe instance is ACL-checked before accepting clients.
 - PTY output is kept in bounded worker memory and is not persisted. Registry
   metadata records session/process identity, shell path and display name, pipe
   name, state, dimensions, working directory, and a path-free startup failure
@@ -79,9 +81,13 @@ missing named gate exits with the expected failure code instead of opening a
 prompt. The manager cleanup tests also reject incomplete or inconsistent
 startup identity without signaling a PID or removing the registry.
 
-The existing isolated ConPTY feasibility suite also passed on that host. This
-is automated backend evidence, not a native Windows Terminal visual or human
-UX acceptance result.
+The multi-client regression opens three independent clients on the same
+isolated session, verifies matching session identity and live screen
+observation, races two lease acquisitions and confirms exactly one winner,
+blocks writes from non-owners, transfers the lease after disconnect, and stops
+the session while a read-only observer remains connected. This is automated
+backend evidence, not a native Windows Terminal visual or human UX acceptance
+result.
 
 ## Not yet validated
 
@@ -90,7 +96,6 @@ UX acceptance result.
 - Windows 10, Windows Server, macOS, and real user-account/SID separation.
 - Native Windows Terminal visual QA, mouse behavior, Unicode input edge cases,
   and broad application/TUI compatibility.
-- Multiple simultaneous pipe clients and concurrent observe/input behavior.
 - Process/job behavior under every host policy, nested Job Object configuration,
   endpoint security product, and forced OS shutdown.
 - Full PTY semantics for terminal queries, bracketed paste, mouse protocols,
