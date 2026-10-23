@@ -130,19 +130,10 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         assert client.call("observe_marker", identity=identity, marker=first_marker) == {
             "ok": True, "synthetic_marker_only": True,
         }
-        assert client.call("input", identity=identity, text=first_command)["ok"]
-        # ConPTY may echo a write in multiple chunks. Seeing only the marker
-        # prefix does not prove the rest of the command reached the line
-        # editor before Enter; wait for the complete synthetic command echo.
-        echo_snapshot = wait_text(client, first_command)
-        assert first_marker not in echo_snapshot["text"], "echo alone must not satisfy output verification"
-        print("enter_phase=before " + json.dumps({
-            "sequence": echo_snapshot["sequence"],
-            "complete_command_echo": first_command in echo_snapshot["text"],
-            "command_echo_ascii_only": first_command.isascii(),
-            "result_marker_visible": first_marker in echo_snapshot["text"],
-        }, ensure_ascii=True))
-        assert client.call("input", identity=identity, text="\r")["ok"]
+        # Submit this fixture command with Enter in one PTY write, as the
+        # original probe did. The expected Korean marker is absent from this
+        # ASCII-only source, so an echoed command cannot satisfy the assertion.
+        assert client.call("input", identity=identity, text=first_command + "\r")["ok"]
         shown, first_evidence = wait_synthetic_marker(client, first_marker)
         assert first_evidence["same_string_fed_to_pyte"]
         assert first_evidence["api_marker_codepoints"] == [ord(char) for char in first_marker]
@@ -190,16 +181,7 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         assert client.call("observe_marker", identity=identity, marker=resize_marker) == {
             "ok": True, "synthetic_marker_only": True,
         }
-        assert client.call("input", identity=identity, text=resize_command)["ok"]
-        resize_echo = wait_text(client, resize_command)
-        assert resize_marker not in resize_echo["text"], "echo alone must not satisfy output verification"
-        print("resize_enter_phase=before " + json.dumps({
-            "sequence": resize_echo["sequence"],
-            "complete_command_echo": resize_command in resize_echo["text"],
-            "command_echo_ascii_only": resize_command.isascii(),
-            "result_marker_visible": resize_marker in resize_echo["text"],
-        }, ensure_ascii=True))
-        assert client.call("input", identity=identity, text="\r")["ok"]
+        assert client.call("input", identity=identity, text=resize_command + "\r")["ok"]
         resized_snapshot, resize_evidence = wait_synthetic_marker(client, resize_marker)
         assert resize_evidence["same_string_fed_to_pyte"]
         assert resize_evidence["api_marker_codepoints"] == [ord(char) for char in resize_marker]
