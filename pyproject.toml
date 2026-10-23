@@ -9,7 +9,11 @@ description = "JTT, a local-first workspace for independent interactive PTY term
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
-dependencies = ["pyte>=0.8.2,<0.9"]
+dependencies = [
+    "pyte>=0.8.2,<0.9",
+    "pywinpty>=3.1,<4; sys_platform == 'win32'",
+    "pywin32>=306; sys_platform == 'win32'",
+]
 authors = [{ name = "ju0o" }]
 keywords = [
     "tmux",

@@ -6,17 +6,27 @@ private registry directory exists. A shell is started only by an explicit
 about tmux, SSH, or agent-specific executables.
 """
 
+import sys
+
 from .manager import (
-    TerminalClient,
     TerminalCell,
     TerminalError,
     TerminalIdentity,
     TerminalObservation,
-    TerminalRegistry,
     TerminalScreen,
     TerminalUpdate,
-    renderer_available,
 )
+
+if sys.platform == "win32":
+    from . import windows_manager as manager
+    from .windows_manager import TerminalClient, TerminalRegistry, renderer_available
+else:
+    from . import manager
+    from .manager import (
+        TerminalClient,
+        TerminalRegistry,
+        renderer_available,
+    )
 
 __all__ = [
     "TerminalClient",
