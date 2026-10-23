@@ -3,6 +3,9 @@ on:
   pull_request:
     paths:
       - 'experiments/windows_native/**'
+      - 'src/tmux_agent_tower/terminal/**'
+      - 'tests/test_windows_terminal_backend.py'
+      - 'pyproject.toml'
       - '.github/workflows/windows-feasibility.yml'
       - 'src/tmux_agent_tower/jtt.py'
       - 'tests/test_jtt_cli_update.py'
@@ -25,3 +28,5 @@ jobs:
         run: jtt --version
       - name: Native ConPTY and Textual headless probe
         run: python -m pytest -q -s experiments/windows_native/test_probe.py
+      - name: Native JTT Windows terminal backend
+        run: python -m pytest -q -s tests/test_windows_terminal_backend.py

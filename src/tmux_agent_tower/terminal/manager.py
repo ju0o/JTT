@@ -12,7 +12,10 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import pwd
+try:
+    import pwd
+except ImportError:  # Windows imports the shared data contract, not this backend.
+    pwd = None
 import re
 import signal
 import socket
@@ -342,6 +345,8 @@ def _check_root_components(path: Path, *, require_leaf: bool) -> None:
 
 
 def _default_root() -> Path:
+    if pwd is None:
+        raise TerminalError("the POSIX terminal backend is unavailable on Windows")
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if runtime:
         base = Path(runtime)
@@ -364,6 +369,8 @@ def _default_root() -> Path:
 def _validate_shell() -> Tuple[str, str]:
     """Resolve only the current account's configured login shell."""
 
+    if pwd is None:
+        raise TerminalError("the POSIX terminal backend is unavailable on Windows")
     account = pwd.getpwuid(os.getuid())
     configured = account.pw_shell
     if not configured or not os.path.isabs(configured):
