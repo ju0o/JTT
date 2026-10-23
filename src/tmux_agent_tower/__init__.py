@@ -50,11 +50,14 @@ if __name__ == "ju0_terminal_tower":
                 and not _matches_path(_legacy_spec.origin, _own_file)
             )
             _search_locations = _legacy_spec.submodule_search_locations
+            _unresolved_spec = (
+                _legacy_spec.origin is None and _search_locations is None
+            )
             _foreign_search_path = _search_locations is not None and any(
                 not _matches_path(location, _own_package_dir)
                 for location in _search_locations
             )
-            if _foreign_origin or _foreign_search_path:
+            if _unresolved_spec or _foreign_origin or _foreign_search_path:
                 raise ImportError(
                     "another tmux_agent_tower source is visible on this Python path; "
                     "use a separate Python environment for JTT"

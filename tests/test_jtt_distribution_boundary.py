@@ -112,6 +112,24 @@ def test_candidate_runtime_refuses_foreign_namespace_package_locations(tmp_path)
     assert "another tmux_agent_tower source is visible" in result.stderr
 
 
+def test_candidate_runtime_refuses_import_spec_without_resolvable_location(tmp_path):
+    site = _isolated_package(tmp_path)
+    result = _run(
+        site,
+        "import importlib.machinery, importlib.util, sys; "
+        "finder = type('Finder', (), {'find_spec': lambda self, fullname, path=None, target=None: "
+        "importlib.machinery.ModuleSpec(fullname, loader=None, origin=None) "
+        "if fullname == 'tmux_agent_tower' else None})(); "
+        "sys.meta_path.insert(0, finder); "
+        "spec = importlib.util.find_spec('tmux_agent_tower'); "
+        "assert spec is not None and spec.origin is None; "
+        "assert spec.submodule_search_locations is None; "
+        "import ju0_terminal_tower",
+    )
+    assert result.returncode != 0
+    assert "another tmux_agent_tower source is visible" in result.stderr
+
+
 def test_package_manager_install_refuses_self_update_and_rollback(tmp_path):
     site = _isolated_package(tmp_path)
     dist = site / "ju0_terminal_tower-0.3.1rc0.dist-info"
