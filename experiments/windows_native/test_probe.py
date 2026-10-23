@@ -34,6 +34,10 @@ def wait_synthetic_marker(client, expected):
     deadline = time.monotonic() + 15
     snapshot = client.call("snapshot")
     while time.monotonic() < deadline:
+        assert not snapshot["renderer_failed"], (
+            "PTY output reader or VT renderer failed before the result marker; "
+            + json.dumps(snapshot["diagnostics"], ensure_ascii=True)
+        )
         if expected in snapshot["text"]:
             events = [
                 event for event in snapshot["diagnostics"]["synthetic_marker_events"]
@@ -54,6 +58,7 @@ def wait_synthetic_marker(client, expected):
             "sequence": snapshot["sequence"],
             "columns": snapshot["columns"],
             "lines": snapshot["lines"],
+            "renderer_failed": snapshot["renderer_failed"],
             "diagnostics": snapshot["diagnostics"],
         }, ensure_ascii=True)
     )

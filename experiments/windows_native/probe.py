@@ -275,8 +275,11 @@ def worker(address, root, session, generation):
                                     )
                     else:
                         stop_reader.wait(0.01)
-            except Exception:
+            except Exception as exc:
                 renderer_failed = True
+                # Record only the exception class; never dump terminal data or
+                # environment details from the reader thread.
+                print(f"renderer_error:{type(exc).__name__}", file=sys.stderr, flush=True)
 
         threading.Thread(target=read_output, daemon=True).start()
         print("READY", flush=True)
