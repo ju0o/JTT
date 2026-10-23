@@ -127,10 +127,14 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
             "ok": True, "synthetic_marker_only": True,
         }
         assert client.call("input", identity=identity, text=first_command)["ok"]
-        echo_snapshot = wait_text(client, f"JTT_DIAG_{first_nonce}_")
+        # ConPTY may echo a write in multiple chunks. Seeing only the marker
+        # prefix does not prove the rest of the command reached the line
+        # editor before Enter; wait for the complete synthetic command echo.
+        echo_snapshot = wait_text(client, first_command)
         assert first_marker not in echo_snapshot["text"], "echo alone must not satisfy output verification"
         print("enter_phase=before " + json.dumps({
             "sequence": echo_snapshot["sequence"],
+            "complete_command_echo": first_command in echo_snapshot["text"],
             "echo_codepoints": [ord(char) for char in first_command if char in "한글"],
             "result_marker_visible": first_marker in echo_snapshot["text"],
         }, ensure_ascii=True))
@@ -179,10 +183,11 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
             "ok": True, "synthetic_marker_only": True,
         }
         assert client.call("input", identity=identity, text=resize_command)["ok"]
-        resize_echo = wait_text(client, f"JTT_DIAG_{resize_nonce}_")
+        resize_echo = wait_text(client, resize_command)
         assert resize_marker not in resize_echo["text"], "echo alone must not satisfy output verification"
         print("resize_enter_phase=before " + json.dumps({
             "sequence": resize_echo["sequence"],
+            "complete_command_echo": resize_command in resize_echo["text"],
             "echo_codepoints": [ord(char) for char in resize_command if char in "입력"],
             "result_marker_visible": resize_marker in resize_echo["text"],
         }, ensure_ascii=True))
