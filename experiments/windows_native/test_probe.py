@@ -121,15 +121,20 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
             }
         first_nonce = uuid.uuid4().hex[:8]
         first_marker = f"JTT_DIAG_{first_nonce}_한글_END"
-        first_command = (
-            f"Write-Output ('JTT_DIAG_{first_nonce}_' + '한' + '글' + '_END')\r"
-        )
+        first_command = f"Write-Output ('JTT_DIAG_{first_nonce}_' + '한' + '글' + '_END')"
         assert first_marker not in first_command, "the result marker must not occur in command echo"
         assert client.call("observe_marker", identity=identity, marker=first_marker) == {
             "ok": True, "synthetic_marker_only": True,
         }
-        command = first_command
-        assert client.call("input", identity=identity, text=command)["ok"]
+        assert client.call("input", identity=identity, text=first_command)["ok"]
+        echo_snapshot = wait_text(client, f"JTT_DIAG_{first_nonce}_")
+        assert first_marker not in echo_snapshot["text"], "echo alone must not satisfy output verification"
+        print("enter_phase=before " + json.dumps({
+            "sequence": echo_snapshot["sequence"],
+            "echo_codepoints": [ord(char) for char in first_command if char in "한글"],
+            "result_marker_visible": first_marker in echo_snapshot["text"],
+        }, ensure_ascii=True))
+        assert client.call("input", identity=identity, text="\r")["ok"]
         shown, first_evidence = wait_synthetic_marker(client, first_marker)
         assert first_evidence["same_string_fed_to_pyte"]
         assert first_evidence["api_marker_codepoints"] == [ord(char) for char in first_marker]
@@ -168,14 +173,20 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         wait_text(client, "SIZE=80")
         resize_nonce = uuid.uuid4().hex[:8]
         resize_marker = f"JTT_DIAG_{resize_nonce}_입력_END"
-        resize_command = (
-            f"Write-Output ('JTT_DIAG_{resize_nonce}_' + '입' + '력' + '_END')\r"
-        )
+        resize_command = f"Write-Output ('JTT_DIAG_{resize_nonce}_' + '입' + '력' + '_END')"
         assert resize_marker not in resize_command, "the result marker must not occur in command echo"
         assert client.call("observe_marker", identity=identity, marker=resize_marker) == {
             "ok": True, "synthetic_marker_only": True,
         }
         assert client.call("input", identity=identity, text=resize_command)["ok"]
+        resize_echo = wait_text(client, f"JTT_DIAG_{resize_nonce}_")
+        assert resize_marker not in resize_echo["text"], "echo alone must not satisfy output verification"
+        print("resize_enter_phase=before " + json.dumps({
+            "sequence": resize_echo["sequence"],
+            "echo_codepoints": [ord(char) for char in resize_command if char in "입력"],
+            "result_marker_visible": resize_marker in resize_echo["text"],
+        }, ensure_ascii=True))
+        assert client.call("input", identity=identity, text="\r")["ok"]
         resized_snapshot, resize_evidence = wait_synthetic_marker(client, resize_marker)
         assert resize_evidence["same_string_fed_to_pyte"]
         assert resize_evidence["api_marker_codepoints"] == [ord(char) for char in resize_marker]
