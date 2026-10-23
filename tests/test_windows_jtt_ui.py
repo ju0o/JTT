@@ -19,7 +19,7 @@ from ju0_terminal_tower.terminal.manager import (
     TerminalObservation,
     TerminalScreen,
 )
-from ju0_terminal_tower.ui.windows_jtt import WindowsJTTApp
+from ju0_terminal_tower.ui.windows_jtt import WindowsJTTApp, _same_identity
 
 
 def _screen(text: str = "JTT_TEST_READY") -> TerminalScreen:
