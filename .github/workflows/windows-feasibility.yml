@@ -4,6 +4,8 @@ on:
     paths:
       - 'experiments/windows_native/**'
       - '.github/workflows/windows-feasibility.yml'
+      - 'src/tmux_agent_tower/jtt.py'
+      - 'tests/test_jtt_cli_update.py'
 permissions:
   contents: read
 jobs:
@@ -17,5 +19,9 @@ jobs:
           python-version: '3.13'
       - name: Install isolated feasibility dependencies
         run: python -m pip install -r experiments/windows_native/requirements.txt
+      - name: Install JTT package for the platform-neutral CLI smoke
+        run: python -m pip install --no-deps -e .
+      - name: Confirm JTT version command avoids the POSIX terminal runtime
+        run: python -m tmux_agent_tower.jtt --version
       - name: Native ConPTY and Textual headless probe
         run: python -m pytest -q -s experiments/windows_native/test_probe.py
