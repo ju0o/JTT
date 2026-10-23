@@ -29,7 +29,7 @@ def wait_text(client, expected):
     )
 
 
-def wait_synthetic_marker(client, expected):
+def wait_synthetic_marker(client, expected, source_echo=None):
     """Wait for a generated result not present contiguously in echoed input."""
     deadline = time.monotonic() + 15
     snapshot = client.call("snapshot")
@@ -59,6 +59,8 @@ def wait_synthetic_marker(client, expected):
             "columns": snapshot["columns"],
             "lines": snapshot["lines"],
             "renderer_failed": snapshot["renderer_failed"],
+            "source_echo_visible": bool(source_echo and source_echo in snapshot["text"]),
+            "prompt_visible": "JTT>" in snapshot["text"],
             "diagnostics": snapshot["diagnostics"],
         }, ensure_ascii=True)
     )
@@ -133,7 +135,8 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
             "ok": True, "synthetic_marker_only": True,
         }
         assert client.call("input", identity=identity, text=ascii_command + "\r")["ok"]
-        ascii_snapshot, ascii_evidence = wait_synthetic_marker(client, first_ascii_marker)
+        ascii_snapshot, ascii_evidence = wait_synthetic_marker(
+            client, first_ascii_marker, source_echo=ascii_command)
         assert ascii_evidence["same_string_fed_to_pyte"]
         assert first_ascii_marker in ascii_snapshot["text"]
         first_command = (
@@ -149,7 +152,8 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         # original probe did. The expected Korean marker is absent from this
         # ASCII-only source, so an echoed command cannot satisfy the assertion.
         assert client.call("input", identity=identity, text=first_command + "\r")["ok"]
-        shown, first_evidence = wait_synthetic_marker(client, first_marker)
+        shown, first_evidence = wait_synthetic_marker(
+            client, first_marker, source_echo=first_command)
         assert first_evidence["same_string_fed_to_pyte"]
         assert first_evidence["api_marker_codepoints"] == [ord(char) for char in first_marker]
         first_row = next(row for row in first_evidence["screen_rows"] if row["exact_marker_on_display"])
@@ -194,7 +198,8 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
             "ok": True, "synthetic_marker_only": True,
         }
         assert client.call("input", identity=identity, text=resize_ascii_command + "\r")["ok"]
-        resize_ascii_snapshot, resize_ascii_evidence = wait_synthetic_marker(client, resize_ascii_marker)
+        resize_ascii_snapshot, resize_ascii_evidence = wait_synthetic_marker(
+            client, resize_ascii_marker, source_echo=resize_ascii_command)
         assert resize_ascii_evidence["same_string_fed_to_pyte"]
         assert resize_ascii_marker in resize_ascii_snapshot["text"]
         resize_command = (
@@ -207,7 +212,8 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
             "ok": True, "synthetic_marker_only": True,
         }
         assert client.call("input", identity=identity, text=resize_command + "\r")["ok"]
-        resized_snapshot, resize_evidence = wait_synthetic_marker(client, resize_marker)
+        resized_snapshot, resize_evidence = wait_synthetic_marker(
+            client, resize_marker, source_echo=resize_command)
         assert resize_evidence["same_string_fed_to_pyte"]
         assert resize_evidence["api_marker_codepoints"] == [ord(char) for char in resize_marker]
         resize_row = next(row for row in resize_evidence["screen_rows"] if row["exact_marker_on_display"])
