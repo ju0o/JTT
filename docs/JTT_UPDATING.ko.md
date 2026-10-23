@@ -55,10 +55,13 @@ JTT 태그는 제품 접두어를 사용합니다. Stable은 `jtt-v주버전.부
 RC는 `jtt-v주버전.부버전.수정버전-rc번호` 형식입니다. 예를 들어 태그의
 버전 부분 `v0.3.0-rc2`는 Python 패키지 버전 `0.3.0rc2`와 대응합니다.
 기존 Tower 태그 `v0.3.0-rc2`는 JTT Release 후보가 아닙니다. 현재 저장소는
-두 명령을 `tmux-agent-tower` 배포 패키지 하나로 빌드하므로 제품별 숫자 버전이
-겹칠 수 있습니다. JTT의 전체 식별은 `jtt-` 태그 접두어, 일치하는 패키지 버전,
-JTT console entry point, 비공개 설치 기록의 `product: jtt` 조합입니다.
-설치기와 업데이트기는 버전이 더 높아도 기존 Tower 태그를 거부합니다.
+이미 공개된 RC3 아티팩트는 `tmux-agent-tower` 배포 메타데이터를 공유합니다.
+이 소스 브랜치는 설치 명령에서 `jtt`만 노출하되 RC3 업데이트기가 다음 전환 버전을
+검증할 수 있도록 배포 이름은 임시로 유지합니다. 배포 이름을 바꾸려면 기존 이름으로
+설치된 사용자를 위한 명시적인 교차 이름 업데이트 경로가 먼저 필요합니다. JTT의 전체
+식별은 `jtt-` 태그 접두어, 일치하는 패키지 버전, JTT console entry point, 비공개
+설치 기록의 `product: jtt` 조합입니다. 설치기와 업데이트기는 버전이 더 높아도 기존
+Tower 태그를 거부합니다.
 JTT RC3의 Release 식별자는 패키지 버전 `0.3.0rc3`, 태그 `jtt-v0.3.0-rc3`,
 제목 `JTT — Ju0 Terminal Tower 0.3.0 RC3`입니다. 기존 Tower RC2 태그
 `v0.3.0-rc2`는 이 JTT RC3 Release가 아닙니다. 설치 전 태그, 공개 Release, 대상 커밋,

@@ -35,11 +35,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ju0o/tmux-agent-tower"
-Issues = "https://github.com/ju0o/tmux-agent-tower/issues"
+Homepage = "https://github.com/ju0o/JTT"
+Issues = "https://github.com/ju0o/JTT/issues"
 
 [project.scripts]
-tower = "tmux_agent_tower.main:cli"
 jtt = "tmux_agent_tower.jtt:cli"
 
 [tool.setuptools.packages.find]

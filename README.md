@@ -56,8 +56,8 @@ jtt
 ```
 
 Expect version `0.3.0rc3` and `OFFICIAL`. This is a **prerelease**, not stable.
-JTT's `jtt-v0.3.0-rc3` is distinct from legacy Tower's `v0.3.0-rc2`, though both commands share a Python distribution.
-The installer validates the published JTT Release, commit, metadata and entry point. It does not change `tower` or shell startup files.
+JTT's `jtt-v0.3.0-rc3` is distinct from legacy Tower's `v0.3.0-rc2`. The already-published RC3 artifact still shares package metadata with legacy Tower; this source line installs only the `jtt` console command. Historical Tower code and documentation remain in the repository, and existing Tower installations are untouched.
+The installer validates the published JTT Release, commit, metadata and entry point. It does not change an existing `tower` command or shell startup files.
 See [updates and rollback](docs/JTT_UPDATING.md) for existing installations.
 
 ## First terminal

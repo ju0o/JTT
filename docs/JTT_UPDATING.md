@@ -56,11 +56,14 @@ JTT tags use a product namespace: `jtt-vMAJOR.MINOR.PATCH` for stable and
 `jtt-vMAJOR.MINOR.PATCH-rcN` for an RC (for example, the tag payload
 `v0.3.0-rc2` maps to Python package version `0.3.0rc2`). The legacy Tower tag
 `v0.3.0-rc2` is not a JTT Release candidate. This repository currently builds
-both commands from the `tmux-agent-tower` distribution, so the numeric package
-version may overlap across products; the full JTT identity is the `jtt-` tag
-namespace, matching package version, JTT console entry point, and private
-`product: jtt` install record. The installer and updater reject a legacy Tower
-tag even when its version is newer.
+the published RC3 artifact still uses the shared `tmux-agent-tower` distribution
+metadata. This source line exposes only the `jtt` console entry point while
+temporarily retaining that distribution name so the RC3 updater can verify a
+transition release. The full JTT identity is the `jtt-` tag namespace, matching
+package version, JTT console entry point, and private `product: jtt` install
+record. A later distribution rename requires an explicit cross-name upgrade
+bridge. The installer and updater reject a legacy Tower tag even when its
+version is newer.
 
 The JTT RC3 release identity is package version `0.3.0rc3`, tag
 `jtt-v0.3.0-rc3`, and title `JTT — Ju0 Terminal Tower 0.3.0 RC3`. The legacy

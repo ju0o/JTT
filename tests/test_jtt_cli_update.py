@@ -35,13 +35,14 @@ def _fake_release_api(releases):
     return fetch
 
 
-def test_cli_version_reports_dev_and_tower_command_remains_separate(monkeypatch, capsys):
+def test_cli_version_reports_dev_and_packaged_console_command_is_only_jtt(monkeypatch, capsys):
     monkeypatch.setattr(jtt_install, "installation_kind", lambda: "DEV")
     assert jtt.cli(["--version"]) == 0
     assert "[DEV]" in capsys.readouterr().out
     project = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'tower = "tmux_agent_tower.main:cli"' in project
     assert 'jtt = "tmux_agent_tower.jtt:cli"' in project
+    assert '\ntower = ' not in project
+    assert 'name = "tmux-agent-tower"' in project
 
 
 def test_jtt_version_does_not_import_posix_terminal_ui():
