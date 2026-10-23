@@ -16,7 +16,7 @@ import time
 import uuid
 
 MAX_MESSAGE = 65536
-DIAGNOSTIC_MARKER = re.compile(r"JTT_DIAG_[0-9a-f]{8}_(?:한글|입력)_END\Z")
+DIAGNOSTIC_MARKER = re.compile(r"JTT_DIAG_[0-9a-f]{8}_(?:ASCII|한글|입력)_END\Z")
 MAX_DIAGNOSTIC_EVENTS = 32
 DIAGNOSTIC_CHARS = frozenset("한글입력")
 
@@ -46,7 +46,7 @@ def _marker_screen_evidence(screen, marker):
     """Return evidence for one synthetic marker, never a general screen dump."""
     from pyte.screens import wcwidth
 
-    suffix_match = re.search(r"(?:한글|입력)_END\Z", marker)
+    suffix_match = re.search(r"(?:ASCII|한글|입력)_END\Z", marker)
     prefix = marker[:suffix_match.start()]
     rows = []
     for y, line in enumerate(screen.display):

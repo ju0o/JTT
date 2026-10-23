@@ -125,9 +125,19 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
                 "error": "identity_mismatch",
             }
         first_nonce = uuid.uuid4().hex[:8]
+        first_ascii_marker = f"JTT_DIAG_{first_nonce}_ASCII_END"
         first_marker = f"JTT_DIAG_{first_nonce}_한글_END"
+        ascii_command = f"Write-Output ('JTT_DIAG_' + '{first_nonce}' + '_ASCII_END')"
+        assert ascii_command.isascii() and first_ascii_marker not in ascii_command
+        assert client.call("observe_marker", identity=identity, marker=first_ascii_marker) == {
+            "ok": True, "synthetic_marker_only": True,
+        }
+        assert client.call("input", identity=identity, text=ascii_command + "\r")["ok"]
+        ascii_snapshot, ascii_evidence = wait_synthetic_marker(client, first_ascii_marker)
+        assert ascii_evidence["same_string_fed_to_pyte"]
+        assert first_ascii_marker in ascii_snapshot["text"]
         first_command = (
-            f"Write-Output ('JTT_DIAG_{first_nonce}_' + "
+            f"Write-Output ('JTT_DIAG_' + '{first_nonce}' + '_' + "
             "[char]0xD55C + [char]0xAE00 + '_END')"
         )
         assert first_command.isascii(), "the shell response, not command echo, must supply Korean"
@@ -176,9 +186,19 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
                            text="[Console]::WriteLine(('SIZE='+[Console]::WindowWidth))\r")["ok"]
         wait_text(client, "SIZE=80")
         resize_nonce = uuid.uuid4().hex[:8]
+        resize_ascii_marker = f"JTT_DIAG_{resize_nonce}_ASCII_END"
         resize_marker = f"JTT_DIAG_{resize_nonce}_입력_END"
+        resize_ascii_command = f"Write-Output ('JTT_DIAG_' + '{resize_nonce}' + '_ASCII_END')"
+        assert resize_ascii_command.isascii() and resize_ascii_marker not in resize_ascii_command
+        assert client.call("observe_marker", identity=identity, marker=resize_ascii_marker) == {
+            "ok": True, "synthetic_marker_only": True,
+        }
+        assert client.call("input", identity=identity, text=resize_ascii_command + "\r")["ok"]
+        resize_ascii_snapshot, resize_ascii_evidence = wait_synthetic_marker(client, resize_ascii_marker)
+        assert resize_ascii_evidence["same_string_fed_to_pyte"]
+        assert resize_ascii_marker in resize_ascii_snapshot["text"]
         resize_command = (
-            f"Write-Output ('JTT_DIAG_{resize_nonce}_' + "
+            f"Write-Output ('JTT_DIAG_' + '{resize_nonce}' + '_' + "
             "[char]0xC785 + [char]0xB825 + '_END')"
         )
         assert resize_command.isascii(), "the shell response, not command echo, must supply Korean"
