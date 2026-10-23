@@ -133,6 +133,35 @@ failed CI evidence; do not infer full Unicode/resize compatibility or adopt
 this renderer/backend combination as production-ready. The hosted failure is
 the next bounded investigation gate, not a reason to fall back to WSL.
 
+### WBS-07 gate follow-up — hosted PowerShell response path
+
+Nonce markers separated result output from echoed source. Hosted run
+`39895866618` (`9e9279be`) showed source echo and an already-present prompt,
+but no synthetic ASCII or Korean response at the `pywinpty.PTY.read()`
+boundary; there was no reader/renderer exception. Thus the earlier codepoint-
+only `입`/`력` evidence was echoed command text, not a result, and this failure
+occurred before pyte could place result cells. Prompt-presence was not treated
+as proof of a new prompt after execution.
+
+The experiment-only correction replaced interactive `Write-Output` pipeline
+commands with `[Console]::WriteLine(...)`, retaining nonce markers absent from
+the submitted command and all Unicode/cell-width assertions. This uses the same
+PowerShell host-output boundary as the successful code-page probe; it is a
+test-fixture correction, not a product workaround. Local Windows 11 Python
+3.13 passed 3/3. Hosted run `39896251556` at `6dffc805` passed 3/3; diagnostics
+show Korean at the pywinpty returned-string boundary before pyte feed and
+contiguous screen cells: pre-resize `한`/`글` at columns 18/20 (width 2 each),
+post-resize `입`/`력` at columns 18/20 (width 2 each). The post-resize output
+read sequence was 27 after resize sequence 16. Linux matrix run
+`39896251538` must complete before the PR CI gate is reported complete.
+
+pywinpty's public API returns text and does not expose underlying raw ConPTY
+pipe bytes. Therefore API-string UTF-8 hex is not raw-pipe evidence. Microsoft
+documents the ConPTY channel as UTF-8, but this run independently verifies only
+the pywinpty string and subsequent pyte screen boundary. Native JTT Windows
+support remains NO-GO: the probe is not integrated with the product UI and does
+not close the process/IPC safety gaps listed below.
+
 Textual headless runs at 160×44 and 80×24 pass, but do not prove native Windows
 Terminal visual acceptance, cursor/color fidelity or the complete approved UI.
 Window/Work Kit product logic is unchanged, not ported by this prototype.

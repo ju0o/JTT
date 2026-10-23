@@ -61,9 +61,39 @@ characters are separately located at columns 51 and 58 on the preceding row.
 This demonstrates why codepoint presence alone was insufficient evidence. The
 pinned pywinpty API returns `str`; it does **not** expose the underlying
 ConPTY pipe bytes, so the UTF-8 hex is a round-trip of the returned string, not
-a capture of raw pipe bytes. Hosted CI must pass with this unambiguous marker
-test before the Windows failure is classified as resolved. Windows product
-readiness remains NO-GO meanwhile; assertions are retained.
+a capture of raw pipe bytes.
+
+### WBS-07 follow-up — Hosted output boundary
+
+Hosted run `39895866618` at `9e9279be` still failed with the nonce-marker
+assertion. Its PowerShell source echo and a prompt already present in the
+screen were visible, but neither generated ASCII nor Korean marker reached
+`PTY.read()`. `renderer_failed` was false, the read sequence remained 10, and
+there were no synthetic marker events. Prompt presence did not prove that a new
+prompt followed command execution. This locates the failure before pyte's
+result-cell rendering, not in Korean cell spacing.
+
+The fixture had used the interactive PowerShell `Write-Output` pipeline for
+synthetic responses. The harness-only correction now uses
+`[Console]::WriteLine(...)`, the same host-output boundary as the successful
+code-page probe. The nonce-bearing ASCII and Korean results are still generated
+by PowerShell after Enter and remain absent from submitted source, so input
+echo cannot satisfy the assertion. No Unicode or marker assertion was relaxed.
+
+After the correction, local Windows 11 Python 3.13 passed the isolated probe
+(`3 passed`, including shell-first-exit). Hosted Windows run `39896251556` at
+`6dffc805` passed (`3 passed in 5.60s`). The trace shows the returned text at
+the pywinpty `str` boundary before `pyte.feed`, then contiguous display cells.
+At 100 columns, `한`/`글` occupy columns 18/20, width 2 each; after resize to
+80×24, `입`/`력` occupy columns 18/20, width 2 each. Post-resize output arrived
+at read sequence 27 after resize sequence 16; no synchronous-output assumption
+was made.
+
+This resolves the experiment's Hosted PowerShell output-path failure for the
+tested commands, not native JTT product support. Raw ConPTY bytes were not
+captured: pywinpty's public API returns a Python string, and recorded UTF-8 hex
+is re-encoding of that string. Windows Terminal visual UX, the production
+backend and its safety gates remain unverified/NO-GO.
 
 ## Explicit limitations / follow-up gates
 
