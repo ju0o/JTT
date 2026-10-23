@@ -31,7 +31,12 @@ import zlib
 
 
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    _package_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(_package_root.parent))
+    if _package_root.name == "ju0_terminal_tower":
+        # Installed JTT wheels carry only the product-specific package root;
+        # bootstrap its guarded alias before importing the shared PTY engine.
+        import ju0_terminal_tower  # noqa: F401,E402
 
 from tmux_agent_tower.terminal.manager import (  # noqa: E402
     MAX_FRAME,

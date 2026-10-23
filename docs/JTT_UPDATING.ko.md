@@ -59,10 +59,16 @@ RC는 `jtt-v주버전.부버전.수정버전-rc번호` 형식입니다. 예를 �
 겹칠 수 있습니다. JTT의 전체 식별은 `jtt-` 태그 접두어, 일치하는 패키지 버전,
 JTT console entry point, 비공개 설치 기록의 `product: jtt` 조합입니다.
 설치기와 업데이트기는 버전이 더 높아도 기존 Tower 태그를 거부합니다.
-JTT RC3의 Release 식별자는 패키지 버전 `0.3.0rc3`, 태그 `jtt-v0.3.0-rc3`,
+JTT RC3의 Release 식별자는 과거 `tmux-agent-tower` 배포명을 유지한 패키지
+버전 `0.3.0rc3`, 태그 `jtt-v0.3.0-rc3`,
 제목 `JTT — Ju0 Terminal Tower 0.3.0 RC3`입니다. 기존 Tower RC2 태그
 `v0.3.0-rc2`는 이 JTT RC3 Release가 아닙니다. 설치 전 태그, 공개 Release, 대상 커밋,
 패키지 버전 및 JTT 진입점이 모두 일치해야 합니다.
+
+현재 개발 브랜치의 `ju0-terminal-tower` / `0.3.1rc0`은 아직 공개되지 않은
+후보입니다. 이 후보를 근거로 pip, pipx, uv 또는 JTT 자체 업데이트를 사용해 RC3을
+이전하지 마세요. RC3 자산과 런처는 유지됩니다. 별도 환경을 사용하는 수동 병행 경로는
+[배포 패키지 전환 계획](JTT_PACKAGE_MIGRATION.ko.md)을 참고하세요.
 
 부트스트랩은 태그 체크아웃이 깨끗한지, GitHub에 실제 공개된 Release와 일치하는지,
 태그가 가리키는 커밋이 같은지 확인한 다음 사용자 확인을 받습니다. 설치는

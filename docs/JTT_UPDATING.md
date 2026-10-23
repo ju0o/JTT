@@ -62,11 +62,18 @@ namespace, matching package version, JTT console entry point, and private
 `product: jtt` install record. The installer and updater reject a legacy Tower
 tag even when its version is newer.
 
-The JTT RC3 release identity is package version `0.3.0rc3`, tag
+The public JTT RC3 remains package version `0.3.0rc3` under the historical
+`tmux-agent-tower` distribution, tag
 `jtt-v0.3.0-rc3`, and title `JTT — Ju0 Terminal Tower 0.3.0 RC3`. The legacy
 Tower RC2 tag `v0.3.0-rc2` is not a JTT RC3 release. Installation is accepted
 only when the JTT tag, published Release, resolved commit, package version, and
 JTT entry point agree.
+
+The separate `ju0-terminal-tower` / `0.3.1rc0` package identity in the current
+development branch is an unpublished candidate. Do not use pip, pipx, uv, or
+the JTT self-updater to migrate an RC3 installation based on this candidate.
+See [the package transition plan](JTT_PACKAGE_MIGRATION.md) for the guarded
+side-by-side path; the RC3 assets and launcher remain unchanged.
 
 The bootstrap verifies a clean exact Git tag, a matching published GitHub
 Release, and the tag's resolved commit before it asks for confirmation. It

@@ -10,7 +10,7 @@ import shutil
 import stat
 import sys
 
-from . import __version__
+from . import JTT_VERSION
 from .jtt_install import installation_kind
 from .state.jtt_workspaces import JTTWorkspaceStore, WorkspaceStoreError, default_jtt_root
 from .terminal import manager as terminal_manager
@@ -114,7 +114,7 @@ def run_doctor(output=None) -> int:
     executable = Path(os.environ.get("JTT_LAUNCHER_PATH") or sys.argv[0]).expanduser().absolute()
     module = Path(__file__).resolve()
     print("JTT — Ju0 Terminal Tower doctor (read-only)", file=output)
-    print(f"Version: {__version__} [{kind}]", file=output)
+    print(f"Version: {JTT_VERSION} [{kind}]", file=output)
     print(f"Executable: {executable}", file=output)
     print(f"Module: {module}", file=output)
     print(f"Python: {sys.version.split()[0]} ({sys.executable})", file=output)

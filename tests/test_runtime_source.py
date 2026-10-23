@@ -51,10 +51,13 @@ def test_repo_launcher_uses_dev_python_and_not_path_tower():
 def test_jtt_has_separate_entrypoint_dev_guard_and_pyte_license_notice():
     root = Path(__file__).resolve().parents[1]
     project = (root / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'tower = "tmux_agent_tower.main:cli"' in project
-    assert 'jtt = "tmux_agent_tower.jtt:cli"' in project
+    assert 'name = "ju0-terminal-tower"' in project
+    assert 'version = "0.3.1rc0"' in project
+    assert 'jtt = "ju0_terminal_tower.bootstrap:main"' in project
+    assert '\ntower =' not in project
+    assert 'Homepage = "https://github.com/ju0o/JTT"' in project
     assert 'pyte>=0.8.2,<0.9' in project
-    assert '"share/licenses/tmux-agent-tower" = ["licenses/pyte-LGPL-3.0.txt"]' in project
+    assert '"share/licenses/ju0-terminal-tower" = ["licenses/pyte-LGPL-3.0.txt"]' in project
     assert (root / "licenses" / "pyte-LGPL-3.0.txt").is_file()
 
     dev = (root / "scripts" / "jtt-dev").read_text(encoding="utf-8")

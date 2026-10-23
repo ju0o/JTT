@@ -174,7 +174,7 @@ def inspect_official_launcher(argv0: str | None = None, *, source: Path | None =
 
 
 def installation_kind() -> str:
-    """Return DEV, OFFICIAL, or UNMANAGED without touching persistent state."""
+    """Return DEV, OFFICIAL, PACKAGE_MANAGER, or UNMANAGED without writes."""
 
     root = source_checkout_root()
     configured_root = os.environ.get("JTT_DEV_ROOT", "")
@@ -188,7 +188,16 @@ def installation_kind() -> str:
             return "OFFICIAL"
     if inspect_official_launcher().get("managed"):
         return "OFFICIAL"
-    return "UNMANAGED"
+    # Any installed distribution that is not the verified official sidecar is
+    # owned by a Python package manager (pip, pipx, uv, and similar). Do not
+    # infer ownership from a mutable PATH shim or a manager-specific directory.
+    try:
+        from importlib import metadata as importlib_metadata
+
+        importlib_metadata.distribution("ju0-terminal-tower")
+    except importlib_metadata.PackageNotFoundError:
+        return "UNMANAGED"
+    return "PACKAGE_MANAGER"
 
 
 def _private_file(path: Path) -> str | None:
@@ -300,7 +309,7 @@ def install_dev_launcher(
                 "PYTHONPATH": str(root / "src"),
             }
             result = subprocess.run([str(target), "--version"], capture_output=True, text=True, timeout=20, env=env, check=False)
-            valid = result.returncode == 0 and result.stdout.strip() == f"jtt {__import__('tmux_agent_tower').__version__} [DEV]"
+            valid = result.returncode == 0 and result.stdout.strip() == f"jtt {__import__('tmux_agent_tower').JTT_VERSION} [DEV]"
         else:
             valid = bool(verify(target))
         if not valid:

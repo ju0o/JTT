@@ -59,6 +59,7 @@ jtt
 JTT의 `jtt-v0.3.0-rc3`는 기존 Tower `v0.3.0-rc2`와 다릅니다. 두 명령은 Python 배포 패키지를 공유합니다.
 설치기는 공개 JTT Release·커밋·메타데이터·진입점을 검증하며 `tower`나 셸 시작 파일을 변경하지 않습니다.
 기존 설치는 [업데이트·롤백 안내](docs/JTT_UPDATING.ko.md)를 참고하세요.
+RC3 이후의 배포명 제안과 수동 병행 전환 절차는 [JTT 패키지 전환 안내](docs/JTT_PACKAGE_MIGRATION.ko.md)에 있습니다. `ju0-terminal-tower` 후보는 PyPI에 공개되지 않았으며, 현재 공개 설치 경로는 위의 공식 RC3 안내입니다.
 
 ## 첫 터미널
 
