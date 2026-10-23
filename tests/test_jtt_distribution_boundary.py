@@ -17,10 +17,11 @@ def _isolated_package(tmp_path):
     return site
 
 
-def _run(site, code):
+def _run(site, code, extra_pythonpath=()):
+    pythonpath = [str(site), *(str(path) for path in extra_pythonpath)]
     env = {
         "PATH": os.defpath,
-        "PYTHONPATH": str(site),
+        "PYTHONPATH": os.pathsep.join(pythonpath),
         "PYTHONNOUSERSITE": "1",
     }
     return subprocess.run(
@@ -87,6 +88,26 @@ def test_candidate_runtime_refuses_foreign_import_path_before_aliasing(tmp_path)
     (legacy / "__init__.py").write_text("__version__ = '0.3.0rc3'\n", encoding="utf-8")
 
     result = _run(site, "import ju0_terminal_tower")
+    assert result.returncode != 0
+    assert "another tmux_agent_tower source is visible" in result.stderr
+
+
+def test_candidate_runtime_refuses_foreign_namespace_package_locations(tmp_path):
+    site = _isolated_package(tmp_path)
+    foreign_root = tmp_path / "foreign"
+    foreign_package = foreign_root / "tmux_agent_tower"
+    foreign_package.mkdir(parents=True)
+    (foreign_package / "external_module.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    result = _run(
+        site,
+        "import importlib.util; "
+        "spec = importlib.util.find_spec('tmux_agent_tower'); "
+        "assert spec is not None and spec.origin is None; "
+        "assert list(spec.submodule_search_locations); "
+        "import ju0_terminal_tower",
+        extra_pythonpath=(foreign_root,),
+    )
     assert result.returncode != 0
     assert "another tmux_agent_tower source is visible" in result.stderr
 

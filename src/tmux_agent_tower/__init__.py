@@ -35,10 +35,28 @@ if __name__ == "ju0_terminal_tower":
             )
     else:
         _legacy_spec = _import_util.find_spec("tmux_agent_tower")
-        if (_legacy_spec is not None and _legacy_spec.origin
-                and _Path(_legacy_spec.origin).resolve() != _Path(__file__).resolve()):
-            raise ImportError(
-                "another tmux_agent_tower source is visible on this Python path; "
-                "use a separate Python environment for JTT"
+        if _legacy_spec is not None:
+            _own_file = _Path(__file__).resolve()
+            _own_package_dir = _own_file.parent
+
+            def _matches_path(candidate, expected):
+                try:
+                    return _Path(candidate).resolve() == expected
+                except (OSError, RuntimeError, TypeError):
+                    return False
+
+            _foreign_origin = (
+                _legacy_spec.origin is not None
+                and not _matches_path(_legacy_spec.origin, _own_file)
             )
+            _search_locations = _legacy_spec.submodule_search_locations
+            _foreign_search_path = _search_locations is not None and any(
+                not _matches_path(location, _own_package_dir)
+                for location in _search_locations
+            )
+            if _foreign_origin or _foreign_search_path:
+                raise ImportError(
+                    "another tmux_agent_tower source is visible on this Python path; "
+                    "use a separate Python environment for JTT"
+                )
         _sys.modules["tmux_agent_tower"] = _sys.modules[__name__]
