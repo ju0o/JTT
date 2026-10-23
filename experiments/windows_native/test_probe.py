@@ -41,7 +41,7 @@ def wait_synthetic_marker(client, expected):
             ]
             assert events, (
                 "screen displayed the synthetic result but the pywinpty API trace did not; "
-                + json.dumps(snapshot["diagnostics"], ensure_ascii=False)
+                + json.dumps(snapshot["diagnostics"], ensure_ascii=True)
             )
             return snapshot, events[-1]
         snapshot = client.call("snapshot")
@@ -55,7 +55,7 @@ def wait_synthetic_marker(client, expected):
             "columns": snapshot["columns"],
             "lines": snapshot["lines"],
             "diagnostics": snapshot["diagnostics"],
-        }, ensure_ascii=False)
+        }, ensure_ascii=True)
     )
 
 
@@ -122,7 +122,7 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         first_nonce = uuid.uuid4().hex[:8]
         first_marker = f"JTT_DIAG_{first_nonce}_한글_END"
         first_command = (
-            f"[Console]::WriteLine(('JTT_DIAG_{first_nonce}_' + '한' + '글' + '_END'))\r"
+            f"Write-Output ('JTT_DIAG_{first_nonce}_' + '한' + '글' + '_END')\r"
         )
         assert first_marker not in first_command, "the result marker must not occur in command echo"
         assert client.call("observe_marker", identity=identity, marker=first_marker) == {
@@ -137,7 +137,7 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         assert first_row["marker_cells_contiguous"]
         first_korean_cells = [cell for cell in first_row["marker_cell_positions"] if cell["char"] in "한글"]
         assert [cell["width"] for cell in first_korean_cells] == [2, 2]
-        print("resize_phase=before " + json.dumps(first_evidence, ensure_ascii=False))
+        print("resize_phase=before " + json.dumps(first_evidence, ensure_ascii=True))
         client.close()
         client = None
         assert process.poll() is None
@@ -169,7 +169,7 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
         resize_nonce = uuid.uuid4().hex[:8]
         resize_marker = f"JTT_DIAG_{resize_nonce}_입력_END"
         resize_command = (
-            f"[Console]::WriteLine(('JTT_DIAG_{resize_nonce}_' + '입' + '력' + '_END'))\r"
+            f"Write-Output ('JTT_DIAG_{resize_nonce}_' + '입' + '력' + '_END')\r"
         )
         assert resize_marker not in resize_command, "the result marker must not occur in command echo"
         assert client.call("observe_marker", identity=identity, marker=resize_marker) == {
@@ -188,7 +188,7 @@ def test_native_conpty_reconnect_identity_and_textual(tmp_path, shell_exits_firs
             "resize": resize_event,
             "result": resize_evidence,
             "observed_korean_reads": resized_snapshot["diagnostics"]["read_chunks_with_diagnostic_characters"],
-        }, ensure_ascii=False))
+        }, ensure_ascii=True))
 
         # UI-framework feasibility only, not the approved JTT UI or native WT visual QA.
         class ProbeUI(App):
