@@ -27,6 +27,7 @@ OUTPUT_BUFFER_BYTES = 256 * 1024
 LEASE_SECONDS = 15.0
 MAX_COLUMNS = 300
 MAX_LINES = 120
+BOOTSTRAP_WAIT_MS = 30_000
 _STAGE = "worker_import"
 
 
@@ -93,6 +94,26 @@ def assign_owned_job(job, process_handle, win32job, win32api, win32event,
         if win32event.WaitForSingleObject(process_handle, 5000) != win32con.WAIT_OBJECT_0:
             raise RuntimeError("owned PowerShell cleanup after job assignment failure timed out")
         raise
+
+
+def _bootstrap_script(release_name, abort_name):
+    """Keep PowerShell non-interactive unless the worker opens the release gate."""
+    return (
+        "$ErrorActionPreference='Stop'; "
+        "try { "
+        "$r=[System.Threading.EventWaitHandle]::OpenExisting('" + release_name + "'); "
+        "$a=[System.Threading.EventWaitHandle]::OpenExisting('" + abort_name + "'); "
+        "$w=[System.Threading.WaitHandle]::WaitAny("
+        "[System.Threading.WaitHandle[]]@($r,$a)," + str(BOOTSTRAP_WAIT_MS) + "); "
+        "if ($w -ne 0) { [System.Environment]::Exit(70) }; "
+        "$r.Dispose(); $a.Dispose(); "
+        "} catch { [System.Environment]::Exit(71) }; "
+        "[Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false); "
+        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
+        "$OutputEncoding=[Console]::OutputEncoding; "
+        "Remove-Module PSReadLine -ErrorAction SilentlyContinue; "
+        "function prompt { 'JTT> ' }"
+    )
 
 
 def _run(session_dir_text, session_id, generation, name, runtime=None):
@@ -199,10 +220,12 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
         shell_env["TERM"] = "xterm"
 
         # PowerShell executes only this controlled wait loop until the process
-        # has joined the Job. The unique event is local to this session.
+        # has joined the Job. Both unique events are local to this session.
         _set_stage("gate_create")
         gate_name = "Local\\JTT-" + uuid.uuid4().hex
+        abort_name = "Local\\JTT-" + uuid.uuid4().hex
         gate = win32event.CreateEvent(attributes, True, False, gate_name)
+        abort_gate = win32event.CreateEvent(attributes, True, False, abort_name)
         _set_stage("conpty_create")
         terminal = PTY(100, 30, backend=Backend.ConPTY)
         _set_stage("job_create")
@@ -222,16 +245,12 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
         shell_in_job = False
         try:
             _set_stage("shell_spawn")
-            gate_script = (
-                "$g=[System.Threading.EventWaitHandle]::OpenExisting('" + gate_name + "'); "
-                "[void]$g.WaitOne(); $g.Dispose(); "
-                "[Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false); "
-                "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
-                "$OutputEncoding=[Console]::OutputEncoding; "
-                "Remove-Module PSReadLine -ErrorAction SilentlyContinue; "
-                "function prompt { 'JTT> ' }"
-            )
+            gate_script = _bootstrap_script(gate_name, abort_name)
             argv = ["-NoLogo", "-NoProfile", "-NoExit", "-Command", gate_script]
+            # Record that spawn is about to be attempted. If its result becomes
+            # ambiguous, the manager must preserve this registry entry.
+            metadata["spawn_attempted"] = True
+            runtime._atomic_metadata(metadata_path, metadata)
             spawned = terminal.spawn(
                 str(shell_path), cmdline=subprocess.list2cmdline(argv),
                 cwd=str(working_directory),
@@ -239,8 +258,12 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
             )
             if not spawned:
                 raise RuntimeError("ConPTY PowerShell creation failed")
-            _set_stage("shell_handle_open")
             shell_pid = int(terminal.pid)
+            # Publish this immediately. Until creation time is available it is
+            # diagnostic only and must never authorize a PID-based signal.
+            metadata.update({"shell_pid": shell_pid, "shell_path": str(shell_path)})
+            runtime._atomic_metadata(metadata_path, metadata)
+            _set_stage("shell_handle_open")
             shell_handle = win32api.OpenProcess(
                 win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_SET_QUOTA
                 | win32con.PROCESS_TERMINATE | win32con.SYNCHRONIZE,
@@ -581,6 +604,13 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
             reader.join(timeout=2)
         finally:
             try:
+                if not shell_in_job and abort_gate is not None:
+                    # Wake a child blocked before ownership was established.
+                    # Its script exits instead of falling through to a prompt.
+                    try:
+                        win32event.SetEvent(abort_gate)
+                    except Exception:
+                        pass
                 if shell_handle is not None:
                     if win32event.WaitForSingleObject(shell_handle, 0) == win32con.WAIT_TIMEOUT:
                         if shell_in_job:
@@ -595,6 +625,7 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                 if shell_handle is not None:
                     shell_handle.Close()
                 gate.Close()
+                abort_gate.Close()
                 job.Close()
     finally:
         pipe.Close()

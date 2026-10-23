@@ -450,3 +450,180 @@ def test_job_assignment_failure_terminates_only_retained_child_handle():
         assign_owned_job("owned-job", "retained-child-handle", JobApi,
                          ProcessApi, EventApi, Constants)
     assert ProcessApi.calls == [("retained-child-handle", 1)]
+
+
+def test_powershell_exits_when_named_startup_gate_cannot_be_opened():
+    import ju0_terminal_tower  # noqa: F401
+    from tmux_agent_tower.terminal._windows_worker import _bootstrap_script
+    from tmux_agent_tower.terminal.windows_manager import _powershell_executable
+
+    missing = "Local\\JTT-missing-" + uuid.uuid4().hex
+    process = subprocess.run(
+        [str(_powershell_executable()), "-NoLogo", "-NoProfile", "-NoExit",
+         "-Command", _bootstrap_script(missing, missing + "-abort")],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=10, check=False,
+    )
+    assert process.returncode == 71
+    assert b"PS " not in process.stdout + process.stderr
+
+
+def test_spawned_powershell_handle_failure_aborts_child_and_keeps_registry(
+    tmp_path, monkeypatch
+):
+    import ju0_terminal_tower  # noqa: F401
+    import pywintypes
+    import win32api
+    import win32con
+    import win32process
+
+    from tmux_agent_tower.terminal import windows_manager as runtime
+    from tmux_agent_tower.terminal._windows_worker import main as worker_main
+
+    root = tmp_path / "isolated-jtt" / "terminals"
+    runtime._ensure_private_directory(root)
+    session_id, generation = uuid.uuid4().hex, uuid.uuid4().hex
+    session_dir = root / session_id
+    session_dir.mkdir()
+    runtime._private_acl(session_dir, directory=True, apply=True)
+    working = tmp_path / "isolated-work"
+    working.mkdir()
+    metadata_path = session_dir / runtime.SESSION_META
+    runtime._atomic_metadata(metadata_path, {
+        "protocol": runtime.PROTOCOL,
+        "session_id": session_id,
+        "generation": generation,
+        "supervisor_pid": 0,
+        "supervisor_start": "",
+        "shell_pid": 0,
+        "shell_start": "",
+        "shell_path": str(runtime._powershell_executable()),
+        "name": "Injected handle acquisition failure",
+        "state": "starting",
+        "renderer_state": "starting",
+        "pipe_name": runtime._planned_socket_path(session_dir, session_id),
+        "working_directory": str(working),
+        "spawn_attempted": False,
+    })
+
+    original_open = win32api.OpenProcess
+    captured = {}
+    handle_attempt = threading.Event()
+    test_errors = []
+
+    def deny_worker_handle(access, inherit, pid):
+        if not captured:
+            # Independent read-only test observer captures the actual child
+            # identity before injecting the worker's retained-handle failure.
+            observer = original_open(
+                win32con.PROCESS_QUERY_LIMITED_INFORMATION | win32con.SYNCHRONIZE,
+                False, pid,
+            )
+            try:
+                captured.update({
+                    "pid": pid,
+                    "start": str(win32process.GetProcessTimes(observer)["CreationTime"]),
+                    "image": runtime._process_image(observer),
+                })
+            finally:
+                observer.Close()
+            handle_attempt.set()
+            raise pywintypes.error(5, "OpenProcess", "injected access denial")
+        return original_open(access, inherit, pid)
+
+    monkeypatch.setattr(win32api, "OpenProcess", deny_worker_handle)
+
+    def run_worker():
+        try:
+            test_errors.append(worker_main([
+                "--worker", str(session_dir), session_id, generation,
+                "Injected handle acquisition failure",
+            ]))
+        except Exception as exc:
+            test_errors.append(exc)
+
+    thread = threading.Thread(target=run_worker, daemon=True)
+    thread.start()
+    assert handle_attempt.wait(15), "ConPTY PowerShell did not reach handle acquisition"
+    thread.join(10)
+    assert not thread.is_alive(), "worker did not exit after startup handle failure"
+    assert test_errors == [1]
+    assert captured["image"].casefold() == str(
+        runtime._powershell_executable()
+    ).casefold()
+
+    metadata = runtime._read_metadata(metadata_path)
+    assert metadata["spawn_attempted"] is True
+    assert metadata["shell_pid"] == captured["pid"]
+    assert metadata["shell_start"] == ""
+    assert metadata["startup_failure"]["stage"] == "shell_handle_open"
+
+    deadline = time.monotonic() + 10
+    exact_child_alive = True
+    while time.monotonic() < deadline:
+        created, _image, alive = runtime._process_facts(
+            captured["pid"], expected_start=captured["start"]
+        )
+        exact_child_alive = alive and created == captured["start"]
+        if not exact_child_alive:
+            break
+        time.sleep(0.02)
+    try:
+        assert not exact_child_alive, (
+            "the exact gated PowerShell process remained alive after worker failure"
+        )
+    finally:
+        if exact_child_alive:
+            # Cleanup is permitted only through the identity-checked helper.
+            runtime._terminate_owned_powershell(
+                captured["pid"], captured["start"], captured["image"]
+            )
+
+    # The worker lacked a retained process handle and therefore cannot certify
+    # cleanup itself. Its registry entry must remain for explicit recovery.
+    assert metadata_path.is_file()
+    rows = {item.session_id: item for item in runtime.TerminalRegistry(root).list_sessions()}
+    assert session_id in rows
+
+
+@pytest.mark.parametrize(("shell_pid", "shell_start"), [(0, ""), (43210, "")])
+def test_failed_startup_without_full_shell_identity_preserves_record(
+    tmp_path, monkeypatch, shell_pid, shell_start
+):
+    import ju0_terminal_tower  # noqa: F401
+    from tmux_agent_tower.terminal import TerminalError
+    from tmux_agent_tower.terminal import windows_manager as runtime
+
+    root = tmp_path / "isolated-jtt" / "terminals"
+    runtime._ensure_private_directory(root)
+    session_id, generation = uuid.uuid4().hex, uuid.uuid4().hex
+    session_dir = root / session_id
+    session_dir.mkdir()
+    runtime._private_acl(session_dir, directory=True, apply=True)
+    metadata_path = session_dir / runtime.SESSION_META
+    runtime._atomic_metadata(metadata_path, {
+        "protocol": runtime.PROTOCOL,
+        "session_id": session_id,
+        "generation": generation,
+        "supervisor_pid": 0,
+        "supervisor_start": "",
+        "shell_pid": shell_pid,
+        "shell_start": shell_start,
+        "shell_path": str(runtime._powershell_executable()),
+        "name": "Unknown startup ownership",
+        "state": "starting",
+        "renderer_state": "starting",
+        "spawn_attempted": True,
+        "startup_failure": {"stage": "shell_handle_open", "exception": "error"},
+    })
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("unknown PID must not be signaled or registry removed")
+
+    monkeypatch.setattr(runtime, "_terminate_owned_powershell", forbidden)
+    monkeypatch.setattr(runtime, "_remove_session_files", forbidden)
+    with pytest.raises(TerminalError, match="registry retained"):
+        runtime._cleanup_failed_startup(
+            session_dir, session_id, generation, "fixture"
+        )
+    assert metadata_path.is_file()

@@ -36,13 +36,19 @@ connecting this backend to the full three-panel application.
   `sys._base_executable` with `-S`, an explicit JTT/runtime import path, and
   user-site imports disabled. This keeps the recorded worker PID tied to the
   process that owns the named pipe and Job Object.
-- The PowerShell bootstrap waits on a per-session event. The worker assigns the
-  retained PowerShell process handle to its Job Object before releasing the
-  prompt. Assignment failure terminates only that retained child handle.
+- The PowerShell bootstrap waits for either a per-session release event or an
+  abort event, with a bounded timeout. It exits on event-open failure, abort,
+  or timeout; it cannot fall through to an interactive prompt. The worker
+  assigns the retained PowerShell process handle to its Job Object before
+  releasing the prompt. Assignment failure terminates only that retained
+  child handle.
 - The worker owns a Job Object configured with
   `KILL_ON_JOB_CLOSE`; explicit stop terminates that job. Startup-failure
   cleanup checks PID, creation time, and the expected PowerShell image before it
-  can terminate the just-created shell.
+  can terminate the just-created shell. If ConPTY spawn was attempted but the
+  worker could not publish a complete shell identity, startup fails closed and
+  the registry record is retained for explicit recovery instead of signaling
+  an unverified PID or deleting the evidence.
 - Session directories and named pipes use an owner-SID-only DACL. The server
   checks the pipe caller SID, and the client verifies the named-pipe server
   PID. This separates Windows users; it does not isolate processes running as
@@ -63,6 +69,15 @@ Korean output, stale-generation rejection, detach/reconnect with the same
 session ID/generation/shell PID, lease revocation, and identity-checked stop.
 The test also checked the Windows venv worker executable's PID behavior and
 that a wrong process creation time cannot terminate the shell.
+
+The startup-failure regression injected an `OpenProcess` denial after a real
+ConPTY PowerShell spawn. An independent observer captured that child PID and
+creation time; the abort event caused that exact PowerShell process to exit.
+The worker could not retain its own process handle, so its startup registry
+record remained present. A separate native PowerShell check confirmed that a
+missing named gate exits with the expected failure code instead of opening a
+prompt. The manager cleanup tests also reject incomplete or inconsistent
+startup identity without signaling a PID or removing the registry.
 
 The existing isolated ConPTY feasibility suite also passed on that host. This
 is automated backend evidence, not a native Windows Terminal visual or human

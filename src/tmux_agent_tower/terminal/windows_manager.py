@@ -589,6 +589,74 @@ def _startup_error_category(message: str) -> str:
     return "startup_validation_failed"
 
 
+def _cleanup_failed_startup(session_dir: Path, session_id: str,
+                            generation: str, last_startup_reason: str) -> None:
+    """Remove a failed startup only after its spawned child is accounted for."""
+    metadata = _read_metadata(session_dir / SESSION_META)
+    if (metadata.get("session_id") != session_id
+            or metadata.get("generation") != generation):
+        raise TerminalError("terminal identity changed during startup cleanup")
+    startup_failure = metadata.get("startup_failure")
+    diagnostic = None
+    if isinstance(startup_failure, dict):
+        stage = startup_failure.get("stage")
+        exception = startup_failure.get("exception")
+        if (isinstance(stage, str) and stage.isidentifier()
+                and isinstance(exception, str) and exception.isidentifier()):
+            cause_stage = startup_failure.get("cause_stage")
+            cause = startup_failure.get("cause")
+            if (isinstance(cause_stage, str) and cause_stage.isidentifier()
+                    and isinstance(cause, str) and cause.isidentifier()):
+                exception = cause_stage + "_" + cause
+            diagnostic = {"stage": stage, "exception": exception}
+    if diagnostic is None and metadata.get("state") == "running":
+        diagnostic = {
+            "stage": "startup_validation",
+            "exception": last_startup_reason,
+        }
+
+    spawn_attempted = metadata.get("spawn_attempted")
+    if not isinstance(spawn_attempted, bool):
+        raise TerminalError("PowerShell spawn state is unknown; registry retained")
+    try:
+        shell_pid = int(metadata.get("shell_pid") or 0)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TerminalError("PowerShell PID is invalid; registry retained") from exc
+    shell_start = str(metadata.get("shell_start") or "")
+    if shell_pid < 0 or (shell_start and not shell_pid):
+        raise TerminalError("PowerShell process identity is inconsistent; registry retained")
+    if not spawn_attempted and (shell_pid or shell_start):
+        raise TerminalError("PowerShell spawn metadata is inconsistent; registry retained")
+    if spawn_attempted and not shell_pid:
+        raise TerminalError(
+            "PowerShell startup ownership is unknown; registry retained",
+            diagnostic=diagnostic or {
+                "stage": "startup_cleanup", "exception": "spawn_identity_missing"
+            },
+        )
+    if shell_pid and not shell_start:
+        raise TerminalError(
+            "PowerShell process start identity is unavailable; registry retained",
+            diagnostic=diagnostic or {
+                "stage": "startup_cleanup", "exception": "shell_start_missing"
+            },
+        )
+    if shell_pid:
+        shell_path = metadata.get("shell_path")
+        if not isinstance(shell_path, str):
+            raise TerminalError("owned PowerShell path is unavailable; registry retained")
+        _terminate_owned_powershell(shell_pid, shell_start, shell_path)
+    _remove_session_files(session_dir)
+    if diagnostic is not None:
+        raise TerminalError(
+            "Windows terminal startup failed "
+            "(stage={}, exception={})".format(
+                diagnostic["stage"], diagnostic["exception"]
+            ), diagnostic=diagnostic,
+        )
+    raise TerminalError("Windows terminal supervisor failed during startup")
+
+
 def _validate_identity(root: Path, session_id: str) -> tuple[Path, dict[str, Any]]:
     _ensure_private_directory(root)
     if not SESSION_ID_RE.fullmatch(str(session_id)):
@@ -702,6 +770,7 @@ class TerminalRegistry:
             "supervisor_pid": 0, "supervisor_start": "", "shell_pid": 0,
             "shell_start": "", "shell_path": str(shell), "name": display_name,
             "state": "starting", "renderer_state": "starting", "pipe_name": pipe_name,
+            "spawn_attempted": False,
             "working_directory": os.getcwd(),
         }
         _atomic_metadata(session_dir / SESSION_META, initial)
@@ -746,46 +815,9 @@ class TerminalRegistry:
                 raise TerminalError(
                     "Windows supervisor startup timed out; registry retained for safety"
                 ) from exc
-        try:
-            metadata = _read_metadata(session_dir / SESSION_META)
-            if metadata.get("session_id") != session_id or metadata.get("generation") != generation:
-                raise TerminalError("terminal identity changed during startup cleanup")
-            startup_failure = metadata.get("startup_failure")
-            diagnostic = None
-            if isinstance(startup_failure, dict):
-                stage = startup_failure.get("stage")
-                exception = startup_failure.get("exception")
-                if (isinstance(stage, str) and stage.isidentifier()
-                        and isinstance(exception, str) and exception.isidentifier()):
-                    cause_stage = startup_failure.get("cause_stage")
-                    cause = startup_failure.get("cause")
-                    if (isinstance(cause_stage, str) and cause_stage.isidentifier()
-                            and isinstance(cause, str) and cause.isidentifier()):
-                        exception = cause_stage + "_" + cause
-                    diagnostic = {"stage": stage, "exception": exception}
-            if diagnostic is None and metadata.get("state") == "running":
-                diagnostic = {
-                    "stage": "startup_validation",
-                    "exception": last_startup_reason,
-                }
-            shell_pid = int(metadata.get("shell_pid") or 0)
-            shell_start = str(metadata.get("shell_start") or "")
-            if shell_pid:
-                shell_path = metadata.get("shell_path")
-                if not isinstance(shell_path, str):
-                    raise TerminalError("owned PowerShell path is unavailable; registry retained")
-                _terminate_owned_powershell(shell_pid, shell_start, shell_path)
-            _remove_session_files(session_dir)
-            if diagnostic is not None:
-                raise TerminalError(
-                    "Windows terminal startup failed "
-                    "(stage={}, exception={})".format(
-                        diagnostic["stage"], diagnostic["exception"]
-                    ), diagnostic=diagnostic,
-                )
-        except TerminalError:
-            raise
-        raise TerminalError("Windows terminal supervisor failed during startup")
+        _cleanup_failed_startup(
+            session_dir, session_id, generation, last_startup_reason
+        )
 
     def connect(self, session_id: str, *, timeout: float = 3.0) -> "TerminalClient":
         _require_windows()
