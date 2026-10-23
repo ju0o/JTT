@@ -45,9 +45,22 @@ def cli(argv: list[str] | None = None) -> int:
         print("JTT는 대화형 터미널에서 실행해야 합니다.", file=sys.stderr)
         return 2
     try:
+        if sys.platform == "win32":
+            from .ui.windows_jtt import run_jtt_windows_ui
+
+            return run_jtt_windows_ui()
         from .ui.jtt import run_jtt_ui
 
         return run_jtt_ui()
+    except ImportError as exc:
+        if sys.platform == "win32" and getattr(exc, "name", "") in {"textual", "rich"}:
+            print(
+                "Windows JTT UI dependencies (Textual/Rich) are unavailable. "
+                "Repair the JTT installation before creating a terminal.",
+                file=sys.stderr,
+            )
+            return 2
+        raise
     except KeyboardInterrupt:
         return 130
 

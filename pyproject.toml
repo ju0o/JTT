@@ -13,6 +13,7 @@ dependencies = [
     "pyte>=0.8.2,<0.9",
     "pywinpty>=3.1,<4; sys_platform == 'win32'",
     "pywin32>=306; sys_platform == 'win32'",
+    "textual==8.2.8; sys_platform == 'win32'",
 ]
 authors = [{ name = "ju0o" }]
 keywords = [
@@ -44,6 +45,9 @@ Issues = "https://github.com/ju0o/JTT/issues"
 
 [project.scripts]
 jtt = "ju0_terminal_tower.bootstrap:main"
+
+[project.optional-dependencies]
+windows-ui-test = ["textual==8.2.8"]
 
 [tool.setuptools.package-data]
 ju0_terminal_tower = ["resources/harnesses/*.md", "remote/*.js"]
