@@ -438,7 +438,8 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                         else:
                             stop_reader.wait(0.01)
                 except Exception:
-                    screen_error = True
+                    with state_lock:
+                        screen_error = True
 
             _set_stage("serve_pipe")
             reader = threading.Thread(target=read_output, name="jtt-conpty-reader", daemon=True)
@@ -619,6 +620,17 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                     if after < 0 or after > sequence:
                         return base(error="stale_identity")
                     if op == "input":
+                        oldest = output[0][0] if output else sequence + 1
+                        if after < oldest - 1:
+                            # Input must never continue from a client whose
+                            # output cursor fell behind the bounded stream.
+                            lease_owner = None
+                            lease_deadline = 0.0
+                            return base(error="stream_gap")
+                        if screen_error:
+                            lease_owner = None
+                            lease_deadline = 0.0
+                            return base(error="renderer_unavailable")
                         try:
                             data = base64.b64decode(request.get("data", ""), validate=True)
                             text = data.decode("utf-8", errors="strict")
@@ -627,6 +639,7 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                         if not data or len(data) > 8192:
                             return base(error="invalid_input")
                         terminal.write(text)
+                        lease_deadline = now + LEASE_SECONDS
                         return base(ok=True, written=len(data), lease=True)
                     columns, lines = request.get("columns"), request.get("lines")
                     if (isinstance(columns, bool) or isinstance(lines, bool)

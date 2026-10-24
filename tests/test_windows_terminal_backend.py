@@ -850,3 +850,47 @@ def test_failed_startup_without_full_shell_identity_preserves_record(
             session_dir, session_id, generation, "fixture"
         )
     assert metadata_path.is_file()
+
+
+def test_native_input_rejects_output_gap_without_preflight_poll(tmp_path):
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalError, TerminalRegistry
+
+    registry = TerminalRegistry(tmp_path / "isolated-jtt" / "terminals")
+    client = registry.create("Bounded stream input guard")
+    identity = client.identity
+    try:
+        assert client.acquire()
+        # Generate more than the bounded stream capacity without polling the
+        # controller. observe() sees the current screen but does not advance
+        # the client's output cursor.
+        command = (
+            "1..25000 | ForEach-Object { [Console]::Write('X' * 64) }; "
+            "[Console]::WriteLine('JTT_STREAM_GAP_DONE')"
+        )
+        client.send((command + "\r").encode("ascii"))
+        deadline = time.monotonic() + 30
+        observed = None
+        while time.monotonic() < deadline:
+            observed = client.observe()
+            if (observed.screen is not None
+                    and "JTT_STREAM_GAP_DONE" in _screen_text(observed.screen)):
+                break
+            time.sleep(0.02)
+        assert observed is not None and observed.screen is not None
+        assert "JTT_STREAM_GAP_DONE" in _screen_text(observed.screen)
+        with pytest.raises(TerminalError, match="stream_gap"):
+            client.send(b"JTT_MUST_NOT_BE_DELIVERED\r")
+        assert not client.lease
+        current = client.observe()
+        assert current.screen is not None
+        assert "JTT_MUST_NOT_BE_DELIVERED" not in _screen_text(current.screen)
+    finally:
+        client.close()
+        current = next((item for item in registry.list_sessions()
+                        if item.session_id == identity.session_id), None)
+        if current is not None:
+            registry.stop(
+                identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )

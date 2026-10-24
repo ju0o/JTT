@@ -18,6 +18,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.css.query import NoMatches
 from textual.dom import NoScreen
+from textual.events import Paste
 from textual.screen import ModalScreen
 from textual.widget import MountError, Widget
 from textual.widgets import Button, Input, Static
@@ -464,7 +465,8 @@ class WindowsJTTApp(App[None]):
     #new-terminal { width: 100%; height: 3; margin-top: 1; }
     #terminal-cards { height: 1fr; }
     .card-row { width: 100%; height: 6; margin-bottom: 1; }
-    .terminal-card { width: 1fr; height: 6; border: round #355d68; content-align: left middle; }
+    .terminal-card { width: 1fr; height: 6; border: round #355d68; content-align: left middle;
+                     text-wrap: nowrap; text-overflow: ellipsis; }
     .terminal-card.selected { border: round #35cbbd; background: #102a35; }
     #live { height: 1fr; width: 100%; overflow-x: hidden; overflow-y: hidden;
             border: round #294550; padding: 0 1; background: #050b13; }
@@ -508,6 +510,7 @@ class WindowsJTTApp(App[None]):
         self._cards_render_lock = asyncio.Lock()
         self._mini_sampler: WindowsMiniLiveSampler | None = None
         self._refresh_timers: list[Any] = []
+        self._input_refresh_timer = None
         self._mini_live_stopping = False
         self._mini_cache: dict[str, tuple[tuple, int, float, TerminalScreen]] = {}
         self._right_observation: tuple[tuple, int, float, TerminalScreen] | None = None
@@ -557,6 +560,9 @@ class WindowsJTTApp(App[None]):
         timers, self._refresh_timers = self._refresh_timers, []
         for timer in timers:
             timer.stop()
+        if self._input_refresh_timer is not None:
+            self._input_refresh_timer.stop()
+            self._input_refresh_timer = None
 
     async def _backend_call(self, function, *args, **kwargs):
         async with self._io_lock:
@@ -608,7 +614,7 @@ class WindowsJTTApp(App[None]):
         # Session refresh updates widgets on the base screen. Like LIVE
         # refresh, defer it while a modal owns the active screen so polling
         # cannot query or mutate the hidden widget tree.
-        if not self._base_widgets_available() or self._busy:
+        if not self._base_widgets_available() or self._busy or self.input_mode:
             return
         try:
             values = await self._backend_call(self.registry.list_sessions)
@@ -867,7 +873,12 @@ class WindowsJTTApp(App[None]):
             for identity in values[start:start + 2]:
                 selected = identity.session_id == self.selected_id
                 state = self._state_label(identity.state)
-                label = Text(f"{identity.name}\n{state} · PID {identity.shell_pid}")
+                # Keep identity metadata on two clipped lines in narrow cards;
+                # wrapping pushes the Mini LIVE preview and status out of view.
+                label = Text(
+                    f"{identity.name}\n{state} · PID {identity.shell_pid}",
+                    no_wrap=True, overflow="ellipsis",
+                )
                 cached = self._fresh_mini_screen(identity, now)
                 if cached is None:
                     label.append("\n미니 화면 대기 중", style="dim")
@@ -938,7 +949,7 @@ class WindowsJTTApp(App[None]):
                      if item.state == "running" and item.session_id != self.selected_id)[:16]
 
     async def _refresh_mini_live(self) -> None:
-        if (not self._base_widgets_available() or self._busy
+        if (not self._base_widgets_available() or self._busy or self.input_mode
                 or self._mini_sampler is None):
             return
         result = self._mini_sampler.take()
@@ -1495,6 +1506,9 @@ class WindowsJTTApp(App[None]):
     async def leave_input_mode(self) -> None:
         self.prefix_pending = False
         self._prefix_generation += 1
+        if self._input_refresh_timer is not None:
+            self._input_refresh_timer.stop()
+            self._input_refresh_timer = None
         if self.client is not None and self.client.lease:
             try:
                 await self._backend_call(self.client.release)
@@ -1516,8 +1530,12 @@ class WindowsJTTApp(App[None]):
     async def _send_bytes(self, data: bytes) -> None:
         client = self.client
         identity = self.selected_identity
-        if (not self.input_mode or client is None or identity is None
-                or not client.lease or not _same_identity(identity, client.identity)):
+        if not self._input_target_is_current(client, identity):
+            if client is not None and client.lease:
+                try:
+                    await self._backend_call(client.release)
+                except Exception:
+                    pass
             self.input_mode = False
             self._set_notice("입력 대상 신원을 확인할 수 없어 키를 차단했습니다.", 8.0)
             return
@@ -1529,8 +1547,48 @@ class WindowsJTTApp(App[None]):
             self._clear_live("입력 실패 · 세션 화면을 다시 선택하세요.")
             self._set_notice(f"키 입력이 차단되었습니다: {exc}", 8.0)
         else:
-            await self._refresh_live()
+            # Avoid a full ConPTY observe and Rich redraw for every character.
+            # Coalesce refreshes while typing; the periodic LIVE timer remains
+            # a fallback if the UI is busy.
+            self._schedule_input_refresh()
         self._update_status()
+
+    def _input_target_is_current(self, client, identity) -> bool:
+        if (not self.input_mode or self._panel_index != 2 or client is None
+                or identity is None or identity.state != "running"
+                or self.selected_id != identity.session_id or not client.lease
+                or not _same_identity(identity, client.identity)):
+            return False
+        visible = self.sessions.get(identity.session_id)
+        return visible is not None and visible.state == "running" and _same_identity(
+            identity, visible
+        )
+
+    def _schedule_input_refresh(self) -> None:
+        if self._input_refresh_timer is not None:
+            self._input_refresh_timer.stop()
+        self._input_refresh_timer = self.set_timer(0.05, self._refresh_live)
+
+    async def on_paste(self, event: Paste) -> None:
+        """Forward an explicit terminal paste event to the verified RIGHT lease.
+
+        Textual receives bracketed-paste text from the terminal host. JTT does
+        not read or modify the operating-system clipboard.
+        """
+        if isinstance(self.screen, ModalScreen):
+            return
+        event.stop()
+        if not event.text:
+            return
+        try:
+            data = event.text.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            self._set_notice("붙여넣기 문자를 UTF-8로 변환할 수 없습니다.")
+            return
+        if len(data) > 8192:
+            self._set_notice("붙여넣기 크기 초과 · 8192바이트 이하만 전달합니다.")
+            return
+        await self._send_bytes(data)
 
     async def _close_selected_client(self) -> None:
         client, self.client = self.client, None

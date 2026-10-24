@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from textual.css.query import NoMatches
+from textual.events import Paste
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
@@ -240,6 +241,112 @@ def test_card_switch_releases_previous_lease_and_stale_identity_hides_screen():
             assert "신원" in str(app.query_one("#live", Static).render())
 
     asyncio.run(scenario())
+
+
+def test_right_paste_uses_only_current_verified_input_lease():
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        registry = FakeRegistry([first, second])
+        app = WindowsJTTApp(registry)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == first.session_id,
+                "initial selected terminal",
+            )
+            await app.enter_input_mode()
+            client = app.client
+            assert client is not None and client.lease
+
+            text = "Write-Output '붙여넣기 JTT'"
+            event = Paste(text)
+            await app.on_paste(event)
+            assert event._stop_propagation
+            assert client.sent == [text.encode("utf-8")]
+
+            # A lost lease, stale identity, or a session outside the selected
+            # Window must block delivery without touching another client.
+            client.sent.clear()
+            client.lease = False
+            await app.on_paste(Paste("must-not-send-without-lease"))
+            assert client.sent == []
+
+            await app.enter_input_mode()
+            client = app.client
+            assert client is not None and client.lease
+            client.lease = True
+            changed = TerminalIdentity(**{**first.__dict__, "generation": "f" * 32})
+            app.sessions[first.session_id] = changed
+            await app.on_paste(Paste("must-not-send-stale-generation"))
+            assert client.sent == []
+
+            app.sessions[first.session_id] = first
+            await app.enter_input_mode()
+            client = app.client
+            assert client is not None and client.lease
+            app.sessions.pop(first.session_id)
+            await app.on_paste(Paste("must-not-send-outside-window"))
+            assert client.sent == []
+            assert registry.clients[0].sent == []
+
+            app.sessions[first.session_id] = first
+            await app.enter_input_mode()
+            client = app.client
+            assert client is not None and client.lease
+            client.sent.clear()
+            await app.on_paste(Paste("x" * 8193))
+            assert client.sent == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (160, 44)])
+def test_terminal_card_identity_text_does_not_wrap(size):
+    async def scenario():
+        identity = _identity(1)
+        identity = TerminalIdentity(**{
+            **identity.__dict__, "name": "Long PowerShell Session Name",
+        })
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        async with app.run_test(size=size):
+            button = app.query_one("#terminal-" + identity.session_id, Button)
+            assert button.styles.text_wrap == "nowrap"
+            assert button.styles.text_overflow == "ellipsis"
+
+    asyncio.run(scenario())
+
+
+def test_windows_client_send_uses_one_input_rpc_and_advances_sequence(tmp_path):
+    from ju0_terminal_tower.terminal.windows_manager import TerminalClient
+
+    identity = _identity(1)
+    client = TerminalClient.__new__(TerminalClient)
+    client._closed = False
+    client.identity = identity
+    client._client_id = "client"
+    client._sequence = 7
+    client.synced = True
+    client.lease = True
+    client.state = "running"
+    client._root = tmp_path
+    calls = []
+
+    def request(operation, **fields):
+        calls.append((operation, fields))
+        assert operation == "input"
+        assert fields["after"] == 7
+        return {
+            "ok": True, "session_id": identity.session_id,
+            "generation": identity.generation, "sequence": 9,
+            "synced": True, "renderer_available": True,
+            "written": len(b"x"), "lease": True,
+        }
+
+    client._request = request
+    assert client.send(b"x") == 1
+    assert len(calls) == 1
+    assert calls[0][0] == "input"
+    assert client._sequence == 9
+    assert client.synced and client.lease
 
 
 def test_exited_live_observation_clears_right_and_mini_card_screen():
@@ -921,6 +1028,56 @@ def test_vt_screen_text_keeps_wide_glyph_cells_adjacent():
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
+def test_native_windows_paste_event_enters_selected_powershell(tmp_path):
+    from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry
+
+    def screen_text(screen):
+        return "\n".join("".join(cell.text for cell in row) for row in screen.rows)
+
+    registry = TerminalRegistry(root=tmp_path / "isolated-jtt" / "terminals")
+    app = WindowsJTTApp(registry)
+    created = {}
+
+    async def scenario():
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.click("#new-terminal")
+            await _wait_for_ui_state(
+                pilot, lambda: app.input_mode and app.client is not None,
+                "new isolated PowerShell input lease",
+            )
+            identity = app.selected_identity
+            assert identity is not None and app.client is not None and app.client.lease
+            created["identity"] = identity
+            nonce = identity.session_id[:10]
+            expected = f"JTT_PASTE_RESULT_{nonce}_END"
+            command = f"[Console]::WriteLine('JTT_PASTE_' + 'RESULT_{nonce}' + '_END')"
+            assert expected not in command
+            assert app.post_message(Paste(command))
+            await _wait_for_ui_state(
+                pilot, lambda: app._input_refresh_timer is not None,
+                "paste dispatched to selected RIGHT terminal",
+            )
+            await pilot.press("enter")
+            await _wait_for_ui_state(
+                pilot,
+                lambda: app._right_observation is not None
+                and expected in screen_text(app._right_observation[3]),
+                "PowerShell executed pasted command",
+                timeout=20,
+            )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        identity = created.get("identity")
+        if identity is not None:
+            registry.stop(
+                identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
 def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path):
     from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry, _process_facts
 
@@ -1172,6 +1329,8 @@ def test_native_windows_interactive_latency_profile(tmp_path, size):
                 counts = {}
                 for operation, _duration in requests:
                     counts[operation] = counts.get(operation, 0) + 1
+                assert counts.get("poll", 0) == 0
+                assert counts.get("input", 0) == len(token)
                 print(
                     "JTT_LATENCY_PROFILE "
                     f"size={size[0]}x{size[1]} terminals=2 session={index + 1} "
