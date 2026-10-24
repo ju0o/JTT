@@ -1075,6 +1075,18 @@ def test_native_powershell_prompt_tracks_long_current_location(
         nonce = identity.session_id[:10]
         width_marker = f"JTT_WIDTH_{nonce}_{columns}_END"
         rawui_width_marker = f"JTT_RAWUI_{nonce}_{columns}_END"
+
+        # A prompt is rendered immediately before PowerShell begins reading
+        # the next line. Require one real command result as the input-ready
+        # barrier instead of assuming the visible prompt is already readable.
+        ready_marker = _generated_marker(client, "PATH_INPUT_READY")
+        start_prompt = _expected_prompt_path(start, 100)
+        _wait(
+            client,
+            lambda item: item.screen is not None
+            and _screen_contains_after(item.screen, ready_marker, start_prompt),
+        )
+
         location_command = f"Set-Location -LiteralPath '{destination.name}'"
         assert str(destination) not in location_command
         client.send((location_command + "\r").encode("utf-8"))
