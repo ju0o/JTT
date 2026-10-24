@@ -357,8 +357,8 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                 mismatch_finished = asyncio.Event()
                 finish_stop = stop_app._finish_stop
 
-                async def record_mismatch_completion(expected):
-                    await finish_stop(expected)
+                async def record_mismatch_completion(expected, _finish=finish_stop):
+                    await _finish(expected)
                     mismatch_finished.set()
 
                 stop_app._finish_stop = record_mismatch_completion
@@ -376,8 +376,8 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                 approved_finished = asyncio.Event()
                 finish_stop = stop_app._finish_stop
 
-                async def record_approved_completion(expected):
-                    await finish_stop(expected)
+                async def record_approved_completion(expected, _finish=finish_stop):
+                    await _finish(expected)
                     approved_finished.set()
 
                 stop_app._finish_stop = record_approved_completion
