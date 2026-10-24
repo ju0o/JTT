@@ -89,7 +89,7 @@ def _wait(client, predicate, timeout=15):
     )
 
 
-def _wait_for_raw_output(client, expected: bytes, timeout=15):
+def _wait_for_raw_output(client, expected: bytes, timeout=15, *, checkpoints=()):
     """Collect actual ConPTY bytes so command echo cannot satisfy output checks."""
     deadline = time.monotonic() + timeout
     output = bytearray()
@@ -100,11 +100,15 @@ def _wait_for_raw_output(client, expected: bytes, timeout=15):
         if expected in output:
             return last, bytes(output)
         time.sleep(0.02)
+    seen_checkpoints = tuple(
+        label for label, marker in checkpoints if marker in output
+    )
     raise AssertionError(
         "PowerShell output marker missing from ConPTY stream: "
         f"state={getattr(last, 'state', None)!r}; "
         f"renderer={getattr(last, 'renderer_state', None)!r}; "
         f"sequence={getattr(last, 'sequence', None)!r}; "
+        f"observed_checkpoints={seen_checkpoints!r}; "
         f"marker={expected!r}"
     )
 
@@ -1092,7 +1096,14 @@ def test_native_powershell_prompt_tracks_long_current_location(
         assert path_end not in verification_command
         assert str(destination) not in verification_command
         client.send((verification_command + "\r").encode("ascii"))
-        update, raw_output = _wait_for_raw_output(client, path_end.encode("ascii"))
+        update, raw_output = _wait_for_raw_output(
+            client, path_end.encode("ascii"),
+            checkpoints=(
+                ("resized_console_width", width_marker.encode("ascii")),
+                ("actual_location_output_started", path_start.encode("ascii")),
+                ("actual_destination_path", str(destination).encode("utf-8")),
+            ),
+        )
         assert width_marker.encode("ascii") in raw_output
         start_index = raw_output.rfind(path_start.encode("ascii"))
         end_index = raw_output.find(path_end.encode("ascii"), start_index + len(path_start))
