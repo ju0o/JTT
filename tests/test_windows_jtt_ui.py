@@ -316,7 +316,7 @@ def test_terminal_card_identity_text_does_not_wrap(size):
     asyncio.run(scenario())
 
 
-def test_windows_client_send_uses_one_input_rpc_and_advances_sequence(tmp_path):
+def test_windows_client_send_does_not_advance_output_cursor(tmp_path):
     from ju0_terminal_tower.terminal.windows_manager import TerminalClient
 
     identity = _identity(1)
@@ -324,12 +324,14 @@ def test_windows_client_send_uses_one_input_rpc_and_advances_sequence(tmp_path):
     client._closed = False
     client.identity = identity
     client._client_id = "client"
-    client._sequence = 7
+    client._output_cursor = 7
     client.synced = True
     client.lease = True
     client.state = "running"
     client._root = tmp_path
     calls = []
+
+    reported_sequences = iter((9, 12))
 
     def request(operation, **fields):
         calls.append((operation, fields))
@@ -337,16 +339,18 @@ def test_windows_client_send_uses_one_input_rpc_and_advances_sequence(tmp_path):
         assert fields["after"] == 7
         return {
             "ok": True, "session_id": identity.session_id,
-            "generation": identity.generation, "sequence": 9,
+            "generation": identity.generation, "sequence": next(reported_sequences),
             "synced": True, "renderer_available": True,
             "written": len(b"x"), "lease": True,
         }
 
     client._request = request
     assert client.send(b"x") == 1
-    assert len(calls) == 1
-    assert calls[0][0] == "input"
-    assert client._sequence == 9
+    assert client.send(b"y") == 1
+    assert len(calls) == 2
+    assert [call[0] for call in calls] == ["input", "input"]
+    assert [call[1]["after"] for call in calls] == [7, 7]
+    assert client._output_cursor == 7
     assert client.synced and client.lease
 
 

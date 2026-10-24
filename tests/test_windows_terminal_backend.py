@@ -149,7 +149,7 @@ def test_native_powershell_create_io_resize_detach_reconnect_stop(tmp_path, monk
         }
         with pytest.raises(Exception, match="stale_identity"):
             client._request("input", identity=stale_identity,
-                            after=client._sequence,
+                            after=client._output_cursor,
                             data=base64.b64encode(b"forbidden").decode("ascii"))
 
         client.close()
@@ -879,6 +879,91 @@ def test_native_input_rejects_output_gap_without_preflight_poll(tmp_path):
             time.sleep(0.02)
         assert observed is not None and observed.screen is not None
         assert "JTT_STREAM_GAP_DONE" in _screen_text(observed.screen)
+        with pytest.raises(TerminalError, match="stream_gap"):
+            client.send(b"JTT_MUST_NOT_BE_DELIVERED\r")
+        assert not client.lease
+        current = client.observe()
+        assert current.screen is not None
+        assert "JTT_MUST_NOT_BE_DELIVERED" not in _screen_text(current.screen)
+    finally:
+        client.close()
+        current = next((item for item in registry.list_sessions()
+                        if item.session_id == identity.session_id), None)
+        if current is not None:
+            registry.stop(
+                identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+
+
+def test_native_input_reply_sequence_does_not_ack_unread_output(tmp_path):
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalError, TerminalRegistry
+    from tmux_agent_tower.terminal._windows_worker import OUTPUT_BUFFER_BYTES
+
+    registry = TerminalRegistry(tmp_path / "isolated-jtt" / "terminals")
+    client = registry.create("Input response is not output acknowledgement")
+    identity = client.identity
+
+    def wait_for_marker(marker, timeout=30):
+        deadline = time.monotonic() + timeout
+        previous_sequence = None
+        stable_reads = 0
+        last = None
+        while time.monotonic() < deadline:
+            last = client.observe()
+            visible = last.screen is not None and marker in _screen_text(last.screen)
+            if visible and last.sequence == previous_sequence:
+                stable_reads += 1
+                if stable_reads >= 2:
+                    return last
+            else:
+                stable_reads = 0
+            previous_sequence = last.sequence
+            time.sleep(0.01)
+        raise AssertionError(
+            f"PowerShell marker not stable in observe snapshot: {marker}; "
+            f"sequence={getattr(last, 'sequence', None)}"
+        )
+
+    try:
+        assert client.acquire()
+        output_cursor = client._output_cursor
+
+        nonce_a = uuid.uuid4().hex[:8]
+        marker_a = f"JTT_SEQ_A_{nonce_a}_END"
+        count_a = (OUTPUT_BUFFER_BYTES - 32 * 1024) // 64
+        command_a = (
+            f"1..{count_a} | ForEach-Object {{ [Console]::Write('A' * 64) }}; "
+            f"[Console]::WriteLine('JTT_SEQ_' + 'A_{nonce_a}_END')"
+        )
+        assert marker_a not in command_a
+        client.send((command_a + "\r").encode("ascii"))
+        observed_a = wait_for_marker(marker_a)
+        assert observed_a.sequence > output_cursor
+        assert client._output_cursor == output_cursor
+
+        # This input response reports the latest output sequence, but returns
+        # no output bytes. It must not claim that the preceding output was
+        # consumed by this client.
+        client.send(b"\r")
+        assert client._output_cursor == output_cursor
+
+        nonce_b = uuid.uuid4().hex[:8]
+        marker_b = f"JTT_SEQ_B_{nonce_b}_END"
+        count_b = (96 * 1024) // 64
+        command_b = (
+            f"1..{count_b} | ForEach-Object {{ [Console]::Write('B' * 64) }}; "
+            f"[Console]::WriteLine('JTT_SEQ_' + 'B_{nonce_b}_END')"
+        )
+        assert marker_b not in command_b
+        client.send((command_b + "\r").encode("ascii"))
+        observed_b = wait_for_marker(marker_b)
+        assert observed_b.sequence > observed_a.sequence
+
+        # A + B exceeds the worker's bounded output buffer. Because no poll
+        # delivered those bytes, the next input must see the old output cursor,
+        # detect the gap, and revoke the lease instead of silently proceeding.
         with pytest.raises(TerminalError, match="stream_gap"):
             client.send(b"JTT_MUST_NOT_BE_DELIVERED\r")
         assert not client.lease
