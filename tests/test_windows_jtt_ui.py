@@ -1532,7 +1532,11 @@ def test_native_windows_interactive_latency_profile(tmp_path, size):
         return ordered[min(len(ordered) - 1, (len(ordered) * percent + 99) // 100 - 1)]
 
     def screen_contains(screen, text):
-        return any(text in "".join(cell.text for cell in row) for row in screen.rows)
+        # A short overall UI can wrap the echoed token across RIGHT rows. Keep
+        # the assertion about visible output while ignoring that line boundary.
+        return text in "".join(
+            cell.text for row in screen.rows for cell in row
+        )
 
     async def scenario():
         async with app.run_test(size=size) as pilot:
