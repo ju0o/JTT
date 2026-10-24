@@ -46,6 +46,33 @@ def _screen_text(screen):
     return "\n".join("".join(cell.text for cell in row) for row in screen.rows)
 
 
+def _compact_screen_text(screen):
+    return "".join(line.rstrip() for line in _screen_text(screen).splitlines())
+
+
+def _screen_contains_after(screen, marker, text):
+    compact = _compact_screen_text(screen)
+    marker_index = compact.rfind(marker)
+    return (
+        marker_index >= 0
+        and compact.find(text, marker_index + len(marker)) >= 0
+    )
+
+
+def _expected_prompt_path(path, columns):
+    from pathlib import PureWindowsPath
+
+    text = str(path)
+    limit = max(12, columns - 36)
+    if len(text) > limit:
+        root = PureWindowsPath(text).anchor
+        if len(root) > limit - 5:
+            root = root[:limit - 5]
+        tail = max(1, limit - len(root) - 4)
+        text = root + "...\\" + text[-tail:]
+    return "PS " + text + ">"
+
+
 def _wait(client, predicate, timeout=15):
     deadline = time.monotonic() + timeout
     last = None
@@ -59,6 +86,45 @@ def _wait(client, predicate, timeout=15):
         f"state={getattr(last, 'state', None)!r}; "
         f"renderer={getattr(last, 'renderer_state', None)!r}; "
         f"sequence={getattr(last, 'sequence', None)!r}"
+    )
+
+
+def _wait_for_raw_output(
+        client, expected: bytes, timeout=15, *, checkpoints=(),
+        screen_checkpoints=()):
+    """Collect actual ConPTY bytes; console soft-wraps may split output markers."""
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    last = None
+    while time.monotonic() < deadline:
+        last = client.poll()
+        output.extend(last.output)
+        compact_output = bytes(output).replace(b"\r", b"").replace(b"\n", b"")
+        if expected in compact_output:
+            return last, bytes(output)
+        time.sleep(0.02)
+    compact_output = bytes(output).replace(b"\r", b"").replace(b"\n", b"")
+    seen_checkpoints = tuple(
+        label for label, marker in checkpoints if marker in compact_output
+    )
+    screen_text = _compact_screen_text(last.screen) if last and last.screen else ""
+    seen_screen_checkpoints = tuple(
+        label for label, marker in screen_checkpoints if marker in screen_text
+    )
+    raise AssertionError(
+        "PowerShell output marker missing from ConPTY stream: "
+        f"state={getattr(last, 'state', None)!r}; "
+        f"renderer={getattr(last, 'renderer_state', None)!r}; "
+        f"sequence={getattr(last, 'sequence', None)!r}; "
+        f"snapshot_sequence={getattr(last, 'snapshot_sequence', None)!r}; "
+        f"synced={getattr(last, 'synced', None)!r}; "
+        f"gap={getattr(last, 'gap', None)!r}; "
+        f"more={getattr(last, 'more', None)!r}; "
+        f"collected_bytes={len(output)}; "
+        f"observed_checkpoints={seen_checkpoints!r}; "
+        f"screen_checkpoints={seen_screen_checkpoints!r}; "
+        f"continuation_prompt={'>>' in screen_text!r}; "
+        f"marker={expected!r}"
     )
 
 
@@ -96,7 +162,8 @@ def test_native_powershell_create_io_resize_detach_reconnect_stop(tmp_path, monk
         )
         assert _process_same(identity.shell_pid, identity.shell_start)
         _wait(client, lambda update: update.screen is not None
-              and "JTT>" in _screen_text(update.screen))
+              and _expected_prompt_path(work, 100)
+              in _compact_screen_text(update.screen))
         assert client.acquire()
         marker = _generated_marker(client, "CREATE")
         assert marker
@@ -864,21 +931,25 @@ def test_native_input_rejects_output_gap_without_preflight_poll(tmp_path):
         # Generate more than the bounded stream capacity without polling the
         # controller. observe() sees the current screen but does not advance
         # the client's output cursor.
+        nonce = identity.session_id[:10]
+        marker = f"JTT_STREAM_GAP_{nonce}_DONE"
         command = (
             "1..25000 | ForEach-Object { [Console]::Write('X' * 64) }; "
-            "[Console]::WriteLine('JTT_STREAM_GAP_DONE')"
+            "[Console]::WriteLine('JTT_STREAM_GAP_' + "
+            f"'{nonce}' + '_DONE')"
         )
+        assert marker not in command
         client.send((command + "\r").encode("ascii"))
         deadline = time.monotonic() + 30
         observed = None
         while time.monotonic() < deadline:
             observed = client.observe()
             if (observed.screen is not None
-                    and "JTT_STREAM_GAP_DONE" in _screen_text(observed.screen)):
+                    and marker in _screen_text(observed.screen)):
                 break
             time.sleep(0.02)
         assert observed is not None and observed.screen is not None
-        assert "JTT_STREAM_GAP_DONE" in _screen_text(observed.screen)
+        assert marker in _screen_text(observed.screen)
         with pytest.raises(TerminalError, match="stream_gap"):
             client.send(b"JTT_MUST_NOT_BE_DELIVERED\r")
         assert not client.lease
@@ -970,6 +1041,196 @@ def test_native_input_reply_sequence_does_not_ack_unread_output(tmp_path):
         current = client.observe()
         assert current.screen is not None
         assert "JTT_MUST_NOT_BE_DELIVERED" not in _screen_text(current.screen)
+    finally:
+        client.close()
+        current = next((item for item in registry.list_sessions()
+                        if item.session_id == identity.session_id), None)
+        if current is not None:
+            registry.stop(
+                identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+
+
+@pytest.mark.parametrize("columns,lines", [(80, 24), (160, 44)])
+def test_native_powershell_prompt_tracks_long_current_location(
+        tmp_path, monkeypatch, columns, lines):
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalRegistry
+
+    start = tmp_path / "isolated-start"
+    destination = start / "dest"
+    start.mkdir()
+    destination.mkdir(parents=True)
+    assert len(str(destination)) > 100
+    monkeypatch.chdir(start)
+    registry = TerminalRegistry(tmp_path / "isolated-jtt" / "terminals")
+    client = registry.create("PowerShell current path prompt")
+    identity = client.identity
+
+    try:
+        initial = _wait(
+            client,
+            lambda update: update.screen is not None
+            and _expected_prompt_path(start, 100)
+            in _compact_screen_text(update.screen),
+        )
+        assert _expected_prompt_path(start, 100) in _compact_screen_text(initial.screen)
+        assert client.acquire()
+        nonce = identity.session_id[:10]
+        width_marker = f"JTT_WIDTH_{nonce}_{columns}_END"
+        rawui_width_marker = f"JTT_RAWUI_{nonce}_{columns}_END"
+
+        # A screen snapshot can lead the client's output cursor. Use bytes that
+        # are absent from the command as the readiness barrier, then drain
+        # through the prompt before sending another line.
+        ready_nonce = uuid.uuid4().hex[:10]
+        ready_marker = f"JTT_PATH_INPUT_READY_{ready_nonce}_END"
+        ready_command = (
+            "[Console]::WriteLine('JTT_PATH_INPUT_READY_' + '"
+            f"{ready_nonce}" + "' + '_END')"
+        )
+        assert ready_marker not in ready_command
+        client.send((ready_command + "\r").encode("ascii"))
+        _ready_output_update, ready_output = _wait_for_raw_output(
+            client, ready_marker.encode("ascii"),
+            checkpoints=(("ready_command_echo", ready_command.encode("ascii")),),
+        )
+        start_prompt = _expected_prompt_path(start, 100)
+        start_prompt_bytes = start_prompt.encode("utf-8")
+        ready_compact = ready_output.replace(b"\r", b"").replace(b"\n", b"")
+        if start_prompt_bytes not in ready_compact:
+            _prompt_update, _prompt_output = _wait_for_raw_output(
+                client, start_prompt_bytes,
+                checkpoints=(("ready_marker_output", ready_marker.encode("ascii")),),
+            )
+        _wait(
+            client,
+            lambda item: item.screen is not None
+            and item.synced and not item.more
+            and item.sequence == item.snapshot_sequence
+            and _screen_contains_after(item.screen, ready_marker, start_prompt),
+        )
+
+        # Keep the submitted line short enough not to wrap from the prompt into
+        # a second input row. The resolved path is not in the command, proving
+        # PowerShell executed the location change rather than echoing input.
+        location_command = f"cd '{destination.name}'; $PWD.Path"
+        assert str(destination) not in location_command
+        assert len(start_prompt) + 2 + len(location_command) < 100
+        # Match the native UI's per-key RPC path, including a separate Enter
+        # acknowledgement, instead of bulk-pasting a whole command line. An
+        # input RPC only acknowledges delivery to ConPTY; wait for the full
+        # echoed line before Enter so the test does not race PowerShell's line
+        # editor on fast hosted runners.
+        for character in location_command:
+            assert client.send(character.encode("utf-8")) == 1
+        typed_line = _wait(
+            client,
+            lambda item: item.screen is not None
+            and _screen_contains_after(item.screen, ready_marker, location_command),
+        )
+        assert _screen_contains_after(typed_line.screen, ready_marker, location_command)
+        # Use the Windows console line terminator after the per-key writes.
+        assert client.send(b"\r\n") == 2
+
+        initial_width_prompt = _expected_prompt_path(destination, 100)
+        prompt_bytes = initial_width_prompt.encode("utf-8")
+        path_bytes = str(destination).encode("utf-8")
+        _path_update, path_output = _wait_for_raw_output(
+            client,
+            path_bytes,
+            checkpoints=(
+                ("location_command_echo", location_command.encode("utf-8")),
+                ("location_error", b"Set-Location :"),
+            ),
+            screen_checkpoints=(
+                ("location_command_echo", location_command),
+                ("resolved_location", str(destination)),
+                ("resolved_prompt", initial_width_prompt),
+            ),
+        )
+        compact_path_output = path_output.replace(b"\r", b"").replace(b"\n", b"")
+        assert path_bytes in compact_path_output
+
+        # The resolved path and prompt may be delivered in one ConPTY read.
+        # Reuse bytes already observed before polling for a later chunk.
+        prompt_output = bytearray(path_output)
+        if prompt_bytes not in compact_path_output:
+            _prompt_update, prompt_more = _wait_for_raw_output(
+                client,
+                prompt_bytes,
+                checkpoints=(("location_error", b"Set-Location :"),),
+            )
+            prompt_output.extend(prompt_more)
+        compact_prompt_output = bytes(prompt_output).replace(b"\r", b"").replace(b"\n", b"")
+        assert prompt_bytes in compact_prompt_output
+
+        # The ConPTY stream proves the new prompt was emitted. Check its
+        # screen-cell rendering separately so output and pyte state cannot be
+        # confused when diagnosing a failure.
+        resolved_path = str(destination)
+
+        def resolved_location_rendered(item):
+            if item.screen is None:
+                return False
+            compact = _compact_screen_text(item.screen)
+            command_index = compact.rfind(location_command)
+            path_index = compact.find(resolved_path, command_index + len(location_command))
+            prompt_index = compact.find(initial_width_prompt, path_index + len(resolved_path))
+            return command_index >= 0 and path_index >= 0 and prompt_index >= 0
+
+        update = _wait(client, resolved_location_rendered)
+        assert (update.columns, update.lines) == (100, 30)
+        rendered_location = _compact_screen_text(update.screen)
+        assert resolved_location_rendered(update)
+        # This verifies the full line-wrapped result made it through pyte cells,
+        # separately from the raw ConPTY assertion above.
+        assert rendered_location.find(resolved_path) >= 0
+
+        client.resize(columns, lines)
+        resized = _wait(
+            client,
+            lambda item: item.screen is not None
+            and (item.columns, item.lines) == (columns, lines),
+        )
+        assert (resized.columns, resized.lines) == (columns, lines)
+
+        width_command = (
+            "[Console]::WriteLine('JTT_'+'WIDTH_'+"
+            f"'{nonce}'+'_'+"
+            "[Console]::WindowWidth+'_END');"
+            "[Console]::WriteLine('JTT_'+'RAWUI_'+"
+            f"'{nonce}'+'_'+"
+            "$Host.UI.RawUI.WindowSize.Width+'_END')"
+        )
+        assert width_marker not in width_command
+        assert rawui_width_marker not in width_command
+        client.send((width_command + "\r").encode("ascii"))
+        _width_update, width_output = _wait_for_raw_output(
+            client, rawui_width_marker.encode("ascii"),
+        )
+        compact_width_output = width_output.replace(b"\r", b"").replace(b"\n", b"")
+        assert width_marker.encode("ascii") in compact_width_output
+        assert rawui_width_marker.encode("ascii") in compact_width_output
+
+        expected_prompt = _expected_prompt_path(destination, columns)
+        def path_prompt_observed(item):
+            if item.screen is None:
+                return False
+            compact = _compact_screen_text(item.screen)
+            width_index = compact.rfind(width_marker)
+            prompt_index = compact.find(expected_prompt, width_index + len(width_marker))
+            # The full destination was already asserted from actual command
+            # output before resizing. A resize may reflow/evict those older
+            # cells, so only require the post-resize width and prompt here.
+            return width_index >= 0 and prompt_index >= 0
+
+        update = _wait(client, path_prompt_observed)
+        display = _compact_screen_text(update.screen)
+        assert (update.columns, update.lines) == (columns, lines)
+
+        assert expected_prompt in display
     finally:
         client.close()
         current = next((item for item in registry.list_sessions()
