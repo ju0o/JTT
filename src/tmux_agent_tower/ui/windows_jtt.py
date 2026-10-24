@@ -276,6 +276,7 @@ class WindowsJTTApp(App[None]):
         self._notice = ""
         self._notice_until = 0.0
         self._card_signature = None
+        self._cards_render_lock = asyncio.Lock()
         self._mini_sampler: WindowsMiniLiveSampler | None = None
         self._mini_cache: dict[str, tuple[tuple, int, float, TerminalScreen]] = {}
         self._right_observation: tuple[tuple, int, float, TerminalScreen] | None = None
@@ -497,8 +498,15 @@ class WindowsJTTApp(App[None]):
         )
 
     async def _render_cards(self) -> None:
-        if not self.is_mounted:
-            return
+        # Session refresh and Mini LIVE sampling can complete in the same UI
+        # frame. Serialize widget-tree replacement so one renderer cannot
+        # detach a row while another is mounting its card buttons.
+        async with self._cards_render_lock:
+            if not self.is_mounted:
+                return
+            await self._render_cards_serial()
+
+    async def _render_cards_serial(self) -> None:
         values = list(self.sessions.values())
         now = time.monotonic()
         signature = tuple(

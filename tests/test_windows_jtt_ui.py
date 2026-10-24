@@ -356,6 +356,60 @@ def test_mini_live_observes_each_card_without_lease_input_or_resize(tmp_path):
     asyncio.run(scenario())
 
 
+def test_concurrent_session_and_mini_refreshes_serialize_card_mounts(tmp_path):
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        registry = FakeRegistry([first, second])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        workspace_store.set_terminal_ids(
+            workspace_store.DEFAULT_ID, [first.session_id, second.session_id]
+        )
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store,
+            layout_store=JTTLayoutStore(workspace_store.root),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            container = app.query_one("#terminal-cards")
+            original_remove = container.remove_children
+            first_remove_entered = asyncio.Event()
+            release_first_remove = asyncio.Event()
+            active_removals = 0
+            maximum_active_removals = 0
+
+            async def gated_remove_children(*args, **kwargs):
+                nonlocal active_removals, maximum_active_removals
+                active_removals += 1
+                maximum_active_removals = max(
+                    maximum_active_removals, active_removals,
+                )
+                first_remove_entered.set()
+                try:
+                    await release_first_remove.wait()
+                    return await original_remove(*args, **kwargs)
+                finally:
+                    active_removals -= 1
+
+            container.remove_children = gated_remove_children
+            app._card_signature = None
+            first_render = asyncio.create_task(app._render_cards())
+            await first_remove_entered.wait()
+            app.sessions.pop(second.session_id)
+            second_render = asyncio.create_task(app._render_cards())
+            await asyncio.sleep(0)  # yield one event-loop turn, without timing assumptions
+            assert maximum_active_removals == 1
+            release_first_remove.set()
+            await asyncio.gather(first_render, second_render)
+            buttons = app.query(".terminal-card")
+            assert {button.id for button in buttons} == {
+                "terminal-" + first.session_id,
+            }
+            assert all(button.is_attached for button in buttons)
+            assert maximum_active_removals == 1
+            await pilot.pause(0)
+
+    asyncio.run(scenario())
+
+
 def test_windows_ui_projects_legacy_sessions_without_startup_migration(tmp_path):
     async def scenario():
         identity = _identity(1)
