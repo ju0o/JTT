@@ -1196,6 +1196,18 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                         pilot, is_mounted, "stop confirmation screen mount",
                     )
 
+                async def send_stop_prefix_command():
+                    # Textual dispatches the prefix binding through its event
+                    # loop. Wait for the observable pending state before the
+                    # command key so repeated modal cycles cannot race it.
+                    await pilot.press("ctrl+g")
+                    await _wait_for_ui_state(
+                        pilot, lambda: stop_app.prefix_pending,
+                        "stop command prefix activation",
+                    )
+                    await pilot.press("x")
+                    await wait_for_confirmation_button()
+
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline and stop_app.client is None:
                     await pilot.pause(0.1)
@@ -1219,7 +1231,7 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
 
                 # The default action is cancel. Confirm the dialog opened from
                 # the real UI command and that cancellation leaves the PTY alive.
-                await pilot.press("ctrl+g", "x")
+                await send_stop_prefix_command()
                 assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
                 await pilot.pause(1.2)
                 assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
@@ -1244,8 +1256,7 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                     mismatch_finished.set()
 
                 stop_app._finish_stop = record_mismatch_completion
-                await pilot.press("ctrl+g", "x")
-                await wait_for_confirmation_button()
+                await send_stop_prefix_command()
                 await pilot.click("#confirm-stop")
                 await asyncio.wait_for(mismatch_finished.wait(), timeout=10)
                 await _wait_for_ui_state(
@@ -1268,8 +1279,7 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                     approved_finished.set()
 
                 stop_app._finish_stop = record_approved_completion
-                await pilot.press("ctrl+g", "x")
-                await wait_for_confirmation_button()
+                await send_stop_prefix_command()
                 assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
                 await pilot.click("#confirm-stop")
                 await asyncio.wait_for(approved_finished.wait(), timeout=15)
