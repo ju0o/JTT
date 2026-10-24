@@ -235,9 +235,11 @@ def test_stop_confirmation_defaults_to_cancel_and_revalidates_identity():
             await app._refresh_live()
             await pilot.click("#cancel-stop")
             assert not isinstance(app.screen, ModalScreen)
-            await app._refresh_sessions()
+            # The interval remains scheduled while the modal is open. Once
+            # the modal closes, a later tick must refresh both the cards and
+            # the selected LIVE view without an explicit manual refresh.
+            await pilot.pause(1.1)
             assert registry.list_calls > calls_before_modal_tick
-            await app._refresh_live()
             assert str(app.query_one("#terminal-summary", Static).render()) == "터미널 1개"
             assert "JTT_TEST_READY" in str(app.query_one("#live", Static).render())
             assert registry.stop_calls == []
