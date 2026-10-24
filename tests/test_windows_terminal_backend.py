@@ -90,18 +90,20 @@ def _wait(client, predicate, timeout=15):
 
 
 def _wait_for_raw_output(client, expected: bytes, timeout=15, *, checkpoints=()):
-    """Collect actual ConPTY bytes so command echo cannot satisfy output checks."""
+    """Collect actual ConPTY bytes; console soft-wraps may split output markers."""
     deadline = time.monotonic() + timeout
     output = bytearray()
     last = None
     while time.monotonic() < deadline:
         last = client.poll()
         output.extend(last.output)
-        if expected in output:
+        compact_output = bytes(output).replace(b"\r", b"").replace(b"\n", b"")
+        if expected in compact_output:
             return last, bytes(output)
         time.sleep(0.02)
+    compact_output = bytes(output).replace(b"\r", b"").replace(b"\n", b"")
     seen_checkpoints = tuple(
-        label for label, marker in checkpoints if marker in output
+        label for label, marker in checkpoints if marker in compact_output
     )
     raise AssertionError(
         "PowerShell output marker missing from ConPTY stream: "
@@ -1084,9 +1086,7 @@ def test_native_powershell_prompt_tracks_long_current_location(
             "[Console]::WriteLine('JTT_' + 'WIDTH_' + "
             f"'{nonce}' + '_' + "
             "[Console]::WindowWidth + '_END'); "
-            "try { Set-Location -LiteralPath '"
-            + str(destination).replace("'", "''")
-            + "' -ErrorAction Stop; "
+            f"try {{ Set-Location -LiteralPath '{destination.name}' -ErrorAction Stop; "
             "[Console]::WriteLine('JTT_' + 'PATH_' + "
             f"'{nonce}' + '_' + "
             "'BEGIN'); "
@@ -1104,6 +1104,7 @@ def test_native_powershell_prompt_tracks_long_current_location(
         assert path_end not in verification_command
         assert change_directory_error not in verification_command
         assert verification_complete not in verification_command
+        assert str(destination) not in verification_command
         client.send((verification_command + "\r").encode("utf-8"))
         update, raw_output = _wait_for_raw_output(
             client, verification_complete.encode("ascii"),
@@ -1115,17 +1116,17 @@ def test_native_powershell_prompt_tracks_long_current_location(
                 ("actual_location_output_finished", path_end.encode("ascii")),
             ),
         )
-        assert change_directory_error.encode("ascii") not in raw_output
-        assert width_marker.encode("ascii") in raw_output
-        start_index = raw_output.rfind(path_start.encode("ascii"))
-        end_index = raw_output.find(path_end.encode("ascii"), start_index + len(path_start))
-        assert start_index >= 0 and end_index > start_index
-        raw_location = raw_output[start_index + len(path_start):end_index]
-        path_bytes = str(destination).encode("utf-8")
-        location_without_linebreaks = raw_location.replace(b"\r", b"").replace(
-            b"\n", b"",
+        compact_output = raw_output.replace(b"\r", b"").replace(b"\n", b"")
+        assert change_directory_error.encode("ascii") not in compact_output
+        assert width_marker.encode("ascii") in compact_output
+        start_index = compact_output.rfind(path_start.encode("ascii"))
+        end_index = compact_output.find(
+            path_end.encode("ascii"), start_index + len(path_start),
         )
-        assert path_bytes in location_without_linebreaks
+        assert start_index >= 0 and end_index > start_index
+        raw_location = compact_output[start_index + len(path_start):end_index]
+        path_bytes = str(destination).encode("utf-8")
+        assert path_bytes in raw_location
 
         expected_prompt = _expected_prompt_path(destination, columns)
         def path_prompt_observed(item):
