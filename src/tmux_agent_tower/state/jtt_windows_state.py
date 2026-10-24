@@ -57,7 +57,13 @@ def validate_private_file(path: Path, error_type: Type[RuntimeError], *,
 
 
 def validate_new_private_file(path: Path, error_type: Type[RuntimeError]) -> None:
-    """Verify a newly created file inherited the private parent DACL."""
+    """Pin and verify the current-user ACL on a file created exclusively by JTT."""
+    try:
+        from ..terminal.windows_manager import _private_acl
+
+        _private_acl(Path(path), directory=False, apply=True)
+    except Exception as exc:
+        raise error_type("JTT state file cannot be secured") from exc
     validate_private_file(path, error_type)
 
 

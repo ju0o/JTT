@@ -121,18 +121,16 @@ def _open_windows_lock(path: Path, error_type: Type[RuntimeError]) -> int:
         if (attributes & getattr(win32con, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
                 or attributes & win32con.FILE_ATTRIBUTE_DIRECTORY):
             raise error_type("The JTT state lock is not a regular file")
-        from .jtt_windows_state import validate_private_file
+        from .jtt_windows_state import validate_new_private_file, validate_private_file
         if created:
             # New files inherit the private directory DACL, but an elevated
             # Windows process may assign a different owner. Pin the new file
             # to the current user's SID before accepting it. Existing files
             # are never repaired here: an unsafe existing lock remains a
             # fail-closed error.
-            from ..terminal.windows_manager import _private_acl
-
-            _private_acl(path, directory=False, apply=True)
-
-        validate_private_file(path, error_type)
+            validate_new_private_file(path, error_type)
+        else:
+            validate_private_file(path, error_type)
         raw_handle = handle.Detach()
         handle = None
         try:
