@@ -15,6 +15,7 @@ from textual.widgets import Button, Static
 
 import ju0_terminal_tower  # noqa: F401 - activates the guarded product namespace
 from ju0_terminal_tower.state.jtt_layouts import JTTLayoutStore
+from ju0_terminal_tower.state.jtt_work_kits import JTTWorkKitStore
 from ju0_terminal_tower.state.jtt_workspaces import JTTWorkspaceStore
 from ju0_terminal_tower.terminal.manager import (
     TerminalCell,
@@ -810,6 +811,61 @@ def test_saved_workspace_selection_rejects_changed_snapshot(tmp_path):
             assert app.selected_id == identity.session_id
             assert registry.create_count == 0
             assert "changed" in app._notice
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (160, 44)])
+def test_work_kit_archive_tab_previews_templates_without_running_or_writing(tmp_path, size):
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        layout_store = JTTLayoutStore(workspace_store.root)
+        work_kit_store = JTTWorkKitStore(workspace_store.root)
+        workspace_store.set_terminal_ids(
+            workspace_store.DEFAULT_ID, [identity.session_id],
+        )
+        kit = work_kit_store.create_kit(
+            "API review", "Template only", [
+                {"name": "Server", "role": "개발", "working_directory": "C:/work/api"},
+                {"name": "Checks", "role": "검증", "working_directory": None},
+            ],
+        )
+        workspace_bytes = workspace_store.path.read_bytes()
+        kit_bytes = work_kit_store.path.read_bytes()
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+            work_kit_store=work_kit_store,
+        )
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id,
+                "initial terminal observation before Work Kit preview",
+            )
+            await pilot.click("#workspace-picker")
+            await pilot.click("#tab-work-kits")
+            await pilot.click("#work-kit-choice-0")
+
+            screen = app.screen
+            preview = screen.query_one("#work-kit-preview", Static).render()
+            preview_text = getattr(preview, "plain", str(preview))
+            assert "API review" in preview_text
+            assert "Template only" in preview_text
+            assert "Server" in preview_text and "C:/work/api" in preview_text
+            assert "실행되지 않습니다" in preview_text
+            assert screen.query_one("#open-saved-workspace", Button).has_class(
+                "archive-hidden"
+            )
+            assert screen.query_one("#work-kit-preview-only", Button).disabled
+            assert not screen.query_one("#work-kit-list").has_class("archive-hidden")
+            assert screen.query_one("#saved-workspace-list").has_class("archive-hidden")
+            assert registry.create_count == 0
+            assert all(not client.lease and client.acquire_calls == 0
+                       and not client.sent and not client.resizes
+                       for client in registry.clients)
+            assert workspace_store.path.read_bytes() == workspace_bytes
+            assert work_kit_store.path.read_bytes() == kit_bytes
 
     asyncio.run(scenario())
 

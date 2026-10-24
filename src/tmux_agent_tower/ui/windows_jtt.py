@@ -31,6 +31,7 @@ from ..state.jtt_workspaces import (
     WorkspaceStoreError,
     default_jtt_root,
 )
+from ..state.jtt_work_kits import JTTWorkKitStore, WorkKitStoreError
 from .windows_mini_live import WindowsMiniLiveSampler, identity_key as _mini_identity_key
 
 
@@ -210,31 +211,45 @@ class CreateWindowScreen(ModalScreen[Optional[str]]):
 
 
 class SavedWorkspaceScreen(ModalScreen[Optional[dict]]):
-    """Choose a saved workspace snapshot without starting or restoring a PTY."""
+    """Browse saved references and Work Kit templates without starting a PTY."""
 
     CSS = """
     SavedWorkspaceScreen { align: center middle; background: $background 70%; }
     #saved-workspace-dialog { width: 92%; height: 88%; border: round $primary;
                               background: $surface; padding: 1; }
+    #archive-tabs { height: 3; }
+    #archive-tabs Button { width: 1fr; margin-right: 1; }
     #saved-workspace-body { height: 1fr; }
     #saved-workspace-list { width: 42%; height: 1fr; border: round #355d68; padding: 0 1; }
+    #work-kit-list { width: 42%; height: 1fr; border: round #355d68; padding: 0 1; }
     #saved-workspace-preview { width: 1fr; height: 1fr; border: round #355d68; padding: 1; }
+    #work-kit-preview { width: 1fr; height: 1fr; border: round #355d68; padding: 1; }
     #saved-workspace-actions { height: 3; align-horizontal: right; }
     #saved-workspace-actions Button { margin-left: 1; }
     .saved-workspace-choice { width: 100%; height: 3; margin-bottom: 1; }
+    .work-kit-choice { width: 100%; height: 3; margin-bottom: 1; }
+    .archive-hidden { display: none; }
     """
 
     def __init__(self, records: list[dict], sessions: dict[str, TerminalIdentity],
-                 selected_id: str):
+                 selected_id: str, work_kits: list[dict] | tuple[dict, ...] = (),
+                 work_kit_error: bool = False):
         super().__init__()
         self.records = tuple(dict(item) for item in records)
         self.sessions = dict(sessions)
         self.selected_id = selected_id
+        self.work_kits = tuple(dict(item) for item in work_kits)
+        self.work_kit_error = work_kit_error
+        self.active_tab = "saved"
+        self.selected_work_kit_id = self.work_kits[0]["id"] if self.work_kits else None
 
     def compose(self) -> ComposeResult:
         selected = self._selected_record()
         with Vertical(id="saved-workspace-dialog"):
-            yield Static("작업 불러오기 · 저장한 작업공간", classes="panel-title")
+            yield Static("보관함", classes="panel-title")
+            with Horizontal(id="archive-tabs"):
+                yield Button("저장한 작업", id="tab-saved-workspaces", variant="primary")
+                yield Button("Work Kit", id="tab-work-kits")
             with Horizontal(id="saved-workspace-body"):
                 with ScrollableContainer(id="saved-workspace-list"):
                     for index, record in enumerate(self.records):
@@ -250,10 +265,34 @@ class SavedWorkspaceScreen(ModalScreen[Optional[dict]]):
                             variant="primary" if record["id"] == self.selected_id else "default",
                         )
                 yield Static(self._preview_text(selected), id="saved-workspace-preview")
+                with ScrollableContainer(id="work-kit-list", classes="archive-hidden"):
+                    if self.work_kit_error:
+                        yield Static("Work Kit 데이터를 읽을 수 없습니다. 저장 작업은 계속 사용할 수 있습니다.")
+                    elif not self.work_kits:
+                        yield Static("저장된 Work Kit이 없습니다.")
+                    else:
+                        for index, kit in enumerate(self.work_kits):
+                            label = Text(
+                                f"{kit['name']}\n템플릿 · 터미널 {len(kit['terminals'])}개"
+                            )
+                            yield Button(
+                                label,
+                                id=f"work-kit-choice-{index}",
+                                classes="work-kit-choice",
+                                variant="primary" if kit["id"] == self.selected_work_kit_id else "default",
+                            )
+                yield Static(
+                    self._work_kit_preview_text(self._selected_work_kit()),
+                    id="work-kit-preview", classes="archive-hidden",
+                )
             with Horizontal(id="saved-workspace-actions"):
                 yield Button("취소", id="cancel-saved-workspace")
                 yield Button(
                     "선택한 작업공간 열기", id="open-saved-workspace", variant="primary",
+                )
+                yield Button(
+                    "Work Kit 미리보기만 · 실행 안 함", id="work-kit-preview-only",
+                    disabled=True, classes="archive-hidden",
                 )
 
     def on_mount(self) -> None:
@@ -266,7 +305,11 @@ class SavedWorkspaceScreen(ModalScreen[Optional[dict]]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
-        if button_id.startswith("saved-workspace-choice-"):
+        if button_id == "tab-saved-workspaces":
+            self._activate_tab("saved")
+        elif button_id == "tab-work-kits":
+            self._activate_tab("work-kit")
+        elif button_id.startswith("saved-workspace-choice-") and self.active_tab == "saved":
             try:
                 index = int(button_id.rsplit("-", 1)[1])
                 record = self.records[index]
@@ -283,7 +326,21 @@ class SavedWorkspaceScreen(ModalScreen[Optional[dict]]):
             self.query_one("#saved-workspace-preview", Static).update(
                 self._preview_text(record)
             )
-        elif button_id == "open-saved-workspace":
+        elif button_id.startswith("work-kit-choice-") and self.active_tab == "work-kit":
+            try:
+                index = int(button_id.rsplit("-", 1)[1])
+                kit = self.work_kits[index]
+            except (ValueError, IndexError):
+                return
+            self.selected_work_kit_id = kit["id"]
+            for choice_index, choice in enumerate(self.work_kits):
+                self.query_one(f"#work-kit-choice-{choice_index}", Button).variant = (
+                    "primary" if choice["id"] == self.selected_work_kit_id else "default"
+                )
+            self.query_one("#work-kit-preview", Static).update(
+                self._work_kit_preview_text(kit)
+            )
+        elif button_id == "open-saved-workspace" and self.active_tab == "saved":
             self.open_selected()
         elif button_id == "cancel-saved-workspace":
             self.dismiss(None)
@@ -300,6 +357,36 @@ class SavedWorkspaceScreen(ModalScreen[Optional[dict]]):
     def _selected_record(self) -> dict | None:
         return next((item for item in self.records
                      if item["id"] == self.selected_id), None)
+
+    def _selected_work_kit(self) -> dict | None:
+        return next((item for item in self.work_kits
+                     if item["id"] == self.selected_work_kit_id), None)
+
+    def _activate_tab(self, tab: str) -> None:
+        self.active_tab = tab
+        saved_active = tab == "saved"
+        for selector in ("#saved-workspace-list", "#saved-workspace-preview",
+                         "#open-saved-workspace"):
+            widget = self.query_one(selector)
+            widget.set_class(not saved_active, "archive-hidden")
+        for selector in ("#work-kit-list", "#work-kit-preview", "#work-kit-preview-only"):
+            widget = self.query_one(selector)
+            widget.set_class(saved_active, "archive-hidden")
+        self.query_one("#tab-saved-workspaces", Button).variant = (
+            "primary" if saved_active else "default"
+        )
+        self.query_one("#tab-work-kits", Button).variant = (
+            "default" if saved_active else "primary"
+        )
+        if saved_active:
+            selected = next((index for index, item in enumerate(self.records)
+                             if item["id"] == self.selected_id), None)
+            target = (self.query_one(f"#saved-workspace-choice-{selected}", Button)
+                      if selected is not None else self.query_one("#tab-saved-workspaces", Button))
+        else:
+            target = (self.query_one("#work-kit-choice-0", Button) if self.work_kits
+                      else self.query_one("#tab-work-kits", Button))
+        target.focus()
 
     def _preview_text(self, record: dict | None) -> Text:
         if record is None:
@@ -326,6 +413,21 @@ class SavedWorkspaceScreen(ModalScreen[Optional[dict]]):
             output.append(f"• {name}: {label}\n")
         output.append("\n선택만으로 셸이나 PTY를 실행하지 않습니다.\n", style="dim")
         output.append("현재 Supervisor의 세션 신원을 다시 확인한 뒤 연결합니다.", style="dim")
+        return output
+
+    def _work_kit_preview_text(self, kit: dict | None) -> Text:
+        if kit is None:
+            message = ("Work Kit 데이터를 읽을 수 없습니다."
+                       if self.work_kit_error else "Work Kit을 선택하세요.")
+            return Text(message, style="dim")
+        output = Text(f"{kit['name']}\n", style="bold #75d9d0")
+        if kit["description"]:
+            output.append(kit["description"] + "\n")
+        output.append(f"템플릿 배치 · {kit['layout']} · 터미널 {len(kit['terminals'])}개\n\n")
+        for terminal in kit["terminals"]:
+            directory = terminal["working_directory"] or "작업 폴더 미지정"
+            output.append(f"• {terminal['name']} · {terminal['role']}\n  {directory}\n")
+        output.append("\n템플릿 미리보기입니다. 셸·PTY·Agent는 실행되지 않습니다.", style="dim")
         return output
 
 
@@ -372,12 +474,14 @@ class WindowsJTTApp(App[None]):
 
     def __init__(self, registry, *, auto_select: bool = True,
                  workspace_store: JTTWorkspaceStore | None = None,
-                 layout_store: JTTLayoutStore | None = None):
+                 layout_store: JTTLayoutStore | None = None,
+                 work_kit_store: JTTWorkKitStore | None = None):
         super().__init__()
         self.registry = registry
         self.auto_select = auto_select
         self.workspace_store = workspace_store
         self.layout_store = layout_store
+        self.work_kit_store = work_kit_store
         self.workspace_id = (workspace_store.DEFAULT_ID if workspace_store is not None
                              else "workspace-default")
         self.workspace_name = "내 작업공간"
@@ -1068,10 +1172,22 @@ class WindowsJTTApp(App[None]):
         except Exception as exc:
             self._set_notice(f"저장 작업공간 목록을 읽지 못했습니다: {exc}", 8.0)
             return
+        work_kits = []
+        work_kit_error = False
+        if self.work_kit_store is not None:
+            try:
+                work_kits = await self._backend_call(self.work_kit_store.kits)
+            except WorkKitStoreError:
+                # Work Kit is an optional archive tab. Preserve access to saved
+                # running-session references when only its template file is bad.
+                work_kit_error = True
         if not self._base_widgets_available():
             return
         self.push_screen(
-            SavedWorkspaceScreen(records, self._registry_sessions, self.workspace_id),
+            SavedWorkspaceScreen(
+                records, self._registry_sessions, self.workspace_id,
+                work_kits=work_kits, work_kit_error=work_kit_error,
+            ),
             callback=self._workspace_picker_result,
         )
 
@@ -1703,6 +1819,7 @@ def run_jtt_windows_ui() -> int:
             registry,
             workspace_store=JTTWorkspaceStore(root),
             layout_store=JTTLayoutStore(root),
+            work_kit_store=JTTWorkKitStore(root),
         )
         result = app.run()
         return result if isinstance(result, int) else 0
