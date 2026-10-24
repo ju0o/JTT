@@ -1076,14 +1076,34 @@ def test_native_powershell_prompt_tracks_long_current_location(
         width_marker = f"JTT_WIDTH_{nonce}_{columns}_END"
         rawui_width_marker = f"JTT_RAWUI_{nonce}_{columns}_END"
 
-        # A prompt is rendered immediately before PowerShell begins reading
-        # the next line. Require one real command result as the input-ready
-        # barrier instead of assuming the visible prompt is already readable.
-        ready_marker = _generated_marker(client, "PATH_INPUT_READY")
+        # A screen snapshot can lead the client's output cursor. Use bytes that
+        # are absent from the command as the readiness barrier, then drain
+        # through the prompt before sending another line.
+        ready_nonce = uuid.uuid4().hex[:10]
+        ready_marker = f"JTT_PATH_INPUT_READY_{ready_nonce}_END"
+        ready_command = (
+            "[Console]::WriteLine('JTT_PATH_INPUT_READY_' + '"
+            f"{ready_nonce}" + "' + '_END')"
+        )
+        assert ready_marker not in ready_command
+        client.send((ready_command + "\r").encode("ascii"))
+        _ready_output_update, ready_output = _wait_for_raw_output(
+            client, ready_marker.encode("ascii"),
+            checkpoints=(("ready_command_echo", ready_command.encode("ascii")),),
+        )
         start_prompt = _expected_prompt_path(start, 100)
+        start_prompt_bytes = start_prompt.encode("utf-8")
+        ready_compact = ready_output.replace(b"\r", b"").replace(b"\n", b"")
+        if start_prompt_bytes not in ready_compact:
+            _prompt_update, _prompt_output = _wait_for_raw_output(
+                client, start_prompt_bytes,
+                checkpoints=(("ready_marker_output", ready_marker.encode("ascii")),),
+            )
         _wait(
             client,
             lambda item: item.screen is not None
+            and item.synced and not item.more
+            and item.sequence == item.snapshot_sequence
             and _screen_contains_after(item.screen, ready_marker, start_prompt),
         )
 
