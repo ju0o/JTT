@@ -1131,7 +1131,8 @@ def test_native_powershell_prompt_tracks_long_current_location(
             and _screen_contains_after(item.screen, ready_marker, location_command),
         )
         assert _screen_contains_after(typed_line.screen, ready_marker, location_command)
-        assert client.send(b"\r") == 1
+        # Use the Windows console line terminator after the per-key writes.
+        assert client.send(b"\r\n") == 2
 
         initial_width_prompt = _expected_prompt_path(destination, 100)
         prompt_bytes = initial_width_prompt.encode("utf-8")
