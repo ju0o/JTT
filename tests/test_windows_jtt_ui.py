@@ -203,7 +203,12 @@ def test_card_switch_releases_previous_lease_and_stale_identity_hides_screen():
         registry = FakeRegistry([first, second])
         app = WindowsJTTApp(registry)
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause(0.15)
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while (app._busy or app.selected_id != first.session_id
+                   or app.client is None):
+                if asyncio.get_running_loop().time() >= deadline:
+                    pytest.fail("initial terminal selection did not become ready")
+                await asyncio.sleep(0.01)
             assert app.selected_id == first.session_id
             assert app.client is not None
             await app.enter_input_mode()
@@ -260,6 +265,133 @@ def test_exited_live_observation_clears_right_and_mini_card_screen():
             assert "STALE_CARD" not in card.label.plain
             assert len(client.sent) == sent_before
             assert len(client.resizes) == resizes_before
+
+    asyncio.run(scenario())
+
+
+def test_mini_live_skips_detached_cards_after_window_creation(tmp_path):
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        workspace_store.set_terminal_ids(
+            workspace_store.DEFAULT_ID, [identity.session_id]
+        )
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store,
+            layout_store=JTTLayoutStore(workspace_store.root),
+        )
+        # Drive refreshes explicitly so the test can place the missing-widget
+        # boundary deterministically instead of depending on interval timing.
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(160, 44)) as pilot:
+            await pilot.pause(0.05)
+            await pilot.click("#new-window")
+            await pilot.press("enter")
+            await pilot.pause(0.05)
+            assert app.selected_window_id != "window-default"
+            cards = app.query_one("#terminal-cards")
+            await cards.remove()
+
+            sampler = app._mini_sampler
+            assert sampler is not None
+            sampler.take = lambda: None
+            sampler.submit = lambda *_args, **_kwargs: pytest.fail(
+                "Mini LIVE must not submit observations without its card view"
+            )
+            await app._refresh_mini_live()
+
+    asyncio.run(scenario())
+
+
+def test_unmount_stops_refresh_timers_and_closes_mini_sampler():
+    class TimerProbe:
+        def __init__(self, timer):
+            self.timer = timer
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+            self.timer.stop()
+
+    async def scenario():
+        app = WindowsJTTApp(FakeRegistry([_identity(1), _identity(2)]), auto_select=False)
+        timers = []
+        set_interval = app.set_interval
+        submit_calls = []
+
+        def track_interval(*args, **kwargs):
+            timer = set_interval(*args, **kwargs)
+            probe = TimerProbe(timer)
+            timers.append(probe)
+            return probe
+
+        app.set_interval = track_interval
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.05)
+            sampler = app._mini_sampler
+            assert sampler is not None
+            sampler.submit = lambda *_args, **_kwargs: submit_calls.append("submit") or True
+            await app._refresh_mini_live()
+            assert submit_calls == ["submit"]
+        assert len(timers) == 3
+        assert all(timer.stopped for timer in timers), (
+            f"closing={app._mini_live_stopping}, stopped={[timer.stopped for timer in timers]}, "
+            f"remaining={len(app._refresh_timers)}"
+        )
+        assert app._mini_sampler is None
+        assert sampler._stopping
+        assert not sampler._thread.is_alive()
+        await app._refresh_mini_live()
+        assert submit_calls == ["submit"]
+
+    asyncio.run(scenario())
+
+
+def test_mini_live_render_aborts_when_cards_detach_during_unmount():
+    async def scenario():
+        identity = _identity(1)
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(
+            stop=lambda: None
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.05)
+            cards = app.query_one("#terminal-cards")
+            sampler = app._mini_sampler
+            assert sampler is not None
+            sample = {
+                "session_id": identity.session_id,
+                "identity": _mini_identity_key(identity),
+                "sequence": 1,
+                "screen": _screen("FRESH_MINI_SAMPLE"),
+                "synced": True,
+            }
+            sampler.take = lambda: ((app._mini_scope(), [sample]))
+            submits = []
+            sampler.submit = lambda *_args, **_kwargs: submits.append(True) or True
+
+            removing = asyncio.Event()
+            resume_render = asyncio.Event()
+            remove_children = cards.remove_children
+
+            async def pause_after_detaching_children():
+                await remove_children()
+                removing.set()
+                await resume_render.wait()
+
+            cards.remove_children = pause_after_detaching_children
+            app._card_signature = None
+            refresh = asyncio.create_task(app._refresh_mini_live())
+            await asyncio.wait_for(removing.wait(), timeout=1.0)
+
+            # Simulate the shutdown latch and detach the view while its
+            # renderer is suspended between clearing and remounting widgets.
+            app._stop_refresh_timers()
+            await cards.remove()
+            resume_render.set()
+            await asyncio.wait_for(refresh, timeout=1.0)
+            assert submits == []
 
     asyncio.run(scenario())
 

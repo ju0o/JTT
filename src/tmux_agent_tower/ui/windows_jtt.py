@@ -13,10 +13,13 @@ import sys
 import time
 from typing import Any, Optional
 
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
+from textual.css.query import NoMatches
+from textual.dom import NoScreen
 from textual.screen import ModalScreen
+from textual.widget import MountError, Widget
 from textual.widgets import Button, Input, Static
 from rich.style import Style
 from rich.text import Text
@@ -278,6 +281,8 @@ class WindowsJTTApp(App[None]):
         self._card_signature = None
         self._cards_render_lock = asyncio.Lock()
         self._mini_sampler: WindowsMiniLiveSampler | None = None
+        self._refresh_timers: list[Any] = []
+        self._mini_live_stopping = False
         self._mini_cache: dict[str, tuple[tuple, int, float, TerminalScreen]] = {}
         self._right_observation: tuple[tuple, int, float, TerminalScreen] | None = None
         self._mini_last_submit = 0.0
@@ -305,21 +310,42 @@ class WindowsJTTApp(App[None]):
         yield Static("탐색 · Ctrl+G n 새 터미널 · Tab 패널 이동 · Enter 입력 · Ctrl+G d 분리", id="statusline")
 
     async def on_mount(self) -> None:
+        self._mini_live_stopping = False
         self._mini_sampler = WindowsMiniLiveSampler()
-        self.set_interval(1.0, self._refresh_sessions)
-        self.set_interval(0.2, self._refresh_live)
-        self.set_interval(0.25, self._refresh_mini_live)
+        self._refresh_timers = [
+            self.set_interval(1.0, self._refresh_sessions),
+            self.set_interval(0.2, self._refresh_live),
+            self.set_interval(0.25, self._refresh_mini_live),
+        ]
         await self._refresh_sessions()
 
     async def on_unmount(self) -> None:
+        self._stop_refresh_timers()
+        sampler, self._mini_sampler = self._mini_sampler, None
+        if sampler is not None:
+            sampler.close()
         await self._close_selected_client()
-        if self._mini_sampler is not None:
-            self._mini_sampler.close()
-            self._mini_sampler = None
+
+    def _stop_refresh_timers(self) -> None:
+        self._mini_live_stopping = True
+        timers, self._refresh_timers = self._refresh_timers, []
+        for timer in timers:
+            timer.stop()
 
     async def _backend_call(self, function, *args, **kwargs):
         async with self._io_lock:
             return await asyncio.to_thread(lambda: function(*args, **kwargs))
+
+    def _base_widgets_available(self) -> bool:
+        try:
+            screen = self.screen
+        except (NoScreen, ScreenStackError):
+            return False
+        return (
+            not self._mini_live_stopping and self.is_mounted
+            and screen.is_attached and screen.is_parent_active
+            and not isinstance(screen, ModalScreen)
+        )
 
     def _set_notice(self, text: str, duration: float = 4.0) -> None:
         self._notice = str(text)
@@ -327,7 +353,7 @@ class WindowsJTTApp(App[None]):
         self._update_status()
 
     def _update_status(self) -> None:
-        if not self.is_mounted:
+        if not self._base_widgets_available():
             return
         if self._notice and asyncio.get_running_loop().time() < self._notice_until:
             message = self._notice
@@ -356,17 +382,23 @@ class WindowsJTTApp(App[None]):
         # Session refresh updates widgets on the base screen. Like LIVE
         # refresh, defer it while a modal owns the active screen so polling
         # cannot query or mutate the hidden widget tree.
-        if self._busy or isinstance(self.screen, ModalScreen):
+        if not self._base_widgets_available() or self._busy:
             return
         try:
             values = await self._backend_call(self.registry.list_sessions)
+            if not self._base_widgets_available():
+                return
         except Exception as exc:
+            if not self._base_widgets_available():
+                return
             self._registry_sessions = {}
             self.sessions = {}
             self._mini_cache.clear()
             self._right_observation = None
             await self._close_selected_client()
             self.selected_identity = None
+            if not self._base_widgets_available():
+                return
             self._clear_live("Supervisor 연결 실패 · 세션 목록을 읽을 수 없습니다.")
             self._set_notice(f"Supervisor 연결 실패: {exc}", 8.0)
             await self._render_cards()
@@ -377,8 +409,12 @@ class WindowsJTTApp(App[None]):
         )}
         try:
             await self._apply_window_projection()
+            if not self._base_widgets_available():
+                return
             self._prune_mini_cache()
         except Exception as exc:
+            if not self._base_widgets_available():
+                return
             self.sessions = {}
             self._mini_cache.clear()
             self._right_observation = None
@@ -386,6 +422,8 @@ class WindowsJTTApp(App[None]):
             self.selected_id = None
             self.selected_identity = None
             self.input_mode = False
+            if not self._base_widgets_available():
+                return
             self._clear_live("Window 저장 상태를 확인할 수 없습니다.")
             self._set_notice(f"Window 목록 연결 실패: {exc}", 8.0)
             await self._render_windows()
@@ -475,12 +513,16 @@ class WindowsJTTApp(App[None]):
         }
 
     async def _render_windows(self) -> None:
-        if not self.is_mounted:
+        if not self._base_widgets_available():
             return
         container = self.query_one("#window-list", ScrollableContainer)
         await container.remove_children()
+        if not self._base_widgets_available() or not container.is_attached:
+            return
         if not self.windows:
-            await container.mount(Static("Window가 없습니다.", id="empty-windows"))
+            await self._mount_if_active(
+                container, Static("Window가 없습니다.", id="empty-windows")
+            )
             return
         for window in self.windows:
             selected = window["id"] == self.selected_window_id
@@ -491,7 +533,10 @@ class WindowsJTTApp(App[None]):
                 classes="window-item selected" if selected else "window-item",
                 variant="primary" if selected else "default",
             )
-            await container.mount(button)
+            if not await self._mount_if_active(container, button):
+                return
+        if not self._base_widgets_available() or not container.is_attached:
+            return
         self.query_one("#current-window", Static).update(
             next(item["name"] for item in self.windows
                  if item["id"] == self.selected_window_id)
@@ -502,11 +547,35 @@ class WindowsJTTApp(App[None]):
         # frame. Serialize widget-tree replacement so one renderer cannot
         # detach a row while another is mounting its card buttons.
         async with self._cards_render_lock:
-            if not self.is_mounted:
+            if not self._base_widgets_available():
                 return
-            await self._render_cards_serial()
+            container = self._mini_cards_container()
+            if container is None:
+                return
+            await self._render_cards_serial(container)
 
-    async def _render_cards_serial(self) -> None:
+    def _widget_render_active(self, parent: Widget) -> bool:
+        return (
+            self._base_widgets_available() and parent.is_attached
+        )
+
+    async def _mount_if_active(self, parent: Widget, *children: Widget) -> bool:
+        if not self._widget_render_active(parent):
+            return False
+        try:
+            await parent.mount(*children)
+        except MountError:
+            # A render may already be awaiting Textual's mount message when
+            # shutdown detaches its parent. Ignore that lifecycle race only;
+            # a MountError on a still-mounted screen remains a real failure.
+            if not self._widget_render_active(parent):
+                return False
+            raise
+        return self._widget_render_active(parent)
+
+    async def _render_cards_serial(self, container: ScrollableContainer) -> None:
+        if not self._widget_render_active(container):
+            return
         values = list(self.sessions.values())
         now = time.monotonic()
         signature = tuple(
@@ -518,11 +587,17 @@ class WindowsJTTApp(App[None]):
         if signature == self._card_signature:
             return
         self._card_signature = signature
-        container = self.query_one("#terminal-cards", ScrollableContainer)
         await container.remove_children()
+        if not self._widget_render_active(container):
+            return
         if not values:
-            await container.mount(Static("이 Window에는 터미널이 없습니다.\n"
-                                         "+ 새 터미널을 선택하면 PTY가 생성됩니다."))
+            await self._mount_if_active(
+                container,
+                Static("이 Window에는 터미널이 없습니다.\n"
+                       "+ 새 터미널을 선택하면 PTY가 생성됩니다."),
+            )
+            if not self._widget_render_active(container):
+                return
             self.query_one("#terminal-summary", Static).update("터미널 0개")
             return
         self.query_one("#terminal-summary", Static).update(f"터미널 {len(values)}개")
@@ -533,7 +608,8 @@ class WindowsJTTApp(App[None]):
         for start in range(0, len(values), 2):
             row = Horizontal(classes="card-row")
             row.styles.height = card_height
-            await container.mount(row)
+            if not await self._mount_if_active(container, row):
+                return
             for identity in values[start:start + 2]:
                 selected = identity.session_id == self.selected_id
                 state = self._state_label(identity.state)
@@ -551,7 +627,8 @@ class WindowsJTTApp(App[None]):
                     variant="primary" if selected else "default",
                 )
                 button.styles.height = card_height
-                await row.mount(button)
+                if not await self._mount_if_active(row, button):
+                    return
 
     def _mini_signature(self, identity: TerminalIdentity, now: float) -> tuple:
         entry = self._mini_cache.get(identity.session_id)
@@ -580,10 +657,20 @@ class WindowsJTTApp(App[None]):
                 or self._right_observation[0] != _mini_identity_key(self.selected_identity))):
             self._right_observation = None
 
-    def _visible_mini_targets(self) -> tuple[TerminalIdentity, ...]:
-        if not self.is_mounted:
-            return ()
-        container = self.query_one("#terminal-cards", ScrollableContainer)
+    def _mini_cards_container(self) -> ScrollableContainer | None:
+        if not self._base_widgets_available():
+            return None
+        try:
+            return self.query_one("#terminal-cards", ScrollableContainer)
+        except NoMatches:
+            # Textual may detach the card subtree before it dispatches
+            # on_unmount. Only this expected missing-widget case is ignored.
+            return None
+
+    def _visible_mini_targets(self) -> tuple[TerminalIdentity, ...] | None:
+        container = self._mini_cards_container()
+        if container is None:
+            return None
         values = list(self.sessions.values())
         card_height = 5 if self.size.height < 30 else 6
         row_pitch = card_height + 1
@@ -597,8 +684,8 @@ class WindowsJTTApp(App[None]):
                      if item.state == "running" and item.session_id != self.selected_id)[:16]
 
     async def _refresh_mini_live(self) -> None:
-        if (not self.is_mounted or self._busy or self._mini_sampler is None
-                or isinstance(self.screen, ModalScreen)):
+        if (not self._base_widgets_available() or self._busy
+                or self._mini_sampler is None):
             return
         result = self._mini_sampler.take()
         if result is not None:
@@ -617,7 +704,11 @@ class WindowsJTTApp(App[None]):
                         )
                     else:
                         self._mini_cache.pop(identity.session_id, None)
+                if not self._base_widgets_available() or self._mini_cards_container() is None:
+                    return
                 await self._render_cards()
+                if not self._base_widgets_available():
+                    return
 
         now = time.monotonic()
         if self._right_observation is not None and self.selected_identity is not None:
@@ -631,6 +722,8 @@ class WindowsJTTApp(App[None]):
         if now - self._mini_last_submit < 1.0 or self._mini_sampler.busy:
             return
         targets = self._visible_mini_targets()
+        if targets is None or not self._base_widgets_available():
+            return
         if self._mini_sampler.submit(self.registry, self._mini_scope(), targets):
             self._mini_last_submit = now
         await self._render_cards()
@@ -686,67 +779,101 @@ class WindowsJTTApp(App[None]):
             self._update_status()
 
     async def _refresh_live(self) -> None:
-        if not self.is_mounted or self._busy or self.selected_identity is None:
+        identity = self.selected_identity
+        if not self._base_widgets_available() or self._busy or identity is None:
             return
         # Live refresh targets widgets on the base screen. While a modal is
         # active Textual scopes App.query_one() to that modal, so polling must
         # pause until the confirmation flow returns to the terminal screen.
-        if isinstance(self.screen, ModalScreen):
-            return
-        if self.selected_identity.state != "running":
-            if self.client is not None:
+        if identity.state != "running":
+            if self.client is not None and _same_identity(identity, self.client.identity):
                 await self._close_selected_client()
+            if not self._selection_matches(identity):
+                return
             self.input_mode = False
             self._right_observation = None
-            self._mini_cache.pop(self.selected_identity.session_id, None)
-            self._clear_live(self._state_label(self.selected_identity.state))
+            self._mini_cache.pop(identity.session_id, None)
+            if not self._base_widgets_available():
+                return
+            self._clear_live(self._state_label(identity.state))
             self._update_status()
             return
+        client = self.client
         try:
-            if self.client is None:
-                self.client = await self._backend_call(
-                    self.registry.connect, self.selected_identity.session_id
-                )
-            if not _same_identity(self.selected_identity, self.client.identity):
+            if client is None:
+                client = await self._backend_call(self.registry.connect, identity.session_id)
+                if not self._base_widgets_available():
+                    await self._backend_call(client.close)
+                    return
+                if not self._selection_matches(identity) or self.client is not None:
+                    await self._backend_call(client.close)
+                    return
+                self.client = client
+            if not _same_identity(identity, client.identity):
                 raise TerminalError("terminal identity changed")
-            observation = await self._backend_call(self.client.observe)
-            if (observation.session_id != self.selected_identity.session_id
-                    or observation.generation != self.selected_identity.generation
-                    or observation.shell_pid != self.selected_identity.shell_pid):
+            observation = await self._backend_call(client.observe)
+            if not self._base_widgets_available():
+                return
+            if not self._selection_matches(identity) or self.client is not client:
+                return
+            if (observation.session_id != identity.session_id
+                    or observation.generation != identity.generation
+                    or observation.shell_pid != identity.shell_pid):
                 raise TerminalError("terminal observation identity changed")
             if observation.state != "running":
                 self.input_mode = False
-                if self.client.lease:
-                    await self._backend_call(self.client.release)
+                if client.lease:
+                    await self._backend_call(client.release)
                 self._right_observation = None
-                self._mini_cache.pop(self.selected_identity.session_id, None)
+                self._mini_cache.pop(identity.session_id, None)
+                if not self._base_widgets_available():
+                    return
+                if not self._selection_matches(identity) or self.client is not client:
+                    return
                 self._clear_live(self._state_label(observation.state))
                 await self._render_cards()
                 self._update_status()
             elif not observation.synced or observation.screen is None:
                 self.input_mode = False
                 self._right_observation = None
-                self._mini_cache.pop(self.selected_identity.session_id, None)
-                if self.client.lease:
-                    await self._backend_call(self.client.release)
+                self._mini_cache.pop(identity.session_id, None)
+                if client.lease:
+                    await self._backend_call(client.release)
+                if not self._base_widgets_available():
+                    return
+                if not self._selection_matches(identity) or self.client is not client:
+                    return
                 self._clear_live("화면 재동기화 중 · 입력 차단")
             else:
                 self._render_terminal(observation.screen)
                 self._right_observation = (
-                    _mini_identity_key(self.selected_identity), observation.sequence,
+                    _mini_identity_key(identity), observation.sequence,
                     time.monotonic(), observation.screen,
                 )
                 self._update_status()
         except Exception as exc:
+            # A refresh can finish after a card/window switch. Never let an
+            # older observation close the new card's client or overwrite its
+            # LIVE state.
+            if not self._selection_matches(identity) or self.client is not client:
+                return
+            if not self._base_widgets_available():
+                return
             await self._close_selected_client()
             self.input_mode = False
-            if self.selected_identity is not None:
-                self._mini_cache.pop(self.selected_identity.session_id, None)
+            self._mini_cache.pop(identity.session_id, None)
             self._right_observation = None
-            if not self.is_mounted:
+            if not self._base_widgets_available():
                 return
             self._clear_live("세션 확인 실패 · 오래된 출력을 숨겼습니다.")
             self._set_notice(f"입력을 차단했습니다: {exc}", 8.0)
+
+    def _selection_matches(self, identity: TerminalIdentity) -> bool:
+        return (
+            self.selected_id == identity.session_id
+            and self.selected_identity is not None
+            and _same_identity(self.selected_identity, identity)
+        )
 
     def _render_terminal(self, screen: TerminalScreen) -> None:
         view = self.query_one("#live", TerminalView)
@@ -756,7 +883,7 @@ class WindowsJTTApp(App[None]):
         view.update(_screen_text(screen, columns, lines))
 
     def _clear_live(self, message: str = "") -> None:
-        if self.is_mounted:
+        if self._base_widgets_available():
             self.query_one("#live", TerminalView).update(Text(message or "터미널을 선택하세요.", style="dim"))
 
     async def _prompt_create_window(self) -> None:
@@ -1245,6 +1372,7 @@ class WindowsJTTApp(App[None]):
         await self._close_selected_client()
         self.input_mode = False
         self.prefix_pending = False
+        self._mini_live_stopping = True
         self.exit()
 
     async def _stop_selected(self) -> None:
