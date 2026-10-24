@@ -1075,51 +1075,27 @@ def test_native_powershell_prompt_tracks_long_current_location(
         nonce = identity.session_id[:10]
         width_marker = f"JTT_WIDTH_{nonce}_{columns}_END"
         rawui_width_marker = f"JTT_RAWUI_{nonce}_{columns}_END"
-        path_start = f"JTT_PATH_{nonce}_BEGIN"
-        path_end = f"JTT_PATH_{nonce}_END"
-        # First verify a real location change and Get-Location result at the
-        # startup size. Then resize and issue a separate, short width query.
-        # The hosted runner echoed the full prior compound input but only
-        # emitted its first statement, so keep the two observations isolated.
-        location_command = (
-            f"Set-Location -LiteralPath '{destination.name}';"
-            "[Console]::WriteLine('JTT_'+'PATH_'+"
-            f"'{nonce}'+'_BEGIN');"
-            "[Console]::WriteLine((Get-Location).Path);"
-            "[Console]::WriteLine('JTT_'+'PATH_'+"
-            f"'{nonce}'+'_END')"
-        )
-        assert path_start not in location_command
-        assert path_end not in location_command
+        location_command = f"Set-Location -LiteralPath '{destination.name}'"
         assert str(destination) not in location_command
         client.send((location_command + "\r").encode("utf-8"))
-        update, raw_output = _wait_for_raw_output(
-            client, path_end.encode("ascii"),
-            checkpoints=(
-                ("actual_location_output_started", path_start.encode("ascii")),
-                ("actual_destination_path", str(destination).encode("utf-8")),
-            ),
-            screen_checkpoints=(
-                ("actual_location_output_finished", path_end),
-            ),
-        )
-        compact_output = raw_output.replace(b"\r", b"").replace(b"\n", b"")
-        start_index = compact_output.rfind(path_start.encode("ascii"))
-        end_index = compact_output.find(
-            path_end.encode("ascii"), start_index + len(path_start),
-        )
-        assert start_index >= 0 and end_index > start_index
-        raw_location = compact_output[start_index + len(path_start):end_index]
-        path_bytes = str(destination).encode("utf-8")
-        assert path_bytes in raw_location
 
         initial_width_prompt = _expected_prompt_path(destination, 100)
         update = _wait(
             client,
             lambda item: item.screen is not None
-            and _screen_contains_after(item.screen, path_end, initial_width_prompt),
+            and _screen_contains_after(item.screen, location_command, initial_width_prompt),
         )
         assert initial_width_prompt in _compact_screen_text(update.screen)
+
+        # Get-Location prints the full resolved path. It is not present in the
+        # command echo or abbreviated prompt, so this checks actual execution.
+        path_bytes = str(destination).encode("utf-8")
+        client.send(b"[Console]::WriteLine((Get-Location).Path)\r")
+        _path_update, path_output = _wait_for_raw_output(
+            client, path_bytes,
+            checkpoints=(("actual_destination_path", path_bytes),),
+        )
+        assert path_bytes in path_output.replace(b"\r", b"").replace(b"\n", b"")
 
         client.resize(columns, lines)
         resized = _wait(
