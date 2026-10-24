@@ -1087,16 +1087,12 @@ def test_native_powershell_prompt_tracks_long_current_location(
             and _screen_contains_after(item.screen, ready_marker, start_prompt),
         )
 
-        # Submit the location change and its independent result in one PTY
-        # write. The hosted failure observed command echo but no execution
-        # output, so echo is not used as an intermediate submission barrier.
-        # The resolved path is not in the command, proving PowerShell executed
-        # Set-Location rather than merely echoing input.
-        location_command = (
-            f"Set-Location -LiteralPath '{destination.name}'; "
-            "[Console]::WriteLine((Get-Location).Path)"
-        )
+        # Keep the submitted line short enough not to wrap from the prompt into
+        # a second input row. The resolved path is not in the command, proving
+        # PowerShell executed the location change rather than echoing input.
+        location_command = f"cd '{destination.name}'; $PWD.Path"
         assert str(destination) not in location_command
+        assert len(start_prompt) + 2 + len(location_command) < 100
         client.send((location_command + "\r").encode("utf-8"))
 
         initial_width_prompt = _expected_prompt_path(destination, 100)
@@ -1108,6 +1104,10 @@ def test_native_powershell_prompt_tracks_long_current_location(
             checkpoints=(
                 ("location_command_echo", location_command.encode("utf-8")),
                 ("location_error", b"Set-Location :"),
+            ),
+            screen_checkpoints=(
+                ("resolved_location", str(destination)),
+                ("resolved_prompt", initial_width_prompt),
             ),
         )
         compact_path_output = path_output.replace(b"\r", b"").replace(b"\n", b"")
