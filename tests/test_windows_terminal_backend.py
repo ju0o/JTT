@@ -1072,27 +1072,16 @@ def test_native_powershell_prompt_tracks_long_current_location(
         )
         assert _expected_prompt_path(start, 100) in _compact_screen_text(initial.screen)
         assert client.acquire()
-        client.resize(columns, lines)
-        resized = _wait(
-            client,
-            lambda update: update.screen is not None
-            and (update.columns, update.lines) == (columns, lines),
-        )
-        assert (resized.columns, resized.lines) == (columns, lines)
-
         nonce = identity.session_id[:10]
         width_marker = f"JTT_WIDTH_{nonce}_{columns}_END"
+        rawui_width_marker = f"JTT_RAWUI_{nonce}_{columns}_END"
         path_start = f"JTT_PATH_{nonce}_BEGIN"
         path_end = f"JTT_PATH_{nonce}_END"
-        # Keep this one input deliberately short: hosted ConPTY could echo the
-        # tail of the earlier long compound line while only executing its
-        # first statement. Runtime markers are assembled from fragments so an
-        # echoed command cannot satisfy the result checks.
-        verification_command = (
-            "[Console]::Write('JTT_'+'WIDTH_'+"
-            f"'{nonce}'+'_');"
-            "[Console]::Write([Console]::WindowWidth);"
-            "[Console]::Write('_END');"
+        # First verify a real location change and Get-Location result at the
+        # startup size. Then resize and issue a separate, short width query.
+        # The hosted runner echoed the full prior compound input but only
+        # emitted its first statement, so keep the two observations isolated.
+        location_command = (
             f"Set-Location -LiteralPath '{destination.name}';"
             "[Console]::Write('JTT_'+'PATH_'+"
             f"'{nonce}'+'_BEGIN');"
@@ -1100,15 +1089,13 @@ def test_native_powershell_prompt_tracks_long_current_location(
             "[Console]::Write('JTT_'+'PATH_'+"
             f"'{nonce}'+'_END')"
         )
-        assert width_marker not in verification_command
-        assert path_start not in verification_command
-        assert path_end not in verification_command
-        assert str(destination) not in verification_command
-        client.send((verification_command + "\r").encode("utf-8"))
+        assert path_start not in location_command
+        assert path_end not in location_command
+        assert str(destination) not in location_command
+        client.send((location_command + "\r").encode("utf-8"))
         update, raw_output = _wait_for_raw_output(
             client, path_end.encode("ascii"),
             checkpoints=(
-                ("resized_console_width", width_marker.encode("ascii")),
                 ("actual_location_output_started", path_start.encode("ascii")),
                 ("actual_destination_path", str(destination).encode("utf-8")),
             ),
@@ -1117,7 +1104,6 @@ def test_native_powershell_prompt_tracks_long_current_location(
             ),
         )
         compact_output = raw_output.replace(b"\r", b"").replace(b"\n", b"")
-        assert width_marker.encode("ascii") in compact_output
         start_index = compact_output.rfind(path_start.encode("ascii"))
         end_index = compact_output.find(
             path_end.encode("ascii"), start_index + len(path_start),
@@ -1127,23 +1113,56 @@ def test_native_powershell_prompt_tracks_long_current_location(
         path_bytes = str(destination).encode("utf-8")
         assert path_bytes in raw_location
 
+        initial_width_prompt = _expected_prompt_path(destination, 100)
+        update = _wait(
+            client,
+            lambda item: item.screen is not None
+            and _screen_contains_after(item.screen, path_end, initial_width_prompt),
+        )
+        assert initial_width_prompt in _compact_screen_text(update.screen)
+
+        client.resize(columns, lines)
+        resized = _wait(
+            client,
+            lambda item: item.screen is not None
+            and (item.columns, item.lines) == (columns, lines),
+        )
+        assert (resized.columns, resized.lines) == (columns, lines)
+
+        width_command = (
+            "[Console]::WriteLine('JTT_'+'WIDTH_'+"
+            f"'{nonce}'+'_'+"
+            "[Console]::WindowWidth+'_END');"
+            "[Console]::WriteLine('JTT_'+'RAWUI_'+"
+            f"'{nonce}'+'_'+"
+            "$Host.UI.RawUI.WindowSize.Width+'_END')"
+        )
+        assert width_marker not in width_command
+        assert rawui_width_marker not in width_command
+        client.send((width_command + "\r").encode("ascii"))
+        _width_update, width_output = _wait_for_raw_output(
+            client, rawui_width_marker.encode("ascii"),
+        )
+        compact_width_output = width_output.replace(b"\r", b"").replace(b"\n", b"")
+        assert width_marker.encode("ascii") in compact_width_output
+        assert rawui_width_marker.encode("ascii") in compact_width_output
+
         expected_prompt = _expected_prompt_path(destination, columns)
         def path_prompt_observed(item):
             if item.screen is None:
                 return False
             compact = _compact_screen_text(item.screen)
-            end_index = compact.rfind(path_end)
-            prompt_index = compact.find(expected_prompt, end_index + len(path_end))
-            return (
-                width_marker in compact and path_start in compact
-                and end_index >= 0 and prompt_index >= 0
-            )
+            width_index = compact.rfind(width_marker)
+            prompt_index = compact.find(expected_prompt, width_index + len(width_marker))
+            # The full destination was already asserted from actual command
+            # output before resizing. A resize may reflow/evict those older
+            # cells, so only require the post-resize width and prompt here.
+            return width_index >= 0 and prompt_index >= 0
 
         update = _wait(client, path_prompt_observed)
         display = _compact_screen_text(update.screen)
         assert (update.columns, update.lines) == (columns, lines)
 
-        assert path_start in display and path_end in display
         assert expected_prompt in display
     finally:
         client.close()
