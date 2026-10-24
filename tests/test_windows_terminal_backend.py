@@ -1083,10 +1083,10 @@ def test_native_powershell_prompt_tracks_long_current_location(
         # emitted its first statement, so keep the two observations isolated.
         location_command = (
             f"Set-Location -LiteralPath '{destination.name}';"
-            "[Console]::Write('JTT_'+'PATH_'+"
+            "[Console]::WriteLine('JTT_'+'PATH_'+"
             f"'{nonce}'+'_BEGIN');"
-            "[Console]::Write((Get-Location).Path);"
-            "[Console]::Write('JTT_'+'PATH_'+"
+            "[Console]::WriteLine((Get-Location).Path);"
+            "[Console]::WriteLine('JTT_'+'PATH_'+"
             f"'{nonce}'+'_END')"
         )
         assert path_start not in location_command
