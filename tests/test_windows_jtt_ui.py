@@ -6,11 +6,13 @@ import asyncio
 import importlib
 import io
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 from textual.css.query import NoMatches
+from textual.events import Paste
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
@@ -240,6 +242,116 @@ def test_card_switch_releases_previous_lease_and_stale_identity_hides_screen():
             assert "신원" in str(app.query_one("#live", Static).render())
 
     asyncio.run(scenario())
+
+
+def test_right_paste_uses_only_current_verified_input_lease():
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        registry = FakeRegistry([first, second])
+        app = WindowsJTTApp(registry)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == first.session_id,
+                "initial selected terminal",
+            )
+            await app.enter_input_mode()
+            client = app.client
+            assert client is not None and client.lease
+
+            text = "Write-Output '붙여넣기 JTT'"
+            event = Paste(text)
+            await app.on_paste(event)
+            assert event._stop_propagation
+            assert client.sent == [text.encode("utf-8")]
+
+            # A lost lease, stale identity, or a session outside the selected
+            # Window must block delivery without touching another client.
+            client.sent.clear()
+            client.lease = False
+            await app.on_paste(Paste("must-not-send-without-lease"))
+            assert client.sent == []
+
+            await app.enter_input_mode()
+            client = app.client
+            assert client is not None and client.lease
+            client.lease = True
+            changed = TerminalIdentity(**{**first.__dict__, "generation": "f" * 32})
+            app.sessions[first.session_id] = changed
+            await app.on_paste(Paste("must-not-send-stale-generation"))
+            assert client.sent == []
+
+            app.sessions[first.session_id] = first
+            await app.enter_input_mode()
+            client = app.client
+            assert client is not None and client.lease
+            app.sessions.pop(first.session_id)
+            await app.on_paste(Paste("must-not-send-outside-window"))
+            assert client.sent == []
+            assert registry.clients[0].sent == []
+
+            app.sessions[first.session_id] = first
+            await app.enter_input_mode()
+            client = app.client
+            assert client is not None and client.lease
+            client.sent.clear()
+            await app.on_paste(Paste("x" * 8193))
+            assert client.sent == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (160, 44)])
+def test_terminal_card_identity_text_does_not_wrap(size):
+    async def scenario():
+        identity = _identity(1)
+        identity = TerminalIdentity(**{
+            **identity.__dict__, "name": "Long PowerShell Session Name",
+        })
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        async with app.run_test(size=size):
+            button = app.query_one("#terminal-" + identity.session_id, Button)
+            assert button.styles.text_wrap == "nowrap"
+            assert button.styles.text_overflow == "ellipsis"
+
+    asyncio.run(scenario())
+
+
+def test_windows_client_send_does_not_advance_output_cursor(tmp_path):
+    from ju0_terminal_tower.terminal.windows_manager import TerminalClient
+
+    identity = _identity(1)
+    client = TerminalClient.__new__(TerminalClient)
+    client._closed = False
+    client.identity = identity
+    client._client_id = "client"
+    client._output_cursor = 7
+    client.synced = True
+    client.lease = True
+    client.state = "running"
+    client._root = tmp_path
+    calls = []
+
+    reported_sequences = iter((9, 12))
+
+    def request(operation, **fields):
+        calls.append((operation, fields))
+        assert operation == "input"
+        assert fields["after"] == 7
+        return {
+            "ok": True, "session_id": identity.session_id,
+            "generation": identity.generation, "sequence": next(reported_sequences),
+            "synced": True, "renderer_available": True,
+            "written": len(b"x"), "lease": True,
+        }
+
+    client._request = request
+    assert client.send(b"x") == 1
+    assert client.send(b"y") == 1
+    assert len(calls) == 2
+    assert [call[0] for call in calls] == ["input", "input"]
+    assert [call[1]["after"] for call in calls] == [7, 7]
+    assert client._output_cursor == 7
+    assert client.synced and client.lease
 
 
 def test_exited_live_observation_clears_right_and_mini_card_screen():
@@ -920,6 +1032,85 @@ def test_vt_screen_text_keeps_wide_glyph_cells_adjacent():
     assert rendered.startswith("JTT 한글 OK")
 
 
+def test_vt_screen_text_coalesces_uniform_cell_styles_for_large_screens():
+    from ju0_terminal_tower.ui.windows_jtt import _screen_text
+
+    columns, lines = 160, 44
+    row = tuple(TerminalCell(" ", "default", "default", False, False, False,
+                             False, False, False) for _ in range(columns))
+    screen = TerminalScreen(tuple(row for _ in range(lines)), 0, 0, True)
+
+    rendered = _screen_text(screen, columns, lines)
+
+    assert len(rendered.plain) == columns * lines + lines - 1
+    # A cell-by-cell renderer produced thousands of Rich spans here. The
+    # cursor contributes one distinct style span; the remaining cells share
+    # one cached style per row at most.
+    assert len(rendered.spans) <= lines + 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
+def test_native_windows_paste_event_enters_selected_powershell(tmp_path):
+    from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry
+
+    def screen_text(screen):
+        return "\n".join("".join(cell.text for cell in row) for row in screen.rows)
+
+    registry = TerminalRegistry(root=tmp_path / "isolated-jtt" / "terminals")
+    app = WindowsJTTApp(registry)
+    created = {}
+
+    async def scenario():
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.click("#new-terminal")
+            await _wait_for_ui_state(
+                pilot, lambda: app.input_mode and app.client is not None,
+                "new isolated PowerShell input lease",
+            )
+            identity = app.selected_identity
+            assert identity is not None and app.client is not None and app.client.lease
+            created["identity"] = identity
+            nonce = identity.session_id[:8]
+            expected = f"JTT_{nonce}"
+            command = f"[Console]::WriteLine('JTT_' + '{nonce}')"
+            assert expected not in command
+            client = app.client
+            assert client is not None
+            paste_bytes = command.encode("utf-8")
+            paste_written = threading.Event()
+            original_send = client.send
+
+            def record_paste(data):
+                written = original_send(data)
+                if data == paste_bytes:
+                    paste_written.set()
+                return written
+
+            client.send = record_paste
+            assert app.post_message(Paste(command))
+            assert await asyncio.to_thread(paste_written.wait, 10), (
+                "Textual Paste event was not sent to the active ConPTY lease"
+            )
+            await app._send_bytes(b"\r")
+            await _wait_for_ui_state(
+                pilot,
+                lambda: app._right_observation is not None
+                and expected in screen_text(app._right_observation[3]),
+                "PowerShell executed pasted command",
+                timeout=20,
+            )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        identity = created.get("identity")
+        if identity is not None:
+            registry.stop(
+                identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
 def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path):
     from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry, _process_facts
@@ -1009,6 +1200,18 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                         pilot, is_mounted, "stop confirmation screen mount",
                     )
 
+                async def send_stop_prefix_command():
+                    # Textual dispatches the prefix binding through its event
+                    # loop. Wait for the observable pending state before the
+                    # command key so repeated modal cycles cannot race it.
+                    await pilot.press("ctrl+g")
+                    await _wait_for_ui_state(
+                        pilot, lambda: stop_app.prefix_pending,
+                        "stop command prefix activation",
+                    )
+                    await pilot.press("x")
+                    await wait_for_confirmation_button()
+
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline and stop_app.client is None:
                     await pilot.pause(0.1)
@@ -1032,11 +1235,15 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
 
                 # The default action is cancel. Confirm the dialog opened from
                 # the real UI command and that cancellation leaves the PTY alive.
-                await pilot.press("ctrl+g", "x")
+                await send_stop_prefix_command()
                 assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
                 await pilot.pause(1.2)
                 assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
                 await pilot.click("#cancel-stop")
+                await _wait_for_ui_state(
+                    pilot, lambda: not isinstance(stop_app.screen, ModalScreen),
+                    "cancelled stop modal dismissal",
+                )
                 await assert_still_running(identity)
 
                 # Simulate a stale card identity without changing persisted
@@ -1053,10 +1260,13 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                     mismatch_finished.set()
 
                 stop_app._finish_stop = record_mismatch_completion
-                await pilot.press("ctrl+g", "x")
-                await wait_for_confirmation_button()
+                await send_stop_prefix_command()
                 await pilot.click("#confirm-stop")
                 await asyncio.wait_for(mismatch_finished.wait(), timeout=10)
+                await _wait_for_ui_state(
+                    pilot, lambda: not isinstance(stop_app.screen, ModalScreen),
+                    "stale stop modal dismissal",
+                )
                 remaining = registry.list_sessions()
                 assert len(remaining) == 1 and _same_identity(identity, remaining[0])
                 await assert_still_running(identity)
@@ -1073,8 +1283,7 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                     approved_finished.set()
 
                 stop_app._finish_stop = record_approved_completion
-                await pilot.press("ctrl+g", "x")
-                await wait_for_confirmation_button()
+                await send_stop_prefix_command()
                 assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
                 await pilot.click("#confirm-stop")
                 await asyncio.wait_for(approved_finished.wait(), timeout=15)
@@ -1092,3 +1301,130 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
         verify_image=False,
     )
     assert not (shell_alive and shell_created == created["identity"].shell_start)
+
+
+@pytest.mark.parametrize("size", [(80, 24), (160, 44)], ids=("80x24", "160x44"))
+@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
+def test_native_windows_interactive_latency_profile(tmp_path, size):
+    """Report repeatable per-key IPC and screen refresh timings on real ConPTY."""
+    from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry
+
+    root = tmp_path / "isolated-jtt-latency"
+    registry = TerminalRegistry(root=root / "terminals")
+    identities = []
+    workspace_store = JTTWorkspaceStore(root / "workspace")
+    layout_store = JTTLayoutStore(workspace_store.root)
+    app = WindowsJTTApp(
+        registry, workspace_store=workspace_store, layout_store=layout_store,
+    )
+
+    def percentile(values, percent):
+        ordered = sorted(values)
+        return ordered[min(len(ordered) - 1, (len(ordered) * percent + 99) // 100 - 1)]
+
+    def screen_contains(screen, text):
+        return any(text in "".join(cell.text for cell in row) for row in screen.rows)
+
+    async def scenario():
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(
+                pilot,
+                lambda: app.selected_identity is not None and app.client is not None,
+                "first native latency session",
+            )
+            for index, identity in enumerate(identities):
+                if app.selected_id != identity.session_id:
+                    await app._select_session(identity, focus=False)
+                await app.enter_input_mode()
+                client = app.client
+                assert client is not None and client.lease
+
+                requests = []
+                original_request = client._request
+                original_send = client.send
+                original_render = app._render_terminal
+                send_durations = []
+                render_durations = []
+
+                def measured_request(operation, **fields):
+                    started = time.perf_counter()
+                    try:
+                        return original_request(operation, **fields)
+                    finally:
+                        requests.append((operation, (time.perf_counter() - started) * 1000))
+
+                def measured_send(data):
+                    started = time.perf_counter()
+                    try:
+                        return original_send(data)
+                    finally:
+                        send_durations.append((time.perf_counter() - started) * 1000)
+
+                def measured_render(screen):
+                    started = time.perf_counter()
+                    try:
+                        return original_render(screen)
+                    finally:
+                        render_durations.append((time.perf_counter() - started) * 1000)
+
+                client._request = measured_request
+                client.send = measured_send
+                app._render_terminal = measured_render
+                token = f"JTTLAT{index}PROFILE"
+                key_latencies = []
+                screen_started = None
+                for offset, character in enumerate(token):
+                    started = time.perf_counter()
+                    if offset == len(token) - 1:
+                        screen_started = started
+                    await pilot.press(character)
+                    key_latencies.append((time.perf_counter() - started) * 1000)
+
+                await _wait_for_ui_state(
+                    pilot,
+                    lambda: (app._right_observation is not None
+                             and screen_contains(app._right_observation[3], token)),
+                    f"{size[0]}x{size[1]} token echoed by session {index + 1}",
+                    timeout=10,
+                )
+                screen_latency = (time.perf_counter() - screen_started) * 1000
+                counts = {}
+                for operation, _duration in requests:
+                    counts[operation] = counts.get(operation, 0) + 1
+                assert counts.get("poll", 0) == 0
+                assert counts.get("input", 0) == len(token)
+                print(
+                    "JTT_LATENCY_PROFILE "
+                    f"size={size[0]}x{size[1]} terminals=2 session={index + 1} "
+                    f"keys={len(token)} rpc={counts} "
+                    f"request_ms_p50={percentile([item[1] for item in requests], 50):.2f} "
+                    f"send_ms_p50={percentile(send_durations, 50):.2f} "
+                    f"render_ms_p50={percentile(render_durations, 50):.2f} "
+                    f"render_ms_p95={percentile(render_durations, 95):.2f} "
+                    f"key_ms_p50={percentile(key_latencies, 50):.2f} "
+                    f"key_ms_p95={percentile(key_latencies, 95):.2f} "
+                    f"screen_ms={screen_latency:.2f}",
+                    flush=True,
+                )
+                app._render_terminal = original_render
+                client._request = original_request
+                client.send = original_send
+                await app.leave_input_mode()
+
+    try:
+        for name in ("Profile A", "Profile B"):
+            client = registry.create(name)
+            identity = client.identity
+            client.close()
+            identities.append(identity)
+        workspace_store.set_terminal_ids(
+            workspace_store.DEFAULT_ID, [item.session_id for item in identities],
+        )
+        asyncio.run(scenario())
+    finally:
+        for identity in identities:
+            registry.stop(
+                identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+    assert registry.list_sessions() == ()
