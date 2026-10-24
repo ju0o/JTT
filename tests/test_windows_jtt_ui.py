@@ -23,6 +23,7 @@ from ju0_terminal_tower.terminal.manager import (
     TerminalScreen,
 )
 from ju0_terminal_tower.ui.windows_jtt import WindowsJTTApp, _same_identity
+from ju0_terminal_tower.ui.windows_mini_live import identity_key as _mini_identity_key
 
 
 def _screen(text: str = "JTT_TEST_READY") -> TerminalScreen:
@@ -47,15 +48,22 @@ class FakeClient:
         self.closed = False
         self.sent: list[bytes] = []
         self.resizes: list[tuple[int, int]] = []
+        self.acquire_calls = 0
+        self.observation_state = "running"
+        self.screen_text = "SESSION_" + self.identity.session_id[-4:]
 
     def observe(self):
         return TerminalObservation(
             session_id=self.identity.session_id, generation=self.identity.generation,
-            shell_pid=self.identity.shell_pid, sequence=len(self.sent), state="running",
-            synced=True, columns=100, lines=30, screen=_screen(), renderer_state="ready",
+            shell_pid=self.identity.shell_pid, sequence=len(self.sent),
+            state=self.observation_state,
+            synced=True, columns=100, lines=30,
+            screen=_screen(self.screen_text),
+            renderer_state="ready",
         )
 
     def acquire(self):
+        self.acquire_calls += 1
         self.lease = True
         return True
 
@@ -88,7 +96,7 @@ class FakeRegistry:
         self.list_calls += 1
         return tuple(self.sessions)
 
-    def connect(self, session_id):
+    def connect(self, session_id, *, timeout=3.0):
         identity = next(item for item in self.sessions if item.session_id == session_id)
         client = FakeClient(identity)
         self.clients.append(client)
@@ -195,7 +203,12 @@ def test_card_switch_releases_previous_lease_and_stale_identity_hides_screen():
         registry = FakeRegistry([first, second])
         app = WindowsJTTApp(registry)
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause(0.15)
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while (app._busy or app.selected_id != first.session_id
+                   or app.client is None):
+                if asyncio.get_running_loop().time() >= deadline:
+                    pytest.fail("initial terminal selection did not become ready")
+                await asyncio.sleep(0.01)
             assert app.selected_id == first.session_id
             assert app.client is not None
             await app.enter_input_mode()
@@ -214,6 +227,171 @@ def test_card_switch_releases_previous_lease_and_stale_identity_hides_screen():
             assert app.selected_id is None
             assert app.client is None
             assert "신원" in str(app.query_one("#live", Static).render())
+
+    asyncio.run(scenario())
+
+
+def test_exited_live_observation_clears_right_and_mini_card_screen():
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        app = WindowsJTTApp(registry)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.15)
+            client = app.client
+            assert client is not None
+            key = _mini_identity_key(identity)
+            stale_screen = _screen("STALE_CARD")
+            cached = (key, 77, time.monotonic(), stale_screen)
+            app._right_observation = cached
+            app._mini_cache[identity.session_id] = cached
+            app._card_signature = None
+            await app._render_cards()
+            card = app.query_one("#terminal-" + identity.session_id, Button)
+            assert "STALE_CARD" in card.label.plain
+
+            await app.enter_input_mode()
+            assert client.lease
+            sent_before = len(client.sent)
+            resizes_before = len(client.resizes)
+            client.observation_state = "exited"
+            await app._refresh_live()
+
+            assert not app.input_mode
+            assert not client.lease
+            assert app._right_observation is None
+            assert identity.session_id not in app._mini_cache
+            card = app.query_one("#terminal-" + identity.session_id, Button)
+            assert "STALE_CARD" not in card.label.plain
+            assert len(client.sent) == sent_before
+            assert len(client.resizes) == resizes_before
+
+    asyncio.run(scenario())
+
+
+def test_mini_live_skips_detached_cards_after_window_creation(tmp_path):
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        workspace_store.set_terminal_ids(
+            workspace_store.DEFAULT_ID, [identity.session_id]
+        )
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store,
+            layout_store=JTTLayoutStore(workspace_store.root),
+        )
+        # Drive refreshes explicitly so the test can place the missing-widget
+        # boundary deterministically instead of depending on interval timing.
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(160, 44)) as pilot:
+            await pilot.pause(0.05)
+            await pilot.click("#new-window")
+            await pilot.press("enter")
+            await pilot.pause(0.05)
+            assert app.selected_window_id != "window-default"
+            cards = app.query_one("#terminal-cards")
+            await cards.remove()
+
+            sampler = app._mini_sampler
+            assert sampler is not None
+            sampler.take = lambda: None
+            sampler.submit = lambda *_args, **_kwargs: pytest.fail(
+                "Mini LIVE must not submit observations without its card view"
+            )
+            await app._refresh_mini_live()
+
+    asyncio.run(scenario())
+
+
+def test_unmount_stops_refresh_timers_and_closes_mini_sampler():
+    class TimerProbe:
+        def __init__(self, timer):
+            self.timer = timer
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+            self.timer.stop()
+
+    async def scenario():
+        app = WindowsJTTApp(FakeRegistry([_identity(1), _identity(2)]), auto_select=False)
+        timers = []
+        set_interval = app.set_interval
+        submit_calls = []
+
+        def track_interval(*args, **kwargs):
+            timer = set_interval(*args, **kwargs)
+            probe = TimerProbe(timer)
+            timers.append(probe)
+            return probe
+
+        app.set_interval = track_interval
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.05)
+            sampler = app._mini_sampler
+            assert sampler is not None
+            sampler.submit = lambda *_args, **_kwargs: submit_calls.append("submit") or True
+            await app._refresh_mini_live()
+            assert submit_calls == ["submit"]
+        assert len(timers) == 3
+        assert all(timer.stopped for timer in timers), (
+            f"closing={app._mini_live_stopping}, stopped={[timer.stopped for timer in timers]}, "
+            f"remaining={len(app._refresh_timers)}"
+        )
+        assert app._mini_sampler is None
+        assert sampler._stopping
+        assert not sampler._thread.is_alive()
+        await app._refresh_mini_live()
+        assert submit_calls == ["submit"]
+
+    asyncio.run(scenario())
+
+
+def test_mini_live_render_aborts_when_cards_detach_during_unmount():
+    async def scenario():
+        identity = _identity(1)
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(
+            stop=lambda: None
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.05)
+            cards = app.query_one("#terminal-cards")
+            sampler = app._mini_sampler
+            assert sampler is not None
+            sample = {
+                "session_id": identity.session_id,
+                "identity": _mini_identity_key(identity),
+                "sequence": 1,
+                "screen": _screen("FRESH_MINI_SAMPLE"),
+                "synced": True,
+            }
+            sampler.take = lambda: ((app._mini_scope(), [sample]))
+            submits = []
+            sampler.submit = lambda *_args, **_kwargs: submits.append(True) or True
+
+            removing = asyncio.Event()
+            resume_render = asyncio.Event()
+            remove_children = cards.remove_children
+
+            async def pause_after_detaching_children():
+                await remove_children()
+                removing.set()
+                await resume_render.wait()
+
+            cards.remove_children = pause_after_detaching_children
+            app._card_signature = None
+            refresh = asyncio.create_task(app._refresh_mini_live())
+            await asyncio.wait_for(removing.wait(), timeout=1.0)
+
+            # Simulate the shutdown latch and detach the view while its
+            # renderer is suspended between clearing and remounting widgets.
+            app._stop_refresh_timers()
+            await cards.remove()
+            resume_render.set()
+            await asyncio.wait_for(refresh, timeout=1.0)
+            assert submits == []
 
     asyncio.run(scenario())
 
@@ -293,6 +471,114 @@ def test_keyboard_window_switch_keeps_left_focus_and_does_not_acquire_new_lease(
             assert app.client is not None and not app.client.lease
             assert old_client.closed and not old_client.lease
             assert registry.create_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_mini_live_observes_each_card_without_lease_input_or_resize(tmp_path):
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        registry = FakeRegistry([first, second])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        workspace_store.set_terminal_ids(
+            workspace_store.DEFAULT_ID, [first.session_id, second.session_id]
+        )
+        layout_store = JTTLayoutStore(workspace_store.root)
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+        )
+        async with app.run_test(size=(160, 44)) as pilot:
+            visible_targets = app._visible_mini_targets()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and second.session_id not in app._mini_cache:
+                await pilot.pause(0.1)
+            entry = app._mini_cache.get(second.session_id)
+            assert entry is not None, (
+                "non-selected terminal did not receive a Mini LIVE sample; "
+                f"visible={[item.session_id for item in visible_targets]}, "
+                f"clients={[item.identity.session_id for item in registry.clients]}, "
+                f"sampler_busy={app._mini_sampler.busy if app._mini_sampler else None}, "
+                f"mini_last={app._mini_last_submit:.3f}, now={time.monotonic():.3f}, "
+                f"busy={app._busy}, "
+                f"thread_alive={app._mini_sampler._thread.is_alive()}, "
+                f"stopping={app._mini_sampler._stopping}, "
+                f"requests={app._mini_sampler._requests.qsize()}, "
+                f"results={app._mini_sampler._results.qsize()}, "
+                f"window_sessions={list(app.sessions)}"
+            )
+            assert entry[0] == _mini_identity_key(second)
+            await pilot.pause(0.05)
+            assert "SESSION_0002" in app.query_one(
+                "#terminal-" + second.session_id, Button
+            ).label.plain
+            observers = [client for client in registry.clients
+                         if client.identity.session_id == second.session_id]
+            assert observers
+            assert all(not client.lease and client.acquire_calls == 0 for client in observers)
+            assert all(not client.sent and not client.resizes for client in observers)
+            assert registry.create_count == 0
+
+            changed = TerminalIdentity(**{**second.__dict__, "generation": "f" * 32})
+            registry.sessions[1] = changed
+            await app._refresh_sessions()
+            assert second.session_id not in app._mini_cache
+            assert "SESSION_0002" not in app.query_one(
+                "#terminal-" + second.session_id, Button
+            ).label.plain
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_session_and_mini_refreshes_serialize_card_mounts(tmp_path):
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        registry = FakeRegistry([first, second])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        workspace_store.set_terminal_ids(
+            workspace_store.DEFAULT_ID, [first.session_id, second.session_id]
+        )
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store,
+            layout_store=JTTLayoutStore(workspace_store.root),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            container = app.query_one("#terminal-cards")
+            original_remove = container.remove_children
+            first_remove_entered = asyncio.Event()
+            release_first_remove = asyncio.Event()
+            active_removals = 0
+            maximum_active_removals = 0
+
+            async def gated_remove_children(*args, **kwargs):
+                nonlocal active_removals, maximum_active_removals
+                active_removals += 1
+                maximum_active_removals = max(
+                    maximum_active_removals, active_removals,
+                )
+                first_remove_entered.set()
+                try:
+                    await release_first_remove.wait()
+                    return await original_remove(*args, **kwargs)
+                finally:
+                    active_removals -= 1
+
+            container.remove_children = gated_remove_children
+            app._card_signature = None
+            first_render = asyncio.create_task(app._render_cards())
+            await first_remove_entered.wait()
+            app.sessions.pop(second.session_id)
+            second_render = asyncio.create_task(app._render_cards())
+            await asyncio.sleep(0)  # yield one event-loop turn, without timing assumptions
+            assert maximum_active_removals == 1
+            release_first_remove.set()
+            await asyncio.gather(first_render, second_render)
+            buttons = app.query(".terminal-card")
+            assert {button.id for button in buttons} == {
+                "terminal-" + first.session_id,
+            }
+            assert all(button.is_attached for button in buttons)
+            assert maximum_active_removals == 1
+            await pilot.pause(0)
 
     asyncio.run(scenario())
 
@@ -391,7 +677,7 @@ def test_stop_confirmation_defaults_to_cancel_and_revalidates_identity():
             await pilot.pause(1.1)
             assert registry.list_calls > calls_before_modal_tick
             assert str(app.query_one("#terminal-summary", Static).render()) == "터미널 1개"
-            assert "JTT_TEST_READY" in str(app.query_one("#live", Static).render())
+            assert "SESSION_0001" in str(app.query_one("#live", Static).render())
             assert registry.stop_calls == []
             assert registry.sessions == [identity]
 
