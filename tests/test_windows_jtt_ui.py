@@ -49,13 +49,16 @@ class FakeClient:
         self.sent: list[bytes] = []
         self.resizes: list[tuple[int, int]] = []
         self.acquire_calls = 0
+        self.observation_state = "running"
+        self.screen_text = "SESSION_" + self.identity.session_id[-4:]
 
     def observe(self):
         return TerminalObservation(
             session_id=self.identity.session_id, generation=self.identity.generation,
-            shell_pid=self.identity.shell_pid, sequence=len(self.sent), state="running",
+            shell_pid=self.identity.shell_pid, sequence=len(self.sent),
+            state=self.observation_state,
             synced=True, columns=100, lines=30,
-            screen=_screen("SESSION_" + self.identity.session_id[-4:]),
+            screen=_screen(self.screen_text),
             renderer_state="ready",
         )
 
@@ -219,6 +222,44 @@ def test_card_switch_releases_previous_lease_and_stale_identity_hides_screen():
             assert app.selected_id is None
             assert app.client is None
             assert "신원" in str(app.query_one("#live", Static).render())
+
+    asyncio.run(scenario())
+
+
+def test_exited_live_observation_clears_right_and_mini_card_screen():
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        app = WindowsJTTApp(registry)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.15)
+            client = app.client
+            assert client is not None
+            key = _mini_identity_key(identity)
+            stale_screen = _screen("STALE_CARD")
+            cached = (key, 77, time.monotonic(), stale_screen)
+            app._right_observation = cached
+            app._mini_cache[identity.session_id] = cached
+            app._card_signature = None
+            await app._render_cards()
+            card = app.query_one("#terminal-" + identity.session_id, Button)
+            assert "STALE_CARD" in card.label.plain
+
+            await app.enter_input_mode()
+            assert client.lease
+            sent_before = len(client.sent)
+            resizes_before = len(client.resizes)
+            client.observation_state = "exited"
+            await app._refresh_live()
+
+            assert not app.input_mode
+            assert not client.lease
+            assert app._right_observation is None
+            assert identity.session_id not in app._mini_cache
+            card = app.query_one("#terminal-" + identity.session_id, Button)
+            assert "STALE_CARD" not in card.label.plain
+            assert len(client.sent) == sent_before
+            assert len(client.resizes) == resizes_before
 
     asyncio.run(scenario())
 

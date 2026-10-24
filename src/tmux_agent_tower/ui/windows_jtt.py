@@ -718,7 +718,11 @@ class WindowsJTTApp(App[None]):
                 self.input_mode = False
                 if self.client.lease:
                     await self._backend_call(self.client.release)
+                self._right_observation = None
+                self._mini_cache.pop(self.selected_identity.session_id, None)
                 self._clear_live(self._state_label(observation.state))
+                await self._render_cards()
+                self._update_status()
             elif not observation.synced or observation.screen is None:
                 self.input_mode = False
                 self._right_observation = None
