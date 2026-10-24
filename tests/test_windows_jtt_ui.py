@@ -1092,3 +1092,113 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
         verify_image=False,
     )
     assert not (shell_alive and shell_created == created["identity"].shell_start)
+
+
+@pytest.mark.parametrize("size", [(80, 24), (160, 44)], ids=("80x24", "160x44"))
+@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
+def test_native_windows_interactive_latency_profile(tmp_path, size):
+    """Report repeatable per-key IPC and screen refresh timings on real ConPTY."""
+    from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry
+
+    root = tmp_path / "isolated-jtt-latency"
+    registry = TerminalRegistry(root=root / "terminals")
+    identities = []
+    workspace_store = JTTWorkspaceStore(root / "workspace")
+    layout_store = JTTLayoutStore(workspace_store.root)
+    app = WindowsJTTApp(
+        registry, workspace_store=workspace_store, layout_store=layout_store,
+    )
+
+    def percentile(values, percent):
+        ordered = sorted(values)
+        return ordered[min(len(ordered) - 1, (len(ordered) * percent + 99) // 100 - 1)]
+
+    def screen_contains(screen, text):
+        return any(text in "".join(cell.text for cell in row) for row in screen.rows)
+
+    async def scenario():
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(
+                pilot,
+                lambda: app.selected_identity is not None and app.client is not None,
+                "first native latency session",
+            )
+            for index, identity in enumerate(identities):
+                if app.selected_id != identity.session_id:
+                    await app._select_session(identity, focus=False)
+                await app.enter_input_mode()
+                client = app.client
+                assert client is not None and client.lease
+
+                requests = []
+                original_request = client._request
+                original_send = client.send
+                send_durations = []
+
+                def measured_request(operation, **fields):
+                    started = time.perf_counter()
+                    try:
+                        return original_request(operation, **fields)
+                    finally:
+                        requests.append((operation, (time.perf_counter() - started) * 1000))
+
+                def measured_send(data):
+                    started = time.perf_counter()
+                    try:
+                        return original_send(data)
+                    finally:
+                        send_durations.append((time.perf_counter() - started) * 1000)
+
+                client._request = measured_request
+                client.send = measured_send
+                token = f"JTTLAT{index}PROFILE"
+                key_latencies = []
+                screen_started = None
+                for offset, character in enumerate(token):
+                    started = time.perf_counter()
+                    if offset == len(token) - 1:
+                        screen_started = started
+                    await pilot.press(character)
+                    key_latencies.append((time.perf_counter() - started) * 1000)
+
+                await _wait_for_ui_state(
+                    pilot,
+                    lambda: (app._right_observation is not None
+                             and screen_contains(app._right_observation[3], token)),
+                    f"{size[0]}x{size[1]} token echoed by session {index + 1}",
+                    timeout=10,
+                )
+                screen_latency = (time.perf_counter() - screen_started) * 1000
+                counts = {}
+                for operation, _duration in requests:
+                    counts[operation] = counts.get(operation, 0) + 1
+                print(
+                    "JTT_LATENCY_PROFILE "
+                    f"size={size[0]}x{size[1]} terminals=2 session={index + 1} "
+                    f"keys={len(token)} rpc={counts} "
+                    f"request_ms_p50={percentile([item[1] for item in requests], 50):.2f} "
+                    f"send_ms_p50={percentile(send_durations, 50):.2f} "
+                    f"key_ms_p50={percentile(key_latencies, 50):.2f} "
+                    f"key_ms_p95={percentile(key_latencies, 95):.2f} "
+                    f"screen_ms={screen_latency:.2f}",
+                    flush=True,
+                )
+                await app.leave_input_mode()
+
+    try:
+        for name in ("Profile A", "Profile B"):
+            client = registry.create(name)
+            identity = client.identity
+            client.close()
+            identities.append(identity)
+        workspace_store.set_terminal_ids(
+            workspace_store.DEFAULT_ID, [item.session_id for item in identities],
+        )
+        asyncio.run(scenario())
+    finally:
+        for identity in identities:
+            registry.stop(
+                identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+    assert registry.list_sessions() == ()
