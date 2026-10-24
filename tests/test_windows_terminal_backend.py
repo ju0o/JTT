@@ -1049,7 +1049,10 @@ def test_native_powershell_prompt_tracks_long_current_location(
         # though the resolved working directory is over 100 characters.
         command = f"cd '{destination.name}'"
         assert str(destination) not in command
-        client.send((command + "\r").encode("utf-8"))
+        client.send(command.encode("utf-8"))
+        _wait(client, lambda item: item.screen is not None
+              and command in _screen_text(item.screen))
+        client.send(b"\r")
         try:
             update = _wait(
                 client,
@@ -1069,7 +1072,10 @@ def test_native_powershell_prompt_tracks_long_current_location(
         # in the command echo and remains distinct from the shortened prompt.
         query = "pwd"
         assert str(destination) not in query
-        client.send((query + "\r").encode("ascii"))
+        client.send(query.encode("ascii"))
+        _wait(client, lambda item: item.screen is not None
+              and query in _screen_text(item.screen))
+        client.send(b"\r")
         output = _wait(
             client,
             lambda item: item.screen is not None
