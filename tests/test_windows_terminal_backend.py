@@ -1074,6 +1074,8 @@ def test_native_powershell_prompt_tracks_long_current_location(
         width_marker = f"JTT_WIDTH_{nonce}_{columns}_END"
         path_start = f"JTT_PATH_{nonce}_BEGIN"
         path_end = f"JTT_PATH_{nonce}_END"
+        change_directory_error = f"JTT_CD_ERROR_{nonce}_END"
+        verification_complete = f"JTT_VERIFY_COMPLETE_{nonce}_END"
         # A rendered prompt may still be visible while PowerShell is handling
         # a previous command. Keep the resize, location change, and actual
         # command results in one input so no screenshot is used as an input
@@ -1082,28 +1084,38 @@ def test_native_powershell_prompt_tracks_long_current_location(
             "[Console]::WriteLine('JTT_' + 'WIDTH_' + "
             f"'{nonce}' + '_' + "
             "[Console]::WindowWidth + '_END'); "
-            f"Set-Location -LiteralPath '{destination.name}'; "
+            "try { Set-Location -LiteralPath '"
+            + str(destination).replace("'", "''")
+            + "' -ErrorAction Stop; "
             "[Console]::WriteLine('JTT_' + 'PATH_' + "
             f"'{nonce}' + '_' + "
             "'BEGIN'); "
             "[Console]::WriteLine((Get-Location).Path); "
             "[Console]::WriteLine('JTT_' + 'PATH_' + "
             f"'{nonce}' + '_' + "
-            "'END')"
+            "'END') } catch { "
+            "[Console]::WriteLine('JTT_' + 'CD_ERROR_' + "
+            f"'{nonce}' + '_END') }}; "
+            "[Console]::WriteLine('JTT_' + 'VERIFY_COMPLETE_' + "
+            f"'{nonce}' + '_END')"
         )
         assert width_marker not in verification_command
         assert path_start not in verification_command
         assert path_end not in verification_command
-        assert str(destination) not in verification_command
-        client.send((verification_command + "\r").encode("ascii"))
+        assert change_directory_error not in verification_command
+        assert verification_complete not in verification_command
+        client.send((verification_command + "\r").encode("utf-8"))
         update, raw_output = _wait_for_raw_output(
-            client, path_end.encode("ascii"),
+            client, verification_complete.encode("ascii"),
             checkpoints=(
                 ("resized_console_width", width_marker.encode("ascii")),
                 ("actual_location_output_started", path_start.encode("ascii")),
                 ("actual_destination_path", str(destination).encode("utf-8")),
+                ("Set-Location_error", change_directory_error.encode("ascii")),
+                ("actual_location_output_finished", path_end.encode("ascii")),
             ),
         )
+        assert change_directory_error.encode("ascii") not in raw_output
         assert width_marker.encode("ascii") in raw_output
         start_index = raw_output.rfind(path_start.encode("ascii"))
         end_index = raw_output.find(path_end.encode("ascii"), start_index + len(path_start))
