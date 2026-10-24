@@ -1022,11 +1022,17 @@ def test_native_powershell_prompt_tracks_long_current_location(
         )
         assert marker not in command
         client.send((command + "\r").encode("utf-8"))
-        update = _wait(
-            client,
-            lambda item: item.screen is not None
-            and marker in _compact_screen_text(item.screen),
-        )
+        try:
+            update = _wait(
+                client,
+                lambda item: item.screen is not None
+                and marker in _compact_screen_text(item.screen),
+            )
+        except AssertionError as exc:
+            last = client.poll()
+            captured = (_compact_screen_text(last.screen)
+                        if last is not None and last.screen is not None else "<no screen>")
+            raise AssertionError(f"PowerShell path output was not observed; screen={captured!r}") from exc
         display = _compact_screen_text(update.screen)
         assert marker in display
         assert "PS " + str(destination) + ">" in display
