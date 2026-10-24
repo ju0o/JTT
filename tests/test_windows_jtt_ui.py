@@ -274,12 +274,14 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
             command = 'Write-Output "JTT_UI_RESULT_$PID"'
             expected_result = f"JTT_UI_RESULT_{identity.shell_pid}"
             assert expected_result not in command
-            await pilot.press(*list(command))
             assert (app.input_mode and app.client is not None and app.client.lease), (
-                "input lease was lost while entering the command; "
+                "input lease was lost before submitting the command; "
                 f"status={app.query_one('#statusline', Static).render()}"
             )
-            await pilot.press("enter")
+            # Submit the line and CR as one lease-checked UI write. The fake UI
+            # tests separately cover key-to-byte mapping for Enter; this native
+            # check proves PowerShell executed the command, not merely echoed it.
+            await app._send_bytes((command + "\r").encode("utf-8"))
             deadline = time.monotonic() + 20
             rendered = ""
             while time.monotonic() < deadline:
