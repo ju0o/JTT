@@ -391,6 +391,11 @@ class WindowsJTTApp(App[None]):
     async def _refresh_live(self) -> None:
         if not self.is_mounted or self._busy or self.selected_identity is None:
             return
+        # Live refresh targets widgets on the base screen. While a modal is
+        # active Textual scopes App.query_one() to that modal, so polling must
+        # pause until the confirmation flow returns to the terminal screen.
+        if isinstance(self.screen, ModalScreen):
+            return
         if self.selected_identity.state != "running":
             if self.client is not None:
                 await self._close_selected_client()

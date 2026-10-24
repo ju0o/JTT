@@ -223,6 +223,9 @@ def test_stop_confirmation_defaults_to_cancel_and_revalidates_identity():
             await app._stop_selected()
             await pilot.pause(0.05)
             assert app.screen.query_one("#cancel-stop", Button).has_focus
+            # The periodic LIVE poll must not query the hidden base-screen
+            # widget tree while the confirmation modal is active.
+            await app._refresh_live()
             await pilot.click("#cancel-stop")
             await pilot.pause(0.05)
             assert registry.stop_calls == []
