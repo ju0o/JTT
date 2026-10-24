@@ -1087,39 +1087,50 @@ def test_native_powershell_prompt_tracks_long_current_location(
             and _screen_contains_after(item.screen, ready_marker, start_prompt),
         )
 
-        path_marker = f"JTT_PATH_{nonce}_END"
-        location_command = (
-            f"Set-Location -LiteralPath '{destination.name}'; "
-            "[Console]::WriteLine((Get-Location).Path); "
-            f"[Console]::WriteLine('{path_marker}')"
-        )
+        location_command = f"Set-Location -LiteralPath '{destination.name}'"
         assert str(destination) not in location_command
         client.send((location_command + "\r").encode("utf-8"))
 
         initial_width_prompt = _expected_prompt_path(destination, 100)
+        prompt_bytes = initial_width_prompt.encode("utf-8")
+        _prompt_update, prompt_output = _wait_for_raw_output(
+            client,
+            prompt_bytes,
+            checkpoints=(
+                ("location_command_echo", location_command.encode("utf-8")),
+                ("location_error", b"Set-Location :"),
+            ),
+        )
+        compact_prompt_output = prompt_output.replace(b"\r", b"").replace(b"\n", b"")
+        assert prompt_bytes in compact_prompt_output
+
+        # The ConPTY stream proves the new prompt was emitted. Check its
+        # screen-cell rendering separately so output and pyte state cannot be
+        # confused when diagnosing a failure.
+        update = _wait(
+            client,
+            lambda item: item.screen is not None
+            and _screen_contains_after(item.screen, location_command, initial_width_prompt),
+        )
+        assert initial_width_prompt in _compact_screen_text(update.screen)
+
+        # Get-Location prints the full resolved path. It is not present in the
+        # input command or abbreviated prompt, so this proves PowerShell
+        # actually changed directory independently of the echoed command.
+        path_command = "[Console]::WriteLine((Get-Location).Path)"
+        assert str(destination) not in path_command
+        client.send((path_command + "\r").encode("utf-8"))
         path_bytes = str(destination).encode("utf-8")
         _path_update, path_output = _wait_for_raw_output(
             client,
             path_bytes,
             checkpoints=(
-                ("location_command_echo", location_command.encode("utf-8")),
-                ("location_marker", path_marker.encode("ascii")),
+                ("path_command_echo", path_command.encode("utf-8")),
                 ("location_error", b"Set-Location :"),
             ),
         )
         compact_path_output = path_output.replace(b"\r", b"").replace(b"\n", b"")
         assert path_bytes in compact_path_output
-        assert path_marker.encode("ascii") in compact_path_output
-
-        # Raw ConPTY output proves PowerShell changed directory and reported
-        # the resolved path. Independently require pyte to render that result
-        # followed by the prompt for the new location.
-        update = _wait(
-            client,
-            lambda item: item.screen is not None
-            and _screen_contains_after(item.screen, path_marker, initial_width_prompt),
-        )
-        assert initial_width_prompt in _compact_screen_text(update.screen)
 
         client.resize(columns, lines)
         resized = _wait(
