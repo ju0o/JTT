@@ -1251,7 +1251,10 @@ def test_native_windows_paste_event_enters_selected_powershell(tmp_path):
 @pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
 def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
         tmp_path, monkeypatch):
-    import ju0_terminal_tower.ui.windows_jtt as windows_ui
+    # Patch the module that defines the already-imported app class. Earlier
+    # tests may also import the shared namespace under its legacy name, so a
+    # package-name import here can target a second module object in a full run.
+    windows_ui = importlib.import_module(WindowsJTTApp.__module__)
     from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry
 
     registry = TerminalRegistry(root=tmp_path / "isolated-copy-home" / "terminals")

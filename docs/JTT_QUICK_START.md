@@ -75,9 +75,11 @@ In input mode, Ctrl+G Ctrl+G sends literal Ctrl+G; Ctrl+G Ctrl+] sends literal C
 This matters for programs that reserve those keys. User-configured bindings may differ: follow the displayed hint, not this default-key table.
 See [binding configuration and protocol limits](JTT_TERMINAL_SUPPORT.md).
 
+In the native Windows UI, Ctrl+G c explicitly copies the visible contents of the entire RIGHT viewport to the system clipboard; it does not copy a selected text range. JTT does not read or watch the clipboard. Windows Terminal Shift+drag selection and Ctrl+Shift+C are host-terminal behaviors and remain a separate Windows Human Gate check.
+
 JTT is not a sandbox. Shells run with normal user permissions and login configuration.
 No automatic AI login/model calls are part of JTT.
 The renderer is not a complete xterm emulator; advanced keys, mouse reporting, bracketed paste and arbitrary terminal queries have limits.
-Clipboard and actual WSL restart recovery remain unverified.
+Windows Terminal host selection/Ctrl+Shift+C behavior and actual WSL restart recovery remain unverified.
 
 [Updates / rollback](JTT_UPDATING.md) · [Legacy Tower](TOWER_LEGACY.md)
