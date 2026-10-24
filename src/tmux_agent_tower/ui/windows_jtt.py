@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
-from typing import Any
+from typing import Any, Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -166,7 +166,7 @@ class ConfirmStopScreen(ModalScreen[bool]):
             self.dismiss(False)
 
 
-class CreateWindowScreen(ModalScreen[str | None]):
+class CreateWindowScreen(ModalScreen[Optional[str]]):
     """Collect a logical Window name; it never creates a PTY."""
 
     CSS = """
