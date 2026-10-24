@@ -1007,7 +1007,7 @@ def test_native_powershell_prompt_tracks_long_current_location(
     from tmux_agent_tower.terminal import TerminalRegistry
 
     start = tmp_path / "isolated-start"
-    destination = tmp_path / "dest"
+    destination = start / "dest"
     start.mkdir()
     destination.mkdir(parents=True)
     assert len(str(destination)) > 100
