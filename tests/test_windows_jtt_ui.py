@@ -652,6 +652,134 @@ def test_ui_logical_window_creation_is_blank_and_does_not_start_a_terminal(tmp_p
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("size", [(80, 24), (160, 44)])
+def test_saved_workspace_open_reconnects_exact_live_reference_without_lease_or_write(
+    tmp_path, size,
+):
+    async def scenario():
+        current = _identity(1)
+        saved_identity = _identity(2)
+        registry = FakeRegistry([current, saved_identity])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        layout_store = JTTLayoutStore(workspace_store.root)
+        workspace_store.set_terminal_ids(workspace_store.DEFAULT_ID, [current.session_id])
+        saved = workspace_store.create_workspace("Review session")
+        workspace_store.set_terminal_ids(saved["id"], [saved_identity.session_id])
+        saved_window = layout_store.create_window(
+            saved["id"], "folder-default", "Review",
+        )
+        layout_store.move_terminal(
+            saved["id"], saved_identity.session_id, saved_window["id"],
+            [saved_identity.session_id],
+        )
+        workspace_bytes = workspace_store.path.read_bytes()
+        layout_bytes = layout_store.path.read_bytes()
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+        )
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause(0.15)
+            assert app.selected_id == current.session_id
+            await app.enter_input_mode()
+            previous_client = app.client
+            assert previous_client is not None and previous_client.lease
+
+            await pilot.click("#workspace-picker")
+            assert isinstance(app.screen, ModalScreen)
+            assert not previous_client.lease
+            assert app.screen.query_one("#saved-workspace-preview", Static)
+            await pilot.click("#saved-workspace-choice-1")
+            await pilot.click("#open-saved-workspace")
+            await pilot.pause(0.2)
+
+            assert app.workspace_id == saved["id"]
+            assert app.workspace_name == saved["name"]
+            assert app.selected_window_id == saved_window["id"]
+            assert app.selected_id == saved_identity.session_id
+            assert app.selected_identity == saved_identity
+            assert app.client is not None
+            assert app.client.identity == saved_identity
+            assert not app.input_mode and not app.client.lease
+            assert app.client.acquire_calls == 0
+            assert previous_client.closed and not previous_client.lease
+            assert registry.create_count == 0
+            assert workspace_store.path.read_bytes() == workspace_bytes
+            assert layout_store.path.read_bytes() == layout_bytes
+
+    asyncio.run(scenario())
+
+
+def test_saved_workspace_missing_and_exited_refs_clear_old_live_without_fake_restore(tmp_path):
+    async def scenario():
+        current = _identity(1)
+        exited = _identity(2, state="exited")
+        registry = FakeRegistry([current, exited])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        layout_store = JTTLayoutStore(workspace_store.root)
+        workspace_store.set_terminal_ids(workspace_store.DEFAULT_ID, [current.session_id])
+        saved = workspace_store.create_workspace("Old task")
+        workspace_store.set_terminal_ids(saved["id"], [exited.session_id, "missing-session"])
+        workspace_bytes = workspace_store.path.read_bytes()
+        layout_bytes = layout_store.path.read_bytes() if layout_store.path.exists() else None
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.15)
+            assert app._right_observation is not None
+            assert "SESSION_0001" in str(app.query_one("#live", Static).render())
+            await pilot.click("#workspace-picker")
+            await pilot.click("#saved-workspace-choice-1")
+            await pilot.click("#open-saved-workspace")
+            await pilot.pause(0.2)
+
+            assert app.workspace_id == saved["id"]
+            assert app.selected_id is None
+            assert app.client is None
+            assert app._right_observation is None
+            assert current.session_id not in app._mini_cache
+            assert app.sessions == {exited.session_id: exited}
+            assert app._missing_terminal_refs == {"missing-session"}
+            live_text = str(app.query_one("#live", Static).render())
+            assert "SESSION_0001" not in live_text
+            card_text = str(app.query_one("#terminal-" + exited.session_id, Button).label)
+            assert "셸 종료" in card_text
+            assert registry.create_count == 0
+            assert workspace_store.path.read_bytes() == workspace_bytes
+            if layout_bytes is None:
+                assert not layout_store.path.exists()
+            else:
+                assert layout_store.path.read_bytes() == layout_bytes
+
+    asyncio.run(scenario())
+
+
+def test_saved_workspace_selection_rejects_changed_snapshot(tmp_path):
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        layout_store = JTTLayoutStore(workspace_store.root)
+        saved = workspace_store.create_workspace("Snapshot target")
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.1)
+            await pilot.click("#workspace-picker")
+            workspace_store.set_terminal_ids(saved["id"], [identity.session_id])
+            await pilot.click("#saved-workspace-choice-1")
+            await pilot.click("#open-saved-workspace")
+            await pilot.pause(0.2)
+
+            assert app.workspace_id == workspace_store.DEFAULT_ID
+            assert app.selected_id == identity.session_id
+            assert registry.create_count == 0
+            assert "changed" in app._notice
+
+    asyncio.run(scenario())
+
+
 def test_stop_confirmation_defaults_to_cancel_and_revalidates_identity():
     async def scenario():
         identity = _identity(1)
