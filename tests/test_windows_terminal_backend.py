@@ -1089,7 +1089,8 @@ def test_native_powershell_prompt_tracks_long_current_location(
 
         location_command = f"Set-Location -LiteralPath '{destination.name}'"
         assert str(destination) not in location_command
-        client.send((location_command + "\r").encode("utf-8"))
+        client.send(location_command.encode("utf-8"))
+        client.send(b"\r")
 
         initial_width_prompt = _expected_prompt_path(destination, 100)
         prompt_bytes = initial_width_prompt.encode("utf-8")
@@ -1119,7 +1120,8 @@ def test_native_powershell_prompt_tracks_long_current_location(
         # actually changed directory independently of the echoed command.
         path_command = "[Console]::WriteLine((Get-Location).Path)"
         assert str(destination) not in path_command
-        client.send((path_command + "\r").encode("utf-8"))
+        client.send(path_command.encode("utf-8"))
+        client.send(b"\r")
         path_bytes = str(destination).encode("utf-8")
         _path_update, path_output = _wait_for_raw_output(
             client,
