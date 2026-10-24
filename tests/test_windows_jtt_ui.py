@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from textual.css.query import NoMatches
+from textual.events import Paste
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
@@ -238,6 +239,90 @@ def test_card_switch_releases_previous_lease_and_stale_identity_hides_screen():
             assert app.selected_id is None
             assert app.client is None
             assert "신원" in str(app.query_one("#live", Static).render())
+
+    asyncio.run(scenario())
+
+
+def test_textual_paste_requires_current_window_identity_and_input_lease(tmp_path):
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        registry = FakeRegistry([first, second])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        workspace_id = workspace_store.DEFAULT_ID
+        workspace_store.set_terminal_ids(
+            workspace_id, [first.session_id, second.session_id]
+        )
+        layout_store = JTTLayoutStore(workspace_store.root)
+        next_window = layout_store.create_window(
+            workspace_id, "folder-default", "Paste target"
+        )
+        layout_store.move_terminal(
+            workspace_id, second.session_id, next_window["id"],
+            [first.session_id, second.session_id],
+        )
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _wait_for_ui_state(
+                pilot,
+                lambda: app.selected_id == first.session_id and app.client is not None,
+                "initial paste target",
+            )
+            first_client = app.client
+            assert first_client is not None and not first_client.lease
+
+            app.post_message(Paste("BLOCKED_WITHOUT_LEASE"))
+            await pilot.pause(0.05)
+            assert first_client.sent == []
+
+            await app.enter_input_mode()
+            assert first_client.lease
+            first_payload = "Write-Output 'JTT_PASTE_A'; 한글\r\n"
+            app.post_message(Paste(first_payload))
+            await _wait_for_ui_state(
+                pilot, lambda: bool(first_client.sent), "leased paste delivery",
+            )
+            assert first_client.sent == [first_payload.encode("utf-8")]
+
+            sent_before_oversize = list(first_client.sent)
+            app.post_message(Paste("x" * 8193))
+            await pilot.pause(0.05)
+            assert first_client.sent == sent_before_oversize
+            assert first_client.lease and app.input_mode
+
+            await pilot.click("#window-" + next_window["id"])
+            await _wait_for_ui_state(
+                pilot,
+                lambda: (app.selected_window_id == next_window["id"]
+                         and app.selected_id == second.session_id
+                         and app.client is not None),
+                "window switch to second paste target",
+            )
+            second_client = app.client
+            assert second_client is not None and not second_client.lease
+            assert first_client.closed and not first_client.lease
+
+            app.post_message(Paste("BLOCKED_AFTER_WINDOW_SWITCH"))
+            await pilot.pause(0.05)
+            assert second_client.sent == []
+
+            await app.enter_input_mode()
+            assert second_client.lease
+            second_payload = "JTT_PASTE_B"
+            app.post_message(Paste(second_payload))
+            await _wait_for_ui_state(
+                pilot, lambda: bool(second_client.sent), "second window paste delivery",
+            )
+            assert second_client.sent == [second_payload.encode("utf-8")]
+
+            stale = TerminalIdentity(**{
+                **second.__dict__, "generation": "f" * 32,
+            })
+            app.selected_identity = stale
+            app.post_message(Paste("BLOCKED_STALE_IDENTITY"))
+            await pilot.pause(0.05)
+            assert second_client.sent == [second_payload.encode("utf-8")]
 
     asyncio.run(scenario())
 

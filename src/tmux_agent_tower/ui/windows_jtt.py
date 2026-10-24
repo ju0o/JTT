@@ -13,6 +13,7 @@ import sys
 import time
 from typing import Any, Optional
 
+from textual import events
 from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
@@ -51,6 +52,7 @@ _KEY_BYTES = {
     "home": b"\x1b[H", "end": b"\x1b[F", "delete": b"\x1b[3~",
     "insert": b"\x1b[2~", "pageup": b"\x1b[5~", "pagedown": b"\x1b[6~",
 }
+_MAX_PASTE_BYTES = 8192
 
 
 def _rich_color(value: str) -> str | None:
@@ -1515,9 +1517,7 @@ class WindowsJTTApp(App[None]):
 
     async def _send_bytes(self, data: bytes) -> None:
         client = self.client
-        identity = self.selected_identity
-        if (not self.input_mode or client is None or identity is None
-                or not client.lease or not _same_identity(identity, client.identity)):
+        if not self._input_target_is_current():
             self.input_mode = False
             self._set_notice("입력 대상 신원을 확인할 수 없어 키를 차단했습니다.", 8.0)
             return
@@ -1531,6 +1531,42 @@ class WindowsJTTApp(App[None]):
         else:
             await self._refresh_live()
         self._update_status()
+
+    async def on_paste(self, event: events.Paste) -> None:
+        """Forward only Textual's delivered paste payload to the leased RIGHT PTY.
+
+        The app never reads the operating system clipboard. Paste events in
+        modal forms are left to their focused widgets; otherwise unleased or
+        stale paste input is consumed here and blocked.
+        """
+        if isinstance(self.screen, ModalScreen):
+            return
+        event.stop()
+        if not event.text:
+            return
+        if not self._input_target_is_current():
+            self._set_notice("붙여넣기 차단 · RIGHT 입력 모드와 현재 세션 입력 권한이 필요합니다.", 8.0)
+            return
+        payload = event.text.encode("utf-8", errors="strict")
+        if len(payload) > _MAX_PASTE_BYTES:
+            self._set_notice("붙여넣기 차단 · 한 번에 최대 8192 UTF-8 바이트까지 지원합니다.", 8.0)
+            return
+        await self._send_bytes(payload)
+
+    def _input_target_is_current(self) -> bool:
+        client = self.client
+        identity = self.selected_identity
+        current = (self.sessions.get(identity.session_id)
+                   if identity is not None else None)
+        return bool(
+            not self._busy and self.input_mode and self._panel_index == 2
+            and self.selected_id is not None and identity is not None
+            and self.selected_id == identity.session_id
+            and identity.state == "running" and current is not None
+            and current.state == "running" and _same_identity(identity, current)
+            and client is not None and client.lease
+            and _same_identity(identity, client.identity)
+        )
 
     async def _close_selected_client(self) -> None:
         client, self.client = self.client, None
