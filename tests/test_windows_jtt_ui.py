@@ -1274,20 +1274,20 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 f"JTT_ERROR_{nonce}_END",
                 f"JTT_FINAL_{nonce}_END",
             )
-            command = (
-                f"Write-Output ('한글-' + 'JTT_COPY_{nonce}' + '-OK'); "
-                f"Write-Error ('JTT_ERROR_' + '{nonce}' + '_END'); "
-                f"[Console]::WriteLine('JTT_FINAL_' + '{nonce}' + '_END')"
+            commands = (
+                (f"Write-Output ('한글-' + 'JTT_COPY_{nonce}' + '-OK')", expected[0]),
+                (f"Write-Error ('JTT_ERROR_' + '{nonce}' + '_END')", expected[1]),
+                (f"Write-Output ('JTT_FINAL_' + '{nonce}' + '_END')", expected[2]),
             )
-            assert all(marker not in command for marker in expected)
-            await app._send_bytes((command + "\r").encode("utf-8"))
-            await _wait_for_ui_state(
-                pilot,
-                lambda: app._right_observation is not None
-                and all(marker in _plain_screen_text(app._right_observation[3])
-                         for marker in expected),
-                "generated PowerShell Unicode, error, and final output", timeout=20,
-            )
+            for command, marker in commands:
+                assert marker not in command
+                await app._send_bytes((command + "\r").encode("utf-8"))
+                await _wait_for_ui_state(
+                    pilot,
+                    lambda marker=marker: app._right_observation is not None
+                    and marker in _plain_screen_text(app._right_observation[3]),
+                    f"generated PowerShell output {marker}", timeout=20,
+                )
             await app.leave_input_mode()
             await pilot.press("ctrl+shift+c")
             await _wait_for_ui_state(

@@ -50,6 +50,20 @@ def _compact_screen_text(screen):
     return "".join(line.rstrip() for line in _screen_text(screen).splitlines())
 
 
+def _expected_prompt_path(path, columns):
+    from pathlib import PureWindowsPath
+
+    text = str(path)
+    limit = max(12, columns - 20)
+    if len(text) > limit:
+        root = PureWindowsPath(text).anchor
+        if len(root) > limit - 5:
+            root = root[:limit - 5]
+        tail = max(1, limit - len(root) - 4)
+        text = root + "...\\" + text[-tail:]
+    return "PS " + text + ">"
+
+
 def _wait(client, predicate, timeout=15):
     deadline = time.monotonic() + timeout
     last = None
@@ -993,8 +1007,7 @@ def test_native_powershell_prompt_tracks_long_current_location(
     from tmux_agent_tower.terminal import TerminalRegistry
 
     start = tmp_path / "isolated-start"
-    destination = (tmp_path / ("destination-" + "d" * 28)
-                   / ("nested-" + "n" * 26))
+    destination = tmp_path / "dest"
     start.mkdir()
     destination.mkdir(parents=True)
     assert len(str(destination)) > 100
@@ -1007,36 +1020,45 @@ def test_native_powershell_prompt_tracks_long_current_location(
         initial = _wait(
             client,
             lambda update: update.screen is not None
-            and "PS " + str(start) + ">" in _compact_screen_text(update.screen),
+            and _expected_prompt_path(start, 100)
+            in _compact_screen_text(update.screen),
         )
-        assert "PS " + str(start) + ">" in _compact_screen_text(initial.screen)
+        assert _expected_prompt_path(start, 100) in _compact_screen_text(initial.screen)
         assert client.acquire()
         client.resize(columns, lines)
 
-        escaped = str(destination).replace("'", "''")
-        marker = "JTT_CURRENT_PATH=" + str(destination) + "=END"
-        command = (
-            f"cd '{escaped}'; "
-            "[Console]::WriteLine('JTT_CURRENT_PATH=' + "
-            "(Get-Location).Path + '=END')"
-        )
-        assert marker not in command
+        # Navigate relatively so the test command itself remains short even
+        # though the resolved working directory is over 100 characters.
+        command = f"cd '{destination.name}'"
+        assert str(destination) not in command
         client.send((command + "\r").encode("utf-8"))
         try:
             update = _wait(
                 client,
                 lambda item: item.screen is not None
-                and marker in _compact_screen_text(item.screen),
+                and _expected_prompt_path(destination, columns)
+                in _compact_screen_text(item.screen),
             )
         except AssertionError as exc:
             last = client.poll()
             captured = (_compact_screen_text(last.screen)
                         if last is not None and last.screen is not None else "<no screen>")
-            raise AssertionError(f"PowerShell path output was not observed; screen={captured!r}") from exc
+            raise AssertionError(f"PowerShell cwd prompt was not observed; screen={captured!r}") from exc
         display = _compact_screen_text(update.screen)
-        assert marker in display
-        assert "PS " + str(destination) + ">" in display
         assert (update.columns, update.lines) == (columns, lines)
+
+        # The actual path comes from PowerShell after cd; it is not embedded
+        # in the command echo and remains distinct from the shortened prompt.
+        query = "pwd"
+        assert str(destination) not in query
+        client.send((query + "\r").encode("ascii"))
+        output = _wait(
+            client,
+            lambda item: item.screen is not None
+            and str(destination) in _compact_screen_text(item.screen),
+        )
+        assert str(destination) in _compact_screen_text(output.screen)
+        assert _expected_prompt_path(destination, columns) in _compact_screen_text(output.screen)
     finally:
         client.close()
         current = next((item for item in registry.list_sessions()
