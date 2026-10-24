@@ -50,6 +50,15 @@ def _compact_screen_text(screen):
     return "".join(line.rstrip() for line in _screen_text(screen).splitlines())
 
 
+def _screen_contains_after(screen, marker, text):
+    compact = _compact_screen_text(screen)
+    marker_index = compact.rfind(marker)
+    return (
+        marker_index >= 0
+        and compact.find(text, marker_index + len(marker)) >= 0
+    )
+
+
 def _expected_prompt_path(path, columns):
     from pathlib import PureWindowsPath
 
@@ -1067,6 +1076,12 @@ def test_native_powershell_prompt_tracks_long_current_location(
         assert width_marker not in width_command
         client.send((width_command + "\r").encode("ascii"))
         _wait_for_raw_output(client, width_marker.encode("ascii"))
+        initial_prompt = _expected_prompt_path(start, columns)
+        _wait(
+            client,
+            lambda update: update.screen is not None
+            and _screen_contains_after(update.screen, width_marker, initial_prompt),
+        )
 
         # Confirm Set-Location completed before issuing a separate location
         # query. This distinguishes shell execution from the rendered prompt.
@@ -1086,7 +1101,7 @@ def test_native_powershell_prompt_tracks_long_current_location(
         _wait(
             client,
             lambda update: update.screen is not None
-            and expected_prompt in _compact_screen_text(update.screen),
+            and _screen_contains_after(update.screen, cd_marker, expected_prompt),
         )
 
         path_start = f"JTT_PATH_{nonce}_BEGIN"
