@@ -10,6 +10,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
 import ju0_terminal_tower  # noqa: F401 - activates the guarded product namespace
@@ -79,8 +80,10 @@ class FakeRegistry:
         self.clients: list[FakeClient] = []
         self.create_count = 0
         self.stop_calls = []
+        self.list_calls = 0
 
     def list_sessions(self):
+        self.list_calls += 1
         return tuple(self.sessions)
 
     def connect(self, session_id):
@@ -223,11 +226,20 @@ def test_stop_confirmation_defaults_to_cancel_and_revalidates_identity():
             await app._stop_selected()
             await pilot.pause(0.05)
             assert app.screen.query_one("#cancel-stop", Button).has_focus
-            # The periodic LIVE poll must not query the hidden base-screen
-            # widget tree while the confirmation modal is active.
+            calls_before_modal_tick = registry.list_calls
+            # Keep the modal open across the one-second session refresh interval.
+            # Polling must safely defer rather than query the hidden base screen.
+            await pilot.pause(1.2)
+            assert registry.list_calls == calls_before_modal_tick
+            assert app.screen.query_one("#cancel-stop", Button).has_focus
             await app._refresh_live()
             await pilot.click("#cancel-stop")
-            await pilot.pause(0.05)
+            assert not isinstance(app.screen, ModalScreen)
+            await app._refresh_sessions()
+            assert registry.list_calls > calls_before_modal_tick
+            await app._refresh_live()
+            assert str(app.query_one("#terminal-summary", Static).render()) == "터미널 1개"
+            assert "JTT_TEST_READY" in str(app.query_one("#live", Static).render())
             assert registry.stop_calls == []
             assert registry.sessions == [identity]
 
@@ -352,6 +364,8 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                 # The default action is cancel. Confirm the dialog opened from
                 # the real UI command and that cancellation leaves the PTY alive.
                 await pilot.press("ctrl+g", "x")
+                assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
+                await pilot.pause(1.2)
                 assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
                 await pilot.click("#cancel-stop")
                 await assert_still_running(identity)

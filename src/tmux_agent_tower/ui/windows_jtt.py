@@ -279,7 +279,10 @@ class WindowsJTTApp(App[None]):
         }.get(str(state), "상태 확인 필요")
 
     async def _refresh_sessions(self) -> None:
-        if self._busy:
+        # Session refresh updates widgets on the base screen. Like LIVE
+        # refresh, defer it while a modal owns the active screen so polling
+        # cannot query or mutate the hidden widget tree.
+        if self._busy or isinstance(self.screen, ModalScreen):
             return
         try:
             values = await self._backend_call(self.registry.list_sessions)
