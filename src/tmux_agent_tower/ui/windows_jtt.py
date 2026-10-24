@@ -1,8 +1,8 @@
-"""Initial native Windows three-panel JTT UI over the ConPTY registry.
+"""Native Windows three-panel JTT UI over ConPTY and shared JTT state stores.
 
-This screen intentionally uses the Windows terminal registry as its source of
-truth and does not import the POSIX curses UI or the POSIX workspace stores.
-Workspace and Work Kit persistence are not wired into this first UI slice.
+This screen uses the Windows terminal registry and common versioned JTT
+workspace/layout schemas with Windows ACL checks. It does not import the POSIX
+curses UI or POSIX PTY backend.
 """
 
 from __future__ import annotations
@@ -10,17 +10,23 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
-from typing import Any
+from typing import Any, Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Static
+from textual.widgets import Button, Input, Static
 from rich.style import Style
 from rich.text import Text
 
 from ..terminal.manager import TerminalError, TerminalIdentity, TerminalScreen
+from ..state.jtt_layouts import JTTLayoutStore, JTTLayoutStoreError
+from ..state.jtt_workspaces import (
+    JTTWorkspaceStore,
+    WorkspaceStoreError,
+    default_jtt_root,
+)
 
 
 _COLOR_NAMES = {
@@ -154,6 +160,49 @@ class ConfirmStopScreen(ModalScreen[bool]):
         elif event.button.id == "cancel-stop":
             self.dismiss(False)
 
+    def on_key(self, event) -> None:
+        if str(event.key).lower() == "escape":
+            event.stop()
+            self.dismiss(False)
+
+
+class CreateWindowScreen(ModalScreen[Optional[str]]):
+    """Collect a logical Window name; it never creates a PTY."""
+
+    CSS = """
+    CreateWindowScreen { align: center middle; background: $background 70%; }
+    #window-dialog { width: 56; height: auto; max-height: 10; border: round $primary;
+                     background: $surface; padding: 1 2; }
+    #window-actions { height: 3; align-horizontal: right; }
+    #window-actions Button { margin-left: 1; }
+    """
+
+    def __init__(self, suggested_name: str):
+        super().__init__()
+        self.suggested_name = suggested_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="window-dialog"):
+            yield Static("새 논리 Window 이름\n터미널은 자동 생성되지 않습니다.")
+            yield Input(value=self.suggested_name, max_length=64, id="window-name")
+            with Horizontal(id="window-actions"):
+                yield Button("취소", id="cancel-window")
+                yield Button("Window 만들기", id="confirm-window", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#window-name", Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-window":
+            self.dismiss(self.query_one("#window-name", Input).value)
+        elif event.button.id == "cancel-window":
+            self.dismiss(None)
+
+    def on_key(self, event) -> None:
+        if str(event.key).lower() == "escape":
+            event.stop()
+            self.dismiss(None)
+
 
 class WindowsJTTApp(App[None]):
     """Windows terminal UI backed only by a supplied ConPTY registry."""
@@ -179,10 +228,13 @@ class WindowsJTTApp(App[None]):
     .panel-title { height: 1; color: #75d9d0; text-style: bold; }
     #brand { height: 2; color: #91ece2; text-style: bold; }
     #workspace { height: 3; border: round #355d68; padding: 0 1; margin-top: 1; }
-    #window-note { height: auto; color: #a8b7c3; margin-top: 1; }
-    #new-terminal { width: 100%; height: 3; margin-top: 1; }
-    #left-limits { height: 1fr; color: #81919d; margin-top: 1; }
+    #window-list { height: 1fr; margin-top: 1; }
+    .window-item { width: 100%; height: 3; margin-bottom: 1; }
+    .window-item.selected { border: round #35cbbd; background: #102a35; }
+    #new-window { width: 100%; height: 3; }
     #terminal-summary { height: 1; color: #a8b7c3; }
+    #current-window { height: 1; color: #75d9d0; text-style: bold; }
+    #new-terminal { width: 100%; height: 3; margin-top: 1; }
     #terminal-cards { height: 1fr; }
     .card-row { width: 100%; height: 5; margin-bottom: 1; }
     .terminal-card { width: 1fr; height: 5; border: round #355d68; content-align: left middle; }
@@ -193,10 +245,22 @@ class WindowsJTTApp(App[None]):
     #statusline { height: 1; color: #c4d2d8; background: #10212a; padding: 0 1; }
     """
 
-    def __init__(self, registry, *, auto_select: bool = True):
+    def __init__(self, registry, *, auto_select: bool = True,
+                 workspace_store: JTTWorkspaceStore | None = None,
+                 layout_store: JTTLayoutStore | None = None):
         super().__init__()
         self.registry = registry
         self.auto_select = auto_select
+        self.workspace_store = workspace_store
+        self.layout_store = layout_store
+        self.workspace_id = (workspace_store.DEFAULT_ID if workspace_store is not None
+                             else "workspace-default")
+        self.windows = [{"id": "window-default", "name": "기본 Window",
+                         "folder_id": "folder-default", "terminal_ids": []}]
+        self.selected_window_id = "window-default"
+        self._canonical_terminal_ids: list[str] = []
+        self._runtime_terminal_placements: dict[str, str] = {}
+        self._registry_sessions: dict[str, TerminalIdentity] = {}
         self.sessions: dict[str, TerminalIdentity] = {}
         self.selected_id: str | None = None
         self.selected_identity: TerminalIdentity | None = None
@@ -217,16 +281,14 @@ class WindowsJTTApp(App[None]):
                 yield Static("JTT · JU0 TERMINAL TOWER", id="brand")
                 yield Static("작업공간", classes="panel-title")
                 yield Static("내 작업공간\nWindows · 로컬", id="workspace")
-                yield Static(
-                    "등록된 로컬 세션을 기본 공간에서 보여줍니다.\n"
-                    "저장 작업공간·Window 편집·Work Kit은 아직 연결되지 않았습니다.",
-                    id="window-note",
-                )
-                yield Button("+ 새 터미널", id="new-terminal", variant="primary")
-                yield Static("시작 시 셸을 자동 생성하지 않습니다.", id="left-limits")
+                yield Static("Windows", classes="panel-title")
+                with ScrollableContainer(id="window-list"):
+                    yield Static("Window 목록을 불러오는 중", id="empty-windows", classes="dim")
+                yield Button("+ 새 Window", id="new-window")
             with Vertical(id="center", classes="panel"):
-                yield Static("터미널", classes="panel-title")
+                yield Static("기본 Window", id="current-window", classes="panel-title")
                 yield Static("세션을 불러오는 중", id="terminal-summary")
+                yield Button("+ 새 터미널", id="new-terminal", variant="primary")
                 with ScrollableContainer(id="terminal-cards"):
                     yield Static("등록된 터미널이 없습니다.", id="empty-cards", classes="dim")
             with Vertical(id="right", classes="panel"):
@@ -287,6 +349,7 @@ class WindowsJTTApp(App[None]):
         try:
             values = await self._backend_call(self.registry.list_sessions)
         except Exception as exc:
+            self._registry_sessions = {}
             self.sessions = {}
             await self._close_selected_client()
             self.selected_identity = None
@@ -295,9 +358,23 @@ class WindowsJTTApp(App[None]):
             await self._render_cards()
             return
 
-        self.sessions = {item.session_id: item for item in sorted(
+        self._registry_sessions = {item.session_id: item for item in sorted(
             values, key=lambda item: (item.name.casefold(), item.session_id)
         )}
+        try:
+            await self._apply_window_projection()
+        except Exception as exc:
+            self.sessions = {}
+            await self._close_selected_client()
+            self.selected_id = None
+            self.selected_identity = None
+            self.input_mode = False
+            self._clear_live("Window 저장 상태를 확인할 수 없습니다.")
+            self._set_notice(f"Window 목록 연결 실패: {exc}", 8.0)
+            await self._render_windows()
+            await self._render_cards()
+            return
+
         selection_invalidated = False
         if self.selected_id is not None:
             current = self.sessions.get(self.selected_id)
@@ -319,8 +396,89 @@ class WindowsJTTApp(App[None]):
             if candidate is not None:
                 await self._select_session(candidate, focus=False)
 
+        await self._render_windows()
         await self._render_cards()
         self._update_status()
+
+    async def _apply_window_projection(self) -> None:
+        """Project persisted workspace placements onto verified registry sessions."""
+        if self.workspace_store is None or self.layout_store is None:
+            self.sessions = dict(self._registry_sessions)
+            self._canonical_terminal_ids = list(self.sessions)
+            if not any(item["id"] == self.selected_window_id for item in self.windows):
+                self.selected_window_id = self.windows[0]["id"]
+            return
+
+        def read_projection():
+            workspaces = self.workspace_store.workspaces()
+            workspace = next((item for item in workspaces
+                              if item["id"] == self.workspace_id), None)
+            if workspace is None:
+                raise TerminalError("selected JTT workspace no longer exists")
+            canonical = list(workspace["terminal_ids"])
+            # Older Windows UI builds did not persist references. Keep those
+            # already-running sessions discoverable in the default Window in
+            # memory; opening the UI does not migrate or write user data.
+            if self.workspace_id == self.workspace_store.DEFAULT_ID:
+                canonical.extend(item for item in self._registry_sessions
+                                 if item not in canonical)
+            projection = self.layout_store.layout(self.workspace_id, canonical)
+            return canonical, projection
+
+        canonical, projection = await self._backend_call(read_projection)
+        self._canonical_terminal_ids = canonical
+        windows = [dict(item) for item in projection["windows"]]
+        window_ids = {item["id"] for item in windows}
+        placements = dict(projection["placements"])
+        for session_id, window_id in tuple(self._runtime_terminal_placements.items()):
+            if session_id not in canonical:
+                self._runtime_terminal_placements.pop(session_id, None)
+            elif window_id in window_ids:
+                placements[session_id] = window_id
+            else:
+                self._runtime_terminal_placements.pop(session_id, None)
+
+        default_window_id = next(
+            item["id"] for item in windows if item["id"] == "window-default"
+        )
+        for window in windows:
+            window["terminal_ids"] = [
+                session_id for session_id in canonical
+                if placements.get(session_id, default_window_id) == window["id"]
+            ]
+        self.windows = windows
+        if self.selected_window_id not in window_ids:
+            self.selected_window_id = default_window_id
+        selected_window = next(item for item in windows
+                               if item["id"] == self.selected_window_id)
+        self.sessions = {
+            session_id: self._registry_sessions[session_id]
+            for session_id in selected_window["terminal_ids"]
+            if session_id in self._registry_sessions
+        }
+
+    async def _render_windows(self) -> None:
+        if not self.is_mounted:
+            return
+        container = self.query_one("#window-list", ScrollableContainer)
+        await container.remove_children()
+        if not self.windows:
+            await container.mount(Static("Window가 없습니다.", id="empty-windows"))
+            return
+        for window in self.windows:
+            selected = window["id"] == self.selected_window_id
+            label = Text(f"{window['name']}\n터미널 {len(window['terminal_ids'])}개")
+            button = Button(
+                label,
+                id="window-" + window["id"],
+                classes="window-item selected" if selected else "window-item",
+                variant="primary" if selected else "default",
+            )
+            await container.mount(button)
+        self.query_one("#current-window", Static).update(
+            next(item["name"] for item in self.windows
+                 if item["id"] == self.selected_window_id)
+        )
 
     async def _render_cards(self) -> None:
         if not self.is_mounted:
@@ -330,14 +488,15 @@ class WindowsJTTApp(App[None]):
             (item.session_id, item.generation, item.shell_pid, item.state, item.name,
              item.session_id == self.selected_id)
             for item in values
-        )
+        ) + (("window", self.selected_window_id),)
         if signature == self._card_signature:
             return
         self._card_signature = signature
         container = self.query_one("#terminal-cards", ScrollableContainer)
         await container.remove_children()
         if not values:
-            await container.mount(Static("등록된 터미널이 없습니다.\n+ 새 터미널로 시작하세요."))
+            await container.mount(Static("이 Window에는 터미널이 없습니다.\n"
+                                         "+ 새 터미널을 선택하면 PTY가 생성됩니다."))
             self.query_one("#terminal-summary", Static).update("터미널 0개")
             return
         self.query_one("#terminal-summary", Static).update(f"터미널 {len(values)}개")
@@ -363,13 +522,24 @@ class WindowsJTTApp(App[None]):
         try:
             await self._close_selected_client()
             self.input_mode = False
-            self.selected_id = identity.session_id
-            self.selected_identity = identity
+            self.selected_id = None
+            self.selected_identity = None
             self._clear_live()
-            if identity.state == "running":
+            visible = self.sessions.get(identity.session_id)
+            if visible is None or not _same_identity(identity, visible):
+                raise TerminalError("terminal is no longer in the selected Window")
+            latest = await self._backend_call(self.registry.list_sessions)
+            current = next((item for item in latest
+                            if item.session_id == identity.session_id), None)
+            if current is None or not _same_identity(identity, current):
+                raise TerminalError("terminal identity changed before selection")
+            self.selected_id = identity.session_id
+            self.selected_identity = current
+            if current.state == "running":
                 client = await self._backend_call(self.registry.connect, identity.session_id)
-                if not _same_identity(identity, client.identity):
+                if not _same_identity(current, client.identity):
                     await self._backend_call(client.close)
+                    self.selected_id = None
                     self.selected_identity = None
                     self._clear_live("세션 신원 불일치 · 출력을 숨겼습니다.")
                     self._set_notice("선택한 카드의 세션 신원을 확인하지 못했습니다.", 8.0)
@@ -434,6 +604,8 @@ class WindowsJTTApp(App[None]):
         except Exception as exc:
             await self._close_selected_client()
             self.input_mode = False
+            if not self.is_mounted:
+                return
             self._clear_live("세션 확인 실패 · 오래된 출력을 숨겼습니다.")
             self._set_notice(f"입력을 차단했습니다: {exc}", 8.0)
 
@@ -448,11 +620,119 @@ class WindowsJTTApp(App[None]):
         if self.is_mounted:
             self.query_one("#live", TerminalView).update(Text(message or "터미널을 선택하세요.", style="dim"))
 
+    async def _prompt_create_window(self) -> None:
+        # The dialog belongs to navigation mode. Revoke any terminal input
+        # lease before moving focus into UI controls.
+        if self.input_mode:
+            await self.leave_input_mode()
+        self.prefix_pending = False
+        suggested = f"Window {len(self.windows) + 1}"
+        self.push_screen(
+            CreateWindowScreen(suggested),
+            callback=self._create_window_result,
+        )
+
+    def _create_window_result(self, name: str | None) -> None:
+        if name is None:
+            self._set_notice("Window 만들기를 취소했습니다.")
+            return
+        self.run_worker(
+            self.create_window(name), name="create-logical-window",
+            group="window-create", exclusive=True,
+        )
+
+    async def create_window(self, name: str) -> None:
+        """Create and select a logical Window without starting a process."""
+        if self._busy:
+            return
+        if self.workspace_store is None or self.layout_store is None:
+            self._set_notice("Window 저장소를 사용할 수 없습니다.", 8.0)
+            return
+        self._busy = True
+        try:
+            workspace = await self._backend_call(
+                lambda: next((item for item in self.workspace_store.workspaces()
+                              if item["id"] == self.workspace_id), None)
+            )
+            if workspace is None:
+                raise TerminalError("selected JTT workspace no longer exists")
+            created = await self._backend_call(
+                self.layout_store.create_window,
+                self.workspace_id, "folder-default", name,
+            )
+            latest = await self._backend_call(
+                self.layout_store.layout, self.workspace_id,
+                workspace["terminal_ids"],
+            )
+            matches = [item for item in latest["windows"]
+                       if item["id"] == created["id"]]
+            if len(matches) != 1 or matches[0]["name"] != created["name"]:
+                raise TerminalError("new Window identity could not be revalidated")
+            await self._close_selected_client()
+            self.input_mode = False
+            self.selected_id = None
+            self.selected_identity = None
+            self.selected_window_id = created["id"]
+            self._card_signature = None
+            self._clear_live("빈 논리 Window · 셸은 아직 생성되지 않았습니다.")
+            self._set_notice(f"{created['name']} 생성 · 터미널은 아직 없습니다.")
+        except Exception as exc:
+            self._set_notice(f"Window를 만들지 않았습니다: {exc}", 8.0)
+        finally:
+            self._busy = False
+            await self._refresh_sessions()
+            self._panel_index = 0
+            self._focus_panel(0)
+
+    async def select_window(self, window_id: str) -> None:
+        if self._busy:
+            return
+        target = next((item for item in self.windows if item["id"] == window_id), None)
+        if target is None:
+            self._set_notice("Window가 갱신되었거나 더 이상 존재하지 않습니다.")
+            await self._refresh_sessions()
+            return
+        if window_id == self.selected_window_id:
+            self._panel_index = 0
+            self._focus_panel(0)
+            return
+        self._busy = True
+        try:
+            # Release the old session's lease before changing the visible set.
+            await self._close_selected_client()
+            self.input_mode = False
+            self.prefix_pending = False
+            self._prefix_generation += 1
+            self.selected_id = None
+            self.selected_identity = None
+            self.selected_window_id = window_id
+            self._card_signature = None
+            self._clear_live("Window 변경 · 읽기 전용 연결을 준비합니다.")
+            self._panel_index = 0
+        finally:
+            self._busy = False
+        await self._refresh_sessions()
+        self._focus_panel(0)
+
+    async def _move_window(self, offset: int) -> None:
+        if not self.windows:
+            return
+        current = next((index for index, item in enumerate(self.windows)
+                        if item["id"] == self.selected_window_id), 0)
+        target = self.windows[(current + offset) % len(self.windows)]
+        await self.select_window(target["id"])
+
     async def create_terminal(self) -> None:
         if self._busy:
             return
         self._busy = True
+        requested_window_id = self.selected_window_id
+        placement_notice = ""
         try:
+            # Only the newly created terminal may receive the automatic input
+            # lease after it has passed its identity and renderer checks.
+            await self._close_selected_client()
+            self.input_mode = False
             name = f"PowerShell {len(self.sessions) + 1}"
             client = await self._backend_call(self.registry.create, name)
             identity = client.identity
@@ -462,6 +742,42 @@ class WindowsJTTApp(App[None]):
                 await self._backend_call(client.close)
                 self._set_notice("새 세션 신원을 확인하지 못해 입력을 시작하지 않았습니다.", 8.0)
                 return
+            if self.workspace_store is not None and self.layout_store is not None:
+                try:
+                    workspace = await self._backend_call(
+                        lambda: next((item for item in self.workspace_store.workspaces()
+                                      if item["id"] == self.workspace_id), None)
+                    )
+                    if workspace is None:
+                        raise TerminalError("selected JTT workspace no longer exists")
+                    projection = await self._backend_call(
+                        self.layout_store.layout, self.workspace_id,
+                        workspace["terminal_ids"],
+                    )
+                    if requested_window_id not in {item["id"] for item in projection["windows"]}:
+                        raise TerminalError("selected Window no longer exists")
+                    updated = await self._backend_call(
+                        self.workspace_store.add_terminal_reference,
+                        self.workspace_id, identity.session_id,
+                    )
+                    if requested_window_id != "window-default":
+                        await self._backend_call(
+                            self.layout_store.move_terminal,
+                            self.workspace_id, identity.session_id, requested_window_id,
+                            updated["terminal_ids"],
+                        )
+                except Exception as exc:
+                    # The process is already owned by the registry. Preserve it
+                    # and keep it visible in memory; do not attempt a second
+                    # shell creation or claim its placement was persisted.
+                    self._runtime_terminal_placements[identity.session_id] = (
+                        requested_window_id if any(
+                            item["id"] == requested_window_id for item in self.windows
+                        ) else "window-default"
+                    )
+                    placement_notice = f"세션은 생성됐지만 Window 저장 실패: {exc}"
+                else:
+                    self.selected_window_id = requested_window_id
             self.sessions[identity.session_id] = found
             await self._close_selected_client()
             self.client = client
@@ -473,12 +789,14 @@ class WindowsJTTApp(App[None]):
                     and observation.generation == identity.generation
                     and observation.shell_pid == identity.shell_pid
                     and await self._backend_call(client.acquire)):
+                self._render_terminal(observation.screen)
                 self.input_mode = True
                 await self._resize_selected_terminal()
                 self._panel_index = 2
                 self._focus_panel(2)
-                await self._refresh_live()
-                self._set_notice("새 PowerShell 준비 완료 · RIGHT 입력 모드", 5.0)
+                self._set_notice(
+                    placement_notice or "새 PowerShell 준비 완료 · RIGHT 입력 모드", 5.0
+                )
             else:
                 if client.lease:
                     await self._backend_call(client.release)
@@ -491,6 +809,7 @@ class WindowsJTTApp(App[None]):
             self._set_notice(f"터미널 생성 실패: {exc}", 8.0)
         finally:
             self._busy = False
+            await self._refresh_sessions()
             await self._render_cards()
             self._update_status()
 
@@ -593,10 +912,12 @@ class WindowsJTTApp(App[None]):
         self._panel_index = index % 3
         try:
             if self._panel_index == 0:
-                self.query_one("#new-terminal", Button).focus()
+                target = (self.query_one("#window-" + self.selected_window_id, Button)
+                          if self.windows else self.query_one("#new-window", Button))
+                target.focus()
             elif self._panel_index == 1:
                 target = (self.query_one("#terminal-" + self.selected_id, Button)
-                          if self.selected_id else self.query_one("#terminal-cards"))
+                          if self.selected_id else self.query_one("#new-terminal", Button))
                 target.focus()
             else:
                 self.query_one("#live", TerminalView).focus()
@@ -618,6 +939,8 @@ class WindowsJTTApp(App[None]):
             next_index = (current + (-1 if token == "h" else 1)) % len(values)
             await self._select_session(values[next_index])
         elif token == "w":
+            if self.input_mode:
+                await self.leave_input_mode()
             self._focus_panel(0)
         elif token == "d":
             await self.action_detach()
@@ -641,6 +964,8 @@ class WindowsJTTApp(App[None]):
             self._set_notice("Prefix 시간 초과 · 키를 터미널에 보내지 않았습니다.")
 
     async def action_prefix(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
         if self.prefix_pending:
             self._clear_prefix()
             if self.input_mode:
@@ -655,6 +980,8 @@ class WindowsJTTApp(App[None]):
         self._update_status()
 
     async def action_input_escape(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
         if self.prefix_pending:
             self._clear_prefix()
             self._set_notice("Prefix 명령을 취소했습니다.")
@@ -662,14 +989,17 @@ class WindowsJTTApp(App[None]):
             await self.leave_input_mode()
 
     async def action_send_ctrl_c(self) -> None:
-        if self.input_mode:
+        if self.input_mode and not isinstance(self.screen, ModalScreen):
             await self._send_bytes(b"\x03")
 
     async def action_send_ctrl_q(self) -> None:
-        if self.input_mode:
+        if self.input_mode and not isinstance(self.screen, ModalScreen):
             await self._send_bytes(b"\x11")
 
     async def action_panel_next(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            self.screen.focus_next()
+            return
         if self.prefix_pending:
             self._clear_prefix()
             self._set_notice("Prefix 명령을 취소했습니다.")
@@ -680,6 +1010,9 @@ class WindowsJTTApp(App[None]):
             self._update_status()
 
     async def action_panel_previous(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            self.screen.focus_previous()
+            return
         if self.input_mode:
             await self._send_bytes(b"\x1b[Z")
         else:
@@ -687,12 +1020,35 @@ class WindowsJTTApp(App[None]):
             self._update_status()
 
     async def action_enter(self) -> None:
+        if isinstance(self.screen, CreateWindowScreen):
+            self.screen.dismiss(self.screen.query_one("#window-name", Input).value)
+            return
+        if isinstance(self.screen, ConfirmStopScreen):
+            focused_id = getattr(self.focused, "id", "")
+            self.screen.dismiss(focused_id == "confirm-stop")
+            return
+        if isinstance(self.screen, ModalScreen):
+            return
         if self.input_mode:
             await self._send_bytes(b"\r")
+        elif self._panel_index == 0:
+            focused = self.focused
+            focused_id = getattr(focused, "id", "")
+            if focused_id == "new-window":
+                await self._prompt_create_window()
+            elif focused_id and focused_id.startswith("window-"):
+                await self.select_window(focused_id[len("window-"):])
+        elif self._panel_index == 1 and getattr(self.focused, "id", "") == "new-terminal":
+            await self.create_terminal()
         elif self._panel_index in (1, 2):
             await self.enter_input_mode()
 
     async def action_backspace(self) -> None:
+        if isinstance(self.screen, CreateWindowScreen):
+            self.screen.query_one("#window-name", Input).action_delete_left()
+            return
+        if isinstance(self.screen, ModalScreen):
+            return
         if self.input_mode:
             await self._send_bytes(b"\x7f")
 
@@ -709,7 +1065,10 @@ class WindowsJTTApp(App[None]):
                 event.stop()
                 await self._send_bytes(data)
             return
-        if key in ("up", "left") and self._panel_index == 1:
+        if key in ("up", "down") and self._panel_index == 0:
+            event.stop()
+            await self._move_window(-1 if key == "up" else 1)
+        elif key in ("up", "left") and self._panel_index == 1:
             event.stop()
             await self._move_card(-1)
         elif key in ("down", "right") and self._panel_index == 1:
@@ -730,6 +1089,12 @@ class WindowsJTTApp(App[None]):
         button_id = event.button.id or ""
         if button_id == "new-terminal":
             await self.create_terminal()
+            return
+        if button_id == "new-window":
+            await self._prompt_create_window()
+            return
+        if button_id.startswith("window-"):
+            await self.select_window(button_id[len("window-"):])
             return
         if button_id.startswith("terminal-"):
             session_id = button_id[len("terminal-"):]
@@ -797,10 +1162,15 @@ def run_jtt_windows_ui() -> int:
     try:
         from ..terminal import TerminalRegistry
 
-        registry = TerminalRegistry()
-        app = WindowsJTTApp(registry)
+        root = default_jtt_root()
+        registry = TerminalRegistry(root=root / "terminals")
+        app = WindowsJTTApp(
+            registry,
+            workspace_store=JTTWorkspaceStore(root),
+            layout_store=JTTLayoutStore(root),
+        )
         result = app.run()
         return result if isinstance(result, int) else 0
-    except TerminalError as exc:
+    except (TerminalError, WorkspaceStoreError, JTTLayoutStoreError) as exc:
         print(f"Windows JTT terminal backend unavailable: {exc}", file=sys.stderr)
         return 2

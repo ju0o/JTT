@@ -170,15 +170,20 @@ class JTTLayoutStore:
             return {}
         self._validate_root()
         self._validate_file()
-        fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) & 0o077 or info.st_nlink != 1):
-            os.close(fd)
-            raise JTTLayoutStoreError("JTT layout file is not private")
         try:
-            with os.fdopen(fd, "rb") as stream:
-                raw = stream.read(_MAX_FILE_BYTES + 1)
+            if os.name == "nt":
+                from .jtt_windows_state import read_private_file
+
+                raw = read_private_file(self.path, _MAX_FILE_BYTES, JTTLayoutStoreError)
+            else:
+                fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) & 0o077 or info.st_nlink != 1):
+                    os.close(fd)
+                    raise JTTLayoutStoreError("JTT layout file is not private")
+                with os.fdopen(fd, "rb") as stream:
+                    raw = stream.read(_MAX_FILE_BYTES + 1)
             if len(raw) > _MAX_FILE_BYTES:
                 raise JTTLayoutStoreError("JTT layout data exceeds the allowed size")
             payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
@@ -212,18 +217,31 @@ class JTTLayoutStore:
                      getattr(os, "O_NOFOLLOW", 0), 0o600)
         replaced = False
         try:
-            os.fchmod(fd, 0o600)
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb", closefd=True) as stream:
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temp, self.path)
+            if os.name == "nt":
+                from .jtt_windows_state import validate_new_private_file, validate_private_file
+                from ..terminal.windows_manager import _replace_metadata
+
+                validate_new_private_file(temp, JTTLayoutStoreError)
+                _replace_metadata(temp, self.path)
+            else:
+                os.replace(temp, self.path)
             replaced = True
-            dir_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            if os.name == "nt":
+                from .jtt_windows_state import validate_private_file
+
+                validate_private_file(self.path, JTTLayoutStoreError)
+            else:
+                dir_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         except OSError as exc:
             if not replaced:
                 try:
@@ -234,6 +252,11 @@ class JTTLayoutStore:
             raise JTTLayoutStoreCommittedDurabilityError(workspace_id, item_id) from exc
 
     def _ensure_private_root(self) -> None:
+        if os.name == "nt":
+            from .jtt_windows_state import ensure_private_directory
+
+            ensure_private_directory(self.root, JTTLayoutStoreError)
+            return
         absolute = Path(os.path.abspath(os.fspath(self.root)))
         current = Path(absolute.anchor)
         for part in absolute.parts[1:]:
@@ -251,6 +274,11 @@ class JTTLayoutStore:
         self._validate_root()
 
     def _validate_root(self) -> None:
+        if os.name == "nt":
+            from .jtt_windows_state import validate_private_directory
+
+            validate_private_directory(self.root, JTTLayoutStoreError)
+            return
         absolute = Path(os.path.abspath(os.fspath(self.root)))
         current = Path(absolute.anchor)
         for part in absolute.parts[1:]:
@@ -267,6 +295,11 @@ class JTTLayoutStore:
             raise JTTLayoutStoreError("JTT layout directory is not private")
 
     def _validate_file(self, *, allow_missing: bool = False) -> None:
+        if os.name == "nt":
+            from .jtt_windows_state import validate_private_file
+
+            validate_private_file(self.path, JTTLayoutStoreError, allow_missing=allow_missing)
+            return
         if not os.path.lexists(self.path):
             if allow_missing:
                 return
