@@ -576,7 +576,10 @@ def test_unmount_stops_refresh_timers_and_closes_mini_sampler():
         submit_calls = []
 
         def track_interval(*args, **kwargs):
-            timer = set_interval(*args, **kwargs)
+            # This test invokes the sampler explicitly below. Keep real timer
+            # objects so teardown is checked, but prevent background ticks
+            # from consuming the sampler before the assertion.
+            timer = set_interval(3600, *args[1:], **kwargs)
             probe = TimerProbe(timer)
             timers.append(probe)
             return probe
