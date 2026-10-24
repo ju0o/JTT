@@ -1028,6 +1028,23 @@ def test_vt_screen_text_keeps_wide_glyph_cells_adjacent():
     assert rendered.startswith("JTT 한글 OK")
 
 
+def test_vt_screen_text_coalesces_uniform_cell_styles_for_large_screens():
+    from ju0_terminal_tower.ui.windows_jtt import _screen_text
+
+    columns, lines = 160, 44
+    row = tuple(TerminalCell(" ", "default", "default", False, False, False,
+                             False, False, False) for _ in range(columns))
+    screen = TerminalScreen(tuple(row for _ in range(lines)), 0, 0, True)
+
+    rendered = _screen_text(screen, columns, lines)
+
+    assert len(rendered.plain) == columns * lines + lines - 1
+    # A cell-by-cell renderer produced thousands of Rich spans here. The
+    # cursor contributes one distinct style span; the remaining cells share
+    # one cached style per row at most.
+    assert len(rendered.spans) <= lines + 1
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
 def test_native_windows_paste_event_enters_selected_powershell(tmp_path):
     from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry
@@ -1303,7 +1320,9 @@ def test_native_windows_interactive_latency_profile(tmp_path, size):
                 requests = []
                 original_request = client._request
                 original_send = client.send
+                original_render = app._render_terminal
                 send_durations = []
+                render_durations = []
 
                 def measured_request(operation, **fields):
                     started = time.perf_counter()
@@ -1319,8 +1338,16 @@ def test_native_windows_interactive_latency_profile(tmp_path, size):
                     finally:
                         send_durations.append((time.perf_counter() - started) * 1000)
 
+                def measured_render(screen):
+                    started = time.perf_counter()
+                    try:
+                        return original_render(screen)
+                    finally:
+                        render_durations.append((time.perf_counter() - started) * 1000)
+
                 client._request = measured_request
                 client.send = measured_send
+                app._render_terminal = measured_render
                 token = f"JTTLAT{index}PROFILE"
                 key_latencies = []
                 screen_started = None
@@ -1350,11 +1377,16 @@ def test_native_windows_interactive_latency_profile(tmp_path, size):
                     f"keys={len(token)} rpc={counts} "
                     f"request_ms_p50={percentile([item[1] for item in requests], 50):.2f} "
                     f"send_ms_p50={percentile(send_durations, 50):.2f} "
+                    f"render_ms_p50={percentile(render_durations, 50):.2f} "
+                    f"render_ms_p95={percentile(render_durations, 95):.2f} "
                     f"key_ms_p50={percentile(key_latencies, 50):.2f} "
                     f"key_ms_p95={percentile(key_latencies, 95):.2f} "
                     f"screen_ms={screen_latency:.2f}",
                     flush=True,
                 )
+                app._render_terminal = original_render
+                client._request = original_request
+                client.send = original_send
                 await app.leave_input_mode()
 
     try:

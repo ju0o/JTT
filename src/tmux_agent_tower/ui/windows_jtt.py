@@ -73,28 +73,46 @@ def _screen_text(screen: TerminalScreen | None, columns: int, lines: int) -> Tex
     width = max(0, min(int(columns), max((len(row) for row in screen.rows), default=0)))
     height = max(0, min(int(lines), len(screen.rows)))
     output = Text(no_wrap=True, overflow="crop")
+    style_cache: dict[tuple, Style] = {}
+
+    def flush_run(parts: list[str], signature: tuple | None) -> None:
+        if not parts or signature is None:
+            return
+        style = style_cache.get(signature)
+        if style is None:
+            (foreground, background, bold, italic, underline, reverse,
+             blink, strike) = signature
+            style = Style(
+                color=foreground, bgcolor=background, bold=bold, italic=italic,
+                underline=underline, reverse=reverse, blink=blink, strike=strike,
+            )
+            style_cache[signature] = style
+        output.append("".join(parts), style=style)
+
     for y, row in enumerate(screen.rows[:height]):
         limit = min(width, len(row))
+        run: list[str] = []
+        run_style = None
         for x, cell in enumerate(row[:limit]):
             # pyte represents the trailing cell of a wide glyph with an empty
             # string. Emitting a space here would visibly split Korean and
             # other double-width characters in the RIGHT view.
             if not cell.text:
                 continue
-            value = cell.text
-            style = Style(
-                color=_rich_color(cell.foreground),
-                bgcolor=_rich_color(cell.background),
-                bold=cell.bold,
-                italic=cell.italic,
-                underline=cell.underline,
-                reverse=cell.reverse or (
+            signature = (
+                _rich_color(cell.foreground), _rich_color(cell.background),
+                cell.bold, cell.italic, cell.underline,
+                cell.reverse or (
                     screen.cursor_visible and x == screen.cursor_x and y == screen.cursor_y
                 ),
-                blink=cell.blink,
-                strike=cell.strikethrough,
+                cell.blink, cell.strikethrough,
             )
-            output.append(value, style=style)
+            if run_style is not None and signature != run_style:
+                flush_run(run, run_style)
+                run.clear()
+            run_style = signature
+            run.append(cell.text)
+        flush_run(run, run_style)
         if y + 1 < height:
             output.append("\n")
     return output
