@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+import time
 from typing import Any
 
 from textual.app import App, ComposeResult
@@ -27,6 +28,7 @@ from ..state.jtt_workspaces import (
     WorkspaceStoreError,
     default_jtt_root,
 )
+from .windows_mini_live import WindowsMiniLiveSampler, identity_key as _mini_identity_key
 
 
 _COLOR_NAMES = {
@@ -236,8 +238,8 @@ class WindowsJTTApp(App[None]):
     #current-window { height: 1; color: #75d9d0; text-style: bold; }
     #new-terminal { width: 100%; height: 3; margin-top: 1; }
     #terminal-cards { height: 1fr; }
-    .card-row { width: 100%; height: 5; margin-bottom: 1; }
-    .terminal-card { width: 1fr; height: 5; border: round #355d68; content-align: left middle; }
+    .card-row { width: 100%; height: 6; margin-bottom: 1; }
+    .terminal-card { width: 1fr; height: 6; border: round #355d68; content-align: left middle; }
     .terminal-card.selected { border: round #35cbbd; background: #102a35; }
     #live { height: 1fr; width: 100%; overflow-x: hidden; overflow-y: hidden;
             border: round #294550; padding: 0 1; background: #050b13; }
@@ -274,6 +276,10 @@ class WindowsJTTApp(App[None]):
         self._notice = ""
         self._notice_until = 0.0
         self._card_signature = None
+        self._mini_sampler: WindowsMiniLiveSampler | None = None
+        self._mini_cache: dict[str, tuple[tuple, int, float, TerminalScreen]] = {}
+        self._right_observation: tuple[tuple, int, float, TerminalScreen] | None = None
+        self._mini_last_submit = 0.0
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="panels"):
@@ -298,12 +304,17 @@ class WindowsJTTApp(App[None]):
         yield Static("탐색 · Ctrl+G n 새 터미널 · Tab 패널 이동 · Enter 입력 · Ctrl+G d 분리", id="statusline")
 
     async def on_mount(self) -> None:
+        self._mini_sampler = WindowsMiniLiveSampler()
         self.set_interval(1.0, self._refresh_sessions)
         self.set_interval(0.2, self._refresh_live)
+        self.set_interval(0.25, self._refresh_mini_live)
         await self._refresh_sessions()
 
     async def on_unmount(self) -> None:
         await self._close_selected_client()
+        if self._mini_sampler is not None:
+            self._mini_sampler.close()
+            self._mini_sampler = None
 
     async def _backend_call(self, function, *args, **kwargs):
         async with self._io_lock:
@@ -351,6 +362,8 @@ class WindowsJTTApp(App[None]):
         except Exception as exc:
             self._registry_sessions = {}
             self.sessions = {}
+            self._mini_cache.clear()
+            self._right_observation = None
             await self._close_selected_client()
             self.selected_identity = None
             self._clear_live("Supervisor 연결 실패 · 세션 목록을 읽을 수 없습니다.")
@@ -363,8 +376,11 @@ class WindowsJTTApp(App[None]):
         )}
         try:
             await self._apply_window_projection()
+            self._prune_mini_cache()
         except Exception as exc:
             self.sessions = {}
+            self._mini_cache.clear()
+            self._right_observation = None
             await self._close_selected_client()
             self.selected_id = None
             self.selected_identity = None
@@ -484,11 +500,13 @@ class WindowsJTTApp(App[None]):
         if not self.is_mounted:
             return
         values = list(self.sessions.values())
+        now = time.monotonic()
         signature = tuple(
             (item.session_id, item.generation, item.shell_pid, item.state, item.name,
-             item.session_id == self.selected_id)
+             item.session_id == self.selected_id,
+             self._mini_signature(item, now))
             for item in values
-        ) + (("window", self.selected_window_id),)
+        ) + (("window", self.selected_window_id, self.size.width, self.size.height),)
         if signature == self._card_signature:
             return
         self._card_signature = signature
@@ -500,20 +518,118 @@ class WindowsJTTApp(App[None]):
             self.query_one("#terminal-summary", Static).update("터미널 0개")
             return
         self.query_one("#terminal-summary", Static).update(f"터미널 {len(values)}개")
+        compact = self.size.height < 30
+        preview_lines = 1 if compact else 2
+        card_height = preview_lines + 4
+        card_columns = max(8, (container.size.width - 4) // 2)
         for start in range(0, len(values), 2):
             row = Horizontal(classes="card-row")
+            row.styles.height = card_height
             await container.mount(row)
             for identity in values[start:start + 2]:
                 selected = identity.session_id == self.selected_id
                 state = self._state_label(identity.state)
                 label = Text(f"{identity.name}\n{state} · PID {identity.shell_pid}")
+                cached = self._fresh_mini_screen(identity, now)
+                if cached is None:
+                    label.append("\n미니 화면 대기 중", style="dim")
+                else:
+                    label.append("\n")
+                    label.append(_screen_text(cached[3], card_columns, preview_lines))
                 button = Button(
                     label,
                     id="terminal-" + identity.session_id,
                     classes="terminal-card selected" if selected else "terminal-card",
                     variant="primary" if selected else "default",
                 )
+                button.styles.height = card_height
                 await row.mount(button)
+
+    def _mini_signature(self, identity: TerminalIdentity, now: float) -> tuple:
+        entry = self._mini_cache.get(identity.session_id)
+        if entry is None or entry[0] != _mini_identity_key(identity):
+            return ("none",)
+        if identity.state != "running" or now - entry[2] > 2.5:
+            return ("stale", entry[1])
+        return ("live", entry[1], int((now - entry[2]) / 2.5))
+
+    def _fresh_mini_screen(self, identity: TerminalIdentity, now: float):
+        entry = self._mini_cache.get(identity.session_id)
+        if (entry is None or identity.state != "running"
+                or entry[0] != _mini_identity_key(identity)
+                or now - entry[2] > 2.5):
+            return None
+        return entry
+
+    def _prune_mini_cache(self) -> None:
+        for session_id, entry in tuple(self._mini_cache.items()):
+            identity = self.sessions.get(session_id)
+            if (identity is None or identity.state != "running"
+                    or _mini_identity_key(identity) != entry[0]):
+                self._mini_cache.pop(session_id, None)
+        if (self._right_observation is not None and (
+                self.selected_identity is None
+                or self._right_observation[0] != _mini_identity_key(self.selected_identity))):
+            self._right_observation = None
+
+    def _visible_mini_targets(self) -> tuple[TerminalIdentity, ...]:
+        if not self.is_mounted:
+            return ()
+        container = self.query_one("#terminal-cards", ScrollableContainer)
+        values = list(self.sessions.values())
+        card_height = 5 if self.size.height < 30 else 6
+        row_pitch = card_height + 1
+        first_row = max(0, int(container.scroll_y) // row_pitch)
+        viewport_height = max(1, int(container.size.height))
+        last_row = max(first_row + 1,
+                       (int(container.scroll_y) + viewport_height + row_pitch - 1)
+                       // row_pitch)
+        visible = values[first_row * 2:last_row * 2]
+        return tuple(item for item in visible
+                     if item.state == "running" and item.session_id != self.selected_id)[:16]
+
+    async def _refresh_mini_live(self) -> None:
+        if (not self.is_mounted or self._busy or self._mini_sampler is None
+                or isinstance(self.screen, ModalScreen)):
+            return
+        result = self._mini_sampler.take()
+        if result is not None:
+            token, samples = result
+            if token == self._mini_scope():
+                for sample in samples:
+                    identity = self.sessions.get(sample["session_id"])
+                    if (identity is None
+                            or sample["identity"] != _mini_identity_key(identity)):
+                        continue
+                    if (sample["synced"] and sample["screen"] is not None
+                            and identity.state == "running"):
+                        self._mini_cache[identity.session_id] = (
+                            sample["identity"], int(sample["sequence"]),
+                            time.monotonic(), sample["screen"],
+                        )
+                    else:
+                        self._mini_cache.pop(identity.session_id, None)
+                await self._render_cards()
+
+        now = time.monotonic()
+        if self._right_observation is not None and self.selected_identity is not None:
+            key, sequence, updated, screen = self._right_observation
+            if (key == _mini_identity_key(self.selected_identity)
+                    and self.selected_identity.state == "running"
+                    and now - updated <= 0.5):
+                self._mini_cache[self.selected_identity.session_id] = (
+                    key, sequence, updated, screen,
+                )
+        if now - self._mini_last_submit < 1.0 or self._mini_sampler.busy:
+            return
+        targets = self._visible_mini_targets()
+        if self._mini_sampler.submit(self.registry, self._mini_scope(), targets):
+            self._mini_last_submit = now
+        await self._render_cards()
+
+    def _mini_scope(self) -> tuple:
+        return (self.selected_window_id,
+                tuple(_mini_identity_key(item) for item in self.sessions.values()))
 
     async def _select_session(self, identity: TerminalIdentity, *, focus: bool = True) -> None:
         if self._busy:
@@ -573,6 +689,8 @@ class WindowsJTTApp(App[None]):
             if self.client is not None:
                 await self._close_selected_client()
             self.input_mode = False
+            self._right_observation = None
+            self._mini_cache.pop(self.selected_identity.session_id, None)
             self._clear_live(self._state_label(self.selected_identity.state))
             self._update_status()
             return
@@ -595,15 +713,24 @@ class WindowsJTTApp(App[None]):
                 self._clear_live(self._state_label(observation.state))
             elif not observation.synced or observation.screen is None:
                 self.input_mode = False
+                self._right_observation = None
+                self._mini_cache.pop(self.selected_identity.session_id, None)
                 if self.client.lease:
                     await self._backend_call(self.client.release)
                 self._clear_live("화면 재동기화 중 · 입력 차단")
             else:
                 self._render_terminal(observation.screen)
+                self._right_observation = (
+                    _mini_identity_key(self.selected_identity), observation.sequence,
+                    time.monotonic(), observation.screen,
+                )
                 self._update_status()
         except Exception as exc:
             await self._close_selected_client()
             self.input_mode = False
+            if self.selected_identity is not None:
+                self._mini_cache.pop(self.selected_identity.session_id, None)
+            self._right_observation = None
             if not self.is_mounted:
                 return
             self._clear_live("세션 확인 실패 · 오래된 출력을 숨겼습니다.")

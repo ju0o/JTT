@@ -23,6 +23,7 @@ from ju0_terminal_tower.terminal.manager import (
     TerminalScreen,
 )
 from ju0_terminal_tower.ui.windows_jtt import WindowsJTTApp, _same_identity
+from ju0_terminal_tower.ui.windows_mini_live import identity_key as _mini_identity_key
 
 
 def _screen(text: str = "JTT_TEST_READY") -> TerminalScreen:
@@ -47,15 +48,19 @@ class FakeClient:
         self.closed = False
         self.sent: list[bytes] = []
         self.resizes: list[tuple[int, int]] = []
+        self.acquire_calls = 0
 
     def observe(self):
         return TerminalObservation(
             session_id=self.identity.session_id, generation=self.identity.generation,
             shell_pid=self.identity.shell_pid, sequence=len(self.sent), state="running",
-            synced=True, columns=100, lines=30, screen=_screen(), renderer_state="ready",
+            synced=True, columns=100, lines=30,
+            screen=_screen("SESSION_" + self.identity.session_id[-4:]),
+            renderer_state="ready",
         )
 
     def acquire(self):
+        self.acquire_calls += 1
         self.lease = True
         return True
 
@@ -88,7 +93,7 @@ class FakeRegistry:
         self.list_calls += 1
         return tuple(self.sessions)
 
-    def connect(self, session_id):
+    def connect(self, session_id, *, timeout=3.0):
         identity = next(item for item in self.sessions if item.session_id == session_id)
         client = FakeClient(identity)
         self.clients.append(client)
@@ -297,6 +302,60 @@ def test_keyboard_window_switch_keeps_left_focus_and_does_not_acquire_new_lease(
     asyncio.run(scenario())
 
 
+def test_mini_live_observes_each_card_without_lease_input_or_resize(tmp_path):
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        registry = FakeRegistry([first, second])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        workspace_store.set_terminal_ids(
+            workspace_store.DEFAULT_ID, [first.session_id, second.session_id]
+        )
+        layout_store = JTTLayoutStore(workspace_store.root)
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+        )
+        async with app.run_test(size=(160, 44)) as pilot:
+            visible_targets = app._visible_mini_targets()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and second.session_id not in app._mini_cache:
+                await pilot.pause(0.1)
+            entry = app._mini_cache.get(second.session_id)
+            assert entry is not None, (
+                "non-selected terminal did not receive a Mini LIVE sample; "
+                f"visible={[item.session_id for item in visible_targets]}, "
+                f"clients={[item.identity.session_id for item in registry.clients]}, "
+                f"sampler_busy={app._mini_sampler.busy if app._mini_sampler else None}, "
+                f"mini_last={app._mini_last_submit:.3f}, now={time.monotonic():.3f}, "
+                f"busy={app._busy}, "
+                f"thread_alive={app._mini_sampler._thread.is_alive()}, "
+                f"stopping={app._mini_sampler._stopping}, "
+                f"requests={app._mini_sampler._requests.qsize()}, "
+                f"results={app._mini_sampler._results.qsize()}, "
+                f"window_sessions={list(app.sessions)}"
+            )
+            assert entry[0] == _mini_identity_key(second)
+            await pilot.pause(0.05)
+            assert "SESSION_0002" in app.query_one(
+                "#terminal-" + second.session_id, Button
+            ).label.plain
+            observers = [client for client in registry.clients
+                         if client.identity.session_id == second.session_id]
+            assert observers
+            assert all(not client.lease and client.acquire_calls == 0 for client in observers)
+            assert all(not client.sent and not client.resizes for client in observers)
+            assert registry.create_count == 0
+
+            changed = TerminalIdentity(**{**second.__dict__, "generation": "f" * 32})
+            registry.sessions[1] = changed
+            await app._refresh_sessions()
+            assert second.session_id not in app._mini_cache
+            assert "SESSION_0002" not in app.query_one(
+                "#terminal-" + second.session_id, Button
+            ).label.plain
+
+    asyncio.run(scenario())
+
+
 def test_windows_ui_projects_legacy_sessions_without_startup_migration(tmp_path):
     async def scenario():
         identity = _identity(1)
@@ -391,7 +450,7 @@ def test_stop_confirmation_defaults_to_cancel_and_revalidates_identity():
             await pilot.pause(1.1)
             assert registry.list_calls > calls_before_modal_tick
             assert str(app.query_one("#terminal-summary", Static).render()) == "터미널 1개"
-            assert "JTT_TEST_READY" in str(app.query_one("#live", Static).render())
+            assert "SESSION_0001" in str(app.query_one("#live", Static).render())
             assert registry.stop_calls == []
             assert registry.sessions == [identity]
 
