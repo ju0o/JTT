@@ -351,6 +351,7 @@ def test_prefix_copy_uses_fresh_selected_right_screen_only_on_request(monkeypatc
             )
             assert copied == ["\r\n".join(lines)]
             assert client.lease is False
+            assert app.input_mode is False
             assert client.sent == []
 
             # A changed generation invalidates the copy target without touching
@@ -388,6 +389,7 @@ def test_windows_copy_chord_never_becomes_shell_ctrl_c(monkeypatch):
             await pilot.press("ctrl+shift+c")
             assert client.sent == []
             assert copied == [client.screen_text]
+            assert app.input_mode is True
             await pilot.press("ctrl+c")
             assert client.sent == [b"\x03"]
 

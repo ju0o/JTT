@@ -1027,38 +1027,32 @@ def test_native_powershell_prompt_tracks_long_current_location(
         assert client.acquire()
         client.resize(columns, lines)
 
-        # Wait until PowerShell reports the resized dimensions and returns to
-        # the prompt before sending the path change. The marker alone can be
-        # emitted before PowerShell has finished the command and is ready for
-        # the next line.
-        width_marker = f"JTT_WIDTH_{columns}_END"
-        width_query = (
-            f"[Console]::WriteLine('JTT_WIDTH_' + [Console]::WindowWidth + '_END')"
+        # In one command, report the actual PowerShell width, change location,
+        # then print the resolved path. This avoids inserting a second line
+        # while the host is transitioning from output back to its prompt.
+        width_marker = f"W{columns}"
+        command = (
+            "[Console]::WriteLine('W' + [Console]::WindowWidth); "
+            f"cd '{destination.name}'; "
+            "[Console]::WriteLine((Get-Location).Path)"
         )
-        assert width_marker not in width_query
-        client.send((width_query + "\r").encode("ascii"))
-        resized_prompt = _expected_prompt_path(start, columns)
-        resized = _wait(client, lambda item: item.screen is not None
-                        and width_marker in _screen_text(item.screen)
-                        and resized_prompt in _screen_text(item.screen).split(
-                            width_marker, 1
-                        )[1])
-        assert (resized.columns, resized.lines) == (columns, lines)
-
-        # Navigate relatively so the test command itself remains short even
-        # though the resolved working directory is over 100 characters.
-        command = f"cd '{destination.name}'"
+        assert width_marker not in command
         assert str(destination) not in command
-        client.send(command.encode("utf-8"))
-        _wait(client, lambda item: item.screen is not None
-              and command in _screen_text(item.screen))
-        client.send(b"\r")
+        client.send((command + "\r").encode("utf-8"))
         try:
+            def path_prompt_observed(item):
+                if item.screen is None:
+                    return False
+                compact = _compact_screen_text(item.screen)
+                path_index = compact.rfind(str(destination))
+                return (
+                    width_marker in compact and path_index >= 0
+                    and _expected_prompt_path(destination, columns)
+                    in compact[path_index + len(str(destination)):]
+                )
+
             update = _wait(
-                client,
-                lambda item: item.screen is not None
-                and _expected_prompt_path(destination, columns)
-                in _compact_screen_text(item.screen),
+                client, path_prompt_observed,
             )
         except AssertionError as exc:
             last = client.poll()
@@ -1069,20 +1063,9 @@ def test_native_powershell_prompt_tracks_long_current_location(
         assert (update.columns, update.lines) == (columns, lines)
 
         # The actual path comes from PowerShell after cd; it is not embedded
-        # in the command echo and remains distinct from the shortened prompt.
-        query = "pwd"
-        assert str(destination) not in query
-        client.send(query.encode("ascii"))
-        _wait(client, lambda item: item.screen is not None
-              and query in _screen_text(item.screen))
-        client.send(b"\r")
-        output = _wait(
-            client,
-            lambda item: item.screen is not None
-            and str(destination) in _compact_screen_text(item.screen),
-        )
-        assert str(destination) in _compact_screen_text(output.screen)
-        assert _expected_prompt_path(destination, columns) in _compact_screen_text(output.screen)
+        # in the command echo and the new prompt follows that path output.
+        assert str(destination) in _compact_screen_text(update.screen)
+        assert _expected_prompt_path(destination, columns) in _compact_screen_text(update.screen)
     finally:
         client.close()
         current = next((item for item in registry.list_sessions()
