@@ -89,7 +89,9 @@ def _wait(client, predicate, timeout=15):
     )
 
 
-def _wait_for_raw_output(client, expected: bytes, timeout=15, *, checkpoints=()):
+def _wait_for_raw_output(
+        client, expected: bytes, timeout=15, *, checkpoints=(),
+        screen_checkpoints=()):
     """Collect actual ConPTY bytes; console soft-wraps may split output markers."""
     deadline = time.monotonic() + timeout
     output = bytearray()
@@ -105,12 +107,18 @@ def _wait_for_raw_output(client, expected: bytes, timeout=15, *, checkpoints=())
     seen_checkpoints = tuple(
         label for label, marker in checkpoints if marker in compact_output
     )
+    screen_text = _compact_screen_text(last.screen) if last and last.screen else ""
+    seen_screen_checkpoints = tuple(
+        label for label, marker in screen_checkpoints if marker in screen_text
+    )
     raise AssertionError(
         "PowerShell output marker missing from ConPTY stream: "
         f"state={getattr(last, 'state', None)!r}; "
         f"renderer={getattr(last, 'renderer_state', None)!r}; "
         f"sequence={getattr(last, 'sequence', None)!r}; "
         f"observed_checkpoints={seen_checkpoints!r}; "
+        f"screen_checkpoints={seen_screen_checkpoints!r}; "
+        f"continuation_prompt={'>>' in screen_text!r}; "
         f"marker={expected!r}"
     )
 
@@ -1114,6 +1122,11 @@ def test_native_powershell_prompt_tracks_long_current_location(
                 ("actual_destination_path", str(destination).encode("utf-8")),
                 ("Set-Location_error", change_directory_error.encode("ascii")),
                 ("actual_location_output_finished", path_end.encode("ascii")),
+                ("completion_source_fragment", b"VERIFY_COMPLETE_"),
+            ),
+            screen_checkpoints=(
+                ("completion_source_fragment", "VERIFY_COMPLETE_"),
+                ("PowerShell_continuation_prompt", ">>"),
             ),
         )
         compact_output = raw_output.replace(b"\r", b"").replace(b"\n", b"")
