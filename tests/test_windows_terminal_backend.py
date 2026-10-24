@@ -1087,62 +1087,66 @@ def test_native_powershell_prompt_tracks_long_current_location(
             and _screen_contains_after(item.screen, ready_marker, start_prompt),
         )
 
-        location_command = f"Set-Location -LiteralPath '{destination.name}'"
-        assert str(destination) not in location_command
-        client.send(location_command.encode("utf-8"))
-        _wait_for_raw_output(
-            client,
-            location_command.encode("utf-8"),
-            checkpoints=(("location_command_echo", location_command.encode("utf-8")),),
+        # Submit the location change and its independent result in one PTY
+        # write. The hosted failure observed command echo but no execution
+        # output, so echo is not used as an intermediate submission barrier.
+        # The resolved path is not in the command, proving PowerShell executed
+        # Set-Location rather than merely echoing input.
+        location_command = (
+            f"Set-Location -LiteralPath '{destination.name}'; "
+            "[Console]::WriteLine((Get-Location).Path)"
         )
-        client.send(b"\r")
+        assert str(destination) not in location_command
+        client.send((location_command + "\r").encode("utf-8"))
 
         initial_width_prompt = _expected_prompt_path(destination, 100)
         prompt_bytes = initial_width_prompt.encode("utf-8")
-        _prompt_update, prompt_output = _wait_for_raw_output(
-            client,
-            prompt_bytes,
-            checkpoints=(
-                ("location_command_echo", location_command.encode("utf-8")),
-                ("location_error", b"Set-Location :"),
-            ),
-        )
-        compact_prompt_output = prompt_output.replace(b"\r", b"").replace(b"\n", b"")
-        assert prompt_bytes in compact_prompt_output
-
-        # The ConPTY stream proves the new prompt was emitted. Check its
-        # screen-cell rendering separately so output and pyte state cannot be
-        # confused when diagnosing a failure.
-        update = _wait(
-            client,
-            lambda item: item.screen is not None
-            and _screen_contains_after(item.screen, location_command, initial_width_prompt),
-        )
-        assert initial_width_prompt in _compact_screen_text(update.screen)
-
-        # Get-Location prints the full resolved path. It is not present in the
-        # input command or abbreviated prompt, so this proves PowerShell
-        # actually changed directory independently of the echoed command.
-        path_command = "[Console]::WriteLine((Get-Location).Path)"
-        assert str(destination) not in path_command
-        client.send(path_command.encode("utf-8"))
-        _wait_for_raw_output(
-            client,
-            path_command.encode("utf-8"),
-            checkpoints=(("path_command_echo", path_command.encode("utf-8")),),
-        )
-        client.send(b"\r")
         path_bytes = str(destination).encode("utf-8")
         _path_update, path_output = _wait_for_raw_output(
             client,
             path_bytes,
             checkpoints=(
-                ("path_command_echo", path_command.encode("utf-8")),
+                ("location_command_echo", location_command.encode("utf-8")),
                 ("location_error", b"Set-Location :"),
             ),
         )
         compact_path_output = path_output.replace(b"\r", b"").replace(b"\n", b"")
         assert path_bytes in compact_path_output
+
+        # The resolved path and prompt may be delivered in one ConPTY read.
+        # Reuse bytes already observed before polling for a later chunk.
+        prompt_output = bytearray(path_output)
+        if prompt_bytes not in compact_path_output:
+            _prompt_update, prompt_more = _wait_for_raw_output(
+                client,
+                prompt_bytes,
+                checkpoints=(("location_error", b"Set-Location :"),),
+            )
+            prompt_output.extend(prompt_more)
+        compact_prompt_output = bytes(prompt_output).replace(b"\r", b"").replace(b"\n", b"")
+        assert prompt_bytes in compact_prompt_output
+
+        # The ConPTY stream proves the new prompt was emitted. Check its
+        # screen-cell rendering separately so output and pyte state cannot be
+        # confused when diagnosing a failure.
+        resolved_path = str(destination)
+
+        def resolved_location_rendered(item):
+            if item.screen is None:
+                return False
+            compact = _compact_screen_text(item.screen)
+            command_index = compact.rfind(location_command)
+            path_index = compact.find(resolved_path, command_index + len(location_command))
+            prompt_index = compact.find(initial_width_prompt, path_index + len(resolved_path))
+            return command_index >= 0 and path_index >= 0 and prompt_index >= 0
+
+        update = _wait(client, resolved_location_rendered)
+        assert (update.columns, update.lines) == (100, 30)
+        rendered_location = _compact_screen_text(update.screen)
+        assert resolved_location_rendered(update)
+        # This verifies the full line-wrapped result made it through pyte cells,
+        # separately from the raw ConPTY assertion above.
+        assert rendered_location.find(resolved_path) >= 0
 
         client.resize(columns, lines)
         resized = _wait(
