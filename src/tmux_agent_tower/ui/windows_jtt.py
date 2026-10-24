@@ -510,7 +510,6 @@ class WindowsJTTApp(App[None]):
         self._cards_render_lock = asyncio.Lock()
         self._mini_sampler: WindowsMiniLiveSampler | None = None
         self._refresh_timers: list[Any] = []
-        self._input_refresh_timer = None
         self._mini_live_stopping = False
         self._mini_cache: dict[str, tuple[tuple, int, float, TerminalScreen]] = {}
         self._right_observation: tuple[tuple, int, float, TerminalScreen] | None = None
@@ -543,7 +542,7 @@ class WindowsJTTApp(App[None]):
         self._mini_sampler = WindowsMiniLiveSampler()
         self._refresh_timers = [
             self.set_interval(1.0, self._refresh_sessions),
-            self.set_interval(0.2, self._refresh_live),
+            self.set_interval(0.1, self._refresh_live),
             self.set_interval(0.25, self._refresh_mini_live),
         ]
         await self._refresh_sessions()
@@ -560,9 +559,6 @@ class WindowsJTTApp(App[None]):
         timers, self._refresh_timers = self._refresh_timers, []
         for timer in timers:
             timer.stop()
-        if self._input_refresh_timer is not None:
-            self._input_refresh_timer.stop()
-            self._input_refresh_timer = None
 
     async def _backend_call(self, function, *args, **kwargs):
         async with self._io_lock:
@@ -1110,7 +1106,8 @@ class WindowsJTTApp(App[None]):
                     return
                 self._clear_live("화면 재동기화 중 · 입력 차단")
             else:
-                self._render_terminal(observation.screen)
+                if not self._render_terminal(observation.screen):
+                    return
                 self._right_observation = (
                     _mini_identity_key(identity), observation.sequence,
                     time.monotonic(), observation.screen,
@@ -1140,16 +1137,31 @@ class WindowsJTTApp(App[None]):
             and _same_identity(self.selected_identity, identity)
         )
 
-    def _render_terminal(self, screen: TerminalScreen) -> None:
-        view = self.query_one("#live", TerminalView)
+    def _live_view(self) -> TerminalView | None:
+        if not self._base_widgets_available():
+            return None
+        try:
+            view = self.query_one("#live", TerminalView)
+        except NoMatches:
+            # Textual may detach the RIGHT subtree during screen teardown
+            # before the app's unmount callback stops its timers.
+            return None
+        return view if view.is_attached else None
+
+    def _render_terminal(self, screen: TerminalScreen) -> bool:
+        view = self._live_view()
+        if view is None:
+            return False
         size = view.content_size
         columns = max(1, size.width)
         lines = max(1, size.height)
         view.update(_screen_text(screen, columns, lines))
+        return True
 
     def _clear_live(self, message: str = "") -> None:
-        if self._base_widgets_available():
-            self.query_one("#live", TerminalView).update(Text(message or "터미널을 선택하세요.", style="dim"))
+        view = self._live_view()
+        if view is not None:
+            view.update(Text(message or "터미널을 선택하세요.", style="dim"))
 
     async def _prompt_create_window(self) -> None:
         # The dialog belongs to navigation mode. Revoke any terminal input
@@ -1506,9 +1518,6 @@ class WindowsJTTApp(App[None]):
     async def leave_input_mode(self) -> None:
         self.prefix_pending = False
         self._prefix_generation += 1
-        if self._input_refresh_timer is not None:
-            self._input_refresh_timer.stop()
-            self._input_refresh_timer = None
         if self.client is not None and self.client.lease:
             try:
                 await self._backend_call(self.client.release)
@@ -1546,11 +1555,6 @@ class WindowsJTTApp(App[None]):
             self.input_mode = False
             self._clear_live("입력 실패 · 세션 화면을 다시 선택하세요.")
             self._set_notice(f"키 입력이 차단되었습니다: {exc}", 8.0)
-        else:
-            # Avoid a full ConPTY observe and Rich redraw for every character.
-            # Coalesce refreshes while typing; the periodic LIVE timer remains
-            # a fallback if the UI is busy.
-            self._schedule_input_refresh()
         self._update_status()
 
     def _input_target_is_current(self, client, identity) -> bool:
@@ -1563,11 +1567,6 @@ class WindowsJTTApp(App[None]):
         return visible is not None and visible.state == "running" and _same_identity(
             identity, visible
         )
-
-    def _schedule_input_refresh(self) -> None:
-        if self._input_refresh_timer is not None:
-            self._input_refresh_timer.stop()
-        self._input_refresh_timer = self.set_timer(0.05, self._refresh_live)
 
     async def on_paste(self, event: Paste) -> None:
         """Forward an explicit terminal paste event to the verified RIGHT lease.

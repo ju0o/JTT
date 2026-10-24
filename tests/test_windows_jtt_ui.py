@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import io
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -1052,12 +1053,24 @@ def test_native_windows_paste_event_enters_selected_powershell(tmp_path):
             expected = f"JTT_PASTE_RESULT_{nonce}_END"
             command = f"[Console]::WriteLine('JTT_PASTE_' + 'RESULT_{nonce}' + '_END')"
             assert expected not in command
+            client = app.client
+            assert client is not None
+            paste_bytes = command.encode("utf-8")
+            paste_written = threading.Event()
+            original_send = client.send
+
+            def record_paste(data):
+                written = original_send(data)
+                if data == paste_bytes:
+                    paste_written.set()
+                return written
+
+            client.send = record_paste
             assert app.post_message(Paste(command))
-            await _wait_for_ui_state(
-                pilot, lambda: app._input_refresh_timer is not None,
-                "paste dispatched to selected RIGHT terminal",
+            assert await asyncio.to_thread(paste_written.wait, 10), (
+                "Textual Paste event was not sent to the active ConPTY lease"
             )
-            await pilot.press("enter")
+            await app._send_bytes(b"\r")
             await _wait_for_ui_state(
                 pilot,
                 lambda: app._right_observation is not None
