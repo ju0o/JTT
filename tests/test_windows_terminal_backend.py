@@ -1113,7 +1113,11 @@ def test_native_powershell_prompt_tracks_long_current_location(
         location_command = f"cd '{destination.name}'; $PWD.Path"
         assert str(destination) not in location_command
         assert len(start_prompt) + 2 + len(location_command) < 100
-        client.send((location_command + "\r").encode("utf-8"))
+        # Match the native UI's per-key RPC path, including a separate Enter
+        # acknowledgement, instead of bulk-pasting a whole command line.
+        for character in location_command:
+            assert client.send(character.encode("utf-8")) == 1
+        assert client.send(b"\r") == 1
 
         initial_width_prompt = _expected_prompt_path(destination, 100)
         prompt_bytes = initial_width_prompt.encode("utf-8")
@@ -1126,6 +1130,7 @@ def test_native_powershell_prompt_tracks_long_current_location(
                 ("location_error", b"Set-Location :"),
             ),
             screen_checkpoints=(
+                ("location_command_echo", location_command),
                 ("resolved_location", str(destination)),
                 ("resolved_prompt", initial_width_prompt),
             ),
