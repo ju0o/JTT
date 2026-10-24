@@ -269,10 +269,13 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
             identity = app.selected_identity
             assert identity is not None
             created.update(identity=identity)
-            # The shell expands its own PID, so this result cannot be mistaken
-            # for text echoed from the command line.
-            command = 'Write-Output "JTT_UI_RESULT_$PID"'
-            expected_result = f"JTT_UI_RESULT_{identity.shell_pid}"
+            # PowerShell builds the nonce-bearing output from separate source
+            # fragments, so the completed result cannot be mistaken for echo.
+            nonce = identity.session_id[:10]
+            expected_result = f"JTT_UI_RESULT_{nonce}_END"
+            command = (
+                f"[Console]::WriteLine('JTT_UI_' + 'RESULT_{nonce}' + '_END')"
+            )
             assert expected_result not in command
             assert (app.input_mode and app.client is not None and app.client.lease), (
                 "input lease was lost before submitting the command; "
