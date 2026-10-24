@@ -1044,11 +1044,17 @@ def test_native_powershell_prompt_tracks_long_current_location(
                 if item.screen is None:
                     return False
                 compact = _compact_screen_text(item.screen)
-                path_index = compact.rfind(str(destination))
+                width_index = compact.find(width_marker)
+                output_path_index = compact.find(
+                    str(destination), width_index + len(width_marker),
+                )
+                expected_prompt = _expected_prompt_path(destination, columns)
+                prompt_index = compact.find(
+                    expected_prompt, output_path_index + len(str(destination)),
+                )
                 return (
-                    width_marker in compact and path_index >= 0
-                    and _expected_prompt_path(destination, columns)
-                    in compact[path_index + len(str(destination)):]
+                    width_index >= 0 and output_path_index >= 0
+                    and prompt_index >= 0
                 )
 
             update = _wait(

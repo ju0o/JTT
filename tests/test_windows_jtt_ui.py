@@ -1290,16 +1290,21 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 await _wait_for_ui_state(
                     pilot,
                     lambda marker=marker: app._right_observation is not None
-                    and marker in _plain_screen_text(app._right_observation[3]),
+                    and marker in "".join(
+                        _plain_screen_text(app._right_observation[3]).split()
+                    ),
                     f"generated PowerShell output {marker}", timeout=20,
                 )
             await app.leave_input_mode()
-            await pilot.press("ctrl+shift+c")
+            # Windows Terminal may reserve Ctrl+Shift+C for its host copy
+            # command; exercise JTT's explicit copy fallback through its prefix.
+            await pilot.press("ctrl+g", "c")
             await _wait_for_ui_state(
                 pilot, lambda: bool(copied), "explicit copy chord payload",
             )
             payload = copied[-1]
-            assert all(marker in payload for marker in expected)
+            compact_payload = "".join(payload.split())
+            assert all(marker in compact_payload for marker in expected)
             assert "\r\n" in payload
             await pilot.press("ctrl+g", "d")
 
