@@ -1224,6 +1224,10 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                 await pilot.pause(1.2)
                 assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
                 await pilot.click("#cancel-stop")
+                await _wait_for_ui_state(
+                    pilot, lambda: not isinstance(stop_app.screen, ModalScreen),
+                    "cancelled stop modal dismissal",
+                )
                 await assert_still_running(identity)
 
                 # Simulate a stale card identity without changing persisted
@@ -1244,6 +1248,10 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                 await wait_for_confirmation_button()
                 await pilot.click("#confirm-stop")
                 await asyncio.wait_for(mismatch_finished.wait(), timeout=10)
+                await _wait_for_ui_state(
+                    pilot, lambda: not isinstance(stop_app.screen, ModalScreen),
+                    "stale stop modal dismissal",
+                )
                 remaining = registry.list_sessions()
                 assert len(remaining) == 1 and _same_identity(identity, remaining[0])
                 await assert_still_running(identity)
