@@ -1459,7 +1459,11 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                 await assert_still_running(identity)
 
                 # Simulate a stale card identity without changing persisted
-                # registry metadata or the owned PowerShell process.
+                # registry metadata or the owned PowerShell process. Pause
+                # periodic reconciliation so it does not correctly clear the
+                # deliberately stale selection before the stop confirmation
+                # can exercise its own final identity check.
+                stop_app._stop_refresh_timers()
                 stale_identity = TerminalIdentity(**{
                     **identity.__dict__, "generation": "f" * 32,
                 })

@@ -1068,45 +1068,17 @@ def test_native_powershell_prompt_tracks_long_current_location(
 
         nonce = identity.session_id[:10]
         width_marker = f"JTT_WIDTH_{nonce}_{columns}_END"
-        width_command = (
-            "[Console]::WriteLine('JTT_' + 'WIDTH_' + "
-            f"'{nonce}' + '_' + "
-            "[Console]::WindowWidth + '_END')"
-        )
-        assert width_marker not in width_command
-        client.send((width_command + "\r").encode("ascii"))
-        _wait_for_raw_output(client, width_marker.encode("ascii"))
-        initial_prompt = _expected_prompt_path(start, columns)
-        _wait(
-            client,
-            lambda update: update.screen is not None
-            and _screen_contains_after(update.screen, width_marker, initial_prompt),
-        )
-
-        # Confirm Set-Location completed before issuing a separate location
-        # query. This distinguishes shell execution from the rendered prompt.
-        cd_marker = f"JTT_CD_{nonce}_END"
-        cd_command = (
-            f"Set-Location -LiteralPath '{destination.name}'; "
-            "[Console]::WriteLine('JTT_' + 'CD_' + "
-            f"'{nonce}' + '_' + "
-            "'END')"
-        )
-        assert cd_marker not in cd_command
-        assert str(destination) not in cd_command
-        client.send((cd_command + "\r").encode("ascii"))
-        _wait_for_raw_output(client, cd_marker.encode("ascii"))
-
-        expected_prompt = _expected_prompt_path(destination, columns)
-        _wait(
-            client,
-            lambda update: update.screen is not None
-            and _screen_contains_after(update.screen, cd_marker, expected_prompt),
-        )
-
         path_start = f"JTT_PATH_{nonce}_BEGIN"
         path_end = f"JTT_PATH_{nonce}_END"
-        path_command = (
+        # A rendered prompt may still be visible while PowerShell is handling
+        # a previous command. Keep the resize, location change, and actual
+        # command results in one input so no screenshot is used as an input
+        # readiness signal.
+        verification_command = (
+            "[Console]::WriteLine('JTT_' + 'WIDTH_' + "
+            f"'{nonce}' + '_' + "
+            "[Console]::WindowWidth + '_END'); "
+            f"Set-Location -LiteralPath '{destination.name}'; "
             "[Console]::WriteLine('JTT_' + 'PATH_' + "
             f"'{nonce}' + '_' + "
             "'BEGIN'); "
@@ -1115,11 +1087,13 @@ def test_native_powershell_prompt_tracks_long_current_location(
             f"'{nonce}' + '_' + "
             "'END')"
         )
-        assert path_start not in path_command
-        assert path_end not in path_command
-        assert str(destination) not in path_command
-        client.send((path_command + "\r").encode("ascii"))
+        assert width_marker not in verification_command
+        assert path_start not in verification_command
+        assert path_end not in verification_command
+        assert str(destination) not in verification_command
+        client.send((verification_command + "\r").encode("ascii"))
         update, raw_output = _wait_for_raw_output(client, path_end.encode("ascii"))
+        assert width_marker.encode("ascii") in raw_output
         start_index = raw_output.rfind(path_start.encode("ascii"))
         end_index = raw_output.find(path_end.encode("ascii"), start_index + len(path_start))
         assert start_index >= 0 and end_index > start_index
@@ -1130,26 +1104,19 @@ def test_native_powershell_prompt_tracks_long_current_location(
         )
         assert path_bytes in location_without_linebreaks
 
-        try:
-            def path_prompt_observed(item):
-                if item.screen is None:
-                    return False
-                compact = _compact_screen_text(item.screen)
-                end_index = compact.rfind(path_end)
-                prompt_index = compact.find(expected_prompt, end_index + len(path_end))
-                return (
-                    path_start in compact and end_index >= 0 and prompt_index >= 0
-                )
+        expected_prompt = _expected_prompt_path(destination, columns)
+        def path_prompt_observed(item):
+            if item.screen is None:
+                return False
+            compact = _compact_screen_text(item.screen)
+            end_index = compact.rfind(path_end)
+            prompt_index = compact.find(expected_prompt, end_index + len(path_end))
+            return (
+                width_marker in compact and path_start in compact
+                and end_index >= 0 and prompt_index >= 0
+            )
 
-            update = _wait(client, path_prompt_observed)
-        except AssertionError as exc:
-            last = client.poll()
-            captured = (_compact_screen_text(last.screen)
-                        if last is not None and last.screen is not None else "<no screen>")
-            raise AssertionError(
-                "PowerShell location output reached ConPTY but final prompt was "
-                f"not rendered; screen={captured!r}"
-            ) from exc
+        update = _wait(client, path_prompt_observed)
         display = _compact_screen_text(update.screen)
         assert (update.columns, update.lines) == (columns, lines)
 
