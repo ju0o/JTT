@@ -201,8 +201,8 @@ def _bootstrap_script(release_name, abort_name):
         "function global:prompt { "
         "$path=$ExecutionContext.SessionState.Path.CurrentLocation.Path; "
         "$width=120; try { $width=[int]$Host.UI.RawUI.WindowSize.Width } catch {}; "
-        # Leave room for a useful input line when the path is abbreviated.
-        "$limit=[Math]::Max(12,$width-20); "
+        # Leave about 30 columns for command entry when the path is abbreviated.
+        "$limit=[Math]::Max(12,$width-36); "
         "if ($path.Length -gt $limit) { "
         "$root=[System.IO.Path]::GetPathRoot($path); "
         "if ($null -eq $root) { $root='' }; "

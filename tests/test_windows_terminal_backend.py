@@ -54,7 +54,7 @@ def _expected_prompt_path(path, columns):
     from pathlib import PureWindowsPath
 
     text = str(path)
-    limit = max(12, columns - 20)
+    limit = max(12, columns - 36)
     if len(text) > limit:
         root = PureWindowsPath(text).anchor
         if len(root) > limit - 5:
@@ -114,8 +114,8 @@ def test_native_powershell_create_io_resize_detach_reconnect_stop(tmp_path, monk
         )
         assert _process_same(identity.shell_pid, identity.shell_start)
         _wait(client, lambda update: update.screen is not None
-              and "PS " in _screen_text(update.screen)
-              and str(work) + ">" in _compact_screen_text(update.screen))
+              and _expected_prompt_path(work, 100)
+              in _compact_screen_text(update.screen))
         assert client.acquire()
         marker = _generated_marker(client, "CREATE")
         assert marker
@@ -1026,6 +1026,18 @@ def test_native_powershell_prompt_tracks_long_current_location(
         assert _expected_prompt_path(start, 100) in _compact_screen_text(initial.screen)
         assert client.acquire()
         client.resize(columns, lines)
+
+        # Wait for PowerShell itself to observe the resize before sending the
+        # path change; this avoids racing ConPTY's asynchronous resize event.
+        width_marker = f"JTT_WIDTH_{columns}_END"
+        width_query = (
+            f"[Console]::WriteLine('JTT_WIDTH_' + [Console]::WindowWidth + '_END')"
+        )
+        assert width_marker not in width_query
+        client.send((width_query + "\r").encode("ascii"))
+        resized = _wait(client, lambda item: item.screen is not None
+                        and width_marker in _screen_text(item.screen))
+        assert (resized.columns, resized.lines) == (columns, lines)
 
         # Navigate relatively so the test command itself remains short even
         # though the resolved working directory is over 100 characters.
