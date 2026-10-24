@@ -198,7 +198,8 @@ def _bootstrap_script(release_name, abort_name):
         "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
         "$OutputEncoding=[Console]::OutputEncoding; "
         "Remove-Module PSReadLine -ErrorAction SilentlyContinue; "
-        "function prompt { 'JTT> ' }"
+        "function global:prompt { 'PS ' + "
+        "$ExecutionContext.SessionState.Path.CurrentLocation.Path + '> ' }"
     )
 
 

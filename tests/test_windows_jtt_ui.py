@@ -36,6 +36,17 @@ def _screen(text: str = "JTT_TEST_READY") -> TerminalScreen:
     return TerminalScreen((cells,), min(len(cells), 3), 0, True)
 
 
+def _screen_lines(*lines: str) -> TerminalScreen:
+    rows = tuple(tuple(TerminalCell(
+        char, "default", "default", False, False, False, False, False, False
+    ) for char in line) for line in lines)
+    return TerminalScreen(rows, 0, max(0, len(rows) - 1), True)
+
+
+def _plain_screen_text(screen: TerminalScreen) -> str:
+    return "\n".join("".join(cell.text for cell in row) for row in screen.rows)
+
+
 def _identity(index: int, *, state: str = "running") -> TerminalIdentity:
     return TerminalIdentity(
         session_id=f"{index:032x}", generation=f"{index + 100:032x}",
@@ -298,6 +309,127 @@ def test_right_paste_uses_only_current_verified_input_lease():
             assert client.sent == []
 
     asyncio.run(scenario())
+
+
+def test_prefix_copy_uses_fresh_selected_right_screen_only_on_request(monkeypatch):
+    windows_ui = importlib.import_module("ju0_terminal_tower.ui.windows_jtt")
+    copied = []
+    monkeypatch.setattr(
+        windows_ui, "_write_windows_clipboard", lambda text: copied.append(text),
+        raising=False,
+    )
+
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        app = WindowsJTTApp(registry)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id
+                and app.client is not None,
+                "selected PowerShell observation before explicit copy",
+            )
+            client = app.client
+            assert client is not None and not client.lease
+            assert copied == []
+
+            lines = (
+                "PowerShell 오류: 경로를 찾을 수 없습니다.",
+                "Get-Item: Cannot find path 'JTT_MISSING' because it does not exist.",
+            )
+            screen = _screen_lines(*lines)
+            client.observe = lambda: TerminalObservation(
+                session_id=identity.session_id, generation=identity.generation,
+                shell_pid=identity.shell_pid, sequence=17, state="running",
+                synced=True, columns=100, lines=30, screen=screen,
+                renderer_state="ready",
+            )
+
+            await pilot.press("ctrl+g", "c")
+            await _wait_for_ui_state(
+                pilot, lambda: bool(copied), "explicit RIGHT screen copy",
+            )
+            assert copied == ["\r\n".join(lines)]
+            assert client.lease is False
+            assert client.sent == []
+
+            # A changed generation invalidates the copy target without touching
+            # the clipboard or sending anything to the old session.
+            app.sessions[identity.session_id] = TerminalIdentity(**{
+                **identity.__dict__, "generation": "f" * 32,
+            })
+            await pilot.press("ctrl+g", "c")
+            await pilot.pause(0.05)
+            assert copied == ["\r\n".join(lines)]
+            assert client.sent == []
+
+    asyncio.run(scenario())
+
+
+def test_windows_copy_chord_never_becomes_shell_ctrl_c(monkeypatch):
+    windows_ui = importlib.import_module("ju0_terminal_tower.ui.windows_jtt")
+    copied = []
+    monkeypatch.setattr(windows_ui, "_write_windows_clipboard", copied.append)
+
+    async def scenario():
+        identity = _identity(1)
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id
+                and app.client is not None,
+                "selected terminal before copy chord",
+            )
+            await app.enter_input_mode()
+            client = app.client
+            assert client is not None and client.lease
+            client.sent.clear()
+
+            await pilot.press("ctrl+shift+c")
+            assert client.sent == []
+            assert copied == [client.screen_text]
+            await pilot.press("ctrl+c")
+            assert client.sent == [b"\x03"]
+
+    asyncio.run(scenario())
+
+
+def test_shift_click_keeps_windows_terminal_native_selection_available():
+    async def scenario():
+        identity = _identity(1)
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id
+                and app.client is not None,
+                "selected terminal before native selection click",
+            )
+            assert app.input_mode is False
+            await pilot.click("#live", shift=True)
+            assert app.input_mode is False
+            assert app.client is not None and not app.client.lease
+
+    asyncio.run(scenario())
+
+
+def test_windows_clipboard_writer_sets_unicode_without_reading(monkeypatch):
+    windows_ui = importlib.import_module("ju0_terminal_tower.ui.windows_jtt")
+    calls = []
+    clipboard = SimpleNamespace(
+        OpenClipboard=lambda: calls.append(("open",)),
+        EmptyClipboard=lambda: calls.append(("empty",)),
+        SetClipboardData=lambda kind, text: calls.append(("set", kind, text)),
+        CloseClipboard=lambda: calls.append(("close",)),
+    )
+    constants = SimpleNamespace(CF_UNICODETEXT=13)
+    monkeypatch.setitem(sys.modules, "win32clipboard", clipboard)
+    monkeypatch.setitem(sys.modules, "win32con", constants)
+
+    windows_ui._write_windows_clipboard("오류\r\nPowerShell error")
+
+    assert calls == [
+        ("open",), ("empty",), ("set", 13, "오류\r\nPowerShell error"), ("close",),
+    ]
 
 
 @pytest.mark.parametrize("size", [(80, 24), (160, 44)])
@@ -1107,6 +1239,73 @@ def test_native_windows_paste_event_enters_selected_powershell(tmp_path):
         if identity is not None:
             registry.stop(
                 identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
+def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
+        tmp_path, monkeypatch):
+    import ju0_terminal_tower.ui.windows_jtt as windows_ui
+    from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry
+
+    registry = TerminalRegistry(root=tmp_path / "isolated-copy-home" / "terminals")
+    owner = registry.create("Isolated copy output")
+    identity = owner.identity
+    owner.close()
+    app = WindowsJTTApp(registry)
+    copied = []
+    monkeypatch.setattr(windows_ui, "_write_windows_clipboard", copied.append)
+
+    async def scenario():
+        async with app.run_test(size=(160, 44)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id
+                and app.client is not None,
+                "existing isolated ConPTY copy target", timeout=20,
+            )
+            assert app.selected_identity is not None
+            assert _same_identity(identity, app.selected_identity)
+            await app.enter_input_mode()
+            assert app.input_mode and app.client is not None and app.client.lease
+            nonce = identity.session_id[:10]
+            expected = (
+                f"한글-JTT_COPY_{nonce}-OK",
+                f"JTT_ERROR_{nonce}_END",
+                f"JTT_FINAL_{nonce}_END",
+            )
+            command = (
+                f"Write-Output ('한글-' + 'JTT_COPY_{nonce}' + '-OK'); "
+                f"Write-Error ('JTT_ERROR_' + '{nonce}' + '_END'); "
+                f"[Console]::WriteLine('JTT_FINAL_' + '{nonce}' + '_END')"
+            )
+            assert all(marker not in command for marker in expected)
+            await app._send_bytes((command + "\r").encode("utf-8"))
+            await _wait_for_ui_state(
+                pilot,
+                lambda: app._right_observation is not None
+                and all(marker in _plain_screen_text(app._right_observation[3])
+                         for marker in expected),
+                "generated PowerShell Unicode, error, and final output", timeout=20,
+            )
+            await app.leave_input_mode()
+            await pilot.press("ctrl+shift+c")
+            await _wait_for_ui_state(
+                pilot, lambda: bool(copied), "explicit copy chord payload",
+            )
+            payload = copied[-1]
+            assert all(marker in payload for marker in expected)
+            assert "\r\n" in payload
+            await pilot.press("ctrl+g", "d")
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        current = next((item for item in registry.list_sessions()
+                        if item.session_id == identity.session_id), None)
+        if current is not None and _same_identity(identity, current):
+            registry.stop(
+                current.session_id, expected_generation=identity.generation,
                 expected_shell_pid=identity.shell_pid,
             )
 

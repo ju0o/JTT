@@ -46,6 +46,10 @@ def _screen_text(screen):
     return "\n".join("".join(cell.text for cell in row) for row in screen.rows)
 
 
+def _compact_screen_text(screen):
+    return "".join(line.rstrip() for line in _screen_text(screen).splitlines())
+
+
 def _wait(client, predicate, timeout=15):
     deadline = time.monotonic() + timeout
     last = None
@@ -96,7 +100,8 @@ def test_native_powershell_create_io_resize_detach_reconnect_stop(tmp_path, monk
         )
         assert _process_same(identity.shell_pid, identity.shell_start)
         _wait(client, lambda update: update.screen is not None
-              and "JTT>" in _screen_text(update.screen))
+              and "PS " in _screen_text(update.screen)
+              and str(work) + ">" in _compact_screen_text(update.screen))
         assert client.acquire()
         marker = _generated_marker(client, "CREATE")
         assert marker
@@ -970,6 +975,62 @@ def test_native_input_reply_sequence_does_not_ack_unread_output(tmp_path):
         current = client.observe()
         assert current.screen is not None
         assert "JTT_MUST_NOT_BE_DELIVERED" not in _screen_text(current.screen)
+    finally:
+        client.close()
+        current = next((item for item in registry.list_sessions()
+                        if item.session_id == identity.session_id), None)
+        if current is not None:
+            registry.stop(
+                identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+
+
+@pytest.mark.parametrize("columns,lines", [(80, 24), (160, 44)])
+def test_native_powershell_prompt_tracks_long_current_location(
+        tmp_path, monkeypatch, columns, lines):
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalRegistry
+
+    start = tmp_path / "isolated-start"
+    destination = (tmp_path / ("destination-" + "d" * 28)
+                   / ("nested-" + "n" * 26))
+    start.mkdir()
+    destination.mkdir(parents=True)
+    assert len(str(destination)) > 100
+    monkeypatch.chdir(start)
+    registry = TerminalRegistry(tmp_path / "isolated-jtt" / "terminals")
+    client = registry.create("PowerShell current path prompt")
+    identity = client.identity
+
+    try:
+        initial = _wait(
+            client,
+            lambda update: update.screen is not None
+            and "PS " + str(start) + ">" in _compact_screen_text(update.screen),
+        )
+        assert "PS " + str(start) + ">" in _compact_screen_text(initial.screen)
+        assert client.acquire()
+        client.resize(columns, lines)
+
+        escaped = str(destination).replace("'", "''")
+        marker = "JTT_CURRENT_PATH=" + str(destination) + "=END"
+        command = (
+            f"cd '{escaped}'; "
+            "[Console]::WriteLine('JTT_CURRENT_PATH=' + "
+            "(Get-Location).Path + '=END')"
+        )
+        assert marker not in command
+        client.send((command + "\r").encode("utf-8"))
+        update = _wait(
+            client,
+            lambda item: item.screen is not None
+            and marker in _compact_screen_text(item.screen),
+        )
+        display = _compact_screen_text(update.screen)
+        assert marker in display
+        assert "PS " + str(destination) + ">" in display
+        assert (update.columns, update.lines) == (columns, lines)
     finally:
         client.close()
         current = next((item for item in registry.list_sessions()
