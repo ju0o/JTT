@@ -250,7 +250,7 @@ def test_vt_screen_text_keeps_wide_glyph_cells_adjacent():
 
 @pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
 def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path):
-    from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry
+    from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry, _process_facts
 
     root = tmp_path / "isolated-jtt-home"
     registry = TerminalRegistry(root=root / "terminals")
@@ -269,14 +269,21 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
             identity = app.selected_identity
             assert identity is not None
             created.update(identity=identity)
-            await pilot.press(*list("Write-Output"), "space", *list("JTT_UI_E2E_OK"), "enter")
+            # The shell expands its own PID, so this result cannot be mistaken
+            # for text echoed from the command line.
+            command = 'Write-Output "JTT_UI_RESULT_$PID"'
+            expected_result = f"JTT_UI_RESULT_{identity.shell_pid}"
+            assert expected_result not in command
+            await pilot.press(*list(command), "enter")
             deadline = time.monotonic() + 20
+            rendered = ""
             while time.monotonic() < deadline:
                 rendered = str(app.query_one("#live", Static).render())
-                if "JTT_UI_E2E_OK" in rendered:
+                if expected_result in rendered:
                     break
                 await pilot.pause(0.1)
-            assert "JTT_UI_E2E_OK" in str(app.query_one("#live", Static).render())
+            rendered = str(app.query_one("#live", Static).render())
+            assert expected_result in rendered
             await pilot.press("ctrl+g", "d")
             await pilot.pause(0.1)
             assert app.is_running is False
@@ -303,8 +310,87 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                 await pilot.pause(0.1)
 
         asyncio.run(second_ui())
+
+        stop_app = WindowsJTTApp(registry)
+
+        async def stop_ui():
+            async with stop_app.run_test(size=(160, 44)) as pilot:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and stop_app.client is None:
+                    await pilot.pause(0.1)
+                assert stop_app.selected_identity is not None
+                assert _same_identity(identity, stop_app.selected_identity)
+
+                async def assert_still_running(expected):
+                    sessions = registry.list_sessions()
+                    assert len(sessions) == 1
+                    assert _same_identity(expected, sessions[0])
+                    probe = registry.connect(expected.session_id)
+                    try:
+                        observation = probe.observe()
+                        assert _same_identity(expected, probe.identity)
+                        assert observation.state == "running"
+                        assert observation.session_id == expected.session_id
+                        assert observation.generation == expected.generation
+                        assert observation.shell_pid == expected.shell_pid
+                    finally:
+                        probe.close()
+
+                # The default action is cancel. Confirm the dialog opened from
+                # the real UI command and that cancellation leaves the PTY alive.
+                await pilot.press("ctrl+g", "x")
+                assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
+                await pilot.click("#cancel-stop")
+                await assert_still_running(identity)
+
+                # Simulate a stale card identity without changing persisted
+                # registry metadata or the owned PowerShell process.
+                stale_identity = TerminalIdentity(**{
+                    **identity.__dict__, "generation": "f" * 32,
+                })
+                stop_app.selected_identity = stale_identity
+                mismatch_finished = asyncio.Event()
+                finish_stop = stop_app._finish_stop
+
+                async def record_mismatch_completion(expected):
+                    await finish_stop(expected)
+                    mismatch_finished.set()
+
+                stop_app._finish_stop = record_mismatch_completion
+                await pilot.press("ctrl+g", "x")
+                await pilot.click("#confirm-stop")
+                await asyncio.wait_for(mismatch_finished.wait(), timeout=10)
+                remaining = registry.list_sessions()
+                assert len(remaining) == 1 and _same_identity(identity, remaining[0])
+                await assert_still_running(identity)
+
+                # Restore the verified identity, open the same confirmation,
+                # and approve. The registry performs its generation/PID checks
+                # before stopping this isolated ConPTY session.
+                await stop_app._select_session(identity, focus=False)
+                approved_finished = asyncio.Event()
+                finish_stop = stop_app._finish_stop
+
+                async def record_approved_completion(expected):
+                    await finish_stop(expected)
+                    approved_finished.set()
+
+                stop_app._finish_stop = record_approved_completion
+                await pilot.press("ctrl+g", "x")
+                assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
+                await pilot.click("#confirm-stop")
+                await asyncio.wait_for(approved_finished.wait(), timeout=15)
+                assert registry.list_sessions() == ()
+
+        asyncio.run(stop_ui())
     finally:
         for identity in registry.list_sessions():
             registry.stop(identity.session_id, expected_generation=identity.generation,
                           expected_shell_pid=identity.shell_pid)
     assert registry.list_sessions() == ()
+    shell_created, _shell_image, shell_alive = _process_facts(
+        created["identity"].shell_pid,
+        expected_start=created["identity"].shell_start,
+        verify_image=False,
+    )
+    assert not (shell_alive and shell_created == created["identity"].shell_start)
