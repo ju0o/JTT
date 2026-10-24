@@ -10,6 +10,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
@@ -996,6 +997,18 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
 
         async def stop_ui():
             async with stop_app.run_test(size=(160, 44)) as pilot:
+                async def wait_for_confirmation_button():
+                    def is_mounted():
+                        try:
+                            stop_app.screen.query_one("#confirm-stop", Button)
+                        except NoMatches:
+                            return False
+                        return True
+
+                    await _wait_for_ui_state(
+                        pilot, is_mounted, "stop confirmation screen mount",
+                    )
+
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline and stop_app.client is None:
                     await pilot.pause(0.1)
@@ -1041,6 +1054,7 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
 
                 stop_app._finish_stop = record_mismatch_completion
                 await pilot.press("ctrl+g", "x")
+                await wait_for_confirmation_button()
                 await pilot.click("#confirm-stop")
                 await asyncio.wait_for(mismatch_finished.wait(), timeout=10)
                 remaining = registry.list_sessions()
@@ -1060,6 +1074,7 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
 
                 stop_app._finish_stop = record_approved_completion
                 await pilot.press("ctrl+g", "x")
+                await wait_for_confirmation_button()
                 assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
                 await pilot.click("#confirm-stop")
                 await asyncio.wait_for(approved_finished.wait(), timeout=15)
