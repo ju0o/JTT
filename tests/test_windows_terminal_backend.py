@@ -1027,16 +1027,22 @@ def test_native_powershell_prompt_tracks_long_current_location(
         assert client.acquire()
         client.resize(columns, lines)
 
-        # Wait for PowerShell itself to observe the resize before sending the
-        # path change; this avoids racing ConPTY's asynchronous resize event.
+        # Wait until PowerShell reports the resized dimensions and returns to
+        # the prompt before sending the path change. The marker alone can be
+        # emitted before PowerShell has finished the command and is ready for
+        # the next line.
         width_marker = f"JTT_WIDTH_{columns}_END"
         width_query = (
             f"[Console]::WriteLine('JTT_WIDTH_' + [Console]::WindowWidth + '_END')"
         )
         assert width_marker not in width_query
         client.send((width_query + "\r").encode("ascii"))
+        resized_prompt = _expected_prompt_path(start, columns)
         resized = _wait(client, lambda item: item.screen is not None
-                        and width_marker in _screen_text(item.screen))
+                        and width_marker in _screen_text(item.screen)
+                        and resized_prompt in _screen_text(item.screen).split(
+                            width_marker, 1
+                        )[1])
         assert (resized.columns, resized.lines) == (columns, lines)
 
         # Navigate relatively so the test command itself remains short even
