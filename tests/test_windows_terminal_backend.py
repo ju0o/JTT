@@ -116,6 +116,11 @@ def _wait_for_raw_output(
         f"state={getattr(last, 'state', None)!r}; "
         f"renderer={getattr(last, 'renderer_state', None)!r}; "
         f"sequence={getattr(last, 'sequence', None)!r}; "
+        f"snapshot_sequence={getattr(last, 'snapshot_sequence', None)!r}; "
+        f"synced={getattr(last, 'synced', None)!r}; "
+        f"gap={getattr(last, 'gap', None)!r}; "
+        f"more={getattr(last, 'more', None)!r}; "
+        f"collected_bytes={len(output)}; "
         f"observed_checkpoints={seen_checkpoints!r}; "
         f"screen_checkpoints={seen_screen_checkpoints!r}; "
         f"continuation_prompt={'>>' in screen_text!r}; "
@@ -1114,9 +1119,18 @@ def test_native_powershell_prompt_tracks_long_current_location(
         assert str(destination) not in location_command
         assert len(start_prompt) + 2 + len(location_command) < 100
         # Match the native UI's per-key RPC path, including a separate Enter
-        # acknowledgement, instead of bulk-pasting a whole command line.
+        # acknowledgement, instead of bulk-pasting a whole command line. An
+        # input RPC only acknowledges delivery to ConPTY; wait for the full
+        # echoed line before Enter so the test does not race PowerShell's line
+        # editor on fast hosted runners.
         for character in location_command:
             assert client.send(character.encode("utf-8")) == 1
+        typed_line = _wait(
+            client,
+            lambda item: item.screen is not None
+            and _screen_contains_after(item.screen, ready_marker, location_command),
+        )
+        assert _screen_contains_after(typed_line.screen, ready_marker, location_command)
         assert client.send(b"\r") == 1
 
         initial_width_prompt = _expected_prompt_path(destination, 100)
