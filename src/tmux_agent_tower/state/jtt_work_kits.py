@@ -69,12 +69,17 @@ class JTTWorkKitStore:
         self._validate_file_path()
         fd = None
         try:
-            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            info = os.fstat(fd)
-            self._validate_file_info(info)
-            with os.fdopen(fd, "r", encoding="utf-8") as stream:
-                fd = None
-                raw = stream.read(_MAX_FILE_BYTES + 1)
+            if os.name == "nt":
+                from .jtt_windows_state import read_private_file
+
+                raw = read_private_file(self.path, _MAX_FILE_BYTES, WorkKitStoreError).decode("utf-8")
+            else:
+                fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                info = os.fstat(fd)
+                self._validate_file_info(info)
+                with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                    fd = None
+                    raw = stream.read(_MAX_FILE_BYTES + 1)
             if len(raw.encode("utf-8")) > _MAX_FILE_BYTES:
                 raise WorkKitStoreError("Work Kit data exceeds the allowed size")
             payload = json.loads(raw, object_pairs_hook=_unique_object_pairs)
@@ -367,19 +372,32 @@ class JTTWorkKitStore:
             temp = self.root / (".work_kits." + secrets.token_hex(8) + ".tmp")
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(temp, flags, 0o600)
-            os.fchmod(fd, 0o600)
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb", closefd=True) as stream:
                 fd = None
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temp, self.path)
+            if os.name == "nt":
+                from .jtt_windows_state import validate_new_private_file, validate_private_file
+                from ..terminal.windows_manager import _replace_metadata
+
+                validate_new_private_file(temp, WorkKitStoreError)
+                _replace_metadata(temp, self.path)
+            else:
+                os.replace(temp, self.path)
             replaced = True
-            dir_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            if os.name == "nt":
+                from .jtt_windows_state import validate_private_file
+
+                validate_private_file(self.path, WorkKitStoreError)
+            else:
+                dir_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         except Exception as exc:
             if fd is not None:
                 try:
@@ -402,6 +420,11 @@ class JTTWorkKitStore:
             raise
 
     def _ensure_private_root(self) -> None:
+        if os.name == "nt":
+            from .jtt_windows_state import ensure_private_directory
+
+            ensure_private_directory(self.root, WorkKitStoreError)
+            return
         absolute = Path(os.path.abspath(os.fspath(self.root)))
         current = Path(absolute.anchor)
         for part in absolute.parts[1:]:
@@ -419,6 +442,11 @@ class JTTWorkKitStore:
         self._validate_root()
 
     def _validate_root(self) -> None:
+        if os.name == "nt":
+            from .jtt_windows_state import validate_private_directory
+
+            validate_private_directory(self.root, WorkKitStoreError)
+            return
         absolute = Path(os.path.abspath(os.fspath(self.root)))
         current = Path(absolute.anchor)
         for part in absolute.parts[1:]:
@@ -438,6 +466,11 @@ class JTTWorkKitStore:
             raise WorkKitStoreError("JTT state directory is not private")
 
     def _validate_file_path(self, *, allow_missing: bool = False) -> None:
+        if os.name == "nt":
+            from .jtt_windows_state import validate_private_file
+
+            validate_private_file(self.path, WorkKitStoreError, allow_missing=allow_missing)
+            return
         if not os.path.lexists(self.path):
             if allow_missing:
                 return

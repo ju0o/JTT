@@ -10,11 +10,13 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
 import ju0_terminal_tower  # noqa: F401 - activates the guarded product namespace
 from ju0_terminal_tower.state.jtt_layouts import JTTLayoutStore
+from ju0_terminal_tower.state.jtt_work_kits import JTTWorkKitStore
 from ju0_terminal_tower.state.jtt_workspaces import JTTWorkspaceStore
 from ju0_terminal_tower.terminal.manager import (
     TerminalCell,
@@ -814,6 +816,61 @@ def test_saved_workspace_selection_rejects_changed_snapshot(tmp_path):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("size", [(80, 24), (160, 44)])
+def test_work_kit_archive_tab_previews_templates_without_running_or_writing(tmp_path, size):
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        layout_store = JTTLayoutStore(workspace_store.root)
+        work_kit_store = JTTWorkKitStore(workspace_store.root)
+        workspace_store.set_terminal_ids(
+            workspace_store.DEFAULT_ID, [identity.session_id],
+        )
+        kit = work_kit_store.create_kit(
+            "API review", "Template only", [
+                {"name": "Server", "role": "개발", "working_directory": "C:/work/api"},
+                {"name": "Checks", "role": "검증", "working_directory": None},
+            ],
+        )
+        workspace_bytes = workspace_store.path.read_bytes()
+        kit_bytes = work_kit_store.path.read_bytes()
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+            work_kit_store=work_kit_store,
+        )
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id,
+                "initial terminal observation before Work Kit preview",
+            )
+            await pilot.click("#workspace-picker")
+            await pilot.click("#tab-work-kits")
+            await pilot.click("#work-kit-choice-0")
+
+            screen = app.screen
+            preview = screen.query_one("#work-kit-preview", Static).render()
+            preview_text = getattr(preview, "plain", str(preview))
+            assert "API review" in preview_text
+            assert "Template only" in preview_text
+            assert "Server" in preview_text and "C:/work/api" in preview_text
+            assert "실행되지 않습니다" in preview_text
+            assert screen.query_one("#open-saved-workspace", Button).has_class(
+                "archive-hidden"
+            )
+            assert screen.query_one("#work-kit-preview-only", Button).disabled
+            assert not screen.query_one("#work-kit-list").has_class("archive-hidden")
+            assert screen.query_one("#saved-workspace-list").has_class("archive-hidden")
+            assert registry.create_count == 0
+            assert all(not client.lease and client.acquire_calls == 0
+                       and not client.sent and not client.resizes
+                       for client in registry.clients)
+            assert workspace_store.path.read_bytes() == workspace_bytes
+            assert work_kit_store.path.read_bytes() == kit_bytes
+
+    asyncio.run(scenario())
+
+
 def test_stop_confirmation_defaults_to_cancel_and_revalidates_identity():
     async def scenario():
         identity = _identity(1)
@@ -940,6 +997,18 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
 
         async def stop_ui():
             async with stop_app.run_test(size=(160, 44)) as pilot:
+                async def wait_for_confirmation_button():
+                    def is_mounted():
+                        try:
+                            stop_app.screen.query_one("#confirm-stop", Button)
+                        except NoMatches:
+                            return False
+                        return True
+
+                    await _wait_for_ui_state(
+                        pilot, is_mounted, "stop confirmation screen mount",
+                    )
+
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline and stop_app.client is None:
                     await pilot.pause(0.1)
@@ -985,6 +1054,7 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
 
                 stop_app._finish_stop = record_mismatch_completion
                 await pilot.press("ctrl+g", "x")
+                await wait_for_confirmation_button()
                 await pilot.click("#confirm-stop")
                 await asyncio.wait_for(mismatch_finished.wait(), timeout=10)
                 remaining = registry.list_sessions()
@@ -1004,6 +1074,7 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
 
                 stop_app._finish_stop = record_approved_completion
                 await pilot.press("ctrl+g", "x")
+                await wait_for_confirmation_button()
                 assert stop_app.screen.query_one("#cancel-stop", Button).has_focus
                 await pilot.click("#confirm-stop")
                 await asyncio.wait_for(approved_finished.wait(), timeout=15)
