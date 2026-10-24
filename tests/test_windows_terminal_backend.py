@@ -1084,53 +1084,39 @@ def test_native_powershell_prompt_tracks_long_current_location(
         width_marker = f"JTT_WIDTH_{nonce}_{columns}_END"
         path_start = f"JTT_PATH_{nonce}_BEGIN"
         path_end = f"JTT_PATH_{nonce}_END"
-        change_directory_error = f"JTT_CD_ERROR_{nonce}_END"
-        verification_complete = f"JTT_VERIFY_COMPLETE_{nonce}_END"
-        # A rendered prompt may still be visible while PowerShell is handling
-        # a previous command. Keep the resize, location change, and actual
-        # command results in one input so no screenshot is used as an input
-        # readiness signal.
+        # Keep this one input deliberately short: hosted ConPTY could echo the
+        # tail of the earlier long compound line while only executing its
+        # first statement. Runtime markers are assembled from fragments so an
+        # echoed command cannot satisfy the result checks.
         verification_command = (
-            "[Console]::WriteLine('JTT_' + 'WIDTH_' + "
-            f"'{nonce}' + '_' + "
-            "[Console]::WindowWidth + '_END'); "
-            f"try {{ Set-Location -LiteralPath '{destination.name}' -ErrorAction Stop; "
-            "[Console]::WriteLine('JTT_' + 'PATH_' + "
-            f"'{nonce}' + '_' + "
-            "'BEGIN'); "
-            "[Console]::WriteLine((Get-Location).Path); "
-            "[Console]::WriteLine('JTT_' + 'PATH_' + "
-            f"'{nonce}' + '_' + "
-            "'END') } catch { "
-            "[Console]::WriteLine('JTT_' + 'CD_ERROR_' + "
-            f"'{nonce}' + '_END') }}; "
-            "[Console]::WriteLine('JTT_' + 'VERIFY_COMPLETE_' + "
-            f"'{nonce}' + '_END')"
+            "[Console]::Write('JTT_'+'WIDTH_'+"
+            f"'{nonce}'+'_');"
+            "[Console]::Write([Console]::WindowWidth);"
+            "[Console]::Write('_END');"
+            f"Set-Location -LiteralPath '{destination.name}';"
+            "[Console]::Write('JTT_'+'PATH_'+"
+            f"'{nonce}'+'_BEGIN');"
+            "[Console]::Write((Get-Location).Path);"
+            "[Console]::Write('JTT_'+'PATH_'+"
+            f"'{nonce}'+'_END')"
         )
         assert width_marker not in verification_command
         assert path_start not in verification_command
         assert path_end not in verification_command
-        assert change_directory_error not in verification_command
-        assert verification_complete not in verification_command
         assert str(destination) not in verification_command
         client.send((verification_command + "\r").encode("utf-8"))
         update, raw_output = _wait_for_raw_output(
-            client, verification_complete.encode("ascii"),
+            client, path_end.encode("ascii"),
             checkpoints=(
                 ("resized_console_width", width_marker.encode("ascii")),
                 ("actual_location_output_started", path_start.encode("ascii")),
                 ("actual_destination_path", str(destination).encode("utf-8")),
-                ("Set-Location_error", change_directory_error.encode("ascii")),
-                ("actual_location_output_finished", path_end.encode("ascii")),
-                ("completion_source_fragment", b"VERIFY_COMPLETE_"),
             ),
             screen_checkpoints=(
-                ("completion_source_fragment", "VERIFY_COMPLETE_"),
-                ("PowerShell_continuation_prompt", ">>"),
+                ("actual_location_output_finished", path_end),
             ),
         )
         compact_output = raw_output.replace(b"\r", b"").replace(b"\n", b"")
-        assert change_directory_error.encode("ascii") not in compact_output
         assert width_marker.encode("ascii") in compact_output
         start_index = compact_output.rfind(path_start.encode("ascii"))
         end_index = compact_output.find(
