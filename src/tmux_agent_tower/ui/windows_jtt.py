@@ -569,11 +569,21 @@ class WindowsJTTApp(App[None]):
             screen = self.screen
         except (NoScreen, ScreenStackError):
             return False
-        return (
+        active = (
             not self._mini_live_stopping and self.is_mounted
             and screen.is_attached and screen.is_parent_active
             and not isinstance(screen, ModalScreen)
         )
+        if not active:
+            return False
+        try:
+            # During Textual teardown a screen can remain marked active after
+            # its children have already detached but before on_unmount runs.
+            self.query_one("#statusline", Static)
+            self.query_one("#terminal-status", Static)
+        except NoMatches:
+            return False
+        return True
 
     def _set_notice(self, text: str, duration: float = 4.0) -> None:
         self._notice = str(text)

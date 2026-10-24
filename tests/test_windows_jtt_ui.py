@@ -1049,9 +1049,9 @@ def test_native_windows_paste_event_enters_selected_powershell(tmp_path):
             identity = app.selected_identity
             assert identity is not None and app.client is not None and app.client.lease
             created["identity"] = identity
-            nonce = identity.session_id[:10]
-            expected = f"JTT_PASTE_RESULT_{nonce}_END"
-            command = f"[Console]::WriteLine('JTT_PASTE_' + 'RESULT_{nonce}' + '_END')"
+            nonce = identity.session_id[:8]
+            expected = f"JTT_{nonce}"
+            command = f"[Console]::WriteLine('JTT_' + '{nonce}')"
             assert expected not in command
             client = app.client
             assert client is not None
