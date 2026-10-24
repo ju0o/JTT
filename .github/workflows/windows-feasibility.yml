@@ -10,7 +10,9 @@ on:
       - '.github/workflows/windows-feasibility.yml'
       - 'src/tmux_agent_tower/jtt.py'
       - 'src/tmux_agent_tower/ui/windows_jtt.py'
+      - 'src/tmux_agent_tower/state/jtt_*.py'
       - 'tests/test_windows_jtt_ui.py'
+      - 'tests/test_windows_jtt_state.py'
       - 'tests/test_jtt_cli_update.py'
 permissions:
   contents: read
@@ -37,3 +39,5 @@ jobs:
         run: python -m pytest -q tests/test_windows_worker_threads.py
       - name: Native JTT three-panel UI and PTY integration
         run: python -m pytest -q -s tests/test_windows_jtt_ui.py
+      - name: Native Windows JTT workspace and layout persistence
+        run: python -m pytest -q -s tests/test_windows_jtt_state.py

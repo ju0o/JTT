@@ -26,6 +26,19 @@ def test_opening_store_does_not_create_directory_or_workspace_file(tmp_path):
     assert not root.exists()
 
 
+def test_add_terminal_reference_merges_without_replacing_existing_ids(tmp_path):
+    store = JTTWorkspaceStore(tmp_path / "jtt-state")
+    saved = store.create_workspace("first")
+    store.add_terminal_reference(saved["id"], "session-one")
+    merged = store.add_terminal_reference(saved["id"], "session-two")
+    unchanged = store.add_terminal_reference(saved["id"], "session-two")
+
+    assert merged["terminal_ids"] == ["session-one", "session-two"]
+    assert unchanged["terminal_ids"] == ["session-one", "session-two"]
+    persisted = next(item for item in store.workspaces() if item["id"] == saved["id"])
+    assert persisted["terminal_ids"] == ["session-one", "session-two"]
+
+
 def test_workspace_configuration_is_private_and_round_trips(tmp_path):
     root = tmp_path / "private" / "jtt"
     store = JTTWorkspaceStore(root)

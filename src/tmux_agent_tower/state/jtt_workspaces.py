@@ -36,6 +36,13 @@ def default_jtt_root(environ: dict[str, str] | None = None) -> Path:
     explicit = env.get("JTT_HOME")
     if explicit:
         return Path(explicit).expanduser()
+    if os.name == "nt":
+        local = env.get("LOCALAPPDATA")
+        if not local:
+            raise WorkspaceStoreError(
+                "LOCALAPPDATA is unavailable; set JTT_HOME explicitly"
+            )
+        return Path(local) / "JTT"
     state_home = env.get("XDG_STATE_HOME")
     if state_home:
         return Path(state_home).expanduser() / "jtt"
@@ -62,15 +69,20 @@ class JTTWorkspaceStore:
         self._validate_existing_root()
         self._validate_path(self.path, allow_missing=False)
         try:
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(self.path, flags)
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or stat.S_IMODE(info.st_mode) & 0o077 or info.st_nlink != 1):
-                os.close(fd)
-                raise WorkspaceStoreError("JTT workspace file is not private")
-            with os.fdopen(fd, "r", encoding="utf-8") as stream:
-                raw = stream.read(1024 * 1024 + 1)
+            if os.name == "nt":
+                from .jtt_windows_state import read_private_file
+
+                raw = read_private_file(self.path, 1024 * 1024, WorkspaceStoreError).decode("utf-8")
+            else:
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(self.path, flags)
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) & 0o077 or info.st_nlink != 1):
+                    os.close(fd)
+                    raise WorkspaceStoreError("JTT workspace file is not private")
+                with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                    raw = stream.read(1024 * 1024 + 1)
             if len(raw.encode("utf-8")) > 1024 * 1024:
                 raise WorkspaceStoreError("JTT workspace file exceeds the allowed size")
             payload = json.loads(raw)
@@ -302,6 +314,21 @@ class JTTWorkspaceStore:
             target["terminal_ids"] = ids
             self._write(values)
 
+    def add_terminal_reference(self, workspace_id: str, terminal_id: str) -> dict:
+        """Add one explicit session reference without replacing existing IDs."""
+        if (not isinstance(terminal_id, str) or not terminal_id
+                or "\x00" in terminal_id):
+            raise WorkspaceStoreError("Invalid terminal ID")
+        with state_write_lock(self.root, self._ensure_private_root, WorkspaceStoreError):
+            values = self.workspaces()
+            target = next((item for item in values if item["id"] == workspace_id), None)
+            if target is None:
+                raise WorkspaceStoreError("Workspace no longer exists")
+            if terminal_id not in target["terminal_ids"]:
+                target["terminal_ids"].append(terminal_id)
+                self._write(values)
+            return dict(target)
+
     def _write(self, values: list[dict]) -> None:
         self._ensure_private_root()
         self._validate_path(self.path, allow_missing=True)
@@ -319,18 +346,31 @@ class JTTWorkspaceStore:
         fd = os.open(temp, flags, 0o600)
         replaced = False
         try:
-            os.fchmod(fd, 0o600)
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb", closefd=True) as stream:
                 stream.write(encoded)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temp, self.path)
+            if os.name == "nt":
+                from .jtt_windows_state import validate_new_private_file, validate_private_file
+                from ..terminal.windows_manager import _replace_metadata
+
+                validate_new_private_file(temp, WorkspaceStoreError)
+                _replace_metadata(temp, self.path)
+            else:
+                os.replace(temp, self.path)
             replaced = True
-            dir_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            if os.name == "nt":
+                from .jtt_windows_state import validate_private_file
+
+                validate_private_file(self.path, WorkspaceStoreError)
+            else:
+                dir_fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         except OSError as exc:
             try:
                 os.close(fd)
@@ -358,6 +398,11 @@ class JTTWorkspaceStore:
             raise
 
     def _ensure_private_root(self) -> None:
+        if os.name == "nt":
+            from .jtt_windows_state import ensure_private_directory
+
+            ensure_private_directory(self.root, WorkspaceStoreError)
+            return
         absolute = Path(os.path.abspath(os.fspath(self.root)))
         current = Path(absolute.anchor)
         for part in absolute.parts[1:]:
@@ -377,6 +422,11 @@ class JTTWorkspaceStore:
         self._validate_existing_root()
 
     def _validate_existing_root(self) -> None:
+        if os.name == "nt":
+            from .jtt_windows_state import validate_private_directory
+
+            validate_private_directory(self.root, WorkspaceStoreError)
+            return
         absolute = Path(os.path.abspath(os.fspath(self.root)))
         current = Path(absolute.anchor)
         for part in absolute.parts[1:]:
@@ -395,6 +445,11 @@ class JTTWorkspaceStore:
             raise WorkspaceStoreError("JTT state directory is not private")
 
     def _validate_path(self, path: Path, *, allow_missing: bool) -> None:
+        if os.name == "nt":
+            from .jtt_windows_state import validate_private_file
+
+            validate_private_file(path, WorkspaceStoreError, allow_missing=allow_missing)
+            return
         if not os.path.lexists(path):
             if allow_missing:
                 return

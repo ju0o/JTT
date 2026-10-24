@@ -14,6 +14,8 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
 import ju0_terminal_tower  # noqa: F401 - activates the guarded product namespace
+from ju0_terminal_tower.state.jtt_layouts import JTTLayoutStore
+from ju0_terminal_tower.state.jtt_workspaces import JTTWorkspaceStore
 from ju0_terminal_tower.terminal.manager import (
     TerminalCell,
     TerminalIdentity,
@@ -212,6 +214,154 @@ def test_card_switch_releases_previous_lease_and_stale_identity_hides_screen():
             assert app.selected_id is None
             assert app.client is None
             assert "신원" in str(app.query_one("#live", Static).render())
+
+    asyncio.run(scenario())
+
+
+def test_logical_window_switch_filters_cards_and_releases_old_lease(tmp_path):
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        registry = FakeRegistry([first, second])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        workspace_id = workspace_store.DEFAULT_ID
+        workspace_store.set_terminal_ids(
+            workspace_id, [first.session_id, second.session_id]
+        )
+        layout_store = JTTLayoutStore(workspace_store.root)
+        window = layout_store.create_window(workspace_id, "folder-default", "Build")
+        layout_store.move_terminal(
+            workspace_id, second.session_id, window["id"],
+            [first.session_id, second.session_id],
+        )
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.15)
+            assert app.selected_window_id == "window-default"
+            assert set(app.sessions) == {first.session_id}
+            assert app.selected_id == first.session_id
+            await app.enter_input_mode()
+            old_client = app.client
+            assert old_client is not None and old_client.lease
+
+            await pilot.click("#window-" + window["id"])
+            await pilot.pause(0.1)
+
+            assert old_client.closed and not old_client.lease
+            assert app.selected_window_id == window["id"]
+            assert set(app.sessions) == {second.session_id}
+            assert app.selected_id == second.session_id
+            assert app.client is not None and app.client.identity.session_id == second.session_id
+            assert app.client.lease is False
+            assert registry.create_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_keyboard_window_switch_keeps_left_focus_and_does_not_acquire_new_lease(tmp_path):
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        registry = FakeRegistry([first, second])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        workspace_id = workspace_store.DEFAULT_ID
+        workspace_store.set_terminal_ids(
+            workspace_id, [first.session_id, second.session_id]
+        )
+        layout_store = JTTLayoutStore(workspace_store.root)
+        next_window = layout_store.create_window(workspace_id, "folder-default", "Review")
+        layout_store.move_terminal(
+            workspace_id, second.session_id, next_window["id"],
+            [first.session_id, second.session_id],
+        )
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause(0.15)
+            await app.enter_input_mode()
+            old_client = app.client
+            assert old_client is not None and old_client.lease
+
+            await pilot.press("ctrl+g", "w", "down")
+            await pilot.pause(0.1)
+
+            assert app.selected_window_id == next_window["id"]
+            assert app._panel_index == 0
+            assert getattr(app.focused, "id", None) == "window-" + next_window["id"]
+            assert app.selected_id == second.session_id
+            assert app.client is not None and not app.client.lease
+            assert old_client.closed and not old_client.lease
+            assert registry.create_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_windows_ui_projects_legacy_sessions_without_startup_migration(tmp_path):
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        layout_store = JTTLayoutStore(workspace_store.root)
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+        )
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause(0.15)
+            assert app.selected_id == identity.session_id
+            assert set(app.sessions) == {identity.session_id}
+            assert registry.create_count == 0
+            assert not workspace_store.path.exists()
+            assert not layout_store.path.exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (160, 44)])
+def test_ui_logical_window_creation_is_blank_and_does_not_start_a_terminal(tmp_path, size):
+    async def scenario():
+        existing = _identity(1)
+        registry = FakeRegistry([existing])
+        workspace_store = JTTWorkspaceStore(tmp_path / "jtt")
+        layout_store = JTTLayoutStore(workspace_store.root)
+        saved = workspace_store.create_workspace("Saved workspace")
+        workspace_store.set_terminal_ids(saved["id"], ["saved-session"])
+        saved_window = layout_store.create_window(
+            saved["id"], "folder-default", "Saved Window",
+        )
+        layout_store.move_terminal(
+            saved["id"], "saved-session", saved_window["id"], ["saved-session"],
+        )
+        saved_layout_before = layout_store.layout(saved["id"], ["saved-session"])
+        app = WindowsJTTApp(
+            registry, workspace_store=workspace_store, layout_store=layout_store,
+        )
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause(0.15)
+            await app.enter_input_mode()
+            prior_client = app.client
+            assert prior_client is not None and prior_client.lease
+            await pilot.click("#new-window")
+            assert not app.input_mode and not prior_client.lease
+            assert app.screen.query_one("#window-name").value == "Window 2"
+            await pilot.press("enter")
+            await pilot.pause(0.15)
+
+            assert prior_client.closed
+            assert registry.create_count == 0
+            assert registry.sessions == [existing]
+            assert len(app.windows) == 2
+            created = next(item for item in app.windows
+                           if item["id"] == app.selected_window_id)
+            assert created["name"] == "Window 2"
+            assert created["terminal_ids"] == []
+            assert app.sessions == {}
+            assert app.selected_id is None
+            assert app.client is None
+            persisted = layout_store.layout(workspace_store.DEFAULT_ID, [existing.session_id])
+            assert any(item["id"] == created["id"] and not item["terminal_ids"]
+                       for item in persisted["windows"])
+            assert layout_store.layout(saved["id"], ["saved-session"]) == saved_layout_before
 
     asyncio.run(scenario())
 
