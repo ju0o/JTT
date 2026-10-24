@@ -41,6 +41,15 @@ def _identity(index: int, *, state: str = "running") -> TerminalIdentity:
     )
 
 
+async def _wait_for_ui_state(pilot, predicate, reason: str, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail(f"timed out waiting for UI state: {reason}")
+        await pilot.pause(min(0.05, remaining))
+
+
 class FakeClient:
     def __init__(self, identity):
         self.identity = identity
@@ -678,7 +687,10 @@ def test_saved_workspace_open_reconnects_exact_live_reference_without_lease_or_w
             registry, workspace_store=workspace_store, layout_store=layout_store,
         )
         async with app.run_test(size=size) as pilot:
-            await pilot.pause(0.15)
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == current.session_id,
+                "initial running workspace selection",
+            )
             assert app.selected_id == current.session_id
             await app.enter_input_mode()
             previous_client = app.client
@@ -690,7 +702,14 @@ def test_saved_workspace_open_reconnects_exact_live_reference_without_lease_or_w
             assert app.screen.query_one("#saved-workspace-preview", Static)
             await pilot.click("#saved-workspace-choice-1")
             await pilot.click("#open-saved-workspace")
-            await pilot.pause(0.2)
+            await _wait_for_ui_state(
+                pilot,
+                lambda: (app.workspace_id == saved["id"]
+                         and app.selected_id == saved_identity.session_id
+                         and app.client is not None and not app.client.lease
+                         and app._right_observation is not None),
+                "saved workspace read-only reconnect",
+            )
 
             assert app.workspace_id == saved["id"]
             assert app.workspace_name == saved["name"]
@@ -725,13 +744,22 @@ def test_saved_workspace_missing_and_exited_refs_clear_old_live_without_fake_res
             registry, workspace_store=workspace_store, layout_store=layout_store,
         )
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause(0.15)
+            await _wait_for_ui_state(
+                pilot, lambda: app._right_observation is not None,
+                "initial RIGHT observation before stale workspace switch",
+            )
             assert app._right_observation is not None
             assert "SESSION_0001" in str(app.query_one("#live", Static).render())
             await pilot.click("#workspace-picker")
             await pilot.click("#saved-workspace-choice-1")
             await pilot.click("#open-saved-workspace")
-            await pilot.pause(0.2)
+            await _wait_for_ui_state(
+                pilot,
+                lambda: (app.workspace_id == saved["id"]
+                         and app._missing_terminal_refs == {"missing-session"}
+                         and app.sessions == {exited.session_id: exited}),
+                "stale and exited saved references projected without restore",
+            )
 
             assert app.workspace_id == saved["id"]
             assert app.selected_id is None
@@ -765,12 +793,18 @@ def test_saved_workspace_selection_rejects_changed_snapshot(tmp_path):
             registry, workspace_store=workspace_store, layout_store=layout_store,
         )
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause(0.1)
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id,
+                "initial running workspace selection before snapshot race",
+            )
             await pilot.click("#workspace-picker")
             workspace_store.set_terminal_ids(saved["id"], [identity.session_id])
             await pilot.click("#saved-workspace-choice-1")
             await pilot.click("#open-saved-workspace")
-            await pilot.pause(0.2)
+            await _wait_for_ui_state(
+                pilot, lambda: "changed" in app._notice,
+                "changed saved workspace snapshot rejection",
+            )
 
             assert app.workspace_id == workspace_store.DEFAULT_ID
             assert app.selected_id == identity.session_id
