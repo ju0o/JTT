@@ -209,6 +209,126 @@ class CreateWindowScreen(ModalScreen[Optional[str]]):
             self.dismiss(None)
 
 
+class SavedWorkspaceScreen(ModalScreen[Optional[dict]]):
+    """Choose a saved workspace snapshot without starting or restoring a PTY."""
+
+    CSS = """
+    SavedWorkspaceScreen { align: center middle; background: $background 70%; }
+    #saved-workspace-dialog { width: 92%; height: 88%; border: round $primary;
+                              background: $surface; padding: 1; }
+    #saved-workspace-body { height: 1fr; }
+    #saved-workspace-list { width: 42%; height: 1fr; border: round #355d68; padding: 0 1; }
+    #saved-workspace-preview { width: 1fr; height: 1fr; border: round #355d68; padding: 1; }
+    #saved-workspace-actions { height: 3; align-horizontal: right; }
+    #saved-workspace-actions Button { margin-left: 1; }
+    .saved-workspace-choice { width: 100%; height: 3; margin-bottom: 1; }
+    """
+
+    def __init__(self, records: list[dict], sessions: dict[str, TerminalIdentity],
+                 selected_id: str):
+        super().__init__()
+        self.records = tuple(dict(item) for item in records)
+        self.sessions = dict(sessions)
+        self.selected_id = selected_id
+
+    def compose(self) -> ComposeResult:
+        selected = self._selected_record()
+        with Vertical(id="saved-workspace-dialog"):
+            yield Static("작업 불러오기 · 저장한 작업공간", classes="panel-title")
+            with Horizontal(id="saved-workspace-body"):
+                with ScrollableContainer(id="saved-workspace-list"):
+                    for index, record in enumerate(self.records):
+                        kind = ("현재 작업공간" if record["id"] == JTTWorkspaceStore.DEFAULT_ID
+                                else "저장 구성")
+                        label = Text(
+                            f"{record['name']}\n{kind} · 참조 {len(record['terminal_ids'])}개"
+                        )
+                        yield Button(
+                            label,
+                            id=f"saved-workspace-choice-{index}",
+                            classes="saved-workspace-choice",
+                            variant="primary" if record["id"] == self.selected_id else "default",
+                        )
+                yield Static(self._preview_text(selected), id="saved-workspace-preview")
+            with Horizontal(id="saved-workspace-actions"):
+                yield Button("취소", id="cancel-saved-workspace")
+                yield Button(
+                    "선택한 작업공간 열기", id="open-saved-workspace", variant="primary",
+                )
+
+    def on_mount(self) -> None:
+        selected = next((index for index, item in enumerate(self.records)
+                         if item["id"] == self.selected_id), 0)
+        if self.records:
+            self.query_one(f"#saved-workspace-choice-{selected}", Button).focus()
+        else:
+            self.query_one("#cancel-saved-workspace", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id.startswith("saved-workspace-choice-"):
+            try:
+                index = int(button_id.rsplit("-", 1)[1])
+                record = self.records[index]
+            except (ValueError, IndexError):
+                return
+            if record["id"] == self.selected_id:
+                self.open_selected()
+                return
+            self.selected_id = record["id"]
+            for choice_index, choice in enumerate(self.records):
+                self.query_one(f"#saved-workspace-choice-{choice_index}", Button).variant = (
+                    "primary" if choice["id"] == self.selected_id else "default"
+                )
+            self.query_one("#saved-workspace-preview", Static).update(
+                self._preview_text(record)
+            )
+        elif button_id == "open-saved-workspace":
+            self.open_selected()
+        elif button_id == "cancel-saved-workspace":
+            self.dismiss(None)
+
+    def on_key(self, event) -> None:
+        if str(event.key).lower() == "escape":
+            event.stop()
+            self.dismiss(None)
+
+    def open_selected(self) -> None:
+        record = self._selected_record()
+        self.dismiss(dict(record) if record is not None else None)
+
+    def _selected_record(self) -> dict | None:
+        return next((item for item in self.records
+                     if item["id"] == self.selected_id), None)
+
+    def _preview_text(self, record: dict | None) -> Text:
+        if record is None:
+            return Text("작업공간을 선택하세요.", style="dim")
+        output = Text(f"{record['name']}\n", style="bold #75d9d0")
+        terminal_ids = tuple(record.get("terminal_ids", ()))
+        output.append(f"저장된 터미널 참조 {len(terminal_ids)}개\n\n")
+        if not terminal_ids:
+            output.append("터미널 참조가 없습니다.\n", style="dim")
+        for session_id in terminal_ids:
+            identity = self.sessions.get(session_id)
+            if identity is None:
+                label = "연결 확인 불가 · 재연결하지 않음"
+                name = "저장된 터미널"
+            elif identity.state == "running":
+                label = f"실행 중 · PID {identity.shell_pid} · 재연결 대상"
+                name = identity.name
+            elif identity.state == "exited":
+                label = "셸 종료 · 다시 실행하지 않음"
+                name = identity.name
+            else:
+                label = f"{WindowsJTTApp._state_label(identity.state)} · 재연결 확인 필요"
+                name = identity.name
+            output.append(f"• {name}: {label}\n")
+        output.append("\n선택만으로 셸이나 PTY를 실행하지 않습니다.\n", style="dim")
+        output.append("현재 Supervisor의 세션 신원을 다시 확인한 뒤 연결합니다.", style="dim")
+        return output
+
+
 class WindowsJTTApp(App[None]):
     """Windows terminal UI backed only by a supplied ConPTY registry."""
 
@@ -232,7 +352,7 @@ class WindowsJTTApp(App[None]):
     #right { width: 44%; min-width: 26; }
     .panel-title { height: 1; color: #75d9d0; text-style: bold; }
     #brand { height: 2; color: #91ece2; text-style: bold; }
-    #workspace { height: 3; border: round #355d68; padding: 0 1; margin-top: 1; }
+    #workspace-picker { width: 100%; height: 3; margin-top: 1; }
     #window-list { height: 1fr; margin-top: 1; }
     .window-item { width: 100%; height: 3; margin-bottom: 1; }
     .window-item.selected { border: round #35cbbd; background: #102a35; }
@@ -260,11 +380,13 @@ class WindowsJTTApp(App[None]):
         self.layout_store = layout_store
         self.workspace_id = (workspace_store.DEFAULT_ID if workspace_store is not None
                              else "workspace-default")
+        self.workspace_name = "내 작업공간"
         self.windows = [{"id": "window-default", "name": "기본 Window",
                          "folder_id": "folder-default", "terminal_ids": []}]
         self.selected_window_id = "window-default"
         self._canonical_terminal_ids: list[str] = []
-        self._runtime_terminal_placements: dict[str, str] = {}
+        self._missing_terminal_refs: set[str] = set()
+        self._runtime_terminal_placements: dict[tuple[str, str], str] = {}
         self._registry_sessions: dict[str, TerminalIdentity] = {}
         self.sessions: dict[str, TerminalIdentity] = {}
         self.selected_id: str | None = None
@@ -292,7 +414,7 @@ class WindowsJTTApp(App[None]):
             with Vertical(id="left", classes="panel"):
                 yield Static("JTT · JU0 TERMINAL TOWER", id="brand")
                 yield Static("작업공간", classes="panel-title")
-                yield Static("내 작업공간\nWindows · 로컬", id="workspace")
+                yield Button("내 작업공간\n보관함 · 작업 불러오기", id="workspace-picker")
                 yield Static("Windows", classes="panel-title")
                 with ScrollableContainer(id="window-list"):
                     yield Static("Window 목록을 불러오는 중", id="empty-windows", classes="dim")
@@ -393,6 +515,7 @@ class WindowsJTTApp(App[None]):
                 return
             self._registry_sessions = {}
             self.sessions = {}
+            self._missing_terminal_refs.clear()
             self._mini_cache.clear()
             self._right_observation = None
             await self._close_selected_client()
@@ -416,6 +539,7 @@ class WindowsJTTApp(App[None]):
             if not self._base_widgets_available():
                 return
             self.sessions = {}
+            self._missing_terminal_refs.clear()
             self._mini_cache.clear()
             self._right_observation = None
             await self._close_selected_client()
@@ -478,20 +602,28 @@ class WindowsJTTApp(App[None]):
                 canonical.extend(item for item in self._registry_sessions
                                  if item not in canonical)
             projection = self.layout_store.layout(self.workspace_id, canonical)
-            return canonical, projection
+            return canonical, projection, workspace
 
-        canonical, projection = await self._backend_call(read_projection)
+        canonical, projection, workspace = await self._backend_call(read_projection)
         self._canonical_terminal_ids = canonical
+        self.workspace_name = workspace["name"]
         windows = [dict(item) for item in projection["windows"]]
         window_ids = {item["id"] for item in windows}
         placements = dict(projection["placements"])
-        for session_id, window_id in tuple(self._runtime_terminal_placements.items()):
+        for (workspace_id, session_id), window_id in tuple(
+            self._runtime_terminal_placements.items()
+        ):
+            if session_id not in self._registry_sessions:
+                self._runtime_terminal_placements.pop((workspace_id, session_id), None)
+                continue
+            if workspace_id != self.workspace_id:
+                continue
             if session_id not in canonical:
-                self._runtime_terminal_placements.pop(session_id, None)
+                self._runtime_terminal_placements.pop((workspace_id, session_id), None)
             elif window_id in window_ids:
                 placements[session_id] = window_id
             else:
-                self._runtime_terminal_placements.pop(session_id, None)
+                self._runtime_terminal_placements.pop((workspace_id, session_id), None)
 
         default_window_id = next(
             item["id"] for item in windows if item["id"] == "window-default"
@@ -506,6 +638,10 @@ class WindowsJTTApp(App[None]):
             self.selected_window_id = default_window_id
         selected_window = next(item for item in windows
                                if item["id"] == self.selected_window_id)
+        self._missing_terminal_refs = {
+            session_id for session_id in selected_window["terminal_ids"]
+            if session_id not in self._registry_sessions
+        }
         self.sessions = {
             session_id: self._registry_sessions[session_id]
             for session_id in selected_window["terminal_ids"]
@@ -524,6 +660,9 @@ class WindowsJTTApp(App[None]):
                 container, Static("Window가 없습니다.", id="empty-windows")
             )
             return
+        self.query_one("#workspace-picker", Button).label = (
+            f"{self.workspace_name}\n보관함 · 작업 불러오기"
+        )
         for window in self.windows:
             selected = window["id"] == self.selected_window_id
             label = Text(f"{window['name']}\n터미널 {len(window['terminal_ids'])}개")
@@ -591,16 +730,27 @@ class WindowsJTTApp(App[None]):
         if not self._widget_render_active(container):
             return
         if not values:
+            empty_message = (
+                f"저장된 참조 {len(self._missing_terminal_refs)}개를 찾을 수 없습니다.\n"
+                "세션을 복구된 것으로 표시하지 않았습니다."
+                if self._missing_terminal_refs else
+                "이 Window에는 터미널이 없습니다.\n"
+                "새 터미널을 선택하면 PTY가 생성됩니다."
+            )
             await self._mount_if_active(
                 container,
-                Static("이 Window에는 터미널이 없습니다.\n"
-                       "+ 새 터미널을 선택하면 PTY가 생성됩니다."),
+                Static(empty_message),
             )
             if not self._widget_render_active(container):
                 return
-            self.query_one("#terminal-summary", Static).update("터미널 0개")
+            missing = len(self._missing_terminal_refs)
+            summary = "터미널 0개" if not missing else f"사용 불가 참조 {missing}개"
+            self.query_one("#terminal-summary", Static).update(summary)
             return
-        self.query_one("#terminal-summary", Static).update(f"터미널 {len(values)}개")
+        summary = f"터미널 {len(values)}개"
+        if self._missing_terminal_refs:
+            summary += f" · 연결 불가 {len(self._missing_terminal_refs)}개"
+        self.query_one("#terminal-summary", Static).update(summary)
         compact = self.size.height < 30
         preview_lines = 1 if compact else 2
         card_height = preview_lines + 4
@@ -729,7 +879,7 @@ class WindowsJTTApp(App[None]):
         await self._render_cards()
 
     def _mini_scope(self) -> tuple:
-        return (self.selected_window_id,
+        return (self.workspace_id, self.selected_window_id,
                 tuple(_mini_identity_key(item) for item in self.sessions.values()))
 
     async def _select_session(self, identity: TerminalIdentity, *, focus: bool = True) -> None:
@@ -892,11 +1042,124 @@ class WindowsJTTApp(App[None]):
         if self.input_mode:
             await self.leave_input_mode()
         self.prefix_pending = False
+        self._panel_index = 0
+        self._focus_panel(0)
         suggested = f"Window {len(self.windows) + 1}"
         self.push_screen(
             CreateWindowScreen(suggested),
             callback=self._create_window_result,
         )
+
+    async def _open_workspace_picker(self) -> None:
+        if self.workspace_store is None or self.layout_store is None:
+            self._set_notice("저장 작업공간을 사용할 수 없습니다.", 8.0)
+            return
+        if self.input_mode:
+            await self.leave_input_mode()
+        self.prefix_pending = False
+        self._panel_index = 0
+        self._focus_panel(0)
+        try:
+            live_sessions = await self._backend_call(self.registry.list_sessions)
+            if not self._base_widgets_available():
+                return
+            self._registry_sessions = {item.session_id: item for item in live_sessions}
+            records = await self._backend_call(self.workspace_store.workspaces)
+        except Exception as exc:
+            self._set_notice(f"저장 작업공간 목록을 읽지 못했습니다: {exc}", 8.0)
+            return
+        if not self._base_widgets_available():
+            return
+        self.push_screen(
+            SavedWorkspaceScreen(records, self._registry_sessions, self.workspace_id),
+            callback=self._workspace_picker_result,
+        )
+
+    def _workspace_picker_result(self, record: dict | None) -> None:
+        if record is None:
+            return
+        self.run_worker(
+            self.select_workspace(record), name="select-saved-workspace",
+            group="workspace-select", exclusive=True,
+        )
+
+    async def select_workspace(self, expected_snapshot: dict) -> None:
+        """Switch to an unchanged saved reference set without starting a PTY."""
+        if self._busy or self.workspace_store is None or self.layout_store is None:
+            return
+        self._busy = True
+        try:
+            def read_snapshot():
+                records = self.workspace_store.workspaces()
+                matches = [item for item in records if item["id"] == expected_snapshot["id"]]
+                if len(matches) != 1 or matches[0] != expected_snapshot:
+                    raise TerminalError("saved workspace changed while it was selected")
+                workspace = matches[0]
+                projection = self.layout_store.layout(
+                    workspace["id"], workspace["terminal_ids"],
+                )
+                return workspace, projection
+
+            workspace, projection = await self._backend_call(read_snapshot)
+            current_sessions = await self._backend_call(self.registry.list_sessions)
+            current_by_id = {item.session_id: item for item in current_sessions}
+            # Check the saved record again after registry I/O so an edit during
+            # the validation window cannot redirect the selection.
+            verified_workspace = await self._backend_call(
+                lambda: next(
+                    (item for item in self.workspace_store.workspaces()
+                     if item["id"] == expected_snapshot["id"]),
+                    None,
+                )
+            )
+            if verified_workspace != expected_snapshot:
+                raise TerminalError("saved workspace changed before it could be opened")
+            windows = projection["windows"]
+            default_window = next(
+                (item for item in windows if item["id"] == "window-default"),
+                windows[0] if windows else None,
+            )
+            live_ids = {
+                session_id for session_id in workspace["terminal_ids"]
+                if (session_id in current_by_id
+                    and current_by_id[session_id].state == "running")
+            }
+            targets = [item for item in windows if any(
+                session_id in live_ids for session_id in item["terminal_ids"]
+            )]
+            if not targets:
+                targets = [item for item in windows if item["terminal_ids"]]
+            target_window = targets[0] if targets else default_window
+            if target_window is None:
+                raise TerminalError("saved workspace has no valid logical Window")
+
+            await self._close_selected_client()
+            self.input_mode = False
+            self.prefix_pending = False
+            self._prefix_generation += 1
+            self.selected_id = None
+            self.selected_identity = None
+            self.sessions = {}
+            self._registry_sessions = current_by_id
+            self._missing_terminal_refs.clear()
+            self._mini_cache.clear()
+            self._right_observation = None
+            self._card_signature = None
+            self.workspace_id = workspace["id"]
+            self.workspace_name = workspace["name"]
+            self.selected_window_id = target_window["id"]
+            self._panel_index = 0
+            self._clear_live("작업공간 전환 · 저장 참조의 세션 신원을 확인합니다.")
+            self._set_notice(f"{workspace['name']} · 저장된 세션 참조를 확인합니다.")
+        except Exception as exc:
+            self._set_notice(f"작업공간을 열지 않았습니다: {exc}", 8.0)
+            return
+        finally:
+            self._busy = False
+
+        await self._refresh_sessions()
+        self._panel_index = 0
+        self._focus_panel(0)
 
     def _create_window_result(self, name: str | None) -> None:
         if name is None:
@@ -1036,7 +1299,7 @@ class WindowsJTTApp(App[None]):
                     # The process is already owned by the registry. Preserve it
                     # and keep it visible in memory; do not attempt a second
                     # shell creation or claim its placement was persisted.
-                    self._runtime_terminal_placements[identity.session_id] = (
+                    self._runtime_terminal_placements[(self.workspace_id, identity.session_id)] = (
                         requested_window_id if any(
                             item["id"] == requested_window_id for item in self.windows
                         ) else "window-default"
@@ -1300,7 +1563,9 @@ class WindowsJTTApp(App[None]):
         elif self._panel_index == 0:
             focused = self.focused
             focused_id = getattr(focused, "id", "")
-            if focused_id == "new-window":
+            if focused_id == "workspace-picker":
+                await self._open_workspace_picker()
+            elif focused_id == "new-window":
                 await self._prompt_create_window()
             elif focused_id and focused_id.startswith("window-"):
                 await self.select_window(focused_id[len("window-"):])
@@ -1353,6 +1618,9 @@ class WindowsJTTApp(App[None]):
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
+        if button_id == "workspace-picker":
+            await self._open_workspace_picker()
+            return
         if button_id == "new-terminal":
             await self.create_terminal()
             return
