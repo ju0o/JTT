@@ -1087,27 +1087,39 @@ def test_native_powershell_prompt_tracks_long_current_location(
             and _screen_contains_after(item.screen, ready_marker, start_prompt),
         )
 
-        location_command = f"Set-Location -LiteralPath '{destination.name}'"
+        path_marker = f"JTT_PATH_{nonce}_END"
+        location_command = (
+            f"Set-Location -LiteralPath '{destination.name}'; "
+            "[Console]::WriteLine((Get-Location).Path); "
+            f"[Console]::WriteLine('{path_marker}')"
+        )
         assert str(destination) not in location_command
         client.send((location_command + "\r").encode("utf-8"))
 
         initial_width_prompt = _expected_prompt_path(destination, 100)
+        path_bytes = str(destination).encode("utf-8")
+        _path_update, path_output = _wait_for_raw_output(
+            client,
+            path_bytes,
+            checkpoints=(
+                ("location_command_echo", location_command.encode("utf-8")),
+                ("location_marker", path_marker.encode("ascii")),
+                ("location_error", b"Set-Location :"),
+            ),
+        )
+        compact_path_output = path_output.replace(b"\r", b"").replace(b"\n", b"")
+        assert path_bytes in compact_path_output
+        assert path_marker.encode("ascii") in compact_path_output
+
+        # Raw ConPTY output proves PowerShell changed directory and reported
+        # the resolved path. Independently require pyte to render that result
+        # followed by the prompt for the new location.
         update = _wait(
             client,
             lambda item: item.screen is not None
-            and _screen_contains_after(item.screen, location_command, initial_width_prompt),
+            and _screen_contains_after(item.screen, path_marker, initial_width_prompt),
         )
         assert initial_width_prompt in _compact_screen_text(update.screen)
-
-        # Get-Location prints the full resolved path. It is not present in the
-        # command echo or abbreviated prompt, so this checks actual execution.
-        path_bytes = str(destination).encode("utf-8")
-        client.send(b"[Console]::WriteLine((Get-Location).Path)\r")
-        _path_update, path_output = _wait_for_raw_output(
-            client, path_bytes,
-            checkpoints=(("actual_destination_path", path_bytes),),
-        )
-        assert path_bytes in path_output.replace(b"\r", b"").replace(b"\n", b"")
 
         client.resize(columns, lines)
         resized = _wait(
