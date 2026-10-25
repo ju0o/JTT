@@ -52,12 +52,14 @@ jobs:
       - name: Report Draft state without calling it a test pass
         if: github.event_name == 'pull_request' && github.event.pull_request.draft
         env:
-          TESTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 .github/scripts/ci_candidate_gate.py draft skipped "$TESTED_SHA"
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CHECKOUT_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/ci_candidate_gate.py draft skipped "$PR_HEAD_SHA" "$CHECKOUT_SHA"
 
       - name: Require Linux matrix for main and review candidates
         if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
         env:
           TEST_RESULT: ${{ needs.test.result }}
-          TESTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 .github/scripts/ci_candidate_gate.py candidate "$TEST_RESULT" "$TESTED_SHA"
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CHECKOUT_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/ci_candidate_gate.py candidate "$TEST_RESULT" "$PR_HEAD_SHA" "$CHECKOUT_SHA"
