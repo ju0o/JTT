@@ -1,23 +1,17 @@
 name: Windows native feasibility
 on:
   pull_request:
-    paths:
-      - 'experiments/windows_native/**'
-      - 'src/tmux_agent_tower/terminal/**'
-      - 'tests/test_windows_terminal_backend.py'
-      - 'tests/test_windows_worker_threads.py'
-      - 'pyproject.toml'
-      - '.github/workflows/windows-feasibility.yml'
-      - 'src/tmux_agent_tower/jtt.py'
-      - 'src/tmux_agent_tower/ui/windows_jtt.py'
-      - 'src/tmux_agent_tower/state/jtt_*.py'
-      - 'tests/test_windows_jtt_ui.py'
-      - 'tests/test_windows_jtt_state.py'
-      - 'tests/test_jtt_cli_update.py'
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 jobs:
   conpty:
+    if: github.event.pull_request.draft == false
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -41,3 +35,33 @@ jobs:
         run: python -m pytest -q -s tests/test_windows_jtt_ui.py
       - name: Native Windows JTT workspace and layout persistence
         run: python -m pytest -q -s tests/test_windows_jtt_state.py
+
+  candidate-gate:
+    name: Candidate verification status
+    if: always()
+    needs: [conpty]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report Draft state without calling it a test pass
+        if: github.event.pull_request.draft
+        run: |
+          {
+            echo '## Validation state: NOT RUN (Draft)'
+            echo
+            echo 'The Windows feasibility job was intentionally skipped because this PR is Draft. This status is not evidence that Windows tests passed. Mark the PR Ready for review to run the Windows checks.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require Windows feasibility for review candidates
+        if: github.event.pull_request.draft == false
+        env:
+          TEST_RESULT: ${{ needs.conpty.result }}
+        run: |
+          {
+            echo '## Validation state: VERIFIED'
+            echo
+            echo "Windows feasibility result: ${TEST_RESULT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$TEST_RESULT" != "success" ]]; then
+            echo "Windows feasibility did not succeed (result: ${TEST_RESULT})." >&2
+            exit 1
+          fi

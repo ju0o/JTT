@@ -4,9 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -34,3 +40,33 @@ jobs:
 
       - name: tower --doctor (best-effort, no tmux session in CI)
         run: tower --doctor || true
+
+  candidate-gate:
+    name: Candidate verification status
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report Draft state without calling it a test pass
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft
+        run: |
+          {
+            echo '## Validation state: NOT RUN (Draft)'
+            echo
+            echo 'The Linux test matrix was intentionally skipped because this PR is Draft. This status is not evidence that tests passed. Mark the PR Ready for review to run the full matrix.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require Linux matrix for main and review candidates
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          {
+            echo '## Validation state: VERIFIED'
+            echo
+            echo "Linux matrix result: ${TEST_RESULT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$TEST_RESULT" != "success" ]]; then
+            echo "Linux matrix did not succeed (result: ${TEST_RESULT})." >&2
+            exit 1
+          fi
