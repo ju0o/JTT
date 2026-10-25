@@ -42,7 +42,7 @@ jobs:
         run: tower --doctor || true
 
   candidate-gate:
-    name: Candidate verification status
+    name: Linux candidate verification status
     if: always()
     needs: [test]
     runs-on: ubuntu-latest

@@ -37,7 +37,7 @@ jobs:
         run: python -m pytest -q -s tests/test_windows_jtt_state.py
 
   candidate-gate:
-    name: Candidate verification status
+    name: Windows candidate verification status
     if: always()
     needs: [conpty]
     runs-on: ubuntu-latest

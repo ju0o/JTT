@@ -65,6 +65,9 @@ def test_linux_and_windows_candidate_jobs_are_draft_gated_and_have_summary_gates
     assert "if: github.event.pull_request.draft == false" in windows
     assert "needs: [test]" in linux
     assert "needs: [conpty]" in windows
+    assert "name: Linux candidate verification status" in linux
+    assert "name: Windows candidate verification status" in windows
+    assert "name: Candidate verification status" not in linux + windows
     assert "ci_candidate_gate.py candidate \"$TEST_RESULT\" \"$TESTED_SHA\"" in linux
     assert "ci_candidate_gate.py candidate \"$TEST_RESULT\" \"$TESTED_SHA\"" in windows
 
