@@ -2,6 +2,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -1240,3 +1246,685 @@ def test_native_powershell_prompt_tracks_long_current_location(
                 identity.session_id, expected_generation=identity.generation,
                 expected_shell_pid=identity.shell_pid,
             )
+
+
+def _r02_worker_copy(tmp_path, monkeypatch, active_diagnostics):
+    """Instrument a temporary copy of the worker without changing runtime code."""
+    from tmux_agent_tower.terminal import windows_manager
+
+    source_root = Path(windows_manager.__file__).resolve().parents[2]
+    diagnostic_root = tmp_path / "r02-worker-source" / "src"
+    diagnostic_root.mkdir(parents=True)
+    source_package = next(
+        (source_root / package for package in (
+            "tmux_agent_tower", "ju0_terminal_tower",
+        ) if (source_root / package).is_dir()),
+        None,
+    )
+    if source_package is None:
+        raise AssertionError("JTT terminal package source is unavailable for instrumentation")
+    shutil.copytree(
+        source_package,
+        diagnostic_root / "tmux_agent_tower",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+
+    worker = diagnostic_root / "tmux_agent_tower" / "terminal" / "_windows_worker.py"
+    source = worker.read_text(encoding="utf-8")
+
+    write_anchor = "                        terminal.write(text)\n"
+    write_instrumentation = '''                        _r02_write_result = None
+                        _r02_write_error = None
+                        try:
+                            _r02_write_result = terminal.write(text)
+                        except Exception as _r02_exc:
+                            _r02_write_error = type(_r02_exc).__name__
+                            raise
+                        finally:
+                            try:
+                                _r02_log = os.environ.get("JTT_R02_WRITE_LOG")
+                                if _r02_log:
+                                    _r02_record = {
+                                        "input_bytes": len(data),
+                                        "input_hex": data.hex(),
+                                        "write_result_type": type(
+                                            _r02_write_result
+                                        ).__name__,
+                                        "write_result": repr(_r02_write_result),
+                                        "write_error": _r02_write_error,
+                                    }
+                                    with open(_r02_log, "a", encoding="utf-8") as _r02_stream:
+                                        _r02_stream.write(
+                                            json.dumps(_r02_record, sort_keys=True) + "\\n"
+                                        )
+                            except Exception:
+                                pass
+'''
+    if source.count(write_anchor) != 1:
+        raise AssertionError("worker PTY.write instrumentation anchor changed")
+    source = source.replace(write_anchor, write_instrumentation, 1)
+
+    read_state_anchor = "        output = deque()\n"
+    read_state = (
+        read_state_anchor
+        + '        _r02_read_trace = {"chunks": [], "bytes": 0, "truncated": False}\n'
+    )
+    if source.count(read_state_anchor) != 1:
+        raise AssertionError("worker output trace instrumentation anchor changed")
+    source = source.replace(read_state_anchor, read_state, 1)
+
+    read_anchor = "                        if data:\n                            encoded = data.encode(\"utf-8\", errors=\"strict\")\n"
+    read_instrumentation = '''                        if data:
+                            _r02_encoded = data.encode("utf-8", errors="strict")
+                            if (len(_r02_read_trace["chunks"]) < 512
+                                    and _r02_read_trace["bytes"] + len(_r02_encoded)
+                                    <= 131072):
+                                _r02_read_trace["chunks"].append({
+                                    "time": time.monotonic(), "text": data,
+                                })
+                                _r02_read_trace["bytes"] += len(_r02_encoded)
+                            else:
+                                _r02_read_trace["truncated"] = True
+                            encoded = _r02_encoded
+'''
+    if source.count(read_anchor) != 1:
+        raise AssertionError("worker PTY.read instrumentation anchor changed")
+    source = source.replace(read_anchor, read_instrumentation, 1)
+
+    environment_anchor = '        shell_env["TERM"] = "xterm"\n'
+    environment_instrumentation = environment_anchor + '''        for _r02_key in ("JTT_R02_META_FILE", "JTT_R02_N"):
+            if _r02_key in os.environ:
+                shell_env[_r02_key] = os.environ[_r02_key]
+'''
+    if source.count(environment_anchor) != 1:
+        raise AssertionError("worker environment instrumentation anchor changed")
+    source = source.replace(environment_anchor, environment_instrumentation, 1)
+
+    bootstrap_anchor = (
+        '        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "\n'
+        '        "$OutputEncoding=[Console]::OutputEncoding; "\n'
+    )
+    bootstrap_instrumentation = bootstrap_anchor + '''        "if ($env:JTT_R02_META_FILE) { try { "
+        "$r02=@{ pid=$PID; version=$PSVersionTable.PSVersion.ToString(); "
+        "edition=$PSVersionTable.PSEdition; "
+        "input_encoding=[Console]::InputEncoding.WebName; "
+        "input_codepage=[Console]::InputEncoding.CodePage; "
+        "output_encoding=[Console]::OutputEncoding.WebName; "
+        "output_codepage=[Console]::OutputEncoding.CodePage; "
+        "columns=$Host.UI.RawUI.WindowSize.Width; "
+        "lines=$Host.UI.RawUI.WindowSize.Height }; "
+        "[System.IO.File]::WriteAllText($env:JTT_R02_META_FILE, "
+        "($r02 | ConvertTo-Json -Compress)) } catch {} }; "
+'''
+    if source.count(bootstrap_anchor) != 1:
+        raise AssertionError("PowerShell bootstrap instrumentation anchor changed")
+    source = source.replace(bootstrap_anchor, bootstrap_instrumentation, 1)
+
+    flush_anchor = "            reader.join(timeout=1)\n"
+    flush_instrumentation = flush_anchor + '''            try:
+                _r02_read_log = os.environ.get("JTT_R02_READ_LOG")
+                if _r02_read_log:
+                    Path(_r02_read_log).write_text(
+                        json.dumps(_r02_read_trace, sort_keys=True), encoding="utf-8"
+                    )
+            except Exception:
+                pass
+'''
+    if source.count(flush_anchor) != 1:
+        raise AssertionError("worker read trace flush anchor changed")
+    source = source.replace(flush_anchor, flush_instrumentation, 1)
+    worker.write_text(source, encoding="utf-8")
+
+    original_environment = windows_manager._worker_environment
+
+    def diagnostic_environment(session_dir):
+        env = original_environment(session_dir)
+        env.update({key: str(value) for key, value in active_diagnostics.items()})
+        return env
+
+    monkeypatch.setattr(windows_manager, "WORKER", worker)
+    monkeypatch.setattr(windows_manager, "_worker_environment", diagnostic_environment)
+    return windows_manager
+
+
+def _r02_redact(value, roots):
+    text = str(value)
+    for root in sorted((str(item) for item in roots), key=len, reverse=True):
+        if root:
+            text = text.replace(root, "<TEMP>")
+            text = text.replace(root.replace("\\", "/"), "<TEMP>")
+            text = text.replace(root.replace("/", "\\"), "<TEMP>")
+    # Long-path prompt shortening intentionally removes the middle of the
+    # temporary path, so exact-root replacement cannot match that rendering.
+    text = re.sub(r"(?i)(PS\s+)[A-Z]:\\\.{3}\\[^>\r\n]*>", r"\1<TEMP>>", text)
+    return text
+
+
+def _r02_poll_record(update, received_at):
+    return {
+        "time": received_at,
+        "sequence": update.sequence,
+        "snapshot_sequence": update.snapshot_sequence,
+        "state": update.state,
+        "renderer": update.renderer_state,
+        "synced": update.synced,
+        "gap": update.gap,
+        "more": update.more,
+        "output_bytes": len(update.output),
+        "output_sha256": hashlib.sha256(update.output).hexdigest(),
+    }
+
+
+def _r02_wait_for(client, predicate, timeout=15):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = client.poll()
+        if predicate(last):
+            return last
+        time.sleep(0.01)
+    return last
+
+
+def test_r02_powershell_input_and_terminator_diagnostic_matrix(tmp_path, monkeypatch):
+    """Collect six bounded input/terminator observations; do not relax regressions."""
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalRegistry
+
+    cases = tuple(
+        (delivery, terminator_name, terminator)
+        for delivery in ("character", "bulk")
+        for terminator_name, terminator in (
+            ("CR", b"\r"), ("LF", b"\n"), ("CRLF", b"\r\n"),
+        )
+    )
+    active_diagnostics = {}
+    _r02_worker_copy(tmp_path, monkeypatch, active_diagnostics)
+    summaries = []
+
+    for delivery, terminator_name, terminator in cases:
+        case_name = f"{delivery.lower()}-{terminator_name.lower()}"
+        case_root = tmp_path / case_name
+        start_name = "s" * max(1, 108 - len(str(case_root)))
+        start = case_root / start_name
+        destination = start / "d"
+        nonce = uuid.uuid4().hex.upper()
+        marker_path = destination / "m"
+        metadata_path = case_root / "child-meta.json"
+        write_log = case_root / "pty-writes.jsonl"
+        read_log = case_root / "pty-reads.json"
+        active_diagnostics.clear()
+        active_diagnostics.update({
+            "JTT_R02_META_FILE": metadata_path,
+            "JTT_R02_N": nonce,
+            "JTT_R02_WRITE_LOG": write_log,
+            "JTT_R02_READ_LOG": read_log,
+        })
+
+        registry = None
+        client = None
+        identity = None
+        captured_output = bytearray()
+        poll_events = []
+        latest = None
+        input_records = []
+        submit_time = None
+        post_enter_output_start = None
+        command = (
+            "Set-Location d;Set-Content -LiteralPath m -Value "
+            "$env:JTT_R02_N -Encoding Ascii;$PWD.Path"
+        )
+        expected_prompt = _expected_prompt_path(destination, 100)
+        command_echo = False
+        result = {
+            "case": case_name,
+            "delivery": delivery,
+            "terminator": terminator_name,
+            "terminator_hex": terminator.hex(),
+            "command": command,
+            "command_bytes": len(command.encode("ascii")),
+            "command_sha256": hashlib.sha256(command.encode("ascii")).hexdigest(),
+            "initial_columns_lines": None,
+            "child": None,
+            "input_records": input_records,
+            "command_echo": False,
+            "command_execution": "UNKNOWN",
+            "marker_file": "UNKNOWN",
+            "marker_file_content": "UNKNOWN",
+            "poll_events": poll_events,
+            "poll_output_bytes": 0,
+            "poll_output_sha256": None,
+            "poll_output_repr": None,
+            "poll_output_hex_redacted": None,
+            "post_enter_output_bytes": None,
+            "post_enter_output_repr": None,
+            "post_enter_output_hex_redacted": None,
+            "result_path_in_poll_output": "UNKNOWN",
+            "result_path_in_screen": "UNKNOWN",
+            "pty_read_text_repr": None,
+            "pty_read_utf8_hex_redacted": None,
+            "post_enter_pty_read_text_repr": None,
+            "post_enter_pty_read_utf8_hex_redacted": None,
+            "post_enter_elapsed_seconds": None,
+            "pty_read_api_note": (
+                "pywinpty.PTY.read returns Python text; UTF-8 hex is the encoded "
+                "text returned by that API, not native ConPTY bytes"
+            ),
+            "poll_output_api_note": (
+                "worker encodes pywinpty.PTY.read text as UTF-8 before poll"
+            ),
+            "pty_write_records": None,
+            "new_prompt": "UNKNOWN",
+            "final_error": None,
+            "powershell_error": None,
+            "final_sequence": None,
+            "final_snapshot_sequence": None,
+            "final_synced": None,
+            "final_gap": None,
+            "final_more": None,
+            "screen_repr": None,
+            "cleanup": "NOT_ATTEMPTED",
+        }
+
+        try:
+            destination.mkdir(parents=True)
+            if len(str(destination)) <= 100:
+                raise RuntimeError("diagnostic_destination_is_not_longer_than_100")
+            monkeypatch.chdir(start)
+            registry = TerminalRegistry(
+                case_root / "isolated-jtt-home" / "terminals"
+            )
+            client = registry.create("WBS-R02 input diagnostic")
+            identity = client.identity
+            original_poll = client.poll
+
+            def capture_poll():
+                nonlocal latest
+                received_at = time.monotonic()
+                update = original_poll()
+                latest = update
+                if update.output:
+                    captured_output.extend(update.output)
+                if (update.output or update.gap or update.more
+                        or not poll_events
+                        or poll_events[-1]["sequence"] != update.sequence
+                        or poll_events[-1]["snapshot_sequence"]
+                        != update.snapshot_sequence):
+                    poll_events.append(_r02_poll_record(update, received_at))
+                return update
+
+            client.poll = capture_poll
+            initial = _r02_wait_for(
+                client,
+                lambda item: item is not None and item.screen is not None
+                and item.synced and item.state == "running",
+                timeout=15,
+            )
+            if initial is None or initial.screen is None:
+                result["final_error"] = "initial_screen_not_observed"
+                raise RuntimeError("initial_screen_not_observed")
+            result["initial_columns_lines"] = [initial.columns, initial.lines]
+            result["child"] = {
+                "executable": _r02_redact(
+                    identity.shell_path,
+                    (tmp_path, start, destination, os.environ.get("USERPROFILE", "")),
+                ),
+                "pid": identity.shell_pid,
+                "generation_present": bool(identity.generation),
+            }
+
+            metadata_deadline = time.monotonic() + 12
+            while time.monotonic() < metadata_deadline and not metadata_path.is_file():
+                client.poll()
+                time.sleep(0.01)
+            if metadata_path.is_file():
+                try:
+                    result["child"]["runtime"] = json.loads(
+                        metadata_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError, UnicodeError):
+                    result["child"]["runtime"] = "invalid_or_unavailable"
+            else:
+                result["child"]["runtime"] = "not_recorded"
+
+            if not client.acquire():
+                result["final_error"] = "input_lease_not_acquired"
+                raise RuntimeError("input_lease_not_acquired")
+
+            command_bytes = command.encode("ascii")
+            if delivery == "character":
+                for index, byte in enumerate(command_bytes):
+                    payload = bytes((byte,))
+                    try:
+                        written = client.send(payload)
+                        input_records.append({
+                            "phase": "command_char", "index": index,
+                            "bytes": len(payload), "payload_hex": payload.hex(),
+                            "acknowledged_bytes": written,
+                        })
+                    except Exception as exc:
+                        input_records.append({
+                            "phase": "command_char", "index": index,
+                            "bytes": len(payload), "payload_hex": payload.hex(),
+                            "send_error": type(exc).__name__,
+                        })
+                        raise
+                echo_update = _r02_wait_for(
+                    client,
+                    lambda item: item is not None and item.screen is not None
+                    and command in _compact_screen_text(item.screen),
+                    timeout=15,
+                )
+                command_echo = bool(
+                    echo_update is not None and echo_update.screen is not None
+                    and command in _compact_screen_text(echo_update.screen)
+                )
+                send_time = time.monotonic()
+                submit_time = send_time
+                post_enter_output_start = len(captured_output)
+                try:
+                    acknowledged = client.send(terminator)
+                    input_records.append({
+                        "phase": "terminator", "bytes": len(terminator),
+                        "payload_hex": terminator.hex(),
+                        "acknowledged_bytes": acknowledged,
+                        "sent_at": send_time,
+                    })
+                except Exception as exc:
+                    input_records.append({
+                        "phase": "terminator", "bytes": len(terminator),
+                        "payload_hex": terminator.hex(),
+                        "send_error": type(exc).__name__, "sent_at": send_time,
+                    })
+                    raise
+            else:
+                payload = command_bytes + terminator
+                send_time = time.monotonic()
+                submit_time = send_time
+                post_enter_output_start = len(captured_output)
+                try:
+                    acknowledged = client.send(payload)
+                    input_records.append({
+                        "phase": "command_and_terminator",
+                        "bytes": len(payload), "payload_hex": payload.hex(),
+                        "command_sha256": hashlib.sha256(command_bytes).hexdigest(),
+                        "terminator_hex": terminator.hex(),
+                        "acknowledged_bytes": acknowledged,
+                        "sent_at": send_time,
+                    })
+                except Exception as exc:
+                    input_records.append({
+                        "phase": "command_and_terminator",
+                        "bytes": len(payload), "payload_hex": payload.hex(),
+                        "send_error": type(exc).__name__, "sent_at": send_time,
+                    })
+                    raise
+
+            result["command_echo"] = command_echo
+            deadline = time.monotonic() + 15
+            last_error_text = ""
+            prompt_seen = False
+            while time.monotonic() < deadline:
+                update = client.poll()
+                if update.screen is not None:
+                    screen_text = _compact_screen_text(update.screen)
+                    command_echo = command_echo or command in screen_text
+                    if any(token in screen_text for token in (
+                        "ParserError", "Set-Location :", "Set-Content :",
+                        "Cannot find path", "Exception",
+                    )):
+                        last_error_text = screen_text
+                    command_index = screen_text.rfind(command)
+                    result_path_index = screen_text.find(
+                        str(destination), command_index + len(command)
+                    ) if command_index >= 0 else -1
+                    prompt_index = screen_text.rfind(expected_prompt.rstrip())
+                    result["result_path_in_screen"] = (
+                        "YES" if result_path_index >= 0 else "NO"
+                    )
+                    if result_path_index >= 0 and prompt_index > result_path_index:
+                        prompt_seen = True
+                        result["new_prompt"] = "YES"
+                if marker_path.is_file():
+                    try:
+                        if marker_path.read_text(encoding="utf-8").strip() == nonce:
+                            result["command_execution"] = "YES"
+                            result["marker_file"] = "PRESENT_MATCH"
+                            result["marker_file_content"] = "MATCH"
+                        else:
+                            result["command_execution"] = "NO"
+                            result["marker_file"] = "PRESENT_MISMATCH"
+                            result["marker_file_content"] = "MISMATCH"
+                    except (OSError, UnicodeError):
+                        result["marker_file"] = "PRESENT_UNREADABLE"
+                        result["marker_file_content"] = "UNREADABLE"
+                if result["command_execution"] == "YES" and prompt_seen:
+                    break
+                time.sleep(0.01)
+
+            if not marker_path.exists():
+                result["marker_file"] = "ABSENT"
+                if last_error_text:
+                    result["command_execution"] = "NO"
+                result["marker_file_content"] = "ABSENT"
+            if last_error_text:
+                result["powershell_error"] = _r02_redact(
+                    last_error_text,
+                    (tmp_path, start, destination, os.environ.get("USERPROFILE", "")),
+                )
+                if result["command_execution"] != "YES":
+                    result["command_execution"] = "NO"
+            elif result["command_execution"] != "YES":
+                result["command_execution"] = "UNKNOWN"
+
+            latest_screen = latest.screen if latest is not None else None
+            if latest_screen is not None:
+                final_screen_text = _compact_screen_text(latest_screen)
+                command_index = final_screen_text.rfind(command)
+                result_path_index = final_screen_text.find(
+                    str(destination), command_index + len(command)
+                ) if command_index >= 0 else -1
+                prompt_index = final_screen_text.rfind(expected_prompt.rstrip())
+                result["result_path_in_screen"] = (
+                    "YES" if result_path_index >= 0 else "NO"
+                )
+                if result_path_index >= 0 and prompt_index > result_path_index:
+                    result["new_prompt"] = "YES"
+                elif result["command_execution"] == "YES":
+                    result["new_prompt"] = "NO"
+                result["screen_repr"] = _r02_redact(
+                    final_screen_text,
+                    (tmp_path, start, destination, os.environ.get("USERPROFILE", "")),
+                )
+            post_enter_output = (
+                bytes(captured_output[post_enter_output_start:])
+                if post_enter_output_start is not None else b""
+            )
+            compact_post_enter = post_enter_output.replace(b"\r", b"").replace(b"\n", b"")
+            result.update({
+                "command_echo": command_echo,
+                "post_enter_output_bytes": len(post_enter_output),
+                "post_enter_output_repr": _r02_redact(
+                    post_enter_output.decode("utf-8", errors="backslashreplace"),
+                    (tmp_path, start, destination, os.environ.get("USERPROFILE", "")),
+                ),
+                "result_path_in_poll_output": (
+                    "YES" if str(destination).encode("utf-8") in compact_post_enter
+                    else "NO"
+                ),
+            })
+            result["post_enter_output_hex_redacted"] = result[
+                "post_enter_output_repr"
+            ].encode("utf-8").hex()
+            if submit_time is not None:
+                result["post_enter_elapsed_seconds"] = round(
+                    time.monotonic() - submit_time, 3
+                )
+            result.update({
+                "poll_output_bytes": len(captured_output),
+                "poll_output_sha256": hashlib.sha256(captured_output).hexdigest(),
+                "poll_output_repr": _r02_redact(
+                    bytes(captured_output).decode("utf-8", errors="backslashreplace"),
+                    (tmp_path, start, destination, os.environ.get("USERPROFILE", "")),
+                ),
+                "poll_output_hex_redacted": _r02_redact(
+                    bytes(captured_output).decode("utf-8", errors="backslashreplace"),
+                    (tmp_path, start, destination, os.environ.get("USERPROFILE", "")),
+                ).encode("utf-8").hex(),
+                "final_sequence": getattr(latest, "sequence", None),
+                "final_snapshot_sequence": getattr(latest, "snapshot_sequence", None),
+                "final_synced": getattr(latest, "synced", None),
+                "final_gap": getattr(latest, "gap", None),
+                "final_more": getattr(latest, "more", None),
+            })
+        except Exception as exc:
+            result["final_error"] = type(exc).__name__
+            if latest is not None:
+                result.update({
+                    "final_sequence": getattr(latest, "sequence", None),
+                    "final_snapshot_sequence": getattr(latest, "snapshot_sequence", None),
+                    "final_synced": getattr(latest, "synced", None),
+                    "final_gap": getattr(latest, "gap", None),
+                    "final_more": getattr(latest, "more", None),
+                })
+        finally:
+            if submit_time is not None:
+                result["post_enter_elapsed_seconds"] = round(
+                    time.monotonic() - submit_time, 3
+                )
+            if client is not None:
+                try:
+                    client.close()
+                except Exception as exc:
+                    result["cleanup"] = f"client_close_{type(exc).__name__}"
+            if identity is not None:
+                try:
+                    if registry is None:
+                        raise RuntimeError("registry_unavailable_for_identity_cleanup")
+                    registry.stop(
+                        identity.session_id,
+                        expected_generation=identity.generation,
+                        expected_shell_pid=identity.shell_pid,
+                    )
+                    result["cleanup"] = (
+                        "STOPPED" if not _process_same(
+                            identity.shell_pid, identity.shell_start
+                        ) else "PROCESS_STILL_MATCHES_IDENTITY"
+                    )
+                except Exception as exc:
+                    result["cleanup"] = f"STOP_ERROR_{type(exc).__name__}"
+
+        if write_log.is_file():
+            try:
+                write_records = [
+                    json.loads(line)
+                    for line in write_log.read_text(encoding="utf-8").splitlines()
+                    if line
+                ]
+                write_payload = b"".join(
+                    bytes.fromhex(record["input_hex"]) for record in write_records
+                )
+                write_result_counts = {}
+                write_errors = []
+                for record in write_records:
+                    label = (
+                        f"{record['write_result_type']}:{record['write_result']}"
+                    )
+                    write_result_counts[label] = write_result_counts.get(label, 0) + 1
+                    if record["write_error"]:
+                        write_errors.append(record["write_error"])
+                result["pty_write_records"] = {
+                    "calls": len(write_records),
+                    "input_bytes": len(write_payload),
+                    "input_hex": write_payload.hex(),
+                    "write_result_counts": write_result_counts,
+                    "write_errors": write_errors,
+                }
+            except (OSError, ValueError, UnicodeError):
+                result["pty_write_records"] = "unreadable"
+        else:
+            result["pty_write_records"] = "not_recorded"
+
+        if read_log.is_file():
+            try:
+                trace = json.loads(read_log.read_text(encoding="utf-8"))
+                read_chunks = [event["text"] for event in trace.get("chunks", [])]
+                read_text = "".join(read_chunks)
+                redaction_roots = (
+                    tmp_path, start, destination, os.environ.get("USERPROFILE", "")
+                )
+                safe_read_text = _r02_redact(read_text, redaction_roots)
+                read_bytes = read_text.encode("utf-8", errors="strict")
+                read_after_enter = "".join(
+                    event["text"] for event in trace.get("chunks", [])
+                    if submit_time is not None and event["time"] >= submit_time
+                )
+                post_enter_events = [
+                    event for event in trace.get("chunks", [])
+                    if submit_time is not None and event["time"] >= submit_time
+                ]
+                safe_read_after_enter = _r02_redact(
+                    read_after_enter, redaction_roots
+                )
+                result.update({
+                    "pty_read_text_utf8_bytes": len(read_bytes),
+                    "pty_read_text_sha256": hashlib.sha256(read_bytes).hexdigest(),
+                    "pty_read_text_repr": safe_read_text,
+                    "pty_read_utf8_hex_redacted": safe_read_text.encode("utf-8").hex(),
+                    "post_enter_pty_read_text_repr": safe_read_after_enter,
+                    "post_enter_pty_read_utf8_hex_redacted": (
+                        safe_read_after_enter.encode("utf-8").hex()
+                    ),
+                    "post_enter_pty_read_first_seconds": (
+                        round(post_enter_events[0]["time"] - submit_time, 4)
+                        if post_enter_events else None
+                    ),
+                    "post_enter_pty_read_last_seconds": (
+                        round(post_enter_events[-1]["time"] - submit_time, 4)
+                        if post_enter_events else None
+                    ),
+                    "pty_read_chunks": len(read_chunks),
+                    "pty_read_truncated": bool(trace.get("truncated")),
+                })
+            except (OSError, ValueError, UnicodeError, KeyError, TypeError):
+                result["pty_read_text_repr"] = "unreadable"
+
+        # Never print unredacted temporary paths. The command is constant and
+        # contains no nonce; the child environment and file marker carry it.
+        safe_input_records = []
+        character_records = [
+            record for record in input_records if record["phase"] == "command_char"
+        ]
+        other_records = [
+            record for record in input_records if record["phase"] != "command_char"
+        ]
+        if character_records:
+            command_payload = b"".join(
+                bytes.fromhex(record["payload_hex"]) for record in character_records
+            )
+            safe_input_records.append({
+                "phase": "command_character_delivery",
+                "send_calls": len(character_records),
+                "input_bytes": len(command_payload),
+                "payload_hex": command_payload.hex(),
+                "acknowledged_bytes": sum(
+                    int(record.get("acknowledged_bytes", 0))
+                    for record in character_records
+                ),
+                "send_errors": [
+                    record["send_error"] for record in character_records
+                    if "send_error" in record
+                ],
+            })
+        safe_input_records.extend(dict(record) for record in other_records)
+        result["input_records"] = safe_input_records
+        summaries.append(result)
+        print("R02_DIAGNOSTIC " + json.dumps(result, sort_keys=True))
+
+    assert len(summaries) == 6
+    assert {item["case"] for item in summaries} == {
+        f"{delivery.lower()}-{terminator.lower()}"
+        for delivery in ("character", "bulk")
+        for terminator in ("CR", "LF", "CRLF")
+    }
+    assert all(item["cleanup"] == "STOPPED" for item in summaries), summaries
