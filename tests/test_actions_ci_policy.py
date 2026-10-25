@@ -86,13 +86,14 @@ def test_windows_required_workflow_has_no_path_filter_or_soft_failure():
 
 
 def test_concurrency_cancels_only_pull_request_runs():
-    group = "${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}"
+    group = "${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}"
     cancel = "${{ github.event_name == 'pull_request' }}"
 
     for name in ("ci.yml", "windows-feasibility.yml"):
         workflow = (WORKFLOWS / name).read_text(encoding="utf-8")
         assert group in workflow
         assert f"cancel-in-progress: {cancel}" in workflow
+        assert "github.ref }}" not in workflow
 
 
 def test_main_linux_push_and_release_separation_are_preserved():
