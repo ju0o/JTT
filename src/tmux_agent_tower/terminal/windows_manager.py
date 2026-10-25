@@ -917,7 +917,9 @@ class TerminalClient:
         self.state = identity.state
         self.synced = False
         self.lease = False
-        self._sequence = 0
+        # Highest output sequence actually delivered by poll(), not the
+        # producer sequence reported by observe() or input acknowledgements.
+        self._output_cursor = 0
         self._client_id = uuid.uuid4().hex
         self._closed = False
         try:
@@ -977,9 +979,9 @@ class TerminalClient:
         if not response.get("ok"):
             reason = str(response.get("error") or "terminal request rejected")
             if reason in ("stale_identity", "session_exited", "input_lease_required",
-                          "stream_gap", "lease_expired"):
+                          "stream_gap", "lease_expired", "renderer_unavailable"):
                 self.lease = False
-                if reason in ("stale_identity", "stream_gap"):
+                if reason in ("stale_identity", "stream_gap", "renderer_unavailable"):
                     self.synced = False
             raise TerminalError(reason)
         if (response.get("session_id") != self.identity.session_id
@@ -992,16 +994,17 @@ class TerminalClient:
         return response
 
     def poll(self) -> TerminalUpdate:
-        response = self._request("poll", after=self._sequence)
+        response = self._request("poll", after=self._output_cursor)
         try:
             output = base64.b64decode(response.get("data", ""), validate=True)
-            sequence = int(response.get("sequence", self._sequence))
-            if sequence < self._sequence:
+            sequence = int(response.get("sequence", self._output_cursor))
+            if sequence < self._output_cursor:
                 raise ValueError("sequence regressed")
         except (ValueError, TypeError) as exc:
             self.synced = False
             raise TerminalError("terminal output frame is invalid") from exc
-        self._sequence = sequence
+        # Only poll() returns the bytes covered by this cursor and may advance it.
+        self._output_cursor = sequence
         self.synced = bool(response.get("synced"))
         screen = _decode_screen(response)
         available = bool(response.get("renderer_available"))
@@ -1040,7 +1043,7 @@ class TerminalClient:
         if not update.synced or update.gap:
             self.lease = False
             raise TerminalError("stream_gap")
-        response = self._request("acquire", after=self._sequence)
+        response = self._request("acquire", after=self._output_cursor)
         self.lease = bool(response.get("lease"))
         return self.lease
 
@@ -1056,15 +1059,26 @@ class TerminalClient:
     def send(self, data: bytes) -> int:
         if not isinstance(data, bytes) or not data or len(data) > 8192:
             raise TerminalError("terminal input must be 1-8192 bytes")
-        update = self.poll()
-        if not update.synced or update.gap:
-            self.release()
-            raise TerminalError("stream_gap")
         if not self.lease:
             raise TerminalError("input_lease_required")
         response = self._request(
-            "input", data=base64.b64encode(data).decode("ascii"), after=self._sequence
+            "input", data=base64.b64encode(data).decode("ascii"),
+            after=self._output_cursor,
         )
+        try:
+            reported_sequence = int(response.get("sequence", self._output_cursor))
+            if reported_sequence < self._output_cursor:
+                raise ValueError("sequence regressed")
+        except (TypeError, ValueError) as exc:
+            self.synced = self.lease = False
+            raise TerminalError("terminal input response is invalid") from exc
+        if not response.get("synced") or not response.get("renderer_available"):
+            self.synced = self.lease = False
+            raise TerminalError("stream_gap")
+        # The input acknowledgement carries a producer head but no output
+        # bytes. Keep it separate from _output_cursor so a later stream-gap
+        # check cannot mistake unread data for delivered data.
+        self.synced = True
         return int(response.get("written", 0))
 
     def resize(self, columns: int, lines: int) -> None:
@@ -1078,7 +1092,7 @@ class TerminalClient:
         if not update.synced or update.gap:
             self.release()
             raise TerminalError("stream_gap")
-        self._request("resize", columns=columns, lines=lines, after=self._sequence)
+        self._request("resize", columns=columns, lines=lines, after=self._output_cursor)
 
     def close(self) -> None:
         if self._closed:

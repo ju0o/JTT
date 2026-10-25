@@ -18,6 +18,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.css.query import NoMatches
 from textual.dom import NoScreen
+from textual.events import Paste
 from textual.screen import ModalScreen
 from textual.widget import MountError, Widget
 from textual.widgets import Button, Input, Static
@@ -72,28 +73,46 @@ def _screen_text(screen: TerminalScreen | None, columns: int, lines: int) -> Tex
     width = max(0, min(int(columns), max((len(row) for row in screen.rows), default=0)))
     height = max(0, min(int(lines), len(screen.rows)))
     output = Text(no_wrap=True, overflow="crop")
+    style_cache: dict[tuple, Style] = {}
+
+    def flush_run(parts: list[str], signature: tuple | None) -> None:
+        if not parts or signature is None:
+            return
+        style = style_cache.get(signature)
+        if style is None:
+            (foreground, background, bold, italic, underline, reverse,
+             blink, strike) = signature
+            style = Style(
+                color=foreground, bgcolor=background, bold=bold, italic=italic,
+                underline=underline, reverse=reverse, blink=blink, strike=strike,
+            )
+            style_cache[signature] = style
+        output.append("".join(parts), style=style)
+
     for y, row in enumerate(screen.rows[:height]):
         limit = min(width, len(row))
+        run: list[str] = []
+        run_style = None
         for x, cell in enumerate(row[:limit]):
             # pyte represents the trailing cell of a wide glyph with an empty
             # string. Emitting a space here would visibly split Korean and
             # other double-width characters in the RIGHT view.
             if not cell.text:
                 continue
-            value = cell.text
-            style = Style(
-                color=_rich_color(cell.foreground),
-                bgcolor=_rich_color(cell.background),
-                bold=cell.bold,
-                italic=cell.italic,
-                underline=cell.underline,
-                reverse=cell.reverse or (
+            signature = (
+                _rich_color(cell.foreground), _rich_color(cell.background),
+                cell.bold, cell.italic, cell.underline,
+                cell.reverse or (
                     screen.cursor_visible and x == screen.cursor_x and y == screen.cursor_y
                 ),
-                blink=cell.blink,
-                strike=cell.strikethrough,
+                cell.blink, cell.strikethrough,
             )
-            output.append(value, style=style)
+            if run_style is not None and signature != run_style:
+                flush_run(run, run_style)
+                run.clear()
+            run_style = signature
+            run.append(cell.text)
+        flush_run(run, run_style)
         if y + 1 < height:
             output.append("\n")
     return output
@@ -464,7 +483,8 @@ class WindowsJTTApp(App[None]):
     #new-terminal { width: 100%; height: 3; margin-top: 1; }
     #terminal-cards { height: 1fr; }
     .card-row { width: 100%; height: 6; margin-bottom: 1; }
-    .terminal-card { width: 1fr; height: 6; border: round #355d68; content-align: left middle; }
+    .terminal-card { width: 1fr; height: 6; border: round #355d68; content-align: left middle;
+                     text-wrap: nowrap; text-overflow: ellipsis; }
     .terminal-card.selected { border: round #35cbbd; background: #102a35; }
     #live { height: 1fr; width: 100%; overflow-x: hidden; overflow-y: hidden;
             border: round #294550; padding: 0 1; background: #050b13; }
@@ -540,7 +560,7 @@ class WindowsJTTApp(App[None]):
         self._mini_sampler = WindowsMiniLiveSampler()
         self._refresh_timers = [
             self.set_interval(1.0, self._refresh_sessions),
-            self.set_interval(0.2, self._refresh_live),
+            self.set_interval(0.1, self._refresh_live),
             self.set_interval(0.25, self._refresh_mini_live),
         ]
         await self._refresh_sessions()
@@ -567,11 +587,21 @@ class WindowsJTTApp(App[None]):
             screen = self.screen
         except (NoScreen, ScreenStackError):
             return False
-        return (
+        active = (
             not self._mini_live_stopping and self.is_mounted
             and screen.is_attached and screen.is_parent_active
             and not isinstance(screen, ModalScreen)
         )
+        if not active:
+            return False
+        try:
+            # During Textual teardown a screen can remain marked active after
+            # its children have already detached but before on_unmount runs.
+            self.query_one("#statusline", Static)
+            self.query_one("#terminal-status", Static)
+        except NoMatches:
+            return False
+        return True
 
     def _set_notice(self, text: str, duration: float = 4.0) -> None:
         self._notice = str(text)
@@ -608,7 +638,7 @@ class WindowsJTTApp(App[None]):
         # Session refresh updates widgets on the base screen. Like LIVE
         # refresh, defer it while a modal owns the active screen so polling
         # cannot query or mutate the hidden widget tree.
-        if not self._base_widgets_available() or self._busy:
+        if not self._base_widgets_available() or self._busy or self.input_mode:
             return
         try:
             values = await self._backend_call(self.registry.list_sessions)
@@ -867,7 +897,12 @@ class WindowsJTTApp(App[None]):
             for identity in values[start:start + 2]:
                 selected = identity.session_id == self.selected_id
                 state = self._state_label(identity.state)
-                label = Text(f"{identity.name}\n{state} · PID {identity.shell_pid}")
+                # Keep identity metadata on two clipped lines in narrow cards;
+                # wrapping pushes the Mini LIVE preview and status out of view.
+                label = Text(
+                    f"{identity.name}\n{state} · PID {identity.shell_pid}",
+                    no_wrap=True, overflow="ellipsis",
+                )
                 cached = self._fresh_mini_screen(identity, now)
                 if cached is None:
                     label.append("\n미니 화면 대기 중", style="dim")
@@ -938,7 +973,7 @@ class WindowsJTTApp(App[None]):
                      if item.state == "running" and item.session_id != self.selected_id)[:16]
 
     async def _refresh_mini_live(self) -> None:
-        if (not self._base_widgets_available() or self._busy
+        if (not self._base_widgets_available() or self._busy or self.input_mode
                 or self._mini_sampler is None):
             return
         result = self._mini_sampler.take()
@@ -1099,7 +1134,8 @@ class WindowsJTTApp(App[None]):
                     return
                 self._clear_live("화면 재동기화 중 · 입력 차단")
             else:
-                self._render_terminal(observation.screen)
+                if not self._render_terminal(observation.screen):
+                    return
                 self._right_observation = (
                     _mini_identity_key(identity), observation.sequence,
                     time.monotonic(), observation.screen,
@@ -1129,16 +1165,31 @@ class WindowsJTTApp(App[None]):
             and _same_identity(self.selected_identity, identity)
         )
 
-    def _render_terminal(self, screen: TerminalScreen) -> None:
-        view = self.query_one("#live", TerminalView)
+    def _live_view(self) -> TerminalView | None:
+        if not self._base_widgets_available():
+            return None
+        try:
+            view = self.query_one("#live", TerminalView)
+        except NoMatches:
+            # Textual may detach the RIGHT subtree during screen teardown
+            # before the app's unmount callback stops its timers.
+            return None
+        return view if view.is_attached else None
+
+    def _render_terminal(self, screen: TerminalScreen) -> bool:
+        view = self._live_view()
+        if view is None:
+            return False
         size = view.content_size
         columns = max(1, size.width)
         lines = max(1, size.height)
         view.update(_screen_text(screen, columns, lines))
+        return True
 
     def _clear_live(self, message: str = "") -> None:
-        if self._base_widgets_available():
-            self.query_one("#live", TerminalView).update(Text(message or "터미널을 선택하세요.", style="dim"))
+        view = self._live_view()
+        if view is not None:
+            view.update(Text(message or "터미널을 선택하세요.", style="dim"))
 
     async def _prompt_create_window(self) -> None:
         # The dialog belongs to navigation mode. Revoke any terminal input
@@ -1516,8 +1567,12 @@ class WindowsJTTApp(App[None]):
     async def _send_bytes(self, data: bytes) -> None:
         client = self.client
         identity = self.selected_identity
-        if (not self.input_mode or client is None or identity is None
-                or not client.lease or not _same_identity(identity, client.identity)):
+        if not self._input_target_is_current(client, identity):
+            if client is not None and client.lease:
+                try:
+                    await self._backend_call(client.release)
+                except Exception:
+                    pass
             self.input_mode = False
             self._set_notice("입력 대상 신원을 확인할 수 없어 키를 차단했습니다.", 8.0)
             return
@@ -1528,9 +1583,39 @@ class WindowsJTTApp(App[None]):
             self.input_mode = False
             self._clear_live("입력 실패 · 세션 화면을 다시 선택하세요.")
             self._set_notice(f"키 입력이 차단되었습니다: {exc}", 8.0)
-        else:
-            await self._refresh_live()
         self._update_status()
+
+    def _input_target_is_current(self, client, identity) -> bool:
+        if (not self.input_mode or self._panel_index != 2 or client is None
+                or identity is None or identity.state != "running"
+                or self.selected_id != identity.session_id or not client.lease
+                or not _same_identity(identity, client.identity)):
+            return False
+        visible = self.sessions.get(identity.session_id)
+        return visible is not None and visible.state == "running" and _same_identity(
+            identity, visible
+        )
+
+    async def on_paste(self, event: Paste) -> None:
+        """Forward an explicit terminal paste event to the verified RIGHT lease.
+
+        Textual receives bracketed-paste text from the terminal host. JTT does
+        not read or modify the operating-system clipboard.
+        """
+        if isinstance(self.screen, ModalScreen):
+            return
+        event.stop()
+        if not event.text:
+            return
+        try:
+            data = event.text.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            self._set_notice("붙여넣기 문자를 UTF-8로 변환할 수 없습니다.")
+            return
+        if len(data) > 8192:
+            self._set_notice("붙여넣기 크기 초과 · 8192바이트 이하만 전달합니다.")
+            return
+        await self._send_bytes(data)
 
     async def _close_selected_client(self) -> None:
         client, self.client = self.client, None
