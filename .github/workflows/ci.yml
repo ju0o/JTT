@@ -4,9 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -34,3 +40,26 @@ jobs:
 
       - name: tower --doctor (best-effort, no tmux session in CI)
         run: tower --doctor || true
+
+  candidate-gate:
+    name: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'Linux draft validation (NOT RUN)' || 'Linux candidate verification status' }}
+    if: always()
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report Draft state without calling it a test pass
+        if: github.event_name == 'pull_request' && github.event.pull_request.draft
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CHECKOUT_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/ci_candidate_gate.py draft skipped "$PR_HEAD_SHA" "$CHECKOUT_SHA"
+
+      - name: Require Linux matrix for main and review candidates
+        if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          CHECKOUT_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/ci_candidate_gate.py candidate "$TEST_RESULT" "$PR_HEAD_SHA" "$CHECKOUT_SHA"
