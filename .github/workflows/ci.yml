@@ -42,7 +42,7 @@ jobs:
         run: tower --doctor || true
 
   candidate-gate:
-    name: Linux candidate verification status
+    name: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft && 'Linux draft validation (NOT RUN)' || 'Linux candidate verification status' }}
     if: always()
     needs: [test]
     runs-on: ubuntu-latest
