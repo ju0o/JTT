@@ -42,26 +42,14 @@ jobs:
     needs: [conpty]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Report Draft state without calling it a test pass
         if: github.event.pull_request.draft
-        run: |
-          {
-            echo '## Validation state: NOT RUN (Draft)'
-            echo
-            echo 'The Windows feasibility job was intentionally skipped because this PR is Draft. This status is not evidence that Windows tests passed. Mark the PR Ready for review to run the Windows checks.'
-          } >> "$GITHUB_STEP_SUMMARY"
+        run: python3 .github/scripts/ci_candidate_gate.py draft skipped
 
       - name: Require Windows feasibility for review candidates
         if: github.event.pull_request.draft == false
         env:
           TEST_RESULT: ${{ needs.conpty.result }}
-        run: |
-          {
-            echo '## Validation state: VERIFIED'
-            echo
-            echo "Windows feasibility result: ${TEST_RESULT}"
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$TEST_RESULT" != "success" ]]; then
-            echo "Windows feasibility did not succeed (result: ${TEST_RESULT})." >&2
-            exit 1
-          fi
+        run: python3 .github/scripts/ci_candidate_gate.py candidate "$TEST_RESULT"
