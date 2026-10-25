@@ -11,12 +11,12 @@ GATE_SCRIPT = ROOT / ".github" / "scripts" / "ci_candidate_gate.py"
 WORKFLOWS = ROOT / ".github" / "workflows"
 
 
-def _run_gate(tmp_path, state, result):
+def _run_gate(tmp_path, state, result, tested_sha="abc123"):
     summary = tmp_path / "summary.md"
     env = os.environ.copy()
     env["GITHUB_STEP_SUMMARY"] = str(summary)
     completed = subprocess.run(
-        [sys.executable, str(GATE_SCRIPT), state, result],
+        [sys.executable, str(GATE_SCRIPT), state, result, tested_sha],
         cwd=str(ROOT),
         env=env,
         check=False,
@@ -32,6 +32,7 @@ def test_draft_gate_is_successful_but_explicitly_not_tested(tmp_path):
     assert completed.returncode == 0
     assert "NOT RUN (Draft)" in summary
     assert "not a test pass" in summary
+    assert "PR HEAD: abc123" in summary
     assert "VERIFIED PASS" not in summary
 
 
@@ -40,6 +41,7 @@ def test_candidate_gate_accepts_only_success(tmp_path):
 
     assert completed.returncode == 0
     assert "VERIFIED PASS" in summary
+    assert "PR HEAD: abc123" in summary
 
 
 def test_candidate_gate_fails_closed_for_failed_skipped_or_cancelled_jobs(tmp_path):
@@ -63,8 +65,8 @@ def test_linux_and_windows_candidate_jobs_are_draft_gated_and_have_summary_gates
     assert "if: github.event.pull_request.draft == false" in windows
     assert "needs: [test]" in linux
     assert "needs: [conpty]" in windows
-    assert "ci_candidate_gate.py candidate \"$TEST_RESULT\"" in linux
-    assert "ci_candidate_gate.py candidate \"$TEST_RESULT\"" in windows
+    assert "ci_candidate_gate.py candidate \"$TEST_RESULT\" \"$TESTED_SHA\"" in linux
+    assert "ci_candidate_gate.py candidate \"$TEST_RESULT\" \"$TESTED_SHA\"" in windows
 
 
 def test_windows_required_workflow_has_no_path_filter_or_soft_failure():
