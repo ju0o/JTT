@@ -2396,3 +2396,494 @@ def test_r02_powershell_input_and_terminator_diagnostic_matrix(tmp_path, monkeyp
         for terminator in ("CR", "LF", "CRLF")
     }
     assert all(item["cleanup"] == "STOPPED" for item in summaries), summaries
+
+
+def _r02_startup_stage_worker_copy(
+        tmp_path, monkeypatch, trace_dir, nonce, expected_prompt, path_marker):
+    """Instrument only a private worker copy; the original worker remains untouched."""
+    from tmux_agent_tower.terminal import windows_manager
+
+    source_root = Path(windows_manager.__file__).resolve().parents[2]
+    source_package = next(
+        (source_root / package for package in (
+            "tmux_agent_tower", "ju0_terminal_tower",
+        ) if (source_root / package).is_dir()),
+        None,
+    )
+    if source_package is None:
+        raise AssertionError("JTT terminal source is unavailable for startup diagnostics")
+    package_copy = tmp_path / "r02-startup-worker-copy" / "src" / "tmux_agent_tower"
+    package_copy.parent.mkdir(parents=True)
+    shutil.copytree(
+        source_package, package_copy,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    worker = package_copy / "terminal" / "_windows_worker.py"
+    source = worker.read_text(encoding="utf-8")
+
+    marker_helper = '''def _r02_startup_mark(stage, **details):
+    root = os.environ.get("JTT_STARTUP_TRACE_DIR")
+    nonce = os.environ.get("JTT_STARTUP_NONCE")
+    if not root or not nonce:
+        return
+    record = {
+        "stage": stage, "nonce": nonce, "worker_pid": os.getpid(),
+        "utc_ms": int(time.time() * 1000),
+    }
+    record.update(details)
+    path = Path(root) / (nonce + "." + stage + ".json")
+    try:
+        with path.open("x", encoding="utf-8") as stream:
+            json.dump(record, stream, sort_keys=True)
+            stream.flush()
+    except (FileExistsError, OSError, TypeError, ValueError):
+        pass
+
+
+'''
+    import_anchor = "import weakref\n"
+    if source.count(import_anchor) != 1:
+        raise AssertionError("startup diagnostic import anchor changed")
+    source = source.replace(import_anchor, import_anchor + "\n" + marker_helper, 1)
+
+    environment_anchor = '        shell_env["TERM"] = "xterm"\n'
+    environment_forward = environment_anchor + '''        for _r02_key in (
+            "JTT_STARTUP_TRACE_DIR", "JTT_STARTUP_NONCE",
+            "JTT_STARTUP_EXPECTED_PROMPT", "JTT_STARTUP_MARKER",
+        ):
+            if _r02_key in os.environ:
+                shell_env[_r02_key] = os.environ[_r02_key]
+'''
+    if source.count(environment_anchor) != 1:
+        raise AssertionError("startup diagnostic environment anchor changed")
+    source = source.replace(environment_anchor, environment_forward, 1)
+
+    release_anchor = "            win32event.SetEvent(gate)\n"
+    if source.count(release_anchor) != 1:
+        raise AssertionError("startup diagnostic release gate anchor changed")
+    source = source.replace(
+        release_anchor,
+        release_anchor + '            _r02_startup_mark("worker_release_gate")\n',
+        1,
+    )
+
+    ps_helper = (
+        "function global:__jttStartupMark { "
+        "param([string]$stage,[string]$detail=''); "
+        "if (!$env:JTT_STARTUP_TRACE_DIR -or !$env:JTT_STARTUP_NONCE) { return }; "
+        "try { $path=Join-Path $env:JTT_STARTUP_TRACE_DIR "
+        "($env:JTT_STARTUP_NONCE+'.'+$stage+'.json'); "
+        "if (Test-Path -LiteralPath $path) { return }; "
+        "$record=@{nonce=$env:JTT_STARTUP_NONCE;stage=$stage;pid=$PID;"
+        "utc_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()}; "
+        "if ($stage -eq 'bootstrap_initialized') { "
+        "$record.powershell_version=$PSVersionTable.PSVersion.ToString(); "
+        "$record.powershell_edition=$PSVersionTable.PSEdition; "
+        "$record.columns=$Host.UI.RawUI.WindowSize.Width; "
+        "$record.lines=$Host.UI.RawUI.WindowSize.Height; "
+        "$record.input_codepage=[Console]::InputEncoding.CodePage }; "
+        "if ($stage -eq 'prompt_return') { "
+        "$record.prompt_matches_expected=($detail -eq "
+        "$env:JTT_STARTUP_EXPECTED_PROMPT); "
+        "$record.prompt_length=$detail.Length }; "
+        "[System.IO.File]::WriteAllText($path,($record|ConvertTo-Json -Compress)) "
+        "} catch {} }; "
+    )
+    try_anchor = '        "try { "\n'
+    if source.count(try_anchor) != 1:
+        raise AssertionError("startup diagnostic PowerShell bootstrap anchor changed")
+    source = source.replace(
+        try_anchor,
+        "        " + json.dumps(ps_helper + "try { ") + "\n",
+        1,
+    )
+
+    for anchor, injected in (
+        ('        "$r.Dispose(); $a.Dispose(); "\n',
+         "__jttStartupMark 'child_gate_passed'; "),
+        ('        "Remove-Module PSReadLine -ErrorAction SilentlyContinue; "\n',
+         "__jttStartupMark 'bootstrap_initialized' "
+         "($PSVersionTable.PSVersion.ToString()+'|'+"
+         "$Host.UI.RawUI.WindowSize.Width+'|'+"
+         "$Host.UI.RawUI.WindowSize.Height+'|'+"
+         "[Console]::InputEncoding.CodePage); "),
+        ('        "function global:prompt { "\n',
+         "__jttStartupMark 'prompt_invoked'; "),
+    ):
+        if source.count(anchor) != 1:
+            raise AssertionError("startup diagnostic PowerShell stage anchor changed")
+        source = source.replace(
+            anchor, anchor + "        " + json.dumps(injected) + "\n", 1
+        )
+
+    prompt_end = '        "}; \'PS \'+$path+\'> \' }"\n'
+    prompt_replacement = (
+        "}; $jttPromptReturn='PS '+$path+'> '; "
+        "__jttStartupMark 'prompt_return' $jttPromptReturn; "
+        "$jttPromptReturn }; __jttStartupMark 'prompt_registered'"
+    )
+    if source.count(prompt_end) != 1:
+        raise AssertionError("startup diagnostic prompt return anchor changed")
+    source = source.replace(
+        prompt_end, "        " + json.dumps(prompt_replacement) + "\n", 1
+    )
+
+    read_state_anchor = "        output = deque()\n"
+    if source.count(read_state_anchor) != 1:
+        raise AssertionError("startup diagnostic reader state anchor changed")
+    source = source.replace(
+        read_state_anchor,
+        read_state_anchor + '        _r02_startup_read_tail = ""\n',
+        1,
+    )
+    reader_anchor = (
+        "                nonlocal sequence, output_bytes, screen_error, state, exit_code\n"
+    )
+    if source.count(reader_anchor) != 1:
+        raise AssertionError("startup diagnostic reader closure anchor changed")
+    source = source.replace(
+        reader_anchor,
+        "                nonlocal sequence, output_bytes, screen_error, state, exit_code, _r02_startup_read_tail\n",
+        1,
+    )
+    read_anchor = (
+        "                        if data:\n"
+        "                            encoded = data.encode(\"utf-8\", errors=\"strict\")\n"
+    )
+    read_trace = '''                        if data:
+                            _r02_expected_prompt = os.environ.get(
+                                "JTT_STARTUP_EXPECTED_PROMPT", ""
+                            )
+                            _r02_startup_read_tail = (
+                                _r02_startup_read_tail + data
+                            )[-8192:]
+                            _r02_read_prompt_seen = bool(
+                                _r02_expected_prompt
+                                and _r02_expected_prompt in _r02_startup_read_tail
+                            )
+                            encoded = data.encode("utf-8", errors="strict")
+'''
+    if source.count(read_anchor) != 1:
+        raise AssertionError("startup diagnostic PTY read anchor changed")
+    source = source.replace(read_anchor, read_trace, 1)
+    feed_anchor = (
+        "                            with screen_lock:\n"
+        "                                stream.feed(data)\n"
+    )
+    feed_trace = '''                            with screen_lock:
+                                stream.feed(data)
+                                _r02_cell_text = "\\n".join(
+                                    "".join(
+                                        pyte_screen.buffer[y][x].data
+                                        for x in range(pyte_screen.columns)
+                                    )
+                                    for y in range(pyte_screen.lines)
+                                )
+                                _r02_screen_prompt_seen = bool(
+                                    _r02_expected_prompt
+                                    and _r02_expected_prompt in _r02_cell_text
+                                )
+                            if _r02_read_prompt_seen:
+                                _r02_startup_mark("pty_read_prompt")
+                            if _r02_screen_prompt_seen:
+                                _r02_startup_mark("pyte_screen_prompt")
+'''
+    if source.count(feed_anchor) != 1:
+        raise AssertionError("startup diagnostic pyte feed anchor changed")
+    source = source.replace(feed_anchor, feed_trace, 1)
+    worker.write_text(source, encoding="utf-8")
+
+    original_environment = windows_manager._worker_environment
+    monkeypatch.setattr(windows_manager, "WORKER", worker)
+
+    def diagnostic_environment(session_dir):
+        env = original_environment(session_dir)
+        env.update({
+            "JTT_STARTUP_TRACE_DIR": str(trace_dir),
+            "JTT_STARTUP_NONCE": nonce,
+            "JTT_STARTUP_EXPECTED_PROMPT": expected_prompt + " ",
+            "JTT_STARTUP_MARKER": str(path_marker),
+        })
+        return env
+
+    monkeypatch.setattr(
+        windows_manager, "_worker_environment", diagnostic_environment
+    )
+    return windows_manager
+
+
+def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
+        tmp_path, monkeypatch):
+    """Compare a plain session with a separately instrumented worker copy."""
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalRegistry, windows_manager
+
+    case_root = tmp_path / "r02-startup02"
+    start = case_root / "work" / ("segment_" + "a" * 24) / ("segment_" + "b" * 24)
+    destination = start / "dest"
+    destination.mkdir(parents=True)
+    assert 100 < len(str(start)) < 230
+    monkeypatch.chdir(start)
+    expected_start_prompt = _expected_prompt_path(start, 100)
+    expected_destination_prompt = _expected_prompt_path(destination, 100)
+    nonce = uuid.uuid4().hex
+
+    def identity_record(identity, manager):
+        created, image, alive = manager._process_facts(
+            identity.shell_pid, expected_start=identity.shell_start,
+        )
+        return {
+            "session_id": identity.session_id,
+            "generation": identity.generation,
+            "supervisor_pid": identity.supervisor_pid,
+            "supervisor_start": identity.supervisor_start,
+            "shell_pid": identity.shell_pid,
+            "shell_start": identity.shell_start,
+            "shell_start_matches": created == identity.shell_start,
+            "shell_image_matches": image.casefold() == identity.shell_path.casefold(),
+            "shell_alive": bool(alive and created == identity.shell_start),
+        }
+
+    def run_original():
+        registry = TerminalRegistry(case_root / "original-jtt-home" / "terminals")
+        client = registry.create("R02 original uninstrumented startup")
+        identity = client.identity
+        result = {
+            "run": "original_uninstrumented",
+            "identity": identity_record(identity, windows_manager),
+            "initial_size": [100, 30],
+            "first_prompt": "UNKNOWN",
+            "prompt_in_poll_output": False,
+            "prompt_in_client_snapshot": False,
+            "sequence": None,
+            "snapshot_sequence": None,
+            "synced": None,
+            "gap": None,
+            "powershell": "UNKNOWN",
+            "cleanup": "NOT_ATTEMPTED",
+        }
+        try:
+            deadline = time.monotonic() + 15
+            collected_output = ""
+            while time.monotonic() < deadline:
+                update = client.poll()
+                collected_output += update.output.decode("utf-8", errors="replace")
+                visible = bool(
+                    update.screen is not None
+                    and expected_start_prompt in _compact_screen_text(update.screen)
+                )
+                if visible:
+                    result.update({
+                        "first_prompt": "YES",
+                        "prompt_in_poll_output": expected_start_prompt in collected_output,
+                        "prompt_in_client_snapshot": True,
+                        "sequence": update.sequence,
+                        "snapshot_sequence": update.snapshot_sequence,
+                        "synced": update.synced,
+                        "gap": update.gap,
+                    })
+                    break
+                time.sleep(0.02)
+            if result["first_prompt"] == "YES" and client.acquire():
+                version_nonce = uuid.uuid4().hex[:10]
+                marker = f"JTT_STARTUP_VERSION_{version_nonce}_END"
+                command = (
+                    "[Console]::WriteLine('JTT_STARTUP_VERSION_' + '"
+                    + version_nonce
+                    + "' + '_END|' + $PSVersionTable.PSVersion.ToString() + '|' + "
+                    "$Host.UI.RawUI.WindowSize.Width + 'x' + "
+                    "$Host.UI.RawUI.WindowSize.Height + '|' + "
+                    "[Console]::InputEncoding.CodePage)"
+                )
+                assert marker not in command
+                client.send((command + "\r").encode("ascii"))
+                deadline = time.monotonic() + 10
+                output_text = ""
+                while time.monotonic() < deadline:
+                    update = client.poll()
+                    output_text += update.output.decode("utf-8", errors="replace")
+                    match = re.search(
+                        rf"{re.escape(marker)}\|([0-9.]+)\|(\d+x\d+)\|(\d+)",
+                        output_text,
+                    )
+                    if match:
+                        result["powershell"] = {
+                            "version": match.group(1),
+                            "columns_lines": match.group(2),
+                            "input_codepage": int(match.group(3)),
+                        }
+                        break
+                    time.sleep(0.02)
+            return result
+        finally:
+            client.close()
+            registry.stop(
+                identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+            created, _image, alive = windows_manager._process_facts(
+                identity.shell_pid, expected_start=identity.shell_start,
+            )
+            result["cleanup"] = "STOPPED" if not alive else "PROCESS_STILL_ALIVE"
+            result["shell_identity_matched_before_stop"] = (
+                result["identity"]["shell_start_matches"]
+            )
+            result["registry_entries_after_cleanup"] = len(registry.list_sessions())
+
+    original_result = run_original()
+
+    trace_dir = case_root / "private-trace"
+    windows_manager._ensure_private_directory(trace_dir)
+    windows_manager._private_acl(trace_dir, directory=True)
+    permission_probe = trace_dir / (nonce + ".acl-probe")
+    permission_probe.write_text(nonce, encoding="ascii")
+    windows_manager._private_acl(permission_probe, directory=False)
+    assert permission_probe.read_text(encoding="ascii") == nonce
+    permission_probe.unlink()
+
+    path_marker = trace_dir / (nonce + ".path-executed")
+    diagnostic_manager = _r02_startup_stage_worker_copy(
+        tmp_path, monkeypatch, trace_dir, nonce,
+        expected_start_prompt, path_marker,
+    )
+    registry = TerminalRegistry(
+        case_root / "instrumented-jtt-home" / "terminals"
+    )
+    client = registry.create("R02 instrumented startup replica")
+    identity = client.identity
+    replica = {
+        "run": "instrumented_replica",
+        "identity": identity_record(identity, diagnostic_manager),
+        "initial_size": [100, 30],
+        "first_prompt": "UNKNOWN",
+        "prompt_in_poll_output": False,
+        "prompt_in_client_snapshot": False,
+        "sequence": None,
+        "snapshot_sequence": None,
+        "synced": None,
+        "gap": None,
+        "path_change": "NOT_ATTEMPTED",
+        "cleanup": "NOT_ATTEMPTED",
+        "marker_directory_private": True,
+        "marker_write_preflight": True,
+    }
+    try:
+        deadline = time.monotonic() + 15
+        collected_output = ""
+        while time.monotonic() < deadline:
+            update = client.poll()
+            collected_output += update.output.decode("utf-8", errors="replace")
+            visible = bool(
+                update.screen is not None
+                and expected_start_prompt in _compact_screen_text(update.screen)
+            )
+            if visible:
+                replica.update({
+                    "first_prompt": "YES",
+                    "prompt_in_poll_output": expected_start_prompt in collected_output,
+                    "prompt_in_client_snapshot": True,
+                    "sequence": update.sequence,
+                    "snapshot_sequence": update.snapshot_sequence,
+                    "synced": update.synced,
+                    "gap": update.gap,
+                })
+                break
+            time.sleep(0.02)
+
+        if replica["first_prompt"] == "YES" and client.acquire():
+            result_marker = f"JTT_STARTUP_PATH_RESULT_{nonce}_END"
+            command = (
+                "Set-Location 'dest'; "
+                "[System.IO.File]::WriteAllText($env:JTT_STARTUP_MARKER,$env:JTT_STARTUP_NONCE); "
+                "[Console]::WriteLine('JTT_STARTUP_PATH_RESULT_' + "
+                "$env:JTT_STARTUP_NONCE + '_END'); $PWD.Path"
+            )
+            assert result_marker not in command
+            client.send((command + "\r\n").encode("utf-8"))
+            deadline = time.monotonic() + 15
+            output_text = ""
+            next_prompt_seen = False
+            last_update = None
+            while time.monotonic() < deadline:
+                last_update = client.poll()
+                output_text += last_update.output.decode("utf-8", errors="replace")
+                screen = (
+                    _compact_screen_text(last_update.screen)
+                    if last_update.screen is not None else ""
+                )
+                next_prompt_seen = expected_destination_prompt in screen
+                if result_marker in output_text and path_marker.is_file() and next_prompt_seen:
+                    break
+                time.sleep(0.02)
+            replica["path_change"] = {
+                "unique_output_marker": result_marker in output_text,
+                "nonce_file_matches": (
+                    path_marker.is_file()
+                    and path_marker.read_text(encoding="ascii") == nonce
+                ),
+                "destination_prompt": next_prompt_seen,
+                "sequence": getattr(last_update, "sequence", None),
+                "snapshot_sequence": getattr(last_update, "snapshot_sequence", None),
+            }
+
+        stages = (
+            "worker_release_gate", "child_gate_passed", "bootstrap_initialized",
+            "prompt_registered", "prompt_invoked", "prompt_return",
+            "pty_read_prompt", "pyte_screen_prompt",
+        )
+        stage_results = {}
+        for stage in stages:
+            marker_file = trace_dir / f"{nonce}.{stage}.json"
+            if not marker_file.is_file():
+                stage_results[stage] = {
+                    "status": "UNKNOWN",
+                    "evidence": "marker_absent_is_not_stage_failure",
+                }
+                continue
+            try:
+                diagnostic_manager._private_acl(marker_file, directory=False)
+                record = json.loads(marker_file.read_text(encoding="utf-8"))
+                status = "YES" if record.get("nonce") == nonce else "UNKNOWN"
+                stage_results[stage] = {
+                    "status": status,
+                    "marker_acl_valid": True,
+                    "pid": record.get("pid", record.get("worker_pid")),
+                    "utc_ms": record.get("utc_ms"),
+                }
+                if stage == "bootstrap_initialized":
+                    stage_results[stage].update({
+                        key: record.get(key) for key in (
+                            "powershell_version", "powershell_edition",
+                            "columns", "lines", "input_codepage",
+                        )
+                    })
+                if stage == "prompt_return":
+                    stage_results[stage]["prompt_matches_expected"] = record.get(
+                        "prompt_matches_expected", False
+                    )
+            except (OSError, ValueError, UnicodeError):
+                stage_results[stage] = {
+                    "status": "UNKNOWN", "evidence": "marker_unreadable",
+                }
+        replica["stages"] = stage_results
+        replica["marker_directory_private"] = windows_manager.is_private_directory(
+            trace_dir
+        )
+    finally:
+        client.close()
+        registry.stop(
+            identity.session_id, expected_generation=identity.generation,
+            expected_shell_pid=identity.shell_pid,
+        )
+        _created, _image, alive = diagnostic_manager._process_facts(
+            identity.shell_pid, expected_start=identity.shell_start,
+        )
+        replica["cleanup"] = "STOPPED" if not alive else "PROCESS_STILL_ALIVE"
+        replica["shell_identity_matched_before_stop"] = (
+            replica["identity"]["shell_start_matches"]
+        )
+        replica["registry_entries_after_cleanup"] = len(registry.list_sessions())
+        print("STARTUP02_ORIGINAL_UNMODIFIED " + json.dumps(original_result, sort_keys=True))
+        print("STARTUP02_INSTRUMENTED_REPLICA " + json.dumps(replica, sort_keys=True))
+        assert not alive, "isolated diagnostic PowerShell remained alive after stop"
+        assert len(registry.list_sessions()) == 0
