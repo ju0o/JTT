@@ -2731,13 +2731,23 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
             result["registry_entries_after_cleanup"] = len(registry.list_sessions())
 
     original_result = run_original()
+    print(
+        "STARTUP02_ORIGINAL_UNMODIFIED "
+        + json.dumps(original_result, sort_keys=True),
+        flush=True,
+    )
 
     trace_dir = case_root / "private-trace"
     windows_manager._ensure_private_directory(trace_dir)
     windows_manager._private_acl(trace_dir, directory=True)
+
+    def secure_private_marker(path):
+        windows_manager._private_acl(path, directory=False, apply=True)
+        windows_manager._private_acl(path, directory=False)
+
     permission_probe = trace_dir / (nonce + ".acl-probe")
     permission_probe.write_text(nonce, encoding="ascii")
-    windows_manager._private_acl(permission_probe, directory=False)
+    secure_private_marker(permission_probe)
     assert permission_probe.read_text(encoding="ascii") == nonce
     permission_probe.unlink()
 
@@ -2803,6 +2813,7 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
             deadline = time.monotonic() + 15
             output_text = ""
             next_prompt_seen = False
+            path_marker_acl_valid = False
             last_update = None
             while time.monotonic() < deadline:
                 last_update = client.poll()
@@ -2811,16 +2822,25 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
                     _compact_screen_text(last_update.screen)
                     if last_update.screen is not None else ""
                 )
+                if path_marker.is_file() and not path_marker_acl_valid:
+                    secure_private_marker(path_marker)
+                    path_marker_acl_valid = True
                 next_prompt_seen = expected_destination_prompt in screen
-                if result_marker in output_text and path_marker.is_file() and next_prompt_seen:
+                if (result_marker in output_text and path_marker_acl_valid
+                        and next_prompt_seen):
                     break
                 time.sleep(0.02)
+            path_marker_status = "UNKNOWN"
+            if path_marker_acl_valid and path_marker.is_file():
+                path_marker_status = (
+                    "YES"
+                    if path_marker.read_text(encoding="ascii") == nonce
+                    else "NO"
+                )
             replica["path_change"] = {
                 "unique_output_marker": result_marker in output_text,
-                "nonce_file_matches": (
-                    path_marker.is_file()
-                    and path_marker.read_text(encoding="ascii") == nonce
-                ),
+                "nonce_file_status": path_marker_status,
+                "nonce_file_acl_valid": path_marker_acl_valid,
                 "destination_prompt": next_prompt_seen,
                 "sequence": getattr(last_update, "sequence", None),
                 "snapshot_sequence": getattr(last_update, "snapshot_sequence", None),
@@ -2841,7 +2861,7 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
                 }
                 continue
             try:
-                diagnostic_manager._private_acl(marker_file, directory=False)
+                secure_private_marker(marker_file)
                 record = json.loads(marker_file.read_text(encoding="utf-8"))
                 status = "YES" if record.get("nonce") == nonce else "UNKNOWN"
                 stage_results[stage] = {
@@ -2883,7 +2903,10 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
             replica["identity"]["shell_start_matches"]
         )
         replica["registry_entries_after_cleanup"] = len(registry.list_sessions())
-        print("STARTUP02_ORIGINAL_UNMODIFIED " + json.dumps(original_result, sort_keys=True))
-        print("STARTUP02_INSTRUMENTED_REPLICA " + json.dumps(replica, sort_keys=True))
+        print(
+            "STARTUP02_INSTRUMENTED_REPLICA "
+            + json.dumps(replica, sort_keys=True),
+            flush=True,
+        )
         assert not alive, "isolated diagnostic PowerShell remained alive after stop"
         assert len(registry.list_sessions()) == 0
