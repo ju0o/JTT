@@ -198,7 +198,19 @@ def _bootstrap_script(release_name, abort_name):
         "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
         "$OutputEncoding=[Console]::OutputEncoding; "
         "Remove-Module PSReadLine -ErrorAction SilentlyContinue; "
-        "function prompt { 'JTT> ' }"
+        "function global:prompt { "
+        "$path=$ExecutionContext.SessionState.Path.CurrentLocation.Path; "
+        "$width=120; try { $width=[int]$Host.UI.RawUI.WindowSize.Width } catch {}; "
+        # Leave about 30 columns for command entry when the path is abbreviated.
+        "$limit=[Math]::Max(12,$width-36); "
+        "if ($path.Length -gt $limit) { "
+        "$root=[System.IO.Path]::GetPathRoot($path); "
+        "if ($null -eq $root) { $root='' }; "
+        "if ($root.Length -gt ($limit-5)) { $root=$root.Substring(0,$limit-5) }; "
+        "$tailCount=[Math]::Max(1,$limit-$root.Length-4); "
+        "$tailStart=[Math]::Max($root.Length,$path.Length-$tailCount); "
+        "$path=$root+'...\\'+$path.Substring($tailStart) "
+        "}; 'PS '+$path+'> ' }"
     )
 
 

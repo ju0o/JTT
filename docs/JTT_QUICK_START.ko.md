@@ -74,9 +74,11 @@ Ctrl+G Esc는 취소, Ctrl+G ?는 도움말입니다.
 이 키를 사용하는 프로그램에서 우회 입력에 사용하세요. 사용자 지정 키가 있으면 문서의 기본값보다 화면 안내를 따르세요.
 [키 설정·프로토콜 제한](JTT_TERMINAL_SUPPORT.md)을 확인하세요.
 
+Windows 네이티브 UI에서 Ctrl+G c를 명시적으로 실행하면 RIGHT 뷰포트 전체에 보이는 내용을 시스템 클립보드에 복사합니다. 선택한 텍스트 범위만 복사하는 기능은 아닙니다. JTT는 클립보드를 읽거나 감시하지 않습니다. Windows Terminal의 Shift+드래그 선택과 Ctrl+Shift+C는 호스트 터미널 기능이며 별도 Windows Human Gate 검수가 필요합니다.
+
 JTT는 샌드박스가 아닙니다. 셸은 사용자 권한과 로그인 설정을 사용합니다.
 AI 로그인·모델 자동 호출은 JTT 기능이 아닙니다.
 완전한 xterm 에뮬레이터가 아니며 확장 키·마우스 보고·bracketed paste·임의 터미널 질의에 제한이 있습니다.
-Clipboard와 실제 WSL 재시작 복구는 미검증입니다.
+Windows Terminal의 호스트 선택/Ctrl+Shift+C 동작과 실제 WSL 재시작 복구는 미검증입니다.
 
 [업데이트·롤백](JTT_UPDATING.ko.md) · [기존 Tower](TOWER_LEGACY.ko.md)

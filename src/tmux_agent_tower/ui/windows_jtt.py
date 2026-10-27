@@ -118,6 +118,27 @@ def _screen_text(screen: TerminalScreen | None, columns: int, lines: int) -> Tex
     return output
 
 
+def _screen_clipboard_text(screen: TerminalScreen) -> str:
+    """Return plain visible cells, preserving lines and Unicode for an explicit copy."""
+
+    rows = ["".join(cell.text for cell in row).rstrip() for row in screen.rows]
+    return "\r\n".join(rows).strip("\r\n")
+
+
+def _write_windows_clipboard(text: str) -> None:
+    """Write Unicode text only for a direct user copy command; never read clipboard."""
+
+    import win32clipboard
+    import win32con
+
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+    finally:
+        win32clipboard.CloseClipboard()
+
+
 def _same_identity(left: Any, right: Any) -> bool:
     fields = (
         "session_id", "generation", "supervisor_pid", "supervisor_start",
@@ -150,6 +171,11 @@ class TerminalView(Static):
     can_focus = True
 
     async def on_click(self, event) -> None:
+        # Windows Terminal uses Shift+drag for host-side text selection while
+        # a TUI is active. Do not turn the initial shifted click into an input
+        # lease request; let the host/Textual selection handling continue.
+        if event.shift:
+            return
         event.stop()
         await self.app.enter_input_mode()
 
@@ -614,11 +640,20 @@ class WindowsJTTApp(App[None]):
         if self._notice and asyncio.get_running_loop().time() < self._notice_until:
             message = self._notice
         elif self.prefix_pending:
-            message = "명령 대기 · n 새 터미널 · h/l 카드 · w 공간 · d 분리 · x 종료 · Esc 취소"
+            if self.size.width < 100:
+                message = "명령 대기 · n 새 터미널 · c 복사 · h/l 카드 · d 분리 · Esc 취소"
+            else:
+                message = "명령 대기 · n 새 터미널 · h/l 카드 · c RIGHT 복사 · w 공간 · d 분리 · x 종료 · Esc 취소"
         elif self.input_mode:
-            message = "RIGHT 입력 중 · Ctrl+] 탐색 복귀 · Ctrl+G 명령 · Ctrl+G Ctrl+G 전달"
+            if self.size.width < 100:
+                message = "RIGHT 입력 · Ctrl+] 탐색 · Ctrl+G c 복사 · Shift+드래그 선택"
+            else:
+                message = "RIGHT 입력 중 · Ctrl+] 탐색 · Ctrl+G c 화면 복사 · Ctrl+Shift+C 복사 · Ctrl+G Ctrl+G 전달"
         else:
-            message = "탐색 · Ctrl+G n 새 터미널 · Tab 패널 이동 · Enter 입력 · Ctrl+G d 분리"
+            if self.size.width < 100:
+                message = "탐색 · Ctrl+G n 새 터미널 · Ctrl+G c 복사 · Enter 입력 · Ctrl+G d 분리"
+            else:
+                message = "탐색 · Ctrl+G n 새 터미널 · Ctrl+G c RIGHT 복사 · Tab 패널 이동 · Enter 입력 · Ctrl+G d 분리"
         self.query_one("#statusline", Static).update(message)
         status = "입력 권한 보유" if self.input_mode else "관찰 중"
         if self.selected_identity is None:
@@ -1617,6 +1652,53 @@ class WindowsJTTApp(App[None]):
             return
         await self._send_bytes(data)
 
+    async def _copy_right_screen(self) -> None:
+        """Copy the latest verified RIGHT snapshot only after an explicit command."""
+        client = self.client
+        identity = self.selected_identity
+        current = (self.sessions.get(identity.session_id)
+                   if identity is not None else None)
+
+        def target_is_current() -> bool:
+            visible = (self.sessions.get(identity.session_id)
+                       if identity is not None else None)
+            return (
+                identity is not None and client is not None
+                and client is self.client and self._selection_matches(identity)
+                and identity.state == "running" and visible is not None
+                and visible.state == "running" and _same_identity(identity, visible)
+                and _same_identity(identity, client.identity)
+            )
+
+        if self._busy or current is None or not target_is_current():
+            self._set_notice("복사할 실행 중 터미널을 확인할 수 없습니다.")
+            return
+
+        self._busy = True
+        try:
+            observation = await self._backend_call(client.observe)
+            if (not target_is_current() or not observation.synced
+                    or observation.screen is None
+                    or observation.state != "running"
+                    or observation.session_id != identity.session_id
+                    or observation.generation != identity.generation
+                    or observation.shell_pid != identity.shell_pid):
+                self._set_notice("터미널 신원 또는 화면 동기화를 확인할 수 없어 복사를 차단했습니다.")
+                return
+            text = _screen_clipboard_text(observation.screen)
+            if not text:
+                self._set_notice("복사할 화면 텍스트가 없습니다.")
+                return
+            # Clipboard access is isolated from the UI thread and happens only
+            # after Ctrl+Shift+C or Ctrl+G c. No clipboard read is performed.
+            await asyncio.to_thread(_write_windows_clipboard, text)
+            self._set_notice("선택한 RIGHT 터미널 화면을 클립보드에 복사했습니다.")
+        except Exception:
+            self._set_notice("복사 실패 · Windows 클립보드가 사용 중인지 확인하세요.", 8.0)
+        finally:
+            self._busy = False
+            self._update_status()
+
     async def _close_selected_client(self) -> None:
         client, self.client = self.client, None
         if client is None:
@@ -1659,6 +1741,8 @@ class WindowsJTTApp(App[None]):
         token = (character or "").lower()
         if token == "n":
             await self.create_terminal()
+        elif token == "c":
+            await self._copy_right_screen()
         elif token in ("h", "l"):
             values = list(self.sessions.values())
             if not values:
@@ -1677,7 +1761,7 @@ class WindowsJTTApp(App[None]):
         elif token == "x":
             await self._stop_selected()
         elif token == "?":
-            self._set_notice("Ctrl+G n 새 터미널 · h/l 카드 · w 공간 · x 종료 확인 · d 분리")
+            self._set_notice("Ctrl+G n 새 터미널 · c RIGHT 화면 복사 · h/l 카드 · w 공간 · x 종료 확인 · d 분리")
         elif key.lower() == "escape":
             self._set_notice("JTT 명령을 취소했습니다.")
         else:
@@ -1787,6 +1871,12 @@ class WindowsJTTApp(App[None]):
     async def on_key(self, event) -> None:
         key = str(event.key).lower()
         character = getattr(event, "character", None)
+        if isinstance(self.screen, ModalScreen):
+            return
+        if key == "ctrl+shift+c":
+            event.stop()
+            await self._copy_right_screen()
+            return
         if self.prefix_pending:
             event.stop()
             await self._handle_prefix_key(key, character)
