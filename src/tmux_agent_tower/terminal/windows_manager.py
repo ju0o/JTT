@@ -51,6 +51,9 @@ STARTUP_TIMEOUT = 12.0
 STOP_TIMEOUT = 8.0
 SESSION_METADATA_LOCK_TIMEOUT = 5.0
 SESSION_METADATA_MUTEX_PREFIX = r"Global\JTT-Terminal-Metadata-"
+# STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | MUTEX_MODIFY_STATE.
+# Generic rights are object-mapped; the mutex DACL must use the mutex mask.
+MUTEX_ALL_ACCESS = 0x001F0001
 WORKER = Path(__file__).with_name("_windows_worker.py")
 _WINDOWS = sys.platform == "win32"
 
@@ -380,7 +383,7 @@ def _session_metadata_lock(session_id: str, session_dir: Path):
     sid = _current_sid()
     acl = win32security.ACL()
     acl.AddAccessAllowedAceEx(
-        win32security.ACL_REVISION, 0, win32con.GENERIC_ALL, sid
+        win32security.ACL_REVISION, 0, MUTEX_ALL_ACCESS, sid
     )
     descriptor = win32security.SECURITY_DESCRIPTOR()
     descriptor.SetSecurityDescriptorOwner(sid, False)
@@ -409,7 +412,9 @@ def _session_metadata_lock(session_id: str, session_dir: Path):
             raise TerminalError("terminal session lock is not private to this user")
         ace = object_acl.GetAce(0)
         if (ace[0][0] != win32security.ACCESS_ALLOWED_ACE_TYPE
-                or ace[1] != win32con.GENERIC_ALL or ace[2] != sid):
+                or ace[0][1] != 0
+                or ace[1] != MUTEX_ALL_ACCESS
+                or ace[2] != sid):
             raise TerminalError("terminal session lock has an unsafe access list")
 
         wait_result = win32event.WaitForSingleObject(
