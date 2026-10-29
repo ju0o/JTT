@@ -71,6 +71,95 @@ def _assert_output_drain_complete(ui) -> None:
     )
 
 
+def _stop_owned_test_sessions_and_remove_root(registry, root: Path, identities=None,
+                                               *, external_cleanup_confirmed=True) -> None:
+    """Remove a private integration root only after its exact sessions stop."""
+    failures = []
+    root = Path(os.path.abspath(root))
+    expected_registry_root = root / "state" / "terminals"
+    if registry.root != expected_registry_root:
+        raise AssertionError(
+            "test-owned registry path mismatch; isolated root retained at "
+            f"{root}"
+        )
+    try:
+        if root.resolve(strict=False) != root:
+            raise AssertionError("test root resolves through a symlink")
+    except OSError as exc:
+        raise AssertionError(
+            "test root cannot be validated; isolated root retained at "
+            f"{root}: {type(exc).__name__}"
+        ) from exc
+    for directory in (root, root / "state", registry.root):
+        try:
+            directory_stat = directory.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AssertionError(
+                "test registry path cannot be validated; isolated root retained at "
+                f"{root}: {type(exc).__name__}"
+            ) from exc
+        if (not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != os.getuid()
+                or stat.S_IMODE(directory_stat.st_mode) & 0o077):
+            raise AssertionError(
+                "test registry path is not a private owned directory; "
+                f"isolated root retained at {root}"
+            )
+
+    if identities is None:
+        try:
+            identities = registry.list_sessions()
+        except Exception as exc:
+            raise AssertionError(
+                "test-owned sessions cannot be identified; isolated root retained at "
+                f"{root}: {type(exc).__name__}"
+            ) from exc
+    for identity in identities:
+        session_dir = registry.root / identity.session_id
+        evidence = registry.root / (
+            f".stop-evidence-{identity.session_id}-{identity.generation}.json"
+        )
+        if not os.path.lexists(session_dir) and not os.path.lexists(evidence):
+            failures.append(f"{identity.session_id}:owned stop evidence is missing")
+            continue
+        try:
+            registry.stop(
+                identity.session_id,
+                expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+        except Exception as exc:
+            failures.append(f"{identity.session_id}:{type(exc).__name__}")
+
+    try:
+        remaining = tuple(registry.root.iterdir()) if registry.root.exists() else ()
+    except OSError as exc:
+        remaining = (registry.root,)
+        failures.append(f"registry inspection:{type(exc).__name__}")
+    if remaining:
+        failures.append("registry evidence remains")
+    if not external_cleanup_confirmed:
+        failures.append("test-owned external resource remains")
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        root_stat = None
+        failures.append(f"test root inspection:{type(exc).__name__}")
+    if (root_stat is not None
+            and (not stat.S_ISDIR(root_stat.st_mode)
+                 or root_stat.st_uid != os.getuid()
+                 or stat.S_IMODE(root_stat.st_mode) & 0o077)):
+        failures.append("test root ownership or permissions changed")
+    if failures:
+        raise AssertionError(
+            "test-owned cleanup was not verified; isolated root retained at "
+            f"{root}: {', '.join(failures)}"
+        )
+    shutil.rmtree(root)
+
+
 def test_pty_drain_collects_final_bytes_after_child_exit():
     """Bytes queued before exit remain readable after waitpid reaps the child."""
     master_fd, slave_fd = pty.openpty()
@@ -107,6 +196,12 @@ class _UIProcess:
     def __init__(self, runtime_root: Path, source_root: Path, pyte_root: Path,
                  *, height: int = 45, width: int = 160):
         import pyte
+        import ju0_terminal_tower
+
+        # Use the same installed JTT namespace that owns the worker sessions.
+        # A lexical source path mismatch would correctly fail the worker argv
+        # identity check, even when both paths resolve to the same source file.
+        candidate_import_root = Path(ju0_terminal_tower.__file__).parent.parent
 
         self.pid, self.fd = pty.fork()
         self.raw = bytearray()
@@ -122,12 +217,14 @@ class _UIProcess:
                 "LANG": "C.UTF-8",
                 "LC_ALL": "C.UTF-8",
                 "TERM": "xterm",
-                "PYTHONPATH": os.pathsep.join((str(source_root), str(pyte_root))),
+                "PYTHONPATH": os.pathsep.join((
+                    str(candidate_import_root), str(source_root), str(pyte_root)
+                )),
                 "ESCDELAY": "25",
             }
             try:
                 os.execve(os.sys.executable,
-                          [os.sys.executable, "-m", "tmux_agent_tower.jtt"], env)
+                          [os.sys.executable, "-m", "ju0_terminal_tower.jtt"], env)
             except OSError:
                 os._exit(127)
         os.set_blocking(self.fd, False)
@@ -511,13 +608,16 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
     store = JTTWorkspaceStore(root / "state")
     registry = TerminalRegistry(root=root / "state" / "terminals")
     sessions: list[str] = []
+    owned_identities = []
     clients = {}
     try:
         # Two shells are created only by this explicit test action.
         first = registry.create("Fixture A")
         sessions.append(first.identity.session_id)
+        owned_identities.append(first.identity)
         second = registry.create("Fixture B")
         sessions.append(second.identity.session_id)
+        owned_identities.append(second.identity)
         original_pids = {item.session_id: item.shell_pid for item in registry.list_sessions()}
         store.set_terminal_ids(store.DEFAULT_ID, sessions)
         state = jtt.build_state(store, registry)
@@ -559,6 +659,9 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
             binding.close()
         state["managed_terminals"].clear()
         assert {item.session_id: item.shell_pid for item in registry.list_sessions()} == original_pids
+        assert {item.session_id: item.state for item in registry.list_sessions()} == {
+            session_id: "running" for session_id in sessions
+        }
         for pid in original_pids.values():
             os.kill(pid, 0)
 
@@ -616,14 +719,17 @@ def test_jtt_terminal_input_switch_disconnect_reconnect_and_stop(monkeypatch):
             ui.terminate()
         assert {item.session_id: item.shell_pid for item in registry.list_sessions()} == original_pids
     finally:
+        close_failures = []
         for binding in clients.values():
-            binding.close()
-        for session_id in sessions:
             try:
-                registry.stop(session_id)
-            except (OSError, RuntimeError, ValueError):
-                pass
-        shutil.rmtree(root, ignore_errors=True)
+                binding.close()
+            except Exception as exc:
+                close_failures.append(type(exc).__name__)
+        _stop_owned_test_sessions_and_remove_root(registry, root, owned_identities)
+        if close_failures:
+            raise AssertionError(
+                "test-owned client close failed: " + ", ".join(close_failures)
+            )
 
 
 @pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")
@@ -639,12 +745,14 @@ def test_read_only_observe_keeps_two_pty_screens_distinct_and_does_not_take_leas
     _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
     registry = TerminalRegistry(root=root / "state" / "terminals")
     created = []
+    created_identities = []
     observers = []
     active = []
     try:
         for name, marker in (("Mini A", "JTT_MINI_A"), ("Mini B", "JTT_MINI_B")):
             client = registry.create(name)
             created.append(client.identity.session_id)
+            created_identities.append(client.identity)
             assert client.acquire()
             client.send(f"printf '%s\\n' {marker}\n".encode("ascii"))
             _wait_for_marker(jtt.ManagedTerminalBinding(client, client.identity), marker)
@@ -676,13 +784,24 @@ def test_read_only_observe_keeps_two_pty_screens_distinct_and_does_not_take_leas
         _wait_for_marker(after_observe, "JTT_AFTER_OBSERVE")
         assert "JTT_AFTER_OBSERVE" in _binding_text(after_observe)
     finally:
+        close_failures = []
         for observer in observers:
-            observer.close()
+            try:
+                observer.close()
+            except Exception as exc:
+                close_failures.append(type(exc).__name__)
         for client in active:
-            client.close()
-        for session_id in created:
-            registry.stop(session_id)
-        shutil.rmtree(root, ignore_errors=True)
+            try:
+                client.close()
+            except Exception as exc:
+                close_failures.append(type(exc).__name__)
+        _stop_owned_test_sessions_and_remove_root(
+            registry, root, created_identities
+        )
+        if close_failures:
+            raise AssertionError(
+                "test-owned client close failed: " + ", ".join(close_failures)
+            )
 
 
 @pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash fixture requires /bin/bash")
@@ -718,8 +837,15 @@ def test_supervisor_early_exit_does_not_persist_a_failed_workspace_card(monkeypa
         f"worker not launched or unexpected exit; notice={state['jtt_notice']!r}"
     )
     assert store.workspaces()[0]["terminal_ids"] == []
-    assert registry.list_sessions() == ()
-    assert "exited during startup" in state["jtt_notice"]
+    session_dirs = tuple(registry.root.iterdir())
+    assert len(session_dirs) == 1
+    metadata = json.loads((session_dirs[0] / terminal_manager.SESSION_META).read_text(
+        encoding="utf-8"
+    ))
+    assert metadata["session_id"] == session_dirs[0].name
+    assert metadata["generation"]
+    assert metadata.get("process_tree_cleanup_verified") is not True
+    assert "cleanup could not be verified" in state["jtt_notice"]
     assert state["managed_terminals"] == {}
 
 
@@ -731,6 +857,7 @@ def test_real_curses_launch_and_prefix_detach_does_not_autostart_a_shell(monkeyp
     import pyte
     pyte_root = Path(pyte.__file__).resolve().parent.parent
     _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
+    registry = TerminalRegistry(root=root / "state" / "terminals")
     ui = None
     try:
         ui = _UIProcess(root, source_root, pyte_root)
@@ -752,7 +879,7 @@ def test_real_curses_launch_and_prefix_detach_does_not_autostart_a_shell(monkeyp
     finally:
         if ui is not None:
             ui.terminate()
-        shutil.rmtree(root, ignore_errors=True)
+        _stop_owned_test_sessions_and_remove_root(registry, root)
 
 
 @pytest.mark.parametrize(("height", "width"), [(24, 80), (44, 160)])
@@ -796,7 +923,7 @@ def test_real_curses_flat_window_create_and_archive_route_create_no_pty(
     finally:
         if ui is not None:
             ui.terminate()
-        shutil.rmtree(root, ignore_errors=True)
+        _stop_owned_test_sessions_and_remove_root(registry, root)
 
 
 @pytest.mark.parametrize(("height", "width"), [(24, 80), (44, 160)])
@@ -883,7 +1010,7 @@ def test_real_curses_visual_work_kit_create_and_preview_never_starts_shells(
     finally:
         if ui is not None:
             ui.terminate()
-        shutil.rmtree(root, ignore_errors=True)
+        _stop_owned_test_sessions_and_remove_root(registry, root)
 
 
 @pytest.mark.skipif(not renderer_available(), reason="interactive VT renderer unavailable")
@@ -901,6 +1028,7 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
     ui = None
     session_id = None
     shell_pid = None
+    owned_identity = None
     try:
         assert registry.list_sessions() == ()
         ui = _UIProcess(root, source_root, pyte_root)
@@ -913,6 +1041,7 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
         assert len(sessions) == 1 and sessions[0] == created
         session_id = created.session_id
         shell_pid = created.shell_pid
+        owned_identity = created
         marker = "JTT_PREFIX_N_" + uuid.uuid4().hex[:8]
         ui.send(("printf '%s\\n' '" + marker + "'\n").encode("ascii"))
         _wait_for_ui_text(ui, marker)
@@ -971,12 +1100,9 @@ def test_prefix_creates_one_shell_autofocuses_and_reconnects_without_recreation(
     finally:
         if ui is not None:
             ui.terminate()
-        if session_id is not None:
-            try:
-                registry.stop(session_id)
-            except (OSError, RuntimeError, ValueError):
-                pass
-        shutil.rmtree(root, ignore_errors=True)
+        _stop_owned_test_sessions_and_remove_root(
+            registry, root, (owned_identity,) if owned_identity is not None else ()
+        )
 
 
 @pytest.mark.skipif(shutil.which("vim") is None, reason="interactive Vim TUI is unavailable")
@@ -996,10 +1122,10 @@ def test_vim_alternate_screen_unicode_keys_resize_and_shell_return(monkeypatch, 
     _set_private_process_environment(monkeypatch, root, source_root, pyte_root)
     registry = TerminalRegistry(root=root / "state" / "terminals")
     client = None
-    session_id = None
+    owned_identity = None
     try:
         client = registry.create("Isolated Vim fixture")
-        session_id = client.identity.session_id
+        owned_identity = client.identity
         initial = client.poll()
         assert initial.synced and initial.screen is not None
         assert client.acquire()
@@ -1090,9 +1216,9 @@ def test_vim_alternate_screen_unicode_keys_resize_and_shell_return(monkeypatch, 
     finally:
         if client is not None:
             client.close()
-        if session_id is not None:
-            registry.stop(session_id)
-        shutil.rmtree(root, ignore_errors=True)
+        _stop_owned_test_sessions_and_remove_root(
+            registry, root, (owned_identity,) if owned_identity is not None else ()
+        )
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux fixture is unavailable")
@@ -1117,6 +1243,7 @@ def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monk
     client = None
     session_id = None
     shell_pid = None
+    owned_identity = None
 
     def private_tmux(*args: str) -> subprocess.CompletedProcess[str]:
         # The helper validates this exact private socket and adds explicit -S.
@@ -1138,6 +1265,7 @@ def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monk
         client = registry.create("Private tmux fixture")
         session_id = client.identity.session_id
         shell_pid = client.identity.shell_pid
+        owned_identity = client.identity
         update = client.poll()
         assert update.synced and update.screen is not None
         assert client.acquire()
@@ -1225,9 +1353,9 @@ def test_tmux_default_prefix_and_detach_stay_on_private_socket_in_jtt_right(monk
                 private_tmux("kill-server")
             except (OSError, subprocess.SubprocessError):
                 pass
-        if session_id is not None:
-            try:
-                registry.stop(session_id)
-            except (OSError, RuntimeError, ValueError):
-                pass
-        shutil.rmtree(root, ignore_errors=True)
+        _stop_owned_test_sessions_and_remove_root(
+            registry,
+            root,
+            (owned_identity,) if owned_identity is not None else (),
+            external_cleanup_confirmed=not socket_path.exists(),
+        )

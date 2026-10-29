@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+from contextlib import contextmanager
 from dataclasses import replace
 import json
 import os
@@ -48,6 +49,8 @@ OUTPUT_BUFFER_BYTES = 256 * 1024
 METADATA_REPLACE_TIMEOUT = 1.0
 STARTUP_TIMEOUT = 12.0
 STOP_TIMEOUT = 8.0
+SESSION_METADATA_LOCK_TIMEOUT = 5.0
+SESSION_METADATA_MUTEX_PREFIX = r"Global\JTT-Terminal-Metadata-"
 WORKER = Path(__file__).with_name("_windows_worker.py")
 _WINDOWS = sys.platform == "win32"
 
@@ -357,7 +360,110 @@ def _replace_metadata(source: Path, destination: Path) -> None:
             delay = min(delay * 2, 0.05)
 
 
-def _atomic_metadata(path: Path, value: dict[str, Any]) -> None:
+@contextmanager
+def _session_metadata_lock(session_id: str, session_dir: Path):
+    """Serialize JTT metadata writes and cleanup for one owned session.
+
+    The mutex is session-scoped and grants access only to the current user SID.
+    An abandoned mutex, unsafe existing DACL, timeout, or unknown wait result
+    fails closed; callers must leave the registry evidence untouched.
+    """
+    _require_windows()
+    if not SESSION_ID_RE.fullmatch(str(session_id)) or session_dir.name != session_id:
+        raise TerminalError("terminal session lock identity is invalid")
+    _private_acl(session_dir, directory=True)
+    import pywintypes
+    import win32con
+    import win32event
+    import win32security
+
+    sid = _current_sid()
+    acl = win32security.ACL()
+    acl.AddAccessAllowedAceEx(
+        win32security.ACL_REVISION, 0, win32con.GENERIC_ALL, sid
+    )
+    descriptor = win32security.SECURITY_DESCRIPTOR()
+    descriptor.SetSecurityDescriptorOwner(sid, False)
+    descriptor.SetSecurityDescriptorDacl(True, acl, False)
+    attributes = pywintypes.SECURITY_ATTRIBUTES()
+    attributes.SECURITY_DESCRIPTOR = descriptor
+    attributes.bInheritHandle = False
+
+    handle = None
+    acquired = False
+    try:
+        handle = win32event.CreateMutex(
+            attributes, False, SESSION_METADATA_MUTEX_PREFIX + session_id
+        )
+        try:
+            security = win32security.GetKernelObjectSecurity(
+                handle,
+                win32security.OWNER_SECURITY_INFORMATION
+                | win32security.DACL_SECURITY_INFORMATION,
+            )
+            owner = security.GetSecurityDescriptorOwner()
+            object_acl = security.GetSecurityDescriptorDacl()
+        except Exception as exc:
+            raise TerminalError("terminal session lock security is unknown") from exc
+        if owner != sid or object_acl is None or object_acl.GetAceCount() != 1:
+            raise TerminalError("terminal session lock is not private to this user")
+        ace = object_acl.GetAce(0)
+        if (ace[0][0] != win32security.ACCESS_ALLOWED_ACE_TYPE
+                or ace[1] != win32con.GENERIC_ALL or ace[2] != sid):
+            raise TerminalError("terminal session lock has an unsafe access list")
+
+        wait_result = win32event.WaitForSingleObject(
+            handle, int(SESSION_METADATA_LOCK_TIMEOUT * 1000)
+        )
+        if wait_result == getattr(win32event, "WAIT_ABANDONED", 0x80):
+            acquired = True  # WAIT_ABANDONED grants ownership; release below.
+            raise TerminalError("terminal session lock was abandoned; registry retained")
+        if wait_result == win32con.WAIT_TIMEOUT:
+            raise TerminalError("terminal session lock timed out; registry retained")
+        if wait_result != win32con.WAIT_OBJECT_0:
+            raise TerminalError("terminal session lock result is unknown; registry retained")
+        acquired = True
+        yield
+    finally:
+        if handle is not None:
+            try:
+                if acquired:
+                    win32event.ReleaseMutex(handle)
+            finally:
+                handle.Close()
+
+
+def _session_metadata_identity(path: Path, value: dict[str, Any]
+                               ) -> Optional[tuple[str, str]]:
+    """Return identity only for a canonical per-session metadata path."""
+    if path.name != SESSION_META or not SESSION_ID_RE.fullmatch(path.parent.name):
+        return None
+    session_id = path.parent.name
+    generation = value.get("generation")
+    if (value.get("session_id") != session_id
+            or not isinstance(generation, str)
+            or not SESSION_ID_RE.fullmatch(generation)):
+        raise TerminalError("terminal metadata write identity is incomplete")
+    return session_id, generation
+
+
+def _validate_metadata_write_generation(path: Path, session_id: str,
+                                        generation: str, value: dict[str, Any]) -> None:
+    if path.exists():
+        current = _read_metadata(path)
+        if (current.get("session_id") != session_id
+                or current.get("generation") != generation):
+            raise TerminalError("terminal generation changed before metadata write")
+        return
+    # A missing record can only be established by create() before it publishes
+    # the first starting state. A delayed worker cannot recreate a deleted one.
+    if (value.get("state") != "starting"
+            or value.get("spawn_attempted") is not False
+            or any(path.parent.iterdir())):
+        raise TerminalError("terminal metadata disappeared before update")
+
+
+def _write_metadata_unlocked(path: Path, value: dict[str, Any]) -> None:
     temp = path.with_name(".meta-" + uuid.uuid4().hex)
     try:
         with temp.open("x", encoding="utf-8", newline="\n") as stream:
@@ -393,6 +499,19 @@ def _atomic_metadata(path: Path, value: dict[str, Any]) -> None:
             "terminal metadata could not be saved",
             diagnostic={"stage": "metadata_write", "exception": category},
         ) from exc
+
+
+def _atomic_metadata(path: Path, value: dict[str, Any]) -> None:
+    identity = _session_metadata_identity(path, value)
+    if identity is None:
+        _write_metadata_unlocked(path, value)
+        return
+    session_id, generation = identity
+    with _session_metadata_lock(session_id, path.parent):
+        _validate_metadata_write_generation(path, session_id, generation, value)
+        if any(path.parent.glob(".meta-*")):
+            raise TerminalError("stale metadata evidence prevents a safe update")
+        _write_metadata_unlocked(path, value)
 
 
 def _process_facts(pid: int, *, expected_start: Optional[str] = None,
@@ -646,7 +765,10 @@ def _cleanup_failed_startup(session_dir: Path, session_id: str,
         if not isinstance(shell_path, str):
             raise TerminalError("owned PowerShell path is unavailable; registry retained")
         _terminate_owned_powershell(shell_pid, shell_start, shell_path)
-    _remove_session_files(session_dir)
+    _remove_session_files(
+        session_dir, expected_session_id=session_id,
+        expected_generation=generation,
+    )
     if diagnostic is not None:
         raise TerminalError(
             "Windows terminal startup failed "
@@ -679,8 +801,15 @@ def _validate_identity(root: Path, session_id: str) -> tuple[Path, dict[str, Any
             diagnostic={"stage": "identity_validation",
                         "exception": "worker_" + worker_reason},
         )
+    expected_shell = os.path.normcase(os.path.abspath(_powershell_executable()))
+    if (not isinstance(identity.shell_path, str)
+            or os.path.normcase(os.path.abspath(identity.shell_path)) != expected_shell):
+        raise TerminalError(
+            "terminal shell identity is inconsistent",
+            diagnostic={"stage": "identity_validation", "exception": "shell_path_mismatch"},
+        )
     shell_reason = _process_identity_mismatch(
-        identity.shell_pid, identity.shell_start
+        identity.shell_pid, identity.shell_start, expected_shell
     )
     if identity.state == "running" and shell_reason is not None:
         raise TerminalError(
@@ -693,6 +822,13 @@ def _validate_identity(root: Path, session_id: str) -> tuple[Path, dict[str, Any
             "terminal shell identity is inconsistent",
             diagnostic={"stage": "identity_validation",
                         "exception": "shell_still_alive"},
+        )
+    if (identity.state == "exited"
+            and shell_reason not in ("process_unavailable", "creation_time_mismatch")):
+        raise TerminalError(
+            "terminal shell identity is inconsistent",
+            diagnostic={"stage": "identity_validation",
+                        "exception": "shell_image_mismatch"},
         )
     return session_dir, metadata
 
@@ -717,9 +853,12 @@ class TerminalRegistry:
                 identity = _identity(metadata)
                 worker_ok, shell_ok = _identity_matches_process(identity)
                 if worker_ok:
-                    state = "running" if shell_ok else (
-                        "exited" if identity.state == "exited" else "identity_mismatch"
-                    )
+                    if identity.state == "stopping":
+                        state = "stopping"
+                    else:
+                        state = "running" if shell_ok else (
+                            "exited" if identity.state == "exited" else "identity_mismatch"
+                        )
                 else:
                     state = "orphaned"
                 result.append(replace(identity, state=state))
@@ -759,11 +898,17 @@ class TerminalRegistry:
         try:
             shell = _powershell_executable()
         except TerminalError:
-            _remove_session_files(session_dir)
+            _remove_session_files(
+                session_dir, expected_session_id=session_id,
+                expected_generation=generation, allow_empty=True,
+            )
             raise
         pipe_name = _planned_socket_path(session_dir, session_id)
         if len(pipe_name) > MAX_PIPE_NAME_CHARS:
-            _remove_session_files(session_dir)
+            _remove_session_files(
+                session_dir, expected_session_id=session_id,
+                expected_generation=generation, allow_empty=True,
+            )
             raise TerminalError("Windows named pipe path is too long")
         initial = {
             "protocol": PROTOCOL, "session_id": session_id, "generation": generation,
@@ -785,7 +930,10 @@ class TerminalRegistry:
                                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)),
             )
         except OSError as exc:
-            _remove_session_files(session_dir)
+            _remove_session_files(
+                session_dir, expected_session_id=session_id,
+                expected_generation=generation,
+            )
             raise TerminalError("cannot start the Windows terminal supervisor") from exc
         deadline = time.monotonic() + STARTUP_TIMEOUT
         last_startup_reason = "starting"
@@ -820,10 +968,22 @@ class TerminalRegistry:
         )
 
     def connect(self, session_id: str, *, timeout: float = 3.0) -> "TerminalClient":
+        return self._connect(session_id, timeout=timeout, allow_stopping=False)
+
+    def _connect_for_stop(self, session_id: str, *, timeout: float = 3.0
+                          ) -> "TerminalClient":
+        """Open an identity-checked control channel for explicit Stop retry only."""
+        return self._connect(session_id, timeout=timeout, allow_stopping=True)
+
+    def _connect(self, session_id: str, *, timeout: float,
+                 allow_stopping: bool) -> "TerminalClient":
         _require_windows()
         session_dir, metadata = _validate_identity(self.root, session_id)
         identity = _identity(metadata)
-        if identity.state not in ("running", "exited"):
+        ready_states = {"running", "exited"}
+        if allow_stopping:
+            ready_states.add("stopping")
+        if identity.state not in ready_states:
             raise TerminalError("terminal session is not ready")
         pipe_name = metadata.get("pipe_name")
         if not isinstance(pipe_name, str) or pipe_name != _planned_socket_path(session_dir, session_id):
@@ -833,13 +993,21 @@ class TerminalRegistry:
     def stop(self, session_id: str, *, expected_generation: Optional[str] = None,
              expected_shell_pid: Optional[int] = None) -> None:
         _require_windows()
+        if _retry_confirmed_stop_cleanup(
+                self.root, session_id,
+                expected_generation=expected_generation,
+                expected_shell_pid=expected_shell_pid):
+            return
         session_dir, metadata = _validate_identity(self.root, session_id)
         identity = _identity(metadata)
         if expected_generation is not None and identity.generation != str(expected_generation):
             raise TerminalError("terminal identity changed before stop")
         if expected_shell_pid is not None and identity.shell_pid != int(expected_shell_pid):
             raise TerminalError("terminal identity changed before stop")
-        client = self.connect(session_id)
+        # Stop replies include an owned-process exit confirmation bounded by
+        # the worker's shell wait and Job drain deadlines. Use the same
+        # explicit Stop budget instead of the shorter observer default.
+        client = self._connect_for_stop(session_id, timeout=STOP_TIMEOUT)
         try:
             if _terminal_identity_key(client.identity) != _terminal_identity_key(identity):
                 raise TerminalError("terminal identity changed before stop")
@@ -859,7 +1027,11 @@ class TerminalRegistry:
             if (not worker_alive or worker_created != identity.supervisor_start):
                 if shell_alive and shell_created == identity.shell_start:
                     raise TerminalError("owned PowerShell did not exit; registry retained")
-                _remove_session_files(session_dir)
+                _remove_session_files(
+                    session_dir, expected_session_id=identity.session_id,
+                    expected_generation=identity.generation,
+                    expected_identity=identity,
+                )
                 return
             time.sleep(0.025)
         raise TerminalError("Windows supervisor did not stop cleanly; registry retained")
@@ -883,14 +1055,255 @@ def _worker_environment(session_dir: Path) -> dict[str, str]:
     return env
 
 
-def _remove_session_files(path: Path) -> None:
-    _private_acl(path, directory=True)
-    for entry in tuple(path.iterdir()):
-        if _is_reparse(entry) or entry.is_dir():
-            raise TerminalError("refusing to remove an unexpected Windows session artifact")
-        _private_acl(entry, directory=False)
-        entry.unlink()
-    path.rmdir()
+def _restore_metadata_evidence(session_dir: Path, metadata_path: Path,
+                               content: bytes) -> None:
+    """Restore the exact record if the final directory removal fails."""
+    _private_acl(session_dir, directory=True)
+    if tuple(session_dir.iterdir()):
+        raise TerminalError("terminal directory changed before evidence restoration")
+    temp = session_dir / (".meta-restore-" + uuid.uuid4().hex)
+    with temp.open("xb") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+    _private_acl(temp, directory=False, apply=True)
+    os.replace(temp, metadata_path)
+    _private_acl(metadata_path, directory=False)
+
+
+def _confirmed_windows_stop_identity(metadata: dict[str, Any], session_id: str,
+                                     expected_generation: Optional[str],
+                                     expected_shell_pid: Optional[int]
+                                     ) -> Optional[TerminalIdentity]:
+    if (metadata.get("protocol") != PROTOCOL
+            or metadata.get("session_id") != session_id
+            or not isinstance(metadata.get("generation"), str)
+            or not SESSION_ID_RE.fullmatch(metadata["generation"])
+            or (expected_generation is not None
+                and metadata.get("generation") != str(expected_generation))):
+        raise TerminalError("terminal identity changed before cleanup retry")
+    identity = _identity(metadata)
+    if (expected_shell_pid is not None
+            and identity.shell_pid != int(expected_shell_pid)):
+        raise TerminalError("terminal identity changed before cleanup retry")
+    if (identity.supervisor_pid <= 0 or not identity.supervisor_start
+            or identity.shell_pid <= 0 or not identity.shell_start):
+        raise TerminalError("terminal process identity is incomplete")
+    if (metadata.get("state") != "exited"
+            or metadata.get("termination") != "requested"
+            or metadata.get("job_processes_empty") is not True):
+        return None
+    if (not isinstance(identity.shell_path, str)
+            or os.path.normcase(os.path.abspath(identity.shell_path))
+            != os.path.normcase(os.path.abspath(_powershell_executable()))):
+        raise TerminalError("terminal shell image record changed before cleanup retry")
+    for label, pid, start in (
+            ("supervisor", identity.supervisor_pid, identity.supervisor_start),
+            ("shell", identity.shell_pid, identity.shell_start)):
+        created, _image, alive = _process_facts(
+            pid, expected_start=start, verify_image=False
+        )
+        if alive and created != start:
+            raise TerminalError(
+                "terminal {} identity changed before cleanup retry".format(label)
+            )
+        if alive:
+            return None
+    return identity
+
+
+def _retry_confirmed_stop_cleanup(root: Path, session_id: str, *,
+                                  expected_generation: Optional[str],
+                                  expected_shell_pid: Optional[int]) -> bool:
+    if not SESSION_ID_RE.fullmatch(str(session_id)):
+        raise TerminalError("invalid terminal session id")
+    _private_acl(root, directory=True)
+    session_dir = root / session_id
+    backup = None
+    if expected_generation is not None:
+        backup = root / (
+            f".stop-evidence-{session_id}-{expected_generation}.json"
+        )
+    if not os.path.lexists(session_dir):
+        if backup is None or not os.path.lexists(backup):
+            return False
+        metadata = _read_metadata(backup)
+        identity = _confirmed_windows_stop_identity(
+            metadata, session_id, expected_generation, expected_shell_pid
+        )
+        if identity is None:
+            return False
+        backup.unlink()
+        return True
+
+    _private_acl(session_dir, directory=True)
+    metadata_path = session_dir / SESSION_META
+    if not os.path.lexists(metadata_path):
+        if backup is None or not os.path.lexists(backup):
+            raise TerminalError("terminal identity evidence is unavailable")
+        metadata = _read_metadata(backup)
+        identity = _confirmed_windows_stop_identity(
+            metadata, session_id, expected_generation, expected_shell_pid
+        )
+        if identity is None:
+            return False
+        _restore_metadata_evidence(session_dir, metadata_path,
+                                   backup.read_bytes())
+    else:
+        metadata = _read_metadata(metadata_path)
+        identity = _confirmed_windows_stop_identity(
+            metadata, session_id, expected_generation, expected_shell_pid
+        )
+    if identity is None:
+        return False
+    _remove_session_files(
+        session_dir, expected_session_id=session_id,
+        expected_generation=identity.generation, expected_identity=identity,
+    )
+    return True
+
+
+def _preserve_stop_evidence(root: Path, session_id: str, generation: str,
+                            content: bytes) -> Path:
+    """Durably retain one stop record outside the directory being removed."""
+    _private_acl(root, directory=True)
+    backup = root / f".stop-evidence-{session_id}-{generation}.json"
+
+    def reuse_exact_backup() -> Path:
+        metadata = _read_metadata(backup)
+        existing = backup.read_bytes()
+        if (metadata.get("session_id") != session_id
+                or metadata.get("generation") != generation
+                or existing != content):
+            raise TerminalError("conflicting terminal stop evidence is already present")
+        _private_acl(backup, directory=False)
+        return backup
+
+    if os.path.lexists(backup):
+        return reuse_exact_backup()
+    try:
+        with backup.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        return reuse_exact_backup()
+    try:
+        _private_acl(backup, directory=False, apply=True)
+        if backup.read_bytes() != content:
+            raise TerminalError("terminal stop evidence backup did not verify")
+        return backup
+    except Exception as exc:
+        # Leave any partial file in place for inspection. The original metadata
+        # has not been removed yet, so failure cannot erase the registry record.
+        raise TerminalError("terminal stop evidence could not be preserved") from exc
+
+
+def _remove_session_files(
+    path: Path,
+    *,
+    expected_session_id: str,
+    expected_generation: str,
+    expected_identity: Optional[TerminalIdentity] = None,
+    allow_empty: bool = False,
+) -> None:
+    """Remove only one exact generation after preflight and identity checks.
+
+    JTT metadata writers share the session mutex. The directory is deleted only
+    when it contains the sole expected metadata record; unknown artifacts are
+    retained. For normal Stop, the complete process identity and requested,
+    exited state are checked again while holding the mutex. Metadata is the
+    last file removed, and is restored byte-for-byte if rmdir fails.
+    """
+    if (not SESSION_ID_RE.fullmatch(str(expected_session_id))
+            or path.name != expected_session_id
+            or not SESSION_ID_RE.fullmatch(str(expected_generation))):
+        raise TerminalError("terminal cleanup identity is invalid; registry retained")
+    with _session_metadata_lock(expected_session_id, path):
+        _private_acl(path, directory=True)
+        try:
+            entries = tuple(path.iterdir())
+        except OSError as exc:
+            raise TerminalError("terminal cleanup contents are unknown; registry retained") from exc
+        if not entries:
+            if not allow_empty or expected_identity is not None:
+                raise TerminalError("terminal cleanup record is missing; registry retained")
+            try:
+                path.rmdir()
+            except OSError as exc:
+                raise TerminalError("empty startup directory could not be removed") from exc
+            return
+        if len(entries) != 1 or entries[0].name != SESSION_META:
+            raise TerminalError("unexpected terminal evidence prevents cleanup")
+
+        metadata_path = entries[0]
+        if _is_reparse(metadata_path) or metadata_path.is_dir():
+            raise TerminalError("terminal metadata is unsafe; registry retained")
+        _private_acl(metadata_path, directory=False)
+        metadata = _read_metadata(metadata_path)
+        if (metadata.get("protocol") != PROTOCOL
+                or metadata.get("session_id") != expected_session_id
+                or metadata.get("generation") != expected_generation):
+            raise TerminalError("terminal generation changed before cleanup")
+        if expected_identity is not None:
+            current = _identity(metadata)
+            if (_terminal_identity_key(current)
+                    != _terminal_identity_key(expected_identity)
+                    or current.shell_path != expected_identity.shell_path):
+                raise TerminalError("terminal identity changed before cleanup")
+            if metadata.get("state") != "exited" or metadata.get("termination") != "requested":
+                raise TerminalError("terminal stop was not confirmed; registry retained")
+            if metadata.get("job_processes_empty") is not True:
+                raise TerminalError("terminal Job exit was not confirmed; registry retained")
+
+        try:
+            content = metadata_path.read_bytes()
+        except OSError as exc:
+            raise TerminalError("terminal evidence could not be preserved") from exc
+        if len(content) > 16 * 1024:
+            raise TerminalError("terminal metadata is invalid; registry retained")
+        backup = None
+        if expected_identity is not None:
+            backup = _preserve_stop_evidence(
+                path.parent, expected_session_id, expected_generation, content
+            )
+        try:
+            metadata_path.unlink()
+        except OSError as exc:
+            if backup is not None:
+                try:
+                    backup.unlink()
+                except OSError as backup_exc:
+                    raise TerminalError(
+                        "terminal metadata remains and duplicate stop evidence was retained"
+                    ) from backup_exc
+            raise TerminalError("terminal metadata could not be removed") from exc
+        try:
+            path.rmdir()
+        except OSError as exc:
+            try:
+                _restore_metadata_evidence(path, metadata_path, content)
+            except Exception as restore_exc:
+                raise TerminalError(
+                    "terminal cleanup failed; stop evidence backup was retained"
+                ) from restore_exc
+            if backup is not None:
+                try:
+                    backup.unlink()
+                except OSError as backup_exc:
+                    raise TerminalError(
+                        "terminal cleanup failed; metadata restored and duplicate stop evidence retained"
+                    ) from backup_exc
+            raise TerminalError(
+                "terminal directory cleanup failed; registry evidence restored"
+            ) from exc
+        if backup is not None:
+            try:
+                backup.unlink()
+            except OSError as exc:
+                raise TerminalError(
+                    "terminal stopped; retained stop evidence requires later cleanup"
+                ) from exc
 
 
 def _identity_payload(identity: TerminalIdentity) -> dict[str, Any]:

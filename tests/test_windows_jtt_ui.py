@@ -14,7 +14,7 @@ import pytest
 from textual.css.query import NoMatches
 from textual.events import Paste
 from textual.screen import ModalScreen
-from textual.widgets import Button, Static
+from textual.widgets import Button, Input, Static
 
 import ju0_terminal_tower  # noqa: F401 - activates the guarded product namespace
 from ju0_terminal_tower.state.jtt_layouts import JTTLayoutStore
@@ -26,7 +26,12 @@ from ju0_terminal_tower.terminal.manager import (
     TerminalObservation,
     TerminalScreen,
 )
-from ju0_terminal_tower.ui.windows_jtt import WindowsJTTApp, _same_identity
+from ju0_terminal_tower.ui.windows_jtt import (
+    CreateWindowScreen,
+    SavedWorkspaceScreen,
+    WindowsJTTApp,
+    _same_identity,
+)
 from ju0_terminal_tower.ui.windows_mini_live import identity_key as _mini_identity_key
 
 
@@ -34,6 +39,17 @@ def _screen(text: str = "JTT_TEST_READY") -> TerminalScreen:
     cells = tuple(TerminalCell(char, "default", "default", False, False, False,
                                False, False, False) for char in text)
     return TerminalScreen((cells,), min(len(cells), 3), 0, True)
+
+
+def _screen_lines(*lines: str) -> TerminalScreen:
+    rows = tuple(tuple(TerminalCell(
+        char, "default", "default", False, False, False, False, False, False
+    ) for char in line) for line in lines)
+    return TerminalScreen(rows, 0, max(0, len(rows) - 1), True)
+
+
+def _plain_screen_text(screen: TerminalScreen) -> str:
+    return "\n".join("".join(cell.text for cell in row) for row in screen.rows)
 
 
 def _identity(index: int, *, state: str = "running") -> TerminalIdentity:
@@ -52,6 +68,77 @@ async def _wait_for_ui_state(pilot, predicate, reason: str, timeout: float = 5.0
         if remaining <= 0:
             pytest.fail(f"timed out waiting for UI state: {reason}")
         await pilot.pause(min(0.05, remaining))
+
+
+async def _wait_for_focused_widget(pilot, app, selector: str, reason: str):
+    def focused():
+        try:
+            widget = app.query_one(selector)
+        except NoMatches:
+            return False
+        return widget.is_attached and app.focused is widget
+
+    await _wait_for_ui_state(pilot, focused, reason)
+    return app.query_one(selector)
+
+
+def _focus_description(app) -> str:
+    focused = app.focused
+    return (f"widget={type(focused).__name__} id={getattr(focused, 'id', None)!r} "
+            f"screen={type(app.screen).__name__} mounted={app.screen.is_mounted}")
+
+
+async def _keyboard_focus_target(pilot, app, selector: str, key: str, reason: str):
+    """Reach an archive control through one bounded pass of its real focus chain."""
+    screen = app.screen
+    target = screen.query_one(selector)
+    visited = []
+    for _ in range(len(screen.focus_chain) + 1):
+        focused = app.focused
+        visited.append(getattr(focused, "id", None))
+        if focused is target and target.is_attached:
+            return tuple(visited)
+        await pilot.press(key)
+        await _wait_for_ui_state(
+            pilot,
+            lambda: (app.screen is screen and app.focused is not None
+                     and app.focused is not focused and app.focused.is_attached
+                     and app.focused.screen is screen),
+            f"{reason}; previous path={visited!r}; {_focus_description(app)}",
+        )
+    pytest.fail(f"unreachable keyboard target {selector}: {reason}; "
+                f"path={visited!r}; {_focus_description(app)}")
+
+
+async def _wait_for_modal_input_focus(pilot, app, selector: str, reason: str):
+    def focused_and_mounted():
+        screen = app.screen
+        if type(screen) is not CreateWindowScreen or not screen.is_mounted:
+            return False
+        try:
+            widget = screen.query_one(selector, Input)
+        except NoMatches:
+            return False
+        return widget.is_attached and app.focused is widget
+
+    await _wait_for_ui_state(pilot, focused_and_mounted, reason)
+    return app.screen.query_one(selector, Input)
+
+
+async def _wait_for_widget_in_viewport(
+    pilot, app, widget_selector: str, viewport_selector: str, reason: str,
+):
+    def visible():
+        try:
+            widget = app.query_one(widget_selector)
+            viewport = app.query_one(viewport_selector)
+        except NoMatches:
+            return False
+        region = widget.region.intersection(viewport.content_region)
+        return widget.is_attached and region.width > 0 and region.height > 0
+
+    await _wait_for_ui_state(pilot, visible, reason)
+    return app.query_one(widget_selector)
 
 
 class FakeClient:
@@ -151,7 +238,7 @@ def test_cli_dispatches_native_windows_ui_before_curses(monkeypatch):
     assert called == [True]
 
 
-@pytest.mark.parametrize("size", [(160, 44), (80, 24)])
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
 def test_windows_ui_has_three_panels_and_does_not_autocreate(size):
     async def scenario():
         registry = FakeRegistry()
@@ -168,6 +255,919 @@ def test_windows_ui_has_three_panels_and_does_not_autocreate(size):
                        app.query_one("#right").region]
             assert all(region.width > 0 and region.height > 0 for region in regions)
             assert regions[0].x < regions[1].x < regions[2].x
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_responsive_cards_keep_selection_and_archive_accessible(size):
+    """Synthetic R03: layout changes do not create or lease a terminal."""
+    async def scenario():
+        identities = [_identity(1), _identity(2), _identity(3)]
+        registry = FakeRegistry(identities)
+        app = WindowsJTTApp(registry)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identities[0].session_id,
+                "initial synthetic terminal selection",
+            )
+            await pilot.pause(0.05)
+            container = app.query_one("#terminal-cards")
+            cards_per_row = app._cards_per_row(container.size.width)
+            rows = list(container.query(".card-row"))
+            assert len(rows) == (len(identities) + cards_per_row - 1) // cards_per_row
+            assert len(list(rows[0].query(".terminal-card"))) == cards_per_row
+            assert app.query_one("#workspace-picker", Button).label.plain == "보관함"
+            assert app.query_one("#window-list").region.height > 0
+            assert app.query_one("#live").content_region.width > 0
+            await app._move_card(1)
+            assert app.selected_identity == identities[1]
+            assert app.client.identity.generation == identities[1].generation
+            assert not app.client.lease
+            assert registry.create_count == 0
+            assert all(not client.sent and not client.resizes for client in registry.clients)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "width,scroll_y,expected", [(20, 6, [2]), (40, 6, [3, 4])],
+)
+def test_r03_mini_live_visible_rows_match_responsive_card_columns(width, scroll_y, expected):
+    identities = [_identity(index) for index in range(1, 5)]
+    container = SimpleNamespace(size=SimpleNamespace(width=width, height=5), scroll_y=scroll_y)
+    synthetic = SimpleNamespace(
+        sessions={item.session_id: item for item in identities},
+        selected_id=identities[0].session_id,
+        size=SimpleNamespace(height=24),
+        _mini_cards_container=lambda: container,
+        _cards_per_row=WindowsJTTApp._cards_per_row,
+    )
+    targets = WindowsJTTApp._visible_mini_targets(synthetic)
+    assert [item.session_id for item in targets] == [identities[index - 1].session_id
+                                                     for index in expected]
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_visible_click_regions_and_scrolled_card_target_identity(tmp_path, size):
+    """Synthetic viewport and target contract; no PTY or native rendering claim."""
+    async def scenario():
+        identities = [_identity(index) for index in range(1, 13)]
+        registry = FakeRegistry(identities)
+        workspace = JTTWorkspaceStore(tmp_path / "synthetic-jtt")
+        layout = JTTLayoutStore(workspace.root)
+        app = WindowsJTTApp(registry, workspace_store=workspace, layout_store=layout)
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(pilot, lambda: len(app.sessions) == len(identities),
+                                     "synthetic sessions")
+            await pilot.pause(0.05)
+            for selector in ("#left", "#center", "#right"):
+                region = app.query_one(selector).region
+                assert region.width > 0 and region.height > 0
+                assert region.intersection(app.screen.region) == region
+            left = app.query_one("#left")
+            for selector in ("#new-window", "#workspace-picker", "#window-window-default"):
+                region = app.query_one(selector, Button).region
+                assert region.width > 0 and region.height > 0
+                assert region.intersection(left.region) == region
+
+            await pilot.click("#workspace-picker")
+            assert isinstance(app.screen, ModalScreen)
+            await pilot.press("escape")
+            await _wait_for_ui_state(pilot, lambda: not isinstance(app.screen, ModalScreen),
+                                     "archive cancellation")
+            target = list(app.sessions.values())[-1]
+            await app._select_session(target)
+            card_selector = "#terminal-" + target.session_id
+            card = await _wait_for_focused_widget(
+                pilot, app, card_selector, "selected card focus established",
+            )
+            assert isinstance(card, Button)
+            assert app.selected_identity is not None
+            assert _mini_identity_key(app.selected_identity) == _mini_identity_key(target)
+            await _wait_for_widget_in_viewport(
+                pilot, app, card_selector, "#terminal-cards",
+                "selected card intersects CENTER viewport",
+            )
+            await pilot.click("#terminal-" + target.session_id)
+            await _wait_for_ui_state(pilot, lambda: (app.selected_identity == target
+                                     and app.client is not None and not app._busy),
+                                     "clicked card selection")
+            await app._refresh_live()
+            assert app.client.identity.session_id == target.session_id
+            assert app.client.identity.generation == target.generation
+            assert app._right_observation is not None
+            assert app._right_observation[0] == _mini_identity_key(target)
+            assert not app.client.lease and not app.input_mode
+            assert registry.create_count == 0 and registry.stop_calls == []
+            assert all(not client.sent and not client.resizes for client in registry.clients)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_nonselected_stale_mini_screen_expires_without_input(size):
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        registry = FakeRegistry([first, second])
+        app = WindowsJTTApp(registry)
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(pilot, lambda: app.selected_id == first.session_id,
+                                     "synthetic selected terminal")
+            await pilot.pause(0.05)
+            app._mini_cache[second.session_id] = (
+                _mini_identity_key(second), 1, time.monotonic() - 3.0,
+                _screen("EXPIRED_NONSELECTED"),
+            )
+            await app._render_cards()
+            label = app.query_one("#terminal-" + second.session_id, Button).label.plain
+            assert "EXPIRED_NONSELECTED" not in label
+            assert "미니 화면 대기 중" in label
+            assert all(not client.lease and not client.sent and not client.resizes
+                       for client in registry.clients)
+            assert registry.create_count == 0 and registry.stop_calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_window_updates_keep_focused_button_without_replacement(size):
+    async def scenario():
+        registry = FakeRegistry()
+        app = WindowsJTTApp(registry)
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(pilot, lambda: bool(app.query(".window-item")),
+                                     "initial Window button")
+            app._focus_panel(0)
+            focused = await _wait_for_focused_widget(
+                pilot, app, "#window-window-default", "selected Window focus established",
+            )
+            app.windows[0]["name"] = "Renamed Window"
+            app.windows[0]["terminal_ids"] = ["synthetic-ref"]
+            app.windows.append({"id": "synthetic-extra", "name": "Review",
+                                "folder_id": "folder-default", "terminal_ids": []})
+            await app._render_windows()
+            assert app._panel_index == 0 and app.focused is focused
+            assert app.query_one("#window-window-default", Button) is focused
+            assert "Renamed Window" in focused.label.plain
+            assert "1" in focused.label.plain
+            assert app.query_one("#window-synthetic-extra", Button)
+            assert registry.create_count == 0 and registry.stop_calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_mini_live_sequence_updates_keep_selected_card_focus(size):
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        app = WindowsJTTApp(registry)
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(pilot, lambda: app.selected_id == identity.session_id,
+                                     "synthetic card selection")
+            await _wait_for_ui_state(
+                pilot, lambda: bool(app.query(".terminal-card")),
+                "initial card mounted before Mini LIVE update",
+            )
+            await app._render_cards()
+            app._focus_panel(1)
+            focused = await _wait_for_focused_widget(
+                pilot, app, "#terminal-" + identity.session_id,
+                "selected card focus established before Mini LIVE refresh",
+            )
+            for sequence, marker in ((1, "OBSERVED_ONE"), (2, "OBSERVED_TWO")):
+                app._mini_cache[identity.session_id] = (
+                    _mini_identity_key(identity), sequence, time.monotonic(), _screen(marker),
+                )
+                await app._render_cards()
+                assert app._panel_index == 1 and app.focused is focused
+                assert app.query_one("#terminal-" + identity.session_id, Button) is focused
+                assert marker in focused.label.plain
+            assert app.client is not None and not app.client.lease
+            assert all(not client.sent and not client.resizes for client in registry.clients)
+
+    asyncio.run(scenario())
+
+
+def test_r03_async_window_refresh_never_steals_focus_from_right():
+    async def scenario():
+        app = WindowsJTTApp(FakeRegistry())
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _wait_for_ui_state(pilot, lambda: bool(app.query(".window-item")),
+                                     "initial Window button")
+            app._focus_panel(0)
+            entered, resume = asyncio.Event(), asyncio.Event()
+            mount = app._mount_if_active
+
+            async def gated_mount(parent, *children):
+                if any(child.id == "window-synthetic-extra" for child in children):
+                    entered.set()
+                    await resume.wait()
+                return await mount(parent, *children)
+
+            app._mount_if_active = gated_mount
+            app.windows.append({"id": "synthetic-extra", "name": "Review",
+                                "folder_id": "folder-default", "terminal_ids": []})
+            refresh = asyncio.create_task(app._render_windows())
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            app._focus_panel(2)
+            resume.set()
+            await asyncio.wait_for(refresh, timeout=1.0)
+            assert app._panel_index == 2 and app.focused.id == "live"
+
+    asyncio.run(scenario())
+
+
+def test_r03_async_window_refresh_cannot_take_modal_focus():
+    async def scenario():
+        app = WindowsJTTApp(FakeRegistry())
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _wait_for_ui_state(pilot, lambda: bool(app.query(".window-item")),
+                                     "initial Window button")
+            entered, resume = asyncio.Event(), asyncio.Event()
+            mount = app._mount_if_active
+
+            async def gated_mount(parent, *children):
+                if any(child.id == "window-synthetic-extra" for child in children):
+                    entered.set()
+                    await resume.wait()
+                return await mount(parent, *children)
+
+            app._mount_if_active = gated_mount
+            app.windows.append({"id": "synthetic-extra", "name": "Review",
+                                "folder_id": "folder-default", "terminal_ids": []})
+            refresh = asyncio.create_task(app._render_windows())
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            await app._prompt_create_window()
+            name_input = await _wait_for_modal_input_focus(
+                pilot, app, "#window-name", "Window modal input mounted and focused",
+            )
+            resume.set()
+            await asyncio.wait_for(refresh, timeout=1.0)
+            assert isinstance(app.screen, ModalScreen)
+            assert app.focused is name_input
+            assert app.focused.id == "window-name"
+
+    asyncio.run(scenario())
+
+
+def test_r03_async_card_rebuild_never_steals_focus_from_right():
+    async def scenario():
+        identity = _identity(1)
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _wait_for_ui_state(pilot, lambda: app.selected_id == identity.session_id,
+                                     "initial synthetic card")
+            app._focus_panel(1)
+            container = app.query_one("#terminal-cards")
+            remove = container.remove_children
+            entered, resume = asyncio.Event(), asyncio.Event()
+
+            async def gated_remove(*args, **kwargs):
+                entered.set()
+                await resume.wait()
+                return await remove(*args, **kwargs)
+
+            container.remove_children = gated_remove
+            app._card_signature = None
+            app._card_structure = None
+            refresh = asyncio.create_task(app._render_cards())
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            app._focus_panel(2)
+            resume.set()
+            await asyncio.wait_for(refresh, timeout=1.0)
+            assert app._panel_index == 2 and app.focused.id == "live"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_card_rebuild_restores_actual_focus_for_same_session_identity(size):
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        app = WindowsJTTApp(registry)
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id,
+                "selected synthetic terminal before card rebuild",
+            )
+            await app._render_cards()
+            app._focus_panel(1)
+            focused_before = await _wait_for_focused_widget(
+                pilot, app, "#terminal-" + identity.session_id,
+                "selected card focus established before rebuild",
+            )
+            assert isinstance(focused_before, Button)
+            assert focused_before.id == "terminal-" + identity.session_id
+            focused_identity = _mini_identity_key(app.sessions[identity.session_id])
+
+            # Force the structural path; output-only changes are covered by
+            # the in-place Mini LIVE refresh test above.
+            app._card_structure = None
+            app._card_signature = None
+            await app._render_cards()
+
+            current_card = await _wait_for_focused_widget(
+                pilot, app, "#terminal-" + identity.session_id,
+                "same-identity card focus restored after rebuild",
+            )
+            assert current_card.is_attached
+            assert app.focused is current_card
+            assert _mini_identity_key(app.sessions[identity.session_id]) == focused_identity
+            assert app.selected_identity.generation == identity.generation
+            assert app.client is not None and not app.client.lease
+            assert registry.create_count == 0 and registry.stop_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_r03_card_rebuild_restores_nonselected_focused_card_identity():
+    async def scenario():
+        selected, focused_identity = _identity(1), _identity(2)
+        registry = FakeRegistry([selected, focused_identity])
+        app = WindowsJTTApp(registry)
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == selected.session_id,
+                "first terminal selected before focusing another card",
+            )
+            await app._render_cards()
+            first_card = app.query_one("#terminal-" + selected.session_id, Button)
+            focused_card = app.query_one(
+                "#terminal-" + focused_identity.session_id, Button,
+            )
+            focused_card.focus()
+            focused_card = await _wait_for_focused_widget(
+                pilot, app, "#terminal-" + focused_identity.session_id,
+                "nonselected card focus established",
+            )
+            assert app.selected_id == selected.session_id
+            assert app.selected_identity.generation == selected.generation
+            preserved_focus_key = _mini_identity_key(
+                app.sessions[focused_identity.session_id]
+            )
+
+            app._card_structure = None
+            app._card_signature = None
+            await app._render_cards()
+
+            replacement_focused_card = app.query_one(
+                "#terminal-" + focused_identity.session_id, Button,
+            )
+            assert replacement_focused_card is not focused_card
+            assert replacement_focused_card.is_attached
+            replacement_focused_card = await _wait_for_focused_widget(
+                pilot, app, "#terminal-" + focused_identity.session_id,
+                "same-identity card focus restored after rebuild",
+            )
+            assert app.focused is replacement_focused_card
+            assert _mini_identity_key(
+                app.sessions[focused_identity.session_id]
+            ) == preserved_focus_key
+            assert app.selected_id == selected.session_id
+            assert app.selected_identity.generation == selected.generation
+            replacement_selected_card = app.query_one(
+                "#terminal-" + selected.session_id, Button,
+            )
+            assert replacement_selected_card is not first_card
+            assert replacement_selected_card.is_attached
+            assert app.client is not None and not app.client.lease
+            assert all(not client.lease and not client.sent and not client.resizes
+                       for client in registry.clients)
+            assert registry.create_count == 0 and registry.stop_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_r03_one_two_column_reflow_keeps_actual_card_focus():
+    async def scenario():
+        identities = [_identity(index) for index in range(1, 4)]
+        registry = FakeRegistry(identities)
+        app = WindowsJTTApp(registry)
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(160, 44)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identities[0].session_id,
+                "selected terminal before column reflow",
+            )
+            container = app.query_one("#terminal-cards")
+            app._focus_panel(1)
+            focused = await _wait_for_focused_widget(
+                pilot, app, "#terminal-" + identities[0].session_id,
+                "selected card focus established before reflow",
+            )
+            focused_id = focused.id
+            focused_identity = _mini_identity_key(app.sessions[identities[0].session_id])
+
+            # Exercise the same structural 1 <-> 2 column transitions used by
+            # responsive widths while keeping the screen mounted and focus
+            # observable throughout each actual card-tree rebuild.
+            app._cards_per_row = lambda _width: 1
+            app._card_structure = None
+            app._card_signature = None
+            await app._render_cards()
+            rows = list(container.query(".card-row"))
+            assert len(rows) == len(identities)
+            first_card = app.query_one("#" + focused_id, Button)
+            first_card = await _wait_for_focused_widget(
+                pilot, app, "#" + focused_id,
+                "focused card restored after one-column reflow",
+            )
+            assert app.focused is first_card and first_card.is_attached
+            assert _mini_identity_key(app.sessions[identities[0].session_id]) == focused_identity
+
+            app._cards_per_row = lambda _width: 2
+            app._card_structure = None
+            app._card_signature = None
+            await app._render_cards()
+            rows = list(container.query(".card-row"))
+            assert len(rows) == 2
+            first_card = app.query_one("#" + focused_id, Button)
+            first_card = await _wait_for_focused_widget(
+                pilot, app, "#" + focused_id,
+                "focused card restored after two-column reflow",
+            )
+            assert app.focused is first_card and first_card.is_attached
+            assert _mini_identity_key(app.sessions[identities[0].session_id]) == focused_identity
+            assert registry.create_count == 0 and registry.stop_calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "key,expected_panel,expected_widget",
+    [("tab", 2, "live"), ("shift+tab", 0, "window-window-default")],
+)
+def test_r03_navigation_during_card_rebuild_keeps_requested_panel_focus(
+    key, expected_panel, expected_widget,
+):
+    async def scenario():
+        identity = _identity(1)
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id,
+                "selected card before asynchronous rebuild",
+            )
+            app._focus_panel(1)
+            container = app.query_one("#terminal-cards")
+            remove_children = container.remove_children
+            detached = asyncio.Event()
+            resume = asyncio.Event()
+
+            async def gated_remove_children(*args, **kwargs):
+                detached.set()
+                await resume.wait()
+                return await remove_children(*args, **kwargs)
+
+            container.remove_children = gated_remove_children
+            app._card_structure = None
+            app._card_signature = None
+            refresh = asyncio.create_task(app._render_cards())
+            await detached.wait()
+            await pilot.press(key)
+            requested_focus = app.focused
+            assert app._panel_index == expected_panel
+            assert requested_focus.id == expected_widget
+
+            resume.set()
+            await refresh
+            assert app.focused is requested_focus
+            assert app.focused.id == expected_widget
+            assert app._panel_index == expected_panel
+
+    asyncio.run(scenario())
+
+
+def test_r03_modal_focus_is_not_stolen_by_pending_card_rebuild():
+    async def scenario():
+        identity = _identity(1)
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id,
+                "selected card before modal and rebuild",
+            )
+            app._focus_panel(1)
+            container = app.query_one("#terminal-cards")
+            remove_children = container.remove_children
+            detached = asyncio.Event()
+            resume = asyncio.Event()
+
+            async def gated_remove_children(*args, **kwargs):
+                detached.set()
+                await resume.wait()
+                return await remove_children(*args, **kwargs)
+
+            container.remove_children = gated_remove_children
+            app._card_structure = None
+            app._card_signature = None
+            refresh = asyncio.create_task(app._render_cards())
+            await detached.wait()
+            await app._prompt_create_window()
+            name_input = await _wait_for_modal_input_focus(
+                pilot, app, "#window-name",
+                "create Window modal input mounted during card rebuild",
+            )
+            modal_focus = name_input
+            assert modal_focus.id == "window-name"
+
+            resume.set()
+            await refresh
+            assert isinstance(app.screen, ModalScreen)
+            assert app.focused is modal_focus
+            assert app.focused.id == "window-name"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["deleted", "generation"])
+def test_r03_card_rebuild_does_not_restore_focus_to_stale_identity(change):
+    async def scenario():
+        identity = _identity(1)
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id,
+                "selected terminal before identity change",
+            )
+            await app._render_cards()
+            app._focus_panel(1)
+            old_card = await _wait_for_focused_widget(
+                pilot, app, "#terminal-" + identity.session_id,
+                "old-generation card focus established before identity change",
+            )
+            assert old_card.id == "terminal-" + identity.session_id
+            old_identity = _mini_identity_key(app.sessions[identity.session_id])
+            container = app.query_one("#terminal-cards")
+            remove_children = container.remove_children
+            detached = asyncio.Event()
+            resume = asyncio.Event()
+
+            async def gated_remove_children(*args, **kwargs):
+                detached.set()
+                await resume.wait()
+                return await remove_children(*args, **kwargs)
+
+            container.remove_children = gated_remove_children
+            app._card_structure = None
+            app._card_signature = None
+            refresh = asyncio.create_task(app._render_cards())
+            await detached.wait()
+            if change == "deleted":
+                app.sessions.pop(identity.session_id)
+            else:
+                replacement = TerminalIdentity(**{
+                    **identity.__dict__, "generation": "f" * 32,
+                })
+                app.sessions[identity.session_id] = replacement
+            resume.set()
+            await refresh
+
+            # Complete any safe follow-up render for the changed card set.
+            await app._render_cards()
+            fallback = app.query_one("#new-terminal", Button)
+            assert old_card is not fallback
+            fallback = await _wait_for_focused_widget(
+                pilot, app, "#new-terminal",
+                "stale card focus moved to neutral CENTER action",
+            )
+            assert app.focused is fallback
+            assert fallback.is_attached
+            if change == "generation":
+                current = app.sessions[identity.session_id]
+                assert _mini_identity_key(current) != old_identity
+                replacement_card = app.query_one("#terminal-" + identity.session_id, Button)
+                assert app.focused is not replacement_card
+            else:
+                assert identity.session_id not in app.sessions
+            assert app.client is not None and not app.client.lease
+            assert all(not client.sent and not client.resizes for client in app.registry.clients)
+
+    asyncio.run(scenario())
+
+
+def test_r03_adding_and_removing_other_cards_preserves_focused_identity():
+    async def scenario():
+        first = _identity(1)
+        second = _identity(2)
+        registry = FakeRegistry([first, second])
+        app = WindowsJTTApp(registry)
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == first.session_id,
+                "first selected card before add/remove",
+            )
+            app._focus_panel(1)
+            focused = await _wait_for_focused_widget(
+                pilot, app, "#terminal-" + first.session_id,
+                "first selected card focus established before add/remove",
+            )
+            focused_id = focused.id
+            focused_key = _mini_identity_key(app.sessions[first.session_id])
+            app.sessions[second.session_id] = second
+            await app._render_cards()
+            first_card = await _wait_for_focused_widget(
+                pilot, app, "#" + focused_id,
+                "focused card retained after adding another card",
+            )
+            assert app.focused is first_card
+            assert _mini_identity_key(app.sessions[first.session_id]) == focused_key
+
+            app.sessions.pop(second.session_id)
+            await app._render_cards()
+            first_card = await _wait_for_focused_widget(
+                pilot, app, "#" + focused_id,
+                "focused card retained after removing another card",
+            )
+            assert app.focused is first_card
+            assert first_card.is_attached
+            assert _mini_identity_key(app.sessions[first.session_id]) == focused_key
+            assert registry.create_count == 0 and registry.stop_calls == []
+
+    asyncio.run(scenario())
+
+
+def test_r03_mini_live_refresh_does_not_steal_focus_after_navigation():
+    async def scenario():
+        first, second = _identity(1), _identity(2)
+        app = WindowsJTTApp(FakeRegistry([first, second]))
+        app.set_interval = lambda *_args, **_kwargs: SimpleNamespace(stop=lambda: None)
+        async with app.run_test(size=(120, 35)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == first.session_id,
+                "selected card before Mini LIVE update",
+            )
+            app._focus_panel(1)
+            lock = app._cards_render_lock
+            await lock.acquire()
+            app._mini_cache[second.session_id] = (
+                _mini_identity_key(second), 1, time.monotonic(), _screen("NEW_LIVE_FRAME"),
+            )
+            refresh = asyncio.create_task(app._render_cards())
+            await pilot.press("tab")
+            live = app.query_one("#live")
+            assert app.focused is live
+            lock.release()
+            await refresh
+            assert app.focused is live
+            assert "NEW_LIVE_FRAME" in app.query_one(
+                "#terminal-" + second.session_id, Button
+            ).label.plain
+            assert app.client is not None and not app.client.lease
+            assert all(not client.sent and not client.resizes
+                       for client in app.registry.clients)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_long_window_list_keeps_selected_window_in_view(tmp_path, size):
+    async def scenario():
+        registry = FakeRegistry()
+        workspace = JTTWorkspaceStore(tmp_path / "synthetic-jtt")
+        layout = JTTLayoutStore(workspace.root)
+        windows = [layout.create_window(workspace.DEFAULT_ID, "folder-default", f"Window {n}")
+                   for n in range(2, 10)]
+        app = WindowsJTTApp(registry, workspace_store=workspace, layout_store=layout)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(pilot, lambda: len(app.windows) == 9,
+                                     "synthetic Window list")
+            await app.select_window(windows[-1]["id"])
+            selected_selector = "#window-" + windows[-1]["id"]
+            selected = await _wait_for_focused_widget(
+                pilot, app, selected_selector,
+                "selected Window focus established",
+            )
+            selected = await _wait_for_widget_in_viewport(
+                pilot, app, selected_selector, "#window-list",
+                "selected Window intersects LEFT viewport",
+            )
+            window_list = app.query_one("#window-list")
+            assert app._panel_index == 0 and app.focused is selected
+            assert selected.region.intersection(window_list.content_region).height > 0
+            assert app.selected_id is None and app.client is None
+            assert registry.create_count == 0 and registry.stop_calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_left_actions_are_keyboard_accessible_without_terminal_input(tmp_path, size):
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        workspace = JTTWorkspaceStore(tmp_path / "synthetic-jtt")
+        layout = JTTLayoutStore(workspace.root)
+        app = WindowsJTTApp(registry, workspace_store=workspace, layout_store=layout)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(pilot, lambda: app.selected_id == identity.session_id,
+                                     "initial synthetic selection")
+            await pilot.press("ctrl+g", "w", "right")
+            assert app._panel_index == 0 and app.focused.id == "new-window"
+            await app._refresh_sessions()
+            assert app.focused.id == "new-window"
+            await pilot.press("enter")
+            assert isinstance(app.screen, ModalScreen)
+            name_input = app.screen.query_one("#window-name")
+            name_input.cursor_position = len(name_input.value)
+            await pilot.press("left")
+            assert name_input.cursor_position == len(name_input.value) - 1
+            assert app.focused is name_input
+            await pilot.press("escape")
+            await _wait_for_ui_state(pilot, lambda: not isinstance(app.screen, ModalScreen),
+                                     "Window dialog cancellation")
+            await pilot.press("ctrl+g", "w", "right", "right")
+            assert app._panel_index == 0 and app.focused.id == "workspace-picker"
+            await app._refresh_sessions()
+            assert app.focused.id == "workspace-picker"
+            await pilot.press("enter")
+            assert isinstance(app.screen, ModalScreen)
+            assert app.screen.query_one("#tab-work-kits", Button)
+            await pilot.press("escape")
+            await _wait_for_ui_state(pilot, lambda: not isinstance(app.screen, ModalScreen),
+                                     "archive cancellation")
+            await pilot.press("tab")
+            assert app._panel_index == 1
+            assert app.selected_identity == identity
+            assert registry.create_count == 0 and registry.stop_calls == []
+            assert all(not client.lease and not client.sent and not client.resizes
+                       for client in registry.clients)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_keyboard_window_dialog_cancel_and_confirm_are_distinct(tmp_path, size):
+    async def scenario():
+        registry = FakeRegistry()
+        workspace = JTTWorkspaceStore(tmp_path / "synthetic-jtt")
+        layout = JTTLayoutStore(workspace.root)
+        app = WindowsJTTApp(registry, workspace_store=workspace, layout_store=layout)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(pilot, lambda: len(app.windows) == 1,
+                                     "initial synthetic Window")
+            await pilot.press("ctrl+g", "w", "right", "enter")
+            assert isinstance(app.screen, ModalScreen)
+            await pilot.press("tab")
+            assert app.focused.id == "cancel-window"
+            await pilot.press("enter")
+            await _wait_for_ui_state(pilot, lambda: not isinstance(app.screen, ModalScreen),
+                                     "Window creation cancellation")
+            assert len(app.windows) == 1 and registry.create_count == 0
+
+            await pilot.press("ctrl+g", "w", "right", "enter")
+            assert isinstance(app.screen, ModalScreen)
+            await pilot.press("enter")
+            await _wait_for_ui_state(pilot, lambda: len(app.windows) == 2,
+                                     "confirmed logical Window creation")
+            assert app.selected_id is None and app.client is None
+            assert registry.create_count == 0 and registry.stop_calls == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_archive_tabs_preview_and_open_are_keyboard_accessible(tmp_path, size):
+    def record_focus(name, value):
+        # Keep the actual synthetic focus visible in the runner log even for
+        # passing cases, without depending on external pytest plugins.
+        print(f"JTT_ARCHIVE_FOCUS size={size!r} {name}={value}",
+              file=sys.__stdout__, flush=True)
+
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        workspace = JTTWorkspaceStore(tmp_path / "synthetic-jtt")
+        workspace.set_terminal_ids(workspace.DEFAULT_ID, [identity.session_id])
+        saved = workspace.create_workspace("Saved review")
+        workspace.set_terminal_ids(saved["id"], [identity.session_id])
+        saved = next(item for item in workspace.workspaces() if item["id"] == saved["id"])
+        layout = JTTLayoutStore(workspace.root)
+        kits = JTTWorkKitStore(workspace.root)
+        kits.create_kit("Review template", "Preview only", [
+            {"name": "Checks", "role": "검증", "working_directory": None},
+        ])
+        app = WindowsJTTApp(registry, workspace_store=workspace, layout_store=layout,
+                            work_kit_store=kits)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(pilot, lambda: app.selected_id == identity.session_id,
+                                     "synthetic terminal selection")
+            await pilot.press("ctrl+g", "w", "right", "right", "enter")
+            assert isinstance(app.screen, ModalScreen)
+            await _wait_for_ui_state(
+                pilot,
+                lambda: type(app.screen) is SavedWorkspaceScreen
+                         and app.screen.is_mounted,
+                "Saved Workspace archive screen mounted",
+            )
+            record_focus("archive_initial_focus", _focus_description(app))
+            archive = app.screen
+            await _wait_for_ui_state(
+                pilot,
+                lambda: (app.focused is not None and app.focused.is_attached
+                         and app.focused.screen is archive),
+                "archive has an attached focus target",
+            )
+            record_focus("archive_ready_focus", _focus_description(app))
+            selected_index = next(index for index, item in enumerate(archive.records)
+                                  if item["id"] == app.workspace_id)
+            saved_index = next(index for index, item in enumerate(archive.records)
+                               if item["id"] == saved["id"])
+            path = await _keyboard_focus_target(
+                pilot, app, f"#saved-workspace-choice-{selected_index}", "tab",
+                "current saved reference is keyboard reachable from actual initial focus",
+            )
+            record_focus("archive_to_selected_reference", repr(path))
+            path = await _keyboard_focus_target(
+                pilot, app, "#tab-work-kits", "shift+tab",
+                "reverse navigation reaches Work Kit tab",
+            )
+            assert "saved-workspace-list" in path
+            record_focus("archive_to_work_kit_tab", repr(path))
+            await pilot.press("enter")
+            await _wait_for_ui_state(pilot, lambda: app.screen.active_tab == "work-kit",
+                                     "Work Kit tab")
+            path = await _keyboard_focus_target(
+                pilot, app, "#work-kit-choice-0", "tab", "Work Kit choice keyboard access",
+            )
+            record_focus("archive_to_work_kit_choice", repr(path))
+            await pilot.press("enter")
+            preview = app.screen.query_one("#work-kit-preview", Static).render()
+            assert "Review template" in getattr(preview, "plain", str(preview))
+            assert registry.create_count == 0
+
+            path = await _keyboard_focus_target(
+                pilot, app, "#tab-work-kits", "shift+tab",
+                "reverse navigation reaches Work Kit tab",
+            )
+            assert "work-kit-list" in path
+            record_focus("archive_from_work_kit_choice", repr(path))
+            await _keyboard_focus_target(
+                pilot, app, "#tab-saved-workspaces", "shift+tab",
+                "reverse navigation reaches Saved Workspace tab",
+            )
+            await pilot.press("enter")
+            await _wait_for_ui_state(pilot, lambda: app.screen.active_tab == "saved",
+                                     "saved workspace tab")
+            await _keyboard_focus_target(
+                pilot, app, f"#saved-workspace-choice-{saved_index}", "tab",
+                "saved workspace choice receives keyboard focus",
+            )
+            await pilot.press("enter")
+            await _wait_for_ui_state(pilot, lambda: app.screen.selected_id == saved["id"],
+                                     "saved workspace preview selection")
+            await _keyboard_focus_target(
+                pilot, app, "#open-saved-workspace", "tab",
+                "open saved workspace action receives keyboard focus",
+            )
+            await pilot.press("enter")
+            await _wait_for_ui_state(pilot, lambda: (app.workspace_id == saved["id"]
+                                      and app.selected_identity == identity
+                                      and app.client is not None),
+                                     "saved reference opened")
+            assert app.selected_identity == identity
+            assert app.client is not None and not app.client.lease
+            assert registry.create_count == 0 and registry.stop_calls == []
+            assert all(not client.sent and not client.resizes for client in registry.clients)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_r03_saved_workspace_name_retains_full_identity_in_context(tmp_path, size):
+    async def scenario():
+        registry = FakeRegistry()
+        workspace = JTTWorkspaceStore(tmp_path / "synthetic-jtt")
+        layout = JTTLayoutStore(workspace.root)
+        name = "긴 저장 작업공간 Synthetic workspace review 0123456789"
+        saved = workspace.create_workspace(name)
+        app = WindowsJTTApp(registry, workspace_store=workspace, layout_store=layout)
+        async with app.run_test(size=size) as pilot:
+            await _wait_for_ui_state(pilot, lambda: bool(app.windows), "Window list")
+            await app.select_workspace(saved)
+            context = app.query_one("#workspace-context", Static)
+            rendered = context.render()
+            assert getattr(rendered, "plain", str(rendered)) == name
+            assert name in str(context.tooltip)
+            assert context.styles.text_overflow == "ellipsis"
+            assert app.workspace_id == saved["id"]
+            assert registry.create_count == 0 and registry.stop_calls == []
 
     asyncio.run(scenario())
 
@@ -240,6 +1240,19 @@ def test_card_switch_releases_previous_lease_and_stale_identity_hides_screen():
             assert app.selected_id is None
             assert app.client is None
             assert "신원" in str(app.query_one("#live", Static).render())
+            await app._refresh_sessions()
+            await app._refresh_live()
+            assert app.selected_id is None and app.selected_identity is None
+            assert app.client is None and not app.input_mode
+            assert app._right_observation is None
+            assert second.session_id not in app._mini_cache
+            assert "신원" in str(app.query_one("#live", Static).render())
+            assert all(not client.lease for client in registry.clients)
+
+            await app._select_session(changed)
+            assert app.selected_identity == changed
+            assert app.client is not None and not app.client.lease
+            assert not app.input_mode
 
     asyncio.run(scenario())
 
@@ -298,6 +1311,129 @@ def test_right_paste_uses_only_current_verified_input_lease():
             assert client.sent == []
 
     asyncio.run(scenario())
+
+
+def test_prefix_copy_uses_fresh_selected_right_screen_only_on_request(monkeypatch):
+    windows_ui = importlib.import_module("ju0_terminal_tower.ui.windows_jtt")
+    copied = []
+    monkeypatch.setattr(
+        windows_ui, "_write_windows_clipboard", lambda text: copied.append(text),
+        raising=False,
+    )
+
+    async def scenario():
+        identity = _identity(1)
+        registry = FakeRegistry([identity])
+        app = WindowsJTTApp(registry)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id
+                and app.client is not None,
+                "selected PowerShell observation before explicit copy",
+            )
+            client = app.client
+            assert client is not None and not client.lease
+            assert copied == []
+
+            lines = (
+                "PowerShell 오류: 경로를 찾을 수 없습니다.",
+                "Get-Item: Cannot find path 'JTT_MISSING' because it does not exist.",
+            )
+            screen = _screen_lines(*lines)
+            client.observe = lambda: TerminalObservation(
+                session_id=identity.session_id, generation=identity.generation,
+                shell_pid=identity.shell_pid, sequence=17, state="running",
+                synced=True, columns=100, lines=30, screen=screen,
+                renderer_state="ready",
+            )
+
+            await pilot.press("ctrl+g", "c")
+            await _wait_for_ui_state(
+                pilot, lambda: bool(copied), "explicit RIGHT screen copy",
+            )
+            assert copied == ["\r\n".join(lines)]
+            assert client.lease is False
+            assert app.input_mode is False
+            assert client.sent == []
+
+            # A changed generation invalidates the copy target without touching
+            # the clipboard or sending anything to the old session.
+            app.sessions[identity.session_id] = TerminalIdentity(**{
+                **identity.__dict__, "generation": "f" * 32,
+            })
+            await pilot.press("ctrl+g", "c")
+            await pilot.pause(0.05)
+            assert copied == ["\r\n".join(lines)]
+            assert client.sent == []
+
+    asyncio.run(scenario())
+
+
+def test_windows_copy_chord_never_becomes_shell_ctrl_c(monkeypatch):
+    windows_ui = importlib.import_module("ju0_terminal_tower.ui.windows_jtt")
+    copied = []
+    monkeypatch.setattr(windows_ui, "_write_windows_clipboard", copied.append)
+
+    async def scenario():
+        identity = _identity(1)
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id
+                and app.client is not None,
+                "selected terminal before copy chord",
+            )
+            await app.enter_input_mode()
+            client = app.client
+            assert client is not None and client.lease
+            client.sent.clear()
+
+            await pilot.press("ctrl+shift+c")
+            assert client.sent == []
+            assert copied == [client.screen_text]
+            assert app.input_mode is True
+            await pilot.press("ctrl+c")
+            assert client.sent == [b"\x03"]
+
+    asyncio.run(scenario())
+
+
+def test_shift_click_keeps_windows_terminal_native_selection_available():
+    async def scenario():
+        identity = _identity(1)
+        app = WindowsJTTApp(FakeRegistry([identity]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id
+                and app.client is not None,
+                "selected terminal before native selection click",
+            )
+            assert app.input_mode is False
+            await pilot.click("#live", shift=True)
+            assert app.input_mode is False
+            assert app.client is not None and not app.client.lease
+
+    asyncio.run(scenario())
+
+
+def test_windows_clipboard_writer_sets_unicode_without_reading(monkeypatch):
+    windows_ui = importlib.import_module("ju0_terminal_tower.ui.windows_jtt")
+    calls = []
+    clipboard = SimpleNamespace(
+        OpenClipboard=lambda: calls.append(("open",)),
+        EmptyClipboard=lambda: calls.append(("empty",)),
+        SetClipboardData=lambda kind, text: calls.append(("set", kind, text)),
+        CloseClipboard=lambda: calls.append(("close",)),
+    )
+    constants = SimpleNamespace(CF_UNICODETEXT=13)
+    monkeypatch.setitem(sys.modules, "win32clipboard", clipboard)
+    monkeypatch.setitem(sys.modules, "win32con", constants)
+
+    windows_ui._write_windows_clipboard("오류\r\nPowerShell error")
+
+    assert calls == [
+        ("open",), ("empty",), ("set", 13, "오류\r\nPowerShell error"), ("close",),
+    ]
 
 
 @pytest.mark.parametrize("size", [(80, 24), (160, 44)])
@@ -444,7 +1580,10 @@ def test_unmount_stops_refresh_timers_and_closes_mini_sampler():
         submit_calls = []
 
         def track_interval(*args, **kwargs):
-            timer = set_interval(*args, **kwargs)
+            # This test invokes the sampler explicitly below. Keep real timer
+            # objects so teardown is checked, but prevent background ticks
+            # from consuming the sampler before the assertion.
+            timer = set_interval(3600, *args[1:], **kwargs)
             probe = TimerProbe(timer)
             timers.append(probe)
             return probe
@@ -505,6 +1644,9 @@ def test_mini_live_render_aborts_when_cards_detach_during_unmount():
 
             cards.remove_children = pause_after_detaching_children
             app._card_signature = None
+            # Exercise a structural card remount; live-only changes now update
+            # existing buttons and do not call remove_children.
+            app._card_structure = None
             refresh = asyncio.create_task(app._refresh_mini_live())
             await asyncio.wait_for(removing.wait(), timeout=1.0)
 
@@ -519,7 +1661,8 @@ def test_mini_live_render_aborts_when_cards_detach_during_unmount():
     asyncio.run(scenario())
 
 
-def test_logical_window_switch_filters_cards_and_releases_old_lease(tmp_path):
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (120, 40), (160, 44)])
+def test_logical_window_switch_filters_cards_and_releases_old_lease(tmp_path, size):
     async def scenario():
         first, second = _identity(1), _identity(2)
         registry = FakeRegistry([first, second])
@@ -537,7 +1680,7 @@ def test_logical_window_switch_filters_cards_and_releases_old_lease(tmp_path):
         app = WindowsJTTApp(
             registry, workspace_store=workspace_store, layout_store=layout_store,
         )
-        async with app.run_test(size=(120, 40)) as pilot:
+        async with app.run_test(size=size) as pilot:
             await pilot.pause(0.15)
             assert app.selected_window_id == "window-default"
             assert set(app.sessions) == {first.session_id}
@@ -554,13 +1697,16 @@ def test_logical_window_switch_filters_cards_and_releases_old_lease(tmp_path):
             assert set(app.sessions) == {second.session_id}
             assert app.selected_id == second.session_id
             assert app.client is not None and app.client.identity.session_id == second.session_id
+            assert app.selected_identity.generation == second.generation
+            assert app.client.identity.generation == second.generation
             assert app.client.lease is False
             assert registry.create_count == 0
 
     asyncio.run(scenario())
 
 
-def test_keyboard_window_switch_keeps_left_focus_and_does_not_acquire_new_lease(tmp_path):
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (120, 40), (160, 44)])
+def test_keyboard_window_switch_keeps_left_focus_and_does_not_acquire_new_lease(tmp_path, size):
     async def scenario():
         first, second = _identity(1), _identity(2)
         registry = FakeRegistry([first, second])
@@ -578,7 +1724,7 @@ def test_keyboard_window_switch_keeps_left_focus_and_does_not_acquire_new_lease(
         app = WindowsJTTApp(
             registry, workspace_store=workspace_store, layout_store=layout_store,
         )
-        async with app.run_test(size=(120, 40)) as pilot:
+        async with app.run_test(size=size) as pilot:
             await pilot.pause(0.15)
             await app.enter_input_mode()
             old_client = app.client
@@ -591,6 +1737,7 @@ def test_keyboard_window_switch_keeps_left_focus_and_does_not_acquire_new_lease(
             assert app._panel_index == 0
             assert getattr(app.focused, "id", None) == "window-" + next_window["id"]
             assert app.selected_id == second.session_id
+            assert app.selected_identity.generation == second.generation
             assert app.client is not None and not app.client.lease
             assert old_client.closed and not old_client.lease
             assert registry.create_count == 0
@@ -598,7 +1745,8 @@ def test_keyboard_window_switch_keeps_left_focus_and_does_not_acquire_new_lease(
     asyncio.run(scenario())
 
 
-def test_mini_live_observes_each_card_without_lease_input_or_resize(tmp_path):
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
+def test_mini_live_observes_each_card_without_lease_input_or_resize(tmp_path, size):
     async def scenario():
         first, second = _identity(1), _identity(2)
         registry = FakeRegistry([first, second])
@@ -610,7 +1758,7 @@ def test_mini_live_observes_each_card_without_lease_input_or_resize(tmp_path):
         app = WindowsJTTApp(
             registry, workspace_store=workspace_store, layout_store=layout_store,
         )
-        async with app.run_test(size=(160, 44)) as pilot:
+        async with app.run_test(size=size) as pilot:
             visible_targets = app._visible_mini_targets()
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline and second.session_id not in app._mini_cache:
@@ -687,6 +1835,7 @@ def test_concurrent_session_and_mini_refreshes_serialize_card_mounts(tmp_path):
 
             container.remove_children = gated_remove_children
             app._card_signature = None
+            app._card_structure = None
             first_render = asyncio.create_task(app._render_cards())
             await first_remove_entered.wait()
             app.sessions.pop(second.session_id)
@@ -726,7 +1875,7 @@ def test_windows_ui_projects_legacy_sessions_without_startup_migration(tmp_path)
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("size", [(80, 24), (160, 44)])
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
 def test_ui_logical_window_creation_is_blank_and_does_not_start_a_terminal(tmp_path, size):
     async def scenario():
         existing = _identity(1)
@@ -775,7 +1924,7 @@ def test_ui_logical_window_creation_is_blank_and_does_not_start_a_terminal(tmp_p
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("size", [(80, 24), (160, 44)])
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
 def test_saved_workspace_open_reconnects_exact_live_reference_without_lease_or_write(
     tmp_path, size,
 ):
@@ -928,7 +2077,7 @@ def test_saved_workspace_selection_rejects_changed_snapshot(tmp_path):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("size", [(80, 24), (160, 44)])
+@pytest.mark.parametrize("size", [(80, 24), (120, 35), (160, 44)])
 def test_work_kit_archive_tab_previews_templates_without_running_or_writing(tmp_path, size):
     async def scenario():
         identity = _identity(1)
@@ -1112,6 +2261,81 @@ def test_native_windows_paste_event_enters_selected_powershell(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
+def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
+        tmp_path, monkeypatch):
+    # Patch the module that defines the already-imported app class. Earlier
+    # tests may also import the shared namespace under its legacy name, so a
+    # package-name import here can target a second module object in a full run.
+    windows_ui = importlib.import_module(WindowsJTTApp.__module__)
+    from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry
+
+    registry = TerminalRegistry(root=tmp_path / "isolated-copy-home" / "terminals")
+    owner = registry.create("Isolated copy output")
+    identity = owner.identity
+    owner.close()
+    app = WindowsJTTApp(registry)
+    copied = []
+    monkeypatch.setattr(windows_ui, "_write_windows_clipboard", copied.append)
+
+    async def scenario():
+        async with app.run_test(size=(160, 44)) as pilot:
+            await _wait_for_ui_state(
+                pilot, lambda: app.selected_id == identity.session_id
+                and app.client is not None,
+                "existing isolated ConPTY copy target", timeout=20,
+            )
+            assert app.selected_identity is not None
+            assert _same_identity(identity, app.selected_identity)
+            await app.enter_input_mode()
+            assert app.input_mode and app.client is not None and app.client.lease
+            nonce = identity.session_id[:10]
+            expected = (
+                f"한글-JTT_COPY_{nonce}-OK",
+                f"JTT_ERROR_{nonce}_END",
+                f"JTT_FINAL_{nonce}_END",
+            )
+            commands = (
+                (f"Write-Output ('한글-' + 'JTT_COPY_{nonce}' + '-OK')", expected[0]),
+                (f"Write-Error ('JTT_ERROR_' + '{nonce}' + '_END')", expected[1]),
+                (f"Write-Output ('JTT_FINAL_' + '{nonce}' + '_END')", expected[2]),
+            )
+            for command, marker in commands:
+                assert marker not in command
+                await app._send_bytes((command + "\r").encode("utf-8"))
+                await _wait_for_ui_state(
+                    pilot,
+                    lambda marker=marker: app._right_observation is not None
+                    and marker in "".join(
+                        _plain_screen_text(app._right_observation[3]).split()
+                    ),
+                    f"generated PowerShell output {marker}", timeout=20,
+                )
+            await app.leave_input_mode()
+            # Windows Terminal may reserve Ctrl+Shift+C for its host copy
+            # command; exercise JTT's explicit copy fallback through its prefix.
+            await pilot.press("ctrl+g", "c")
+            await _wait_for_ui_state(
+                pilot, lambda: bool(copied), "explicit copy chord payload",
+            )
+            payload = copied[-1]
+            compact_payload = "".join(payload.split())
+            assert all(marker in compact_payload for marker in expected)
+            assert "\r\n" in payload
+            await pilot.press("ctrl+g", "d")
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        current = next((item for item in registry.list_sessions()
+                        if item.session_id == identity.session_id), None)
+        if current is not None and _same_identity(identity, current):
+            registry.stop(
+                current.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
 def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path):
     from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry, _process_facts
 
@@ -1247,7 +2471,11 @@ def test_native_windows_ui_create_input_detach_reconnect_and_safe_stop(tmp_path)
                 await assert_still_running(identity)
 
                 # Simulate a stale card identity without changing persisted
-                # registry metadata or the owned PowerShell process.
+                # registry metadata or the owned PowerShell process. Pause
+                # periodic reconciliation so it does not correctly clear the
+                # deliberately stale selection before the stop confirmation
+                # can exercise its own final identity check.
+                stop_app._stop_refresh_timers()
                 stale_identity = TerminalIdentity(**{
                     **identity.__dict__, "generation": "f" * 32,
                 })
@@ -1323,7 +2551,11 @@ def test_native_windows_interactive_latency_profile(tmp_path, size):
         return ordered[min(len(ordered) - 1, (len(ordered) * percent + 99) // 100 - 1)]
 
     def screen_contains(screen, text):
-        return any(text in "".join(cell.text for cell in row) for row in screen.rows)
+        # A short overall UI can wrap the echoed token across RIGHT rows. Keep
+        # the assertion about visible output while ignoring that line boundary.
+        return text in "".join(
+            cell.text for row in screen.rows for cell in row
+        )
 
     async def scenario():
         async with app.run_test(size=size) as pilot:

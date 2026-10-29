@@ -124,100 +124,245 @@ def _process_start_or_fail(pid: int) -> str:
     return value
 
 
-def _session_processes(session_id: int) -> dict[int, str]:
-    """Return live ``/proc`` members of one PTY-owned process session.
+def _proc_identity(pid: int):
+    """Read the identity fields needed for a process owned by this worker.
 
-    A shell can place a background job in another process group without
-    leaving its session. Signalling only the shell's process group therefore
-    leaks that job on explicit terminal stop. The PTY child is started as a
-    fresh session leader, so its session ID is the scope boundary here.
+    Only explicitly discovered descendants are queried. This deliberately
+    avoids enumerating the host's complete ``/proc`` table.
     """
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(
+            encoding="ascii"
+        ).rsplit(")", 1)[1].split()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ESRCH):
+            return None
+        raise TerminalError("owned process identity is unavailable") from exc
+    except (IndexError, ValueError) as exc:
+        raise TerminalError("owned process identity is malformed") from exc
+    try:
+        return {
+            "state": fields[0],
+            "ppid": int(fields[1]),
+            "session": int(fields[3]),
+            "start": fields[19],
+        }
+    except (IndexError, ValueError) as exc:
+        raise TerminalError("owned process identity is malformed") from exc
 
-    members = {}
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
+
+def _children_of(pid: int) -> set[int]:
+    """Read direct children only from the thread directories of one process."""
+    parent_before = _proc_identity(pid)
+    if parent_before is None:
+        return set()
+    task_root = Path(f"/proc/{pid}/task")
+    try:
+        tasks = tuple(task_root.iterdir())
+    except FileNotFoundError:
+        if _proc_identity(pid) is None:
+            return set()
+        raise TerminalError("owned process child inventory is unavailable")
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ESRCH):
+            if _proc_identity(pid) is None:
+                return set()
+        raise TerminalError("owned process children are unavailable") from exc
+    children = set()
+    for task in tasks:
+        if not task.name.isdigit():
             continue
         try:
-            fields = (entry / "stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
-            if fields[0] in ("Z", "X") or int(fields[3]) != session_id:
+            raw = (task / "children").read_text(encoding="ascii")
+        except FileNotFoundError:
+            try:
+                task.lstat()
+            except FileNotFoundError:
                 continue
-            members[int(entry.name)] = fields[19]
-        except (OSError, IndexError, ValueError):
-            # Processes can exit while /proc is enumerated. The next scan
-            # observes the stable set; malformed/unreadable entries are not
-            # signalled.
+            except OSError as exc:
+                raise TerminalError("owned process child inventory is unavailable") from exc
+            raise TerminalError("owned process child inventory is unavailable")
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
+                continue
+            raise TerminalError("owned process children are unavailable") from exc
+        try:
+            children.update(int(value) for value in raw.split())
+        except ValueError as exc:
+            raise TerminalError("owned process children are malformed") from exc
+    parent_after = _proc_identity(pid)
+    if parent_after is None:
+        return set()
+    if parent_after["start"] != parent_before["start"]:
+        raise TerminalError("owned process identity changed during child inventory")
+    return children
+
+
+def _set_child_subreaper() -> None:
+    """Make this one-terminal worker adopt orphaned terminal descendants."""
+    if not sys.platform.startswith("linux"):
+        raise TerminalError("owned process cleanup requires Linux subreaper support")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                          ctypes.c_ulong, ctypes.c_ulong]
+        prctl.restype = ctypes.c_int
+        current = ctypes.c_int()
+        if prctl(37, ctypes.addressof(current), 0, 0, 0) != 0:  # PR_GET_CHILD_SUBREAPER
+            raise OSError(ctypes.get_errno(), "PR_GET_CHILD_SUBREAPER failed")
+        if not current.value and prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+            raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER failed")
+        current = ctypes.c_int()
+        if (prctl(37, ctypes.addressof(current), 0, 0, 0) != 0
+                or not current.value):
+            raise OSError(ctypes.get_errno(), "child subreaper state was not established")
+    except Exception as exc:
+        raise TerminalError("cannot establish terminal process ownership boundary") from exc
+
+
+def _owned_process_tree(root_pid: int, expected_start: str, *,
+                        owner_pid: Optional[int], allow_root_reaped: bool = False,
+                        include_adopted: bool = False
+                        ) -> dict[int, tuple[str, str]]:
+    """Return live and zombie descendants of this one terminal worker.
+
+    Traversal follows ``children`` files beneath the verified shell and the
+    dedicated worker's direct children. The latter are orphaned descendants
+    adopted by the worker subreaper. No unrelated process table is scanned.
+    """
+    root = _proc_identity(root_pid)
+    members: dict[int, tuple[str, str]] = {}
+    pending: list[tuple[int, str]] = []
+    if root is None:
+        if not allow_root_reaped:
+            raise TerminalError("owned shell identity is unavailable")
+    else:
+        if (root["start"] != expected_start
+                or (owner_pid is not None and root["ppid"] != owner_pid)):
+            raise TerminalError("owned shell identity changed during stop")
+        if root["session"] != root_pid:
+            raise TerminalError("owned shell session identity changed during stop")
+        members[root_pid] = (root["start"], root["state"])
+        pending.append((root_pid, root["start"]))
+
+    # A dedicated worker has one direct child at launch: the PTY shell. Other
+    # direct children can only be its descendants reparented by the subreaper.
+    if include_adopted:
+        if owner_pid is None:
+            raise TerminalError("adopted process ownership is unavailable")
+        for child_pid in _children_of(owner_pid):
+            info = _proc_identity(child_pid)
+            if info is None:
+                continue
+            if info["ppid"] != owner_pid:
+                continue
+            if child_pid == root_pid:
+                if info["start"] != expected_start:
+                    raise TerminalError("owned shell PID was reused during stop")
+                continue
+            members[child_pid] = (info["start"], info["state"])
+            pending.append((child_pid, info["start"]))
+
+    while pending:
+        parent_pid, parent_start = pending.pop()
+        before = _proc_identity(parent_pid)
+        if before is None:
             continue
+        if before["start"] != parent_start:
+            raise TerminalError("owned process identity changed during stop")
+        child_pids = _children_of(parent_pid)
+        after = _proc_identity(parent_pid)
+        if after is None:
+            continue
+        if after["start"] != parent_start:
+            raise TerminalError("owned process identity changed during stop")
+        for child_pid in child_pids:
+            info = _proc_identity(child_pid)
+            if info is None:
+                continue
+            if info["ppid"] != parent_pid and not (
+                    include_adopted and owner_pid is not None
+                    and info["ppid"] == owner_pid):
+                raise TerminalError("owned descendant changed parent unexpectedly")
+            if child_pid in members:
+                if members[child_pid][0] != info["start"]:
+                    raise TerminalError("owned descendant PID was reused during stop")
+                continue
+            members[child_pid] = (info["start"], info["state"])
+            pending.append((child_pid, info["start"]))
     return members
 
 
-def _process_start_in_session(pid: int, session_id: int) -> Optional[str]:
-    try:
-        fields = Path("/proc/{}/stat".format(pid)).read_text(
-            encoding="ascii"
-        ).rsplit(")", 1)[1].split()
-        if fields[0] in ("Z", "X") or int(fields[3]) != session_id:
-            return None
-        return fields[19]
-    except (OSError, IndexError, ValueError):
-        return None
-
-
-def _signal_session_processes(session_id: int, signum: int,
-                              already_signalled: Optional[set[tuple[int, str]]] = None
-                              ) -> set[tuple[int, str]]:
-    """Signal only still-matching process identities in the owned session."""
-
+def _signal_owned_process_tree(root_pid: int, expected_start: str, signum: int,
+                               *, owner_pid: Optional[int],
+                               already_signalled: Optional[set[tuple[int, str]]] = None,
+                               allow_root_reaped: bool = False,
+                               include_adopted: bool = False
+                               ) -> set[tuple[int, str]]:
+    """Signal only process identities still inside this worker's owned tree."""
     sent = already_signalled if already_signalled is not None else set()
-    for pid, start in _session_processes(session_id).items():
+    snapshot = _owned_process_tree(
+        root_pid, expected_start, owner_pid=owner_pid,
+        allow_root_reaped=allow_root_reaped, include_adopted=include_adopted,
+    )
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is None or pidfd_send_signal is None:
+        raise TerminalError("owned process signaling requires pidfd support")
+    for pid, (start, state) in snapshot.items():
         identity = (pid, start)
-        if identity in sent:
+        if identity in sent or state in ("Z", "X"):
             continue
-        # Re-read immediately before signalling so an exited PID reused by an
-        # unrelated process is not acted upon.
-        pidfd_open = getattr(os, "pidfd_open", None)
-        pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
-        pidfd = None
-        if pidfd_open is not None and pidfd_send_signal is not None:
+        try:
+            pidfd = pidfd_open(pid, 0)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            raise TerminalError("owned process pidfd could not be acquired") from exc
+        try:
+            current = _owned_process_tree(
+                root_pid, expected_start, owner_pid=owner_pid,
+                allow_root_reaped=allow_root_reaped,
+                include_adopted=include_adopted,
+            ).get(pid)
+            if (current is None or current[0] != start
+                    or current[1] in ("Z", "X")):
+                continue
             try:
-                pidfd = pidfd_open(pid, 0)
+                pidfd_send_signal(pidfd, signum)
             except ProcessLookupError:
                 continue
             except OSError as exc:
-                # Python may expose the API while the running kernel or a
-                # seccomp profile denies the syscall. Use the documented
-                # start-time/session recheck fallback for those cases.
-                if exc.errno not in (errno.ENOSYS, errno.EINVAL, errno.EPERM):
-                    raise
-            else:
-                try:
-                    if _process_start_in_session(pid, session_id) != start:
-                        continue
-                    try:
-                        pidfd_send_signal(pidfd, signum)
-                    except ProcessLookupError:
-                        continue
-                    except OSError as exc:
-                        if exc.errno not in (errno.ENOSYS, errno.EINVAL, errno.EPERM):
-                            raise
-                        # Some kernels expose pidfd_open but not pidfd_send_signal.
-                        # Close this descriptor and use the checked kill(2) path.
-                    else:
-                        sent.add(identity)
-                        continue
-                finally:
-                    os.close(pidfd)
+                raise TerminalError("owned process pidfd signal failed") from exc
+            sent.add(identity)
+        finally:
+            os.close(pidfd)
+    return sent
 
-        # Older Linux/Python combinations without pidfd support still recheck
-        # both session membership and process start time immediately before
-        # kill(2); pidfd is preferred because it closes the PID-reuse race.
-        if _process_start_in_session(pid, session_id) != start:
+
+def _reap_adopted_descendants(root_pid: int, expected_start: str, *,
+                              owner_pid: int,
+                              allow_root_reaped: bool = False) -> None:
+    """Reap only zombie children that this terminal worker adopted."""
+    members = _owned_process_tree(
+        root_pid, expected_start, owner_pid=owner_pid,
+        allow_root_reaped=allow_root_reaped, include_adopted=True,
+    )
+    for pid, (start, state) in members.items():
+        if pid == root_pid or state not in ("Z", "X"):
+            continue
+        current = _proc_identity(pid)
+        if current is None or current["start"] != start or current["ppid"] != owner_pid:
             continue
         try:
-            os.kill(pid, signum)
-        except ProcessLookupError:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            # A process can still be awaiting reparenting when a snapshot was
+            # taken. The next scoped traversal decides whether it is owned.
             continue
-        sent.add(identity)
-    return sent
 
 
 def _safe_child_setup(slave_fd: int) -> None:
@@ -312,6 +457,8 @@ class PtyOwner:
         self._store_state("starting", startup_stage="renderer_init")
         self._open_vt()
         try:
+            self._store_state("starting", startup_stage="process_ownership")
+            _set_child_subreaper()
             self.startup_stage = "pty_shell_start"
             self._store_state("starting", startup_stage=self.startup_stage)
             self._start_shell()
@@ -552,6 +699,8 @@ class PtyOwner:
         if op == "resize":
             return self._resize(client_id, request), False
         if op == "stop":
+            if self.metadata.get("state") not in {"running", "exited", "stopping"}:
+                raise TerminalError("session_unavailable")
             # A stop request can arrive after the PTY shell exits but before
             # the next event-loop iteration. Persist its wait status before
             # cleanup so that an unconfirmed exit never authorizes signalling
@@ -865,42 +1014,64 @@ class PtyOwner:
         if expected_start and current_start not in (None, expected_start):
             raise TerminalError("shell identity changed during stop")
         if not expected_start:
-            # Startup can fail after Popen but before /proc identity capture.
-            # At that point the fresh shell has received no terminal input or
-            # commands, and Popen still owns its unreaped child PID.
-            child.terminate()
-            try:
-                child.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait(timeout=2.0)
-            self._check_child()
-            return
+            # Popen proves which direct child was created, but without its
+            # kernel start identity we cannot safely enumerate or signal the
+            # shell's descendants. Fail closed; the parent keeps registry
+            # evidence unless a later verified cleanup boundary is recorded.
+            raise TerminalError("shell start identity is unavailable; registry retained")
 
-        # Every PTY shell starts a fresh session (setsid in _safe_child_setup).
-        # Terminate its live members by verified PID/start-time within that
-        # session, not just its process group: shells can put jobs in their
-        # own process groups while keeping those jobs in the same session.
+        # This worker is a subreaper and owns exactly one PTY shell. Traverse
+        # that shell's process tree plus descendants reparented to this worker;
+        # unlike a session-only scan, this includes children that create a new
+        # process group or session.
         term_sent = set()
         try:
-            _signal_session_processes(pid, signal.SIGTERM, term_sent)
             term_deadline = time.monotonic() + 2.0
             while time.monotonic() < term_deadline:
-                child.poll()  # Reap the shell if it has exited.
-                if not _session_processes(pid):
-                    break
-                _signal_session_processes(pid, signal.SIGTERM, term_sent)
-                time.sleep(0.05)
-
-            # Escalate only against processes still observed in this PTY's
-            # session. This also catches stubborn children in separate groups.
-            kill_deadline = time.monotonic() + 2.0
-            while time.monotonic() < kill_deadline:
-                remaining = _session_processes(pid)
+                child.poll()  # Popen owns and reaps the original shell.
+                allow_root_reaped = child.returncode is not None
+                _reap_adopted_descendants(
+                    pid, expected_start, owner_pid=os.getpid(),
+                    allow_root_reaped=allow_root_reaped,
+                )
+                remaining = _owned_process_tree(
+                    pid, expected_start, owner_pid=os.getpid(),
+                    allow_root_reaped=allow_root_reaped,
+                    include_adopted=True,
+                )
                 if not remaining:
                     break
-                _signal_session_processes(pid, signal.SIGKILL)
+                _signal_owned_process_tree(
+                    pid, expected_start, signal.SIGTERM,
+                    owner_pid=os.getpid(), already_signalled=term_sent,
+                    allow_root_reaped=allow_root_reaped,
+                    include_adopted=True,
+                )
+                time.sleep(0.05)
+
+            # Escalate only against the same verified process tree. Descendants
+            # adopted during shutdown are included on each bounded pass.
+            kill_deadline = time.monotonic() + 2.0
+            while time.monotonic() < kill_deadline:
                 child.poll()
+                allow_root_reaped = child.returncode is not None
+                _reap_adopted_descendants(
+                    pid, expected_start, owner_pid=os.getpid(),
+                    allow_root_reaped=allow_root_reaped,
+                )
+                remaining = _owned_process_tree(
+                    pid, expected_start, owner_pid=os.getpid(),
+                    allow_root_reaped=allow_root_reaped,
+                    include_adopted=True,
+                )
+                if not remaining:
+                    break
+                _signal_owned_process_tree(
+                    pid, expected_start, signal.SIGKILL,
+                    owner_pid=os.getpid(),
+                    allow_root_reaped=allow_root_reaped,
+                    include_adopted=True,
+                )
                 time.sleep(0.02)
         except OSError as exc:
             raise TerminalError("cannot inspect PTY process session") from exc
@@ -909,6 +1080,15 @@ class PtyOwner:
             child.wait(timeout=2.0)
         except subprocess.TimeoutExpired as exc:
             raise TerminalError("PTY shell did not exit after session termination") from exc
+        _reap_adopted_descendants(
+            pid, expected_start, owner_pid=os.getpid(), allow_root_reaped=True,
+        )
+        remaining = _owned_process_tree(
+            pid, expected_start, owner_pid=os.getpid(), allow_root_reaped=True,
+            include_adopted=True,
+        )
+        if remaining:
+            raise TerminalError("owned terminal descendants remain after stop")
         self._check_child()
 
     def _shutdown(self):
@@ -939,10 +1119,13 @@ class PtyOwner:
         except FileNotFoundError:
             pass
         if self.metadata.get("state") != "exited":
-            self._store_state("stopped")
-        elif self.metadata.get("state") == "exited":
-            self._store_state("exited", exit_code=self.metadata.get("exit_code"),
-                              exit_signal=self.metadata.get("exit_signal"))
+            self._store_state("stopped", process_tree_cleanup_verified=True)
+        else:
+            self._store_state(
+                "exited", exit_code=self.metadata.get("exit_code"),
+                exit_signal=self.metadata.get("exit_signal"),
+                process_tree_cleanup_verified=True,
+            )
 
 
 def _safe_error(exc: Exception) -> str:
