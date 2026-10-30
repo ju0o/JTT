@@ -786,12 +786,17 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
     identity = client.identity
     marker_file = tmp_path / "owned-job-pids.txt"
     marker_path = str(marker_file).replace("'", "''")
+    launcher_stage_file = tmp_path / "owned-job-launcher-stage.txt"
+    launcher_stage_path = str(launcher_stage_file).replace("'", "''")
     child_stage_file = tmp_path / "owned-job-child-stage.txt"
     child_stage_path = str(child_stage_file).replace("'", "''")
+    grandchild_launch_file = tmp_path / "owned-job-grandchild-launch.txt"
+    grandchild_launch_path = str(grandchild_launch_file).replace("'", "''")
     grandchild_stage_file = tmp_path / "owned-job-grandchild-stage.txt"
     grandchild_stage_path = str(grandchild_stage_file).replace("'", "''")
     child_script_file = work / "owned-job-child.ps1"
     child_script_path = str(child_script_file).replace("'", "''")
+    launcher_script_file = work / "owned-job-launcher.ps1"
     grandchild_script_file = work / "owned-job-grandchild.ps1"
     grandchild_script_path = str(grandchild_script_file).replace("'", "''")
     nonce = uuid.uuid4().hex[:10]
@@ -803,34 +808,74 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
     # tell us whether child creation or command-line parsing had failed.
     grandchild_script_file.write_text(
         "\n".join((
-            "[System.IO.File]::WriteAllText('" + grandchild_stage_path + "',[string]$PID)",
+            "try {",
+            "[System.IO.File]::WriteAllText('" + grandchild_stage_path
+            + "','grandchild_started|'+[string]$PID)",
             "Start-Sleep -Seconds 60",
+            "} catch {",
+            "$failure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId",
+            "[System.IO.File]::WriteAllText('" + grandchild_stage_path
+            + "','grandchild_error|'+$failure)",
+            "throw",
+            "}",
         )) + "\n",
         encoding="utf-8-sig",
     )
     child_script_file.write_text(
         "\n".join((
-            "[System.IO.File]::WriteAllText('" + child_stage_path + "','child_started')",
+            "try {",
+            "$stage='child_start_marker'",
+            "[System.IO.File]::WriteAllText('" + child_stage_path
+            + "','child_started|'+[string]$PID)",
+            "$stage='grandchild_start_process'",
+            "$grand=$null",
+            "try {",
             "$grand=Start-Process -ErrorAction Stop -PassThru -WindowStyle Hidden "
             "-FilePath (Join-Path $PSHOME 'powershell.exe') "
             "-ArgumentList ('-NoLogo -NoProfile -File \"" + grandchild_script_path + "\"')",
+            "} catch { throw }",
+            "$stage='grandchild_launch_marker'",
+            "try {",
+            "[System.IO.File]::WriteAllText('" + grandchild_launch_path
+            + "','grandchild_process_created|'+[string]$grand.Id)",
+            "} catch { throw }",
+            "$stage='grandchild_start_observation'",
             "$deadline=[DateTime]::UtcNow.AddSeconds(10)",
             "while (-not [System.IO.File]::Exists('" + grandchild_stage_path + "') "
             "-and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 25 }",
             "$grand_stage=[System.IO.File]::ReadAllText('" + grandchild_stage_path + "').Trim()",
-            "if ($grand_stage -ne [string]$grand.Id) { throw 'grandchild stage identity mismatch' }",
+            "if ($grand_stage -ne ('grandchild_started|'+[string]$grand.Id)) "
+            "{ throw 'grandchild stage identity mismatch' }",
             "[System.IO.File]::WriteAllText('" + marker_path + "',"
             "([string]$PID+','+[string]$grand.Id))",
             "Start-Sleep -Seconds 60",
+            "} catch {",
+            "$failure=$stage+'|'+$_.Exception.GetType().Name+'|'"
+            "+$_.FullyQualifiedErrorId",
+            "[System.IO.File]::WriteAllText('" + child_stage_path
+            + "','child_error|'+$failure)",
+            "throw",
+            "}",
         )) + "\n",
         encoding="utf-8-sig",
     )
     outer_command = (
         "[Console]::WriteLine('JTT_'+'OWNED_START_'+ '" + nonce + "'+'_END'); "
-        "$null=Start-Process -PassThru -WindowStyle Hidden "
+        "$__jtt_stage='" + launcher_stage_path + "'; "
+        "$__jtt_script='" + child_script_path + "'; "
+        "try { $child=Start-Process -ErrorAction Stop -PassThru -WindowStyle Hidden "
         "-FilePath (Join-Path $PSHOME 'powershell.exe') "
-        "-ArgumentList ('-NoLogo -NoProfile -File \"" + child_script_path + "\"')"
+        "-ArgumentList ('-NoLogo -NoProfile -File \"'+$__jtt_script+'\"') } catch { "
+        "$failure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId; "
+        "[System.IO.File]::WriteAllText($__jtt_stage,'start_process_error|'+$failure); "
+        "$child=$null }; "
+        "if ($null -ne $child) { try { [System.IO.File]::WriteAllText($__jtt_stage,"
+        "'child_process_created|'+[string]$child.Id) } catch { "
+        "[System.IO.File]::WriteAllText($__jtt_stage,"
+        "'child_created_but_stage_write_error|'+$_.Exception.GetType().Name) } }"
     )
+    launcher_script_file.write_text(outer_command + "\n", encoding="utf-8-sig")
+    outer_command = ".\\owned-job-launcher.ps1"
     assert command_started_marker not in outer_command
     assert tree_marker_prefix not in outer_command
     assert len(outer_command) < 512
@@ -880,43 +925,174 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         assert command_started_marker in _screen_text(start_update.screen)
         record_property("owned_job_command_started", True)
 
+        def read_stage(path):
+            try:
+                return path.read_text(encoding="utf-8-sig").strip()
+            except (OSError, UnicodeError):
+                return ""
+
+        launcher_deadline = time.monotonic() + 15
+        launcher_stage = "ABSENT"
+        while time.monotonic() < launcher_deadline:
+            launcher_stage = read_stage(launcher_stage_file)
+            if launcher_stage:
+                break
+            last_update = client.poll()
+            raw_output.extend(last_update.output)
+            time.sleep(0.02)
+        launcher_parts = launcher_stage.split("|")
+        record_property(
+            "owned_job_launcher_stage",
+            launcher_parts[0] if launcher_parts else "ABSENT",
+        )
+        if launcher_parts[0] != "child_process_created":
+            record_property(
+                "owned_job_start_process_error_category",
+                launcher_parts[1] if len(launcher_parts) > 1 else "UNKNOWN",
+            )
+            record_property(
+                "owned_job_start_process_error_id",
+                launcher_parts[2] if len(launcher_parts) > 2 else "UNKNOWN",
+            )
+            raise AssertionError(
+                "Start-Process stage did not confirm child creation; "
+                f"observed={launcher_parts[0] if launcher_parts else 'ABSENT'}"
+            )
+        launcher_child_pid = launcher_parts[-1]
+        record_property("owned_job_launcher_child_pid_is_decimal",
+                        launcher_child_pid.isdecimal())
+        assert launcher_child_pid.isdecimal(), (
+            "Start-Process returned without a decimal test-child PID"
+        )
+        expected_image = os.path.normcase(
+            os.path.abspath(str(_powershell_executable()))
+        )
+        child_created, child_image, child_alive = _process_facts(
+            int(launcher_child_pid)
+        )
+        assert child_alive and child_created and child_image == expected_image, (
+            "the test-owned child PID did not resolve to the expected live "
+            "PowerShell identity"
+        )
+        child_handle = _retain_test_process_handle(
+            int(launcher_child_pid), child_created, expected_image
+        )
+        processes.append((int(launcher_child_pid), child_created, child_handle))
+        record_property("owned_job_child_handle_retained_before_stop", True)
+
         child_started_deadline = time.monotonic() + 15
         child_stage = "ABSENT"
         while time.monotonic() < child_started_deadline:
-            if child_stage_file.is_file():
-                try:
-                    observed_stage = child_stage_file.read_text(
-                        encoding="utf-8-sig"
-                    ).strip()
-                except (OSError, UnicodeError):
-                    observed_stage = ""
-                if observed_stage == "child_started":
-                    child_stage = observed_stage
-                    break
+            child_stage = read_stage(child_stage_file)
+            if child_stage:
+                break
             last_update = client.poll()
             raw_output.extend(last_update.output)
             time.sleep(0.02)
-        record_property("owned_job_child_stage", child_stage)
-        assert child_stage == "child_started", (
-            "PowerShell started the outer command but the test-owned child "
-            "script did not start"
+        child_parts = child_stage.split("|")
+        record_property(
+            "owned_job_child_stage",
+            child_parts[0] if child_parts else "ABSENT",
+        )
+        if child_parts[0] == "child_error":
+            record_property(
+                "owned_job_child_error_stage",
+                child_parts[1] if len(child_parts) > 1 else "UNKNOWN",
+            )
+            record_property(
+                "owned_job_child_error_category",
+                child_parts[2] if len(child_parts) > 2 else "UNKNOWN",
+            )
+            record_property(
+                "owned_job_child_error_id",
+                child_parts[3] if len(child_parts) > 3 else "UNKNOWN",
+            )
+        assert child_parts[0] == "child_started", (
+            "child process was created but its script did not publish the "
+            f"start stage (observed={child_parts[0] if child_parts else 'ABSENT'})"
+        )
+        child_stage_pid = child_parts[-1]
+        assert child_stage_pid.isdecimal()
+        assert child_stage_pid == launcher_child_pid, (
+            "Start-Process returned a different child PID than the child script"
         )
 
-        grandchild_deadline = time.monotonic() + 15
-        grandchild_pid_text = ""
-        while time.monotonic() < grandchild_deadline:
-            if grandchild_stage_file.is_file():
-                try:
-                    grandchild_pid_text = grandchild_stage_file.read_text(
-                        encoding="ascii"
-                    ).strip()
-                except (OSError, UnicodeError):
-                    grandchild_pid_text = ""
-                if grandchild_pid_text.isdecimal():
-                    break
+        grandchild_launch_deadline = time.monotonic() + 15
+        grandchild_launch = "ABSENT"
+        while time.monotonic() < grandchild_launch_deadline:
+            grandchild_launch = read_stage(grandchild_launch_file)
+            if grandchild_launch:
+                break
             last_update = client.poll()
             raw_output.extend(last_update.output)
             time.sleep(0.02)
+        grandchild_launch_parts = grandchild_launch.split("|")
+        record_property(
+            "owned_job_grandchild_process_stage",
+            grandchild_launch_parts[0] if grandchild_launch_parts else "ABSENT",
+        )
+        if grandchild_launch_parts[0] != "grandchild_process_created":
+            late_child_stage = read_stage(child_stage_file).split("|")
+            if late_child_stage and late_child_stage[0] == "child_error":
+                record_property(
+                    "owned_job_grandchild_failure_stage",
+                    late_child_stage[1] if len(late_child_stage) > 1 else "UNKNOWN",
+                )
+                record_property(
+                    "owned_job_grandchild_failure_category",
+                    late_child_stage[2] if len(late_child_stage) > 2 else "UNKNOWN",
+                )
+                record_property(
+                    "owned_job_grandchild_failure_id",
+                    late_child_stage[3] if len(late_child_stage) > 3 else "UNKNOWN",
+                )
+        assert grandchild_launch_parts[0] == "grandchild_process_created", (
+            "child started but Start-Process did not confirm grandchild "
+            f"creation (observed={grandchild_launch_parts[0] if grandchild_launch_parts else 'ABSENT'})"
+        )
+        launched_grandchild_pid = grandchild_launch_parts[-1]
+        assert launched_grandchild_pid.isdecimal()
+        grandchild_created, grandchild_image, grandchild_alive = _process_facts(
+            int(launched_grandchild_pid)
+        )
+        assert (
+            grandchild_alive and grandchild_created
+            and grandchild_image == expected_image
+        ), "the test-owned grandchild PID did not resolve to its expected live identity"
+        grandchild_handle = _retain_test_process_handle(
+            int(launched_grandchild_pid), grandchild_created, expected_image
+        )
+        processes.append((
+            int(launched_grandchild_pid), grandchild_created, grandchild_handle
+        ))
+        record_property("owned_job_grandchild_handle_retained_before_stop", True)
+
+        grandchild_deadline = time.monotonic() + 15
+        grandchild_stage = ""
+        while time.monotonic() < grandchild_deadline:
+            grandchild_stage = read_stage(grandchild_stage_file)
+            if grandchild_stage:
+                break
+            last_update = client.poll()
+            raw_output.extend(last_update.output)
+            time.sleep(0.02)
+        grandchild_stage_parts = grandchild_stage.split("|")
+        if grandchild_stage_parts[0] == "grandchild_error":
+            record_property(
+                "owned_job_grandchild_error_category",
+                grandchild_stage_parts[1]
+                if len(grandchild_stage_parts) > 1 else "UNKNOWN",
+            )
+            record_property(
+                "owned_job_grandchild_error_id",
+                grandchild_stage_parts[2]
+                if len(grandchild_stage_parts) > 2 else "UNKNOWN",
+            )
+        grandchild_pid_text = (
+            grandchild_stage_parts[-1]
+            if grandchild_stage_parts[0] == "grandchild_started"
+            else ""
+        )
         record_property(
             "owned_job_grandchild_started_marker_status",
             "VALID" if grandchild_pid_text.isdecimal() else "ABSENT_OR_INVALID",
@@ -953,18 +1129,16 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
             f"identity data was not produced ({marker_status})"
         )
         child_pid, grandchild_pid = (int(value) for value in pid_values)
+        assert child_pid == int(launcher_child_pid)
+        assert grandchild_pid == int(launched_grandchild_pid)
         assert grandchild_pid == int(grandchild_pid_text), (
             "parent-reported grandchild PID did not match the grandchild's "
             "independent startup marker"
         )
         assert len({child_pid, grandchild_pid, identity.shell_pid}) == 3
-        expected_image = os.path.normcase(os.path.abspath(str(_powershell_executable())))
-        for pid in (child_pid, grandchild_pid):
-            created, image, alive = _process_facts(pid)
-            assert alive and created
-            assert image == expected_image
-            handle = _retain_test_process_handle(pid, created, expected_image)
-            processes.append((pid, created, handle))
+        assert {pid for pid, _created, _handle in processes} == {
+            child_pid, grandchild_pid,
+        }
         membership = []
         for pid, created, handle in processes:
             in_windows_job = bool(win32job.IsProcessInJob(handle, None))
@@ -1822,8 +1996,8 @@ def test_native_input_reply_sequence_does_not_ack_unread_output(tmp_path):
 @pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
 def test_native_conpty_input_execution_path_comparison(
         tmp_path, monkeypatch, record_property):
-    """Compare direct pywinpty writes with the JTT worker's same PS inputs."""
-    import ju0_terminal_tower  # noqa: F401 - installs guarded namespace
+    """Compare steady-state commands in one direct and one JTT-owned shell."""
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded namespace
     import pyte
     import win32api
     import win32con
@@ -1832,447 +2006,649 @@ def test_native_conpty_input_execution_path_comparison(
     from tmux_agent_tower.terminal import TerminalRegistry, windows_manager
 
     root = tmp_path / "jtt-conpty-input-rootcause"
-    start = root / "long-start" / ("segment-a" * 3) / ("segment-b" * 3)
+    start = root / "work"
+    destination = start / "destination"
     start.mkdir(parents=True)
-    assert 100 < len(str(start)) < 230
+    destination.mkdir()
     monkeypatch.chdir(start)
+    nonce = uuid.uuid4().hex[:10]
+    direct_home = root / "direct-home"
+    worker_home = root / "worker-home"
+    direct_home.mkdir()
+    worker_home.mkdir()
 
-    def make_case(label, nonce, marker_file):
-        expected = f"JTT_EXEC_{label}_{nonce}_END"
-        marker_path = str(marker_file).replace("'", "''")
-        file_marker = (
-            "[System.IO.File]::WriteAllText('" + marker_path + "','" + nonce + "')"
+    def ps_quote(value):
+        return str(value).replace("'", "''")
+
+    def case_specs(label, home):
+        marker = f"JTT_EXEC_{label}_{nonce}_END"
+        marker_file = start / f"{label.lower()}-{home.name}.marker"
+        marker_path = ps_quote(
+            marker_file if label == "PATH_CHANGE" else marker_file.name
         )
+        marker_value = nonce
         if label == "SHORT_ASCII":
-            lines = [file_marker + "; [Console]::WriteLine('JTT_'+'EXEC_SHORT_ASCII_'+" +
-                     f"'{nonce}'+'_END')"]
+            commands = [(
+                "[System.IO.File]::WriteAllText('" + marker_path + "','"
+                + nonce + "'); [Console]::WriteLine('JTT_EXEC_'+'SHORT_ASCII_'+"
+                + "'" + nonce + "'+'_END')",
+                marker,
+                marker_value,
+            )]
         elif label == "LONG_ASCII":
-            lines = ["$__jtt_padding='" + ("x" * 640) + "'; "
-                     + file_marker + "; "
-                     "[Console]::WriteLine('JTT_'+'EXEC_LONG_ASCII_'+"
-                     f"'{nonce}'+'_END')"]
+            commands = [(
+                "$__jtt_padding='" + ("x" * 640) + "'; "
+                + "[System.IO.File]::WriteAllText('" + marker_path + "','"
+                + nonce + "'); [Console]::WriteLine('JTT_EXEC_'+'LONG_ASCII_'+"
+                + "'" + nonce + "'+'_END')",
+                marker,
+                marker_value,
+            )]
+        elif label == "MULTI_STEP":
+            first_marker = f"JTT_MULTI_STEP1_{nonce}_END"
+            final_marker = f"JTT_MULTI_STEP2_{nonce}_END"
+            first_file = start / f"multi-step1-{home.name}.marker"
+            final_file = start / f"multi-step2-{home.name}.marker"
+            commands = [
+                (
+                    "$global:JTTInputDiag='" + nonce + "'; "
+                    "[System.IO.File]::WriteAllText('"
+                    + ps_quote(first_file.name) + "','step1|" + nonce + "'); "
+                    "[Console]::WriteLine('JTT_MULTI_STEP1_'+ '" + nonce + "'+'_END')",
+                    first_marker,
+                    "step1|" + nonce,
+                ),
+                (
+                    "if ($global:JTTInputDiag -ne '" + nonce
+                    + "') { throw 'JTT diagnostic state mismatch' }; "
+                    "[System.IO.File]::WriteAllText('"
+                    + ps_quote(final_file.name) + "','step2|" + nonce + "'); "
+                    "[Console]::WriteLine('JTT_MULTI_STEP2_'+ '" + nonce + "'+'_END')",
+                    final_marker,
+                    "step2|" + nonce,
+                ),
+            ]
         elif label == "UNICODE_INPUT":
-            lines = ["Write-Output '한글'; " + file_marker + "; "
-                     "[Console]::WriteLine('JTT_' + "
-                     "'EXEC_UNICODE_INPUT_' + " + f"'{nonce}' + '_END')"]
-        elif label == "MULTILINE":
-            lines = ["& {", file_marker,
-                     "[Console]::WriteLine('JTT_'+'EXEC_MULTILINE_'+"
-                     f"'{nonce}'+'_END')", "}"]
+            commands = [(
+                "Write-Output '한글'; [System.IO.File]::WriteAllText('"
+                + marker_path + "','" + nonce
+                + "'); [Console]::WriteLine('JTT_EXEC_'+'UNICODE_INPUT_'+"
+                + "'" + nonce + "'+'_END')",
+                marker,
+                marker_value,
+            )]
+        elif label == "PATH_CHANGE":
+            expected_path = str(destination)
+            commands = [(
+                "Set-Location '" + ps_quote(destination) + "'; "
+                "$__jtt_actual=$PWD.Path; "
+                "[System.IO.File]::WriteAllText('" + marker_path
+                + "',$__jtt_actual); "
+                "[Console]::WriteLine('JTT_EXEC_'+'PATH_CHANGE_'+"
+                + "'" + nonce + "'+'_END')",
+                marker,
+                expected_path,
+            )]
         else:
             raise AssertionError("unknown ConPTY comparison case")
-        assert expected not in "\n".join(lines)
-        return expected, lines
+        assert all(expected not in command for command, expected, _value in commands)
+        return commands
 
-    def compact(text):
-        return text.replace("\r", "").replace("\n", "")
+    def compact(value):
+        return value.replace("\r", "").replace("\n", "")
 
-    def has_prompt(text):
-        return any(line.lstrip().startswith("PS ") and ">" in line
-                   for line in text.splitlines())
-
-    def error_categories(text):
-        return [token for token in (
-            "ParserError", "Write-Error", "Set-Location :", "Start-Process :",
-            "Cannot find path", "Exception", "FullyQualifiedErrorId",
-        ) if token in text]
-
-    def cleanup_is_confirmed(item):
-        if item.get("cleanup") == "PROCESS_NOT_STARTED":
-            return (
-                item.get("spawn_result") is False
-                and item.get("spawn_pid_state") == "ABSENT"
-            )
-        return (
-            item.get("cleanup") in {
-                "TERMINATED_BY_RETAINED_HANDLE",
-                "ALREADY_EXITED_ON_RETAINED_HANDLE",
-                "REGISTRY_STOP_COMPLETED",
-            }
-            and item.get("retained_handle_signaled_after_cleanup") is True
+    def prompt_seen(text):
+        return any(
+            line.lstrip().startswith("PS ") and ">" in line
+            for line in text.splitlines()
         )
 
-    def run_case(label, expected, lines, *, direct, marker_file, nonce):
+    def powershell_error_categories(text):
+        return [
+            token for token in (
+                "ParserError", "FullyQualifiedErrorId", "Write-Error",
+                "Set-Location :", "Start-Process :", "Cannot find path",
+                "JTT diagnostic state mismatch",
+            )
+            if token in text
+        ]
+
+    def read_marker(marker_file):
+        try:
+            return marker_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return None
+
+    def run_path(*, direct):
+        path_name = "direct_pywinpty" if direct else "jtt_worker"
         result = {
-            "path": "direct_pywinpty_conpty" if direct else "jtt_worker",
-            "case": label, "write_results": [], "input_error_categories": [],
-            "intermediate_input_echo": [],
-            "startup_prompt_seen": False, "command_echo_seen": False,
-            "execution_file_marker_present": False,
-            "execution_file_marker_matches_nonce": False,
-            "execution_marker_in_raw_output": False,
-            "execution_marker_in_pyte_screen": False,
-            "powershell_error_categories": [], "cleanup": "NOT_ATTEMPTED",
+            "path": path_name,
+            "status": "NOT_STARTED",
+            "launch": {
+                "executable": str(windows_manager._powershell_executable()),
+                "initial_size": [100, 30],
+                "working_directory_matches": True,
+                "direct_arguments": (
+                    ["-NoLogo", "-NoProfile", "-NoExit"] if direct else None
+                ),
+                "worker_arguments": (
+                    ["-NoLogo", "-NoProfile", "-NoExit",
+                     "-Command", "<product bootstrap gate>"]
+                    if not direct else None
+                ),
+                "environment_profile": (
+                    "same worker shell allowlist from _worker_environment; "
+                    "JTT_HOME is a distinct test-owned root per path"
+                ),
+                "comparison_scope": (
+                    "initial prompt observed separately; compare only command "
+                    "execution after each path startup"
+                ),
+                "environment_values_logged": False,
+            },
+            "cases": [],
+            "cleanup": "NOT_ATTEMPTED",
+            "cleanup_confirmed": False,
         }
         pty = client = registry = process_handle = None
         identity = None
-        raw_text_parts = []
-        raw_worker_bytes = bytearray()
-        stream_screen = pyte.Screen(100, 30) if direct else None
-        stream = pyte.Stream(stream_screen) if direct else None
+        direct_raw_parts = []
+        worker_raw_bytes = bytearray()
+        direct_screen = pyte.Screen(100, 30) if direct else None
+        direct_stream = pyte.Stream(direct_screen) if direct else None
         latest = None
-
-        def read_execution_marker(marker_file, nonce):
-            try:
-                value = marker_file.read_text(encoding="ascii").strip()
-            except (OSError, UnicodeError):
-                return False, False
-            return True, value == nonce
 
         def observe():
             nonlocal latest
             if direct:
-                try:
-                    text = pty.read(blocking=False)
-                except Exception as exc:
-                    result["read_error_category"] = type(exc).__name__
+                result["last_observation_stage"] = "direct_pty_read"
+                text = pty.read(blocking=False)
+                if text is None:
                     text = ""
+                if not isinstance(text, str):
+                    raise TypeError("pywinpty.PTY.read did not return str")
                 if text:
-                    raw_text_parts.append(text)
-                    stream.feed(text)
+                    direct_raw_parts.append(text)
+                    result["last_observation_stage"] = "direct_pyte_feed"
+                    direct_stream.feed(text)
+                result["last_observation_stage"] = "direct_pyte_screen_render"
                 screen_text = "\n".join(
-                    "".join(stream_screen.buffer[y][x].data
-                            for x in range(stream_screen.columns))
-                    for y in range(stream_screen.lines)
+                    "".join(direct_screen.buffer[y][x].data
+                            for x in range(direct_screen.columns))
+                    for y in range(direct_screen.lines)
                 )
-                raw_text = "".join(raw_text_parts)
-                latest = {"state": "NOT_APPLICABLE_DIRECT_PTY", "sequence": None,
-                          "snapshot_sequence": None, "synced": None, "gap": None}
+                raw_text = "".join(direct_raw_parts)
+                latest = None
             else:
+                result["last_observation_stage"] = "worker_poll"
                 latest = client.poll()
-                raw_worker_bytes.extend(latest.output)
-                raw_text = raw_worker_bytes.decode("utf-8", errors="replace")
+                worker_raw_bytes.extend(latest.output)
+                raw_text = worker_raw_bytes.decode("utf-8", errors="replace")
                 screen_text = (
                     _compact_screen_text(latest.screen)
                     if latest.screen is not None else ""
                 )
             return raw_text, screen_text
 
+        def wait_for(predicate, timeout):
+            deadline = time.monotonic() + timeout
+            raw_text = screen_text = ""
+            while time.monotonic() < deadline:
+                raw_text, screen_text = observe()
+                if predicate(raw_text, screen_text):
+                    return raw_text, screen_text
+                time.sleep(0.02)
+            return raw_text, screen_text
+
         try:
+            result["status"] = "STARTING"
             if direct:
-                shell_env = {
-                    key: os.environ[key] for key in (
-                        "SystemRoot", "WINDIR", "PATH", "LOCALAPPDATA", "APPDATA",
-                        "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP",
-                    ) if key in os.environ
-                }
-                shell_env.setdefault("SystemRoot", r"C:\Windows")
-                shell_env.setdefault("WINDIR", shell_env["SystemRoot"])
-                shell_env.setdefault("PATH", str(Path(shell_env["SystemRoot"]) / "System32"))
-                shell_env["JTT_HOME"] = str(
-                    root / (label.lower() + "-worker-home")
+                session_dir = direct_home / "terminals" / ("direct-" + nonce)
+                template_env = windows_manager._worker_environment(session_dir)
+                shell_keys = (
+                    "SystemRoot", "WINDIR", "PATH", "LOCALAPPDATA", "APPDATA",
+                    "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP",
                 )
+                shell_env = {
+                    key: template_env[key] for key in shell_keys
+                    if key in template_env
+                }
+                shell_env["JTT_HOME"] = str(direct_home)
                 shell_env["TERM"] = "xterm"
+                worker_env_keys = set(shell_env)
+                result["launch"]["environment_keys_match_worker_shell_contract"] = (
+                    worker_env_keys
+                    == set(shell_keys).intersection(template_env)
+                    | {"JTT_HOME", "TERM"}
+                )
+                result["launch"]["jtt_home_is_test_owned"] = (
+                    shell_env["JTT_HOME"] == str(direct_home)
+                )
+                assert result["launch"][
+                    "environment_keys_match_worker_shell_contract"
+                ]
+                assert result["launch"]["jtt_home_is_test_owned"]
                 pty = PTY(100, 30, backend=Backend.ConPTY)
+                result["last_observation_stage"] = "direct_spawn"
                 spawned = pty.spawn(
                     str(windows_manager._powershell_executable()),
-                    cmdline=subprocess.list2cmdline(["-NoLogo", "-NoProfile", "-NoExit"]),
+                    cmdline=subprocess.list2cmdline(
+                        ["-NoLogo", "-NoProfile", "-NoExit"]
+                    ),
                     cwd=str(start),
-                    env="\0".join(f"{key}={value}" for key, value in shell_env.items()) + "\0",
+                    env="\0".join(
+                        f"{key}={value}" for key, value in shell_env.items()
+                    ) + "\0",
                 )
-                result["spawn_result"] = bool(spawned)
+                result["spawn_returned_true"] = bool(spawned)
                 pid_value = pty.pid
+                result["pid_present"] = pid_value is not None
                 if pid_value is None:
-                    result["spawn_pid_state"] = "ABSENT"
-                    if not spawned:
-                        result["cleanup"] = "PROCESS_NOT_STARTED"
-                        return result
-                    result["spawn_pid_state"] = "UNKNOWN_AFTER_SUCCESS_RETURN"
+                    result["status"] = (
+                        "SPAWN_FAILED" if not spawned else "IDENTITY_UNKNOWN"
+                    )
+                    result["cleanup"] = (
+                        "PROCESS_NOT_STARTED" if not spawned
+                        else "OWNERSHIP_UNKNOWN"
+                    )
+                    result["cleanup_confirmed"] = not spawned
                     return result
                 pid = int(pid_value)
-                result["spawn_pid_state"] = "PRESENT"
-                created, _image, alive = windows_manager._process_facts(pid)
+                created, image, alive = windows_manager._process_facts(pid)
                 process_handle = _retain_test_process_handle(
                     pid, created, windows_manager._powershell_executable(),
                     allow_terminate=True,
                 )
-                result["process_identity"] = {
-                    "pid": pid, "creation_time_recorded": bool(created),
-                    "creation_time": created,
-                    "expected_image_verified": True,
-                }
-                result["process_alive_before_input"] = bool(alive)
-                if not spawned:
-                    result["spawn_anomaly"] = "false_return_with_test_owned_pid"
+                result["process_identity_verified"] = bool(
+                    created and alive
+                    and image == os.path.normcase(os.path.abspath(
+                        str(windows_manager._powershell_executable())
+                    ))
+                )
+                result["test_owned_pid"] = pid
+                result["creation_time_recorded"] = bool(created)
+                result["alive_before_input"] = bool(alive)
+                if not spawned or not result["process_identity_verified"]:
+                    result["status"] = "SPAWN_OR_IDENTITY_FAILURE"
                     return result
             else:
-                registry = TerminalRegistry(
-                    root / (label.lower() + "-worker-home") / "terminals"
-                )
-                client = registry.create("isolated ConPTY input comparison")
+                registry = TerminalRegistry(worker_home / "terminals")
+                result["last_observation_stage"] = "worker_registry_create"
+                client = registry.create("isolated ConPTY execution comparison")
                 identity = client.identity
                 process_handle = _retain_test_process_handle(
                     identity.shell_pid, identity.shell_start, identity.shell_path
                 )
-                result["process_identity"] = {
-                    "pid": identity.shell_pid,
-                    "creation_time_recorded": bool(identity.shell_start),
-                    "creation_time": identity.shell_start,
-                    "session_id": identity.session_id,
-                    "generation": identity.generation,
-                    "session_generation_recorded": bool(identity.generation),
-                    "expected_image_verified": True,
-                }
+                result["process_identity_verified"] = True
+                result["test_owned_pid"] = identity.shell_pid
+                result["session_id"] = identity.session_id
+                result["generation"] = identity.generation
+                result["creation_time_recorded"] = bool(identity.shell_start)
+                session_dir, metadata = windows_manager._validate_identity(
+                    registry.root, identity.session_id
+                )
+                result["jtt_home_is_test_owned"] = (
+                    identity.state == "running"
+                    and session_dir.parent.parent.resolve() == worker_home.resolve()
+                )
+                result["launch"]["working_directory_matches"] = (
+                    os.path.normcase(os.path.abspath(
+                        metadata.get("working_directory", "")
+                    )) == os.path.normcase(os.path.abspath(str(start)))
+                )
+                if not result["jtt_home_is_test_owned"]:
+                    raise AssertionError("worker session root is outside test home")
+                if not result["launch"]["working_directory_matches"]:
+                    raise AssertionError("worker working directory differs from direct path")
+                result["launch"]["environment_keys_match_worker_shell_contract"] = (
+                    True  # worker builds this allow-listed shell environment
+                )
+            result["status"] = "RUNNING"
 
             startup_deadline = time.monotonic() + 5
+            startup_raw = ""
             while time.monotonic() < startup_deadline:
-                raw_text, _screen_text = observe()
-                result["startup_prompt_seen"] = has_prompt(raw_text)
-                if direct:
-                    if result["startup_prompt_seen"]:
-                        break
-                elif latest.state == "running" and result["startup_prompt_seen"]:
+                startup_raw, _startup_screen = observe()
+                if prompt_seen(startup_raw):
+                    break
+                if not direct and latest is not None and latest.state != "running":
                     break
                 time.sleep(0.02)
-
+            result["initial_prompt_seen"] = prompt_seen(startup_raw)
+            result["worker_state_before_input"] = (
+                latest.state if not direct and latest is not None else None
+            )
+            result["renderer_state_before_input"] = (
+                getattr(latest, "renderer_state", None)
+                if not direct and latest is not None else None
+            )
             if not direct:
-                result["worker_state_before_input"] = latest.state if latest else None
                 if latest is None or latest.state != "running":
-                    result["input_error_categories"].append("worker_not_running")
+                    result["status"] = "WORKER_NOT_RUNNING"
                     return result
                 if not client.acquire():
-                    result["input_error_categories"].append("input_lease_unavailable")
+                    result["status"] = "LEASE_NOT_ACQUIRED"
                     return result
 
-            for line_index, line in enumerate(lines):
-                payload_text = line + "\r"
-                payload = payload_text.encode("utf-8")
-                try:
-                    written = pty.write(payload_text) if direct else client.send(payload)
-                except Exception as exc:
-                    result["input_error_categories"].append(type(exc).__name__)
-                    break
-                result["write_results"].append({
-                    "reported_return": written,
-                    "expected_utf8_bytes": len(payload),
-                    "expected_python_characters": len(payload_text),
-                    "equals_utf8_byte_count": (
-                        type(written) is int and written == len(payload)
-                    ),
-                    "source": "PTY.write" if direct else "worker PTY.write ACK",
-                })
-                if line_index + 1 < len(lines):
-                    echo_deadline = time.monotonic() + 5
-                    echo_seen = False
-                    while time.monotonic() < echo_deadline:
-                        echo_raw, echo_screen = observe()
-                        if (line in compact(echo_raw)
-                                or line in compact(echo_screen)):
-                            echo_seen = True
-                            break
-                        time.sleep(0.02)
-                    result["intermediate_input_echo"].append({
-                        "line_index": line_index,
-                        "echo_seen_before_next_input": echo_seen,
+            baseline_proven = False
+            stop_cases = False
+            for label in (
+                "SHORT_ASCII", "LONG_ASCII", "MULTI_STEP",
+                "UNICODE_INPUT", "PATH_CHANGE",
+            ):
+                if stop_cases:
+                    result["cases"].append({
+                        "case": label,
+                        "status": "NOT_RUN_PREVIOUS_EXECUTION_UNPROVEN",
                     })
-                    if not echo_seen:
-                        result["input_error_categories"].append(
-                            "input_echo_not_observed_before_next_multiline_input"
+                    continue
+                steps = case_specs(label, direct_home if direct else worker_home)
+                case_result = {"case": label, "steps": []}
+                result["cases"].append(case_result)
+                for step_index, (command, expected, expected_file_value) in enumerate(steps):
+                    marker_file = start / (
+                        f"{label.lower()}-{(direct_home if direct else worker_home).name}.marker"
+                        if label != "MULTI_STEP"
+                        else (
+                            f"multi-step{step_index + 1}-"
+                            f"{(direct_home if direct else worker_home).name}.marker"
                         )
-                        break
-
-            deadline = time.monotonic() + 8
-            marker_file_present = False
-            marker_matches_nonce = False
-            while time.monotonic() < deadline:
-                raw_text, screen_text = observe()
-                marker_file_present, marker_matches_nonce = read_execution_marker(
-                    marker_file, nonce
-                )
-                output_marker_seen = (
-                    expected in compact(raw_text)
-                    or expected in compact(screen_text)
-                )
-                if output_marker_seen and marker_file_present and marker_matches_nonce:
-                    break
-                if result["input_error_categories"]:
-                    break
-                time.sleep(0.02)
-            raw_text, screen_text = observe()
-            marker_file_present, marker_matches_nonce = read_execution_marker(
-                marker_file, nonce
-            )
-            result.update({
-                "command_echo_seen": all(
-                    line in compact(raw_text) or line in compact(screen_text)
-                    for line in lines
-                ),
-                "execution_file_marker_present": marker_file_present,
-                "execution_file_marker_matches_nonce": marker_matches_nonce,
-                "execution_marker_in_raw_output": expected in compact(raw_text),
-                "execution_marker_in_pyte_screen": expected in compact(screen_text),
-                "pywinpty_api_text_characters": len(raw_text) if direct else None,
-                "worker_poll_payload_bytes": (
-                    len(raw_worker_bytes) if not direct else None
-                ),
-                "output_measurement_source": (
-                    "pywinpty.PTY.read returned Python str; no native bytes exposed"
-                    if direct else "decoded worker poll payload bytes"
-                ),
-                "state": latest.state if latest is not None else None,
-                "renderer": getattr(latest, "renderer_state", None),
-                "sequence": getattr(latest, "sequence", None),
-                "snapshot_sequence": getattr(latest, "snapshot_sequence", None),
-                "synced": getattr(latest, "synced", None),
-                "gap": getattr(latest, "gap", None),
-                "powershell_error_categories": error_categories(raw_text + screen_text),
-            })
-            if direct:
-                try:
-                    wait_result = win32event.WaitForSingleObject(process_handle, 0)
-                    result["process_state_after_input"] = (
-                        "alive" if wait_result == win32con.WAIT_TIMEOUT
-                        else "exited" if wait_result == win32con.WAIT_OBJECT_0
-                        else "unknown"
                     )
-                except Exception as exc:
-                    result["process_state_after_input"] = "unknown"
-                    result["process_state_check_error_category"] = type(exc).__name__
-            return result
+                    try:
+                        marker_file.unlink(missing_ok=True)
+                    except OSError as exc:
+                        case_result["status"] = "TEST_MARKER_PREPARATION_ERROR"
+                        case_result["marker_prepare_error_category"] = type(exc).__name__
+                        stop_cases = True
+                        break
+                    step = {
+                        "step": step_index + 1,
+                        "input_ack": None,
+                        "command_echo_seen": False,
+                        "side_effect_file_present": False,
+                        "side_effect_file_matches": False,
+                        "output_marker_in_pty_or_poll": False,
+                        "output_marker_in_pyte_or_worker_screen": False,
+                        "powershell_error_categories": [],
+                    }
+                    case_result["steps"].append(step)
+                    result["last_observation_stage"] = "pre_input_drain"
+                    raw_before, _screen_before = observe()
+                    raw_offset = len(raw_before)
+                    worker_byte_offset = len(worker_raw_bytes)
+                    sequence_before = (
+                        getattr(latest, "sequence", None)
+                        if not direct else None
+                    )
+                    payload = command + "\r"
+                    result["last_observation_stage"] = (
+                        "direct_pty_write" if direct else "worker_client_send"
+                    )
+                    if direct:
+                        written = pty.write(payload)
+                        ack = {
+                            "reported_return": written,
+                            "utf8_payload_bytes": len(payload.encode("utf-8")),
+                            "python_characters": len(payload),
+                            "equals_byte_count": (
+                                type(written) is int
+                                and written == len(payload.encode("utf-8"))
+                            ),
+                            "equals_character_count": (
+                                type(written) is int and written == len(payload)
+                            ),
+                            "api": "PTY.write(str)",
+                        }
+                    else:
+                        written = client.send(payload.encode("utf-8"))
+                        ack = {
+                            "reported_return": written,
+                            "utf8_payload_bytes": len(payload.encode("utf-8")),
+                            "python_characters": len(payload),
+                            "equals_byte_count": (
+                                type(written) is int
+                                and written == len(payload.encode("utf-8"))
+                            ),
+                            "api": "TerminalClient.send(utf8 bytes)",
+                        }
+                    step["input_ack"] = ack
+
+                    def complete(raw_text, screen_text):
+                        value = read_marker(marker_file)
+                        raw_delta = raw_text[raw_offset:]
+                        raw_marker = expected in compact(raw_delta)
+                        screen_marker = expected in compact(screen_text)
+                        step["command_echo_seen"] = (
+                            command in compact(raw_delta)
+                            or command in compact(screen_text)
+                        )
+                        step["side_effect_file_present"] = value is not None
+                        step["side_effect_file_matches"] = (
+                            value == expected_file_value
+                            if label != "PATH_CHANGE"
+                            else bool(value) and os.path.normcase(value)
+                            == os.path.normcase(expected_file_value)
+                        )
+                        step["output_marker_in_pty_or_poll"] = raw_marker
+                        step["output_marker_in_pyte_or_worker_screen"] = screen_marker
+                        step["powershell_error_categories"] = (
+                            powershell_error_categories(raw_delta)
+                        )
+                        if label == "UNICODE_INPUT":
+                            raw_unicode_count = raw_delta.count("한글")
+                            screen_unicode_count = screen_text.count("한글")
+                            step["unicode_output_raw_occurrences"] = raw_unicode_count
+                            step["unicode_output_screen_occurrences"] = screen_unicode_count
+                        return (
+                            step["side_effect_file_matches"]
+                            and raw_marker and screen_marker
+                            and (
+                                label != "UNICODE_INPUT"
+                                or step.get("unicode_output_raw_occurrences", 0) >= 2
+                            )
+                        )
+
+                    result["last_observation_stage"] = "observe_input_echo_and_execution"
+                    raw_text, screen_text = wait_for(
+                        complete, 8
+                    )
+                    complete(raw_text, screen_text)
+                    step["terminal_state"] = (
+                        getattr(latest, "state", None) if not direct else "direct"
+                    )
+                    step["renderer_state"] = (
+                        getattr(latest, "renderer_state", None)
+                        if not direct else "pyte"
+                    )
+                    step["output_sequence"] = (
+                        getattr(latest, "sequence", None) if not direct else None
+                    )
+                    step["snapshot_sequence"] = (
+                        getattr(latest, "snapshot_sequence", None)
+                        if not direct else None
+                    )
+                    step["output_gap"] = (
+                        getattr(latest, "gap", None) if not direct else None
+                    )
+                    step["sequence_before"] = sequence_before
+                    step["sequence_after"] = (
+                        getattr(latest, "sequence", None)
+                        if not direct else None
+                    )
+                    step["pty_read_text_characters"] = (
+                        len(raw_text) - raw_offset if direct else None
+                    )
+                    step["worker_poll_payload_bytes"] = (
+                        len(worker_raw_bytes) - worker_byte_offset
+                        if not direct else None
+                    )
+                    step["output_measurement"] = (
+                        "PTY.read returned Python str; not native ConPTY bytes"
+                        if direct else "TerminalClient.poll output payload bytes"
+                    )
+                    if direct and process_handle is not None:
+                        try:
+                            process_wait = win32event.WaitForSingleObject(
+                                process_handle, 0
+                            )
+                            step["process_state_after_input"] = (
+                                "alive" if process_wait == win32con.WAIT_TIMEOUT
+                                else "exited"
+                                if process_wait == win32con.WAIT_OBJECT_0
+                                else "unknown"
+                            )
+                        except Exception as exc:
+                            step["process_state_after_input"] = "unknown"
+                            step["process_state_error_category"] = type(exc).__name__
+                    else:
+                        step["process_state_after_input"] = (
+                            getattr(latest, "state", None) if latest is not None
+                            else "unknown"
+                        )
+                    step["status"] = (
+                        "EXECUTION_PROVEN" if complete(raw_text, screen_text)
+                        else "EXECUTION_UNPROVEN"
+                    )
+                    if label == "SHORT_ASCII" and step_index == 0:
+                        baseline_proven = step["status"] == "EXECUTION_PROVEN"
+                        result["short_ascii_execution_proven"] = baseline_proven
+                    if step["status"] != "EXECUTION_PROVEN":
+                        case_result["status"] = "EXECUTION_UNPROVEN"
+                        stop_cases = True
+                        break
+                else:
+                    case_result["status"] = "EXECUTION_PROVEN"
+            result["status"] = (
+                "DIAGNOSTIC_TOOL_ERROR" if result.get("diagnostic_error_stage")
+                else "COMPLETE" if not stop_cases
+                else "EXECUTION_UNPROVEN"
+            )
         except Exception as exc:
-            result["exception_category"] = type(exc).__name__
-            return result
+            result["status"] = "DIAGNOSTIC_TOOL_ERROR" if direct else "PATH_ERROR"
+            result["diagnostic_error_stage"] = result.get(
+                "last_observation_stage", "setup_or_command"
+            )
+            result["diagnostic_error_category"] = type(exc).__name__
         finally:
             if direct and process_handle is not None:
                 try:
-                    if win32event.WaitForSingleObject(process_handle, 0) == win32con.WAIT_TIMEOUT:
-                        try:
-                            win32api.TerminateProcess(process_handle, 0)
-                        except Exception as exc:
-                            result["cleanup_error_category"] = type(exc).__name__
-                        exited = win32event.WaitForSingleObject(process_handle, 5000)
-                        result["cleanup"] = (
-                            "TERMINATED_BY_RETAINED_HANDLE"
-                            if exited == win32con.WAIT_OBJECT_0 else "EXIT_UNCONFIRMED"
+                    wait_status = win32event.WaitForSingleObject(process_handle, 0)
+                    if wait_status == win32con.WAIT_TIMEOUT:
+                        result["cleanup_request"] = "retained_test_process_handle"
+                        win32api.TerminateProcess(process_handle, 0)
+                        wait_status = win32event.WaitForSingleObject(
+                            process_handle, 5000
                         )
-                    else:
-                        result["cleanup"] = "ALREADY_EXITED_ON_RETAINED_HANDLE"
-                    result["retained_handle_signaled_after_cleanup"] = (
-                        win32event.WaitForSingleObject(process_handle, 0)
-                        == win32con.WAIT_OBJECT_0
+                    result["cleanup_confirmed"] = (
+                        wait_status == win32con.WAIT_OBJECT_0
+                    )
+                    result["cleanup"] = (
+                        "TERMINATED_OR_EXITED_ON_RETAINED_HANDLE"
+                        if result["cleanup_confirmed"] else "EXIT_UNCONFIRMED"
                     )
                 except Exception as exc:
+                    result["cleanup"] = "CLEANUP_ERROR"
                     result["cleanup_error_category"] = type(exc).__name__
+                finally:
+                    process_handle.Close()
+                    process_handle = None
+                    # pywinpty 3.1.1 exposes no PTY.close() method. Release the
+                    # wrapper only after the retained process handle is checked.
+                    pty = None
+                    result["pty_wrapper_release"] = "NO_CLOSE_API_USED"
+            elif direct and pty is None:
+                result["cleanup_confirmed"] = (
+                    result["cleanup"] == "PROCESS_NOT_STARTED"
+                )
+            elif not direct:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception as exc:
+                        result["client_close_error_category"] = type(exc).__name__
+                if registry is not None and identity is not None:
+                    try:
+                        registry.stop(
+                            identity.session_id,
+                            expected_generation=identity.generation,
+                            expected_shell_pid=identity.shell_pid,
+                        )
+                        result["cleanup"] = "REGISTRY_STOP_COMPLETED"
+                    except Exception as exc:
+                        result["cleanup"] = "STOP_FAILED_EVIDENCE_RETAINED"
+                        result["cleanup_error_category"] = type(exc).__name__
+                if process_handle is not None:
                     try:
                         result["retained_handle_signaled_after_cleanup"] = (
                             win32event.WaitForSingleObject(process_handle, 0)
                             == win32con.WAIT_OBJECT_0
                         )
-                        if result["retained_handle_signaled_after_cleanup"]:
-                            result["cleanup"] = "ALREADY_EXITED_ON_RETAINED_HANDLE"
-                    except Exception as wait_exc:
-                        result["cleanup_wait_error_category"] = type(wait_exc).__name__
-                finally:
-                    process_handle.Close()
-            if direct and pty is not None:
-                try:
-                    pty.close()
-                except Exception as exc:
-                    result["pty_close_error_category"] = type(exc).__name__
-            if not direct and client is not None:
-                try:
-                    client.close()
-                except Exception as exc:
-                    result["client_close_error_category"] = type(exc).__name__
-            if not direct and registry is not None and identity is not None:
-                try:
-                    registry.stop(
-                        identity.session_id,
-                        expected_generation=identity.generation,
-                        expected_shell_pid=identity.shell_pid,
-                    )
-                    result["cleanup"] = "REGISTRY_STOP_COMPLETED"
-                except Exception as exc:
-                    result["cleanup"] = "STOP_FAILED_EVIDENCE_RETAINED"
-                    result["cleanup_error_category"] = type(exc).__name__
-            if not direct and process_handle is not None:
-                try:
-                    result["retained_handle_signaled_after_cleanup"] = (
-                        win32event.WaitForSingleObject(process_handle, 0)
-                        == win32con.WAIT_OBJECT_0
-                    )
-                except Exception as exc:
-                    result["retained_handle_check_error_category"] = type(exc).__name__
-                finally:
-                    process_handle.Close()
+                        result["cleanup_confirmed"] = bool(
+                            result["retained_handle_signaled_after_cleanup"]
+                            and result["cleanup"] == "REGISTRY_STOP_COMPLETED"
+                        )
+                    except Exception as exc:
+                        result["cleanup_confirmed"] = False
+                        result["cleanup_error_category"] = type(exc).__name__
+                    finally:
+                        process_handle.Close()
 
-    evidence = []
-    baseline_execution_proven = False
-    unconfirmed_cleanup = None
-    nonce = uuid.uuid4().hex[:10]
-    for index, label in enumerate(("SHORT_ASCII", "LONG_ASCII", "UNICODE_INPUT", "MULTILINE")):
-        if index and not baseline_execution_proven:
-            evidence.append({
-                "case": label,
-                "status": "NOT_RUN_SHORT_ASCII_EXECUTION_UNPROVEN",
-            })
-            continue
-        direct_marker_file = root / (label.lower() + "-direct.marker")
-        worker_marker_file = root / (label.lower() + "-worker.marker")
-        (root / (label.lower() + "-worker-home")).mkdir(parents=True)
-        expected, direct_lines = make_case(label, nonce, direct_marker_file)
-        _worker_expected, worker_lines = make_case(label, nonce, worker_marker_file)
-        direct = run_case(
-            label, expected, direct_lines, direct=True,
-            marker_file=direct_marker_file, nonce=nonce,
-        )
-        case_evidence = {"case": label, "direct": direct}
-        if not cleanup_is_confirmed(direct):
-            case_evidence["worker"] = {
-                "status": "NOT_RUN_DIRECT_TEST_PROCESS_CLEANUP_UNCONFIRMED"
-            }
-            evidence.append(case_evidence)
-            unconfirmed_cleanup = "direct_pywinpty_conpty"
-            break
-        worker = run_case(
-            label, expected, worker_lines, direct=False,
-            marker_file=worker_marker_file, nonce=nonce,
-        )
-        case_evidence["worker"] = worker
-        evidence.append(case_evidence)
-        if not cleanup_is_confirmed(worker):
-            unconfirmed_cleanup = "jtt_worker"
-            break
-        if index == 0:
-            baseline_execution_proven = all((
-                direct.get("execution_file_marker_matches_nonce"),
-                worker.get("execution_file_marker_matches_nonce"),
-            ))
-    for item in evidence:
-        record_property(
-            "conpty_input_comparison_" + str(item["case"]).lower(),
-            json.dumps(item, sort_keys=True),
-        )
-    print("CONPTY_INPUT_EXECUTION_COMPARISON " + json.dumps(evidence, sort_keys=True))
-    assert unconfirmed_cleanup is None, (
-        "stopped further test-owned process creation because cleanup could not "
-        f"be confirmed for {unconfirmed_cleanup}; see structured evidence"
+    direct = run_path(direct=True)
+    direct_cleanup_confirmed = bool(direct.get("cleanup_confirmed"))
+    if direct_cleanup_confirmed:
+        worker = run_path(direct=False)
+    else:
+        worker = {
+            "path": "jtt_worker",
+            "status": "NOT_RUN_DIRECT_CLEANUP_UNCONFIRMED",
+            "cleanup_confirmed": False,
+            "cases": [],
+        }
+    evidence = {"direct": direct, "worker": worker}
+    record_property(
+        "conpty_input_execution_comparison",
+        json.dumps(evidence, ensure_ascii=True, sort_keys=True),
     )
-    assert baseline_execution_proven, (
-        "short-ASCII command completion was not independently proven through "
-        "both direct ConPTY and the JTT worker; see structured evidence"
+    print("CONPTY_INPUT_EXECUTION_COMPARISON "
+          + json.dumps(evidence, ensure_ascii=True, sort_keys=True))
+
+    worker_cases = {
+        item.get("case"): item for item in worker.get("cases", [])
+        if item.get("case")
+    }
+    worker_short = worker_cases.get("SHORT_ASCII", {})
+    worker_short_steps = worker_short.get("steps", [])
+    assert (
+        worker_short.get("status") == "EXECUTION_PROVEN"
+        and worker_short_steps
+        and worker_short_steps[0].get("status") == "EXECUTION_PROVEN"
+    ), "PRODUCT_WORKER_SHORT_ASCII_EXECUTION_UNPROVEN; see structured evidence"
+    for label in (
+        "LONG_ASCII", "MULTI_STEP", "UNICODE_INPUT", "PATH_CHANGE",
+    ):
+        case = worker_cases.get(label, {})
+        assert case.get("status") == "EXECUTION_PROVEN", (
+            f"PRODUCT_WORKER_{label}_EXECUTION_UNPROVEN; see structured evidence"
+        )
+    if direct.get("status") == "DIAGNOSTIC_TOOL_ERROR":
+        raise AssertionError(
+            "DIAGNOSTIC_TOOL_ERROR at "
+            f"{direct.get('diagnostic_error_stage')}: "
+            f"{direct.get('diagnostic_error_category')}"
+        )
+    direct_cases = {
+        item.get("case"): item for item in direct.get("cases", [])
+        if item.get("case")
+    }
+    assert direct_cases.get("SHORT_ASCII", {}).get("status") == "EXECUTION_PROVEN", (
+        "DIRECT_REFERENCE_SHORT_ASCII_EXECUTION_UNPROVEN; see structured evidence"
     )
-    for item in evidence:
-        if item.get("status"):
-            continue
-        for path in ("direct", "worker"):
-            assert item[path].get("execution_marker_in_raw_output"), (
-                f"{item['case']} marker missing from {path} output"
-            )
-            assert item[path].get("execution_file_marker_matches_nonce"), (
-                f"{item['case']} independent execution marker missing for {path}"
-            )
-            assert item[path].get("execution_marker_in_pyte_screen"), (
-                f"{item['case']} marker missing from {path} screen"
-            )
-            assert item[path].get("retained_handle_signaled_after_cleanup"), (
-                f"{item['case']} {path} test-owned shell cleanup is unconfirmed"
-            )
-            assert item[path].get("cleanup") in {
-                "TERMINATED_BY_RETAINED_HANDLE",
-                "ALREADY_EXITED_ON_RETAINED_HANDLE",
-                "REGISTRY_STOP_COMPLETED",
-            }
+    for label in (
+        "LONG_ASCII", "MULTI_STEP", "UNICODE_INPUT", "PATH_CHANGE",
+    ):
+        assert direct_cases.get(label, {}).get("status") == "EXECUTION_PROVEN", (
+            f"DIRECT_REFERENCE_{label}_EXECUTION_UNPROVEN; see structured evidence"
+        )
 
 
 @pytest.mark.parametrize("columns,lines", [(80, 24), (160, 44)])

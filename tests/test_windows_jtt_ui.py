@@ -2305,6 +2305,7 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
     windows_ui = importlib.import_module(WindowsJTTApp.__module__)
     from ju0_terminal_tower.terminal.windows_manager import TerminalRegistry
 
+    monkeypatch.chdir(tmp_path)
     registry = TerminalRegistry(root=tmp_path / "isolated-copy-home" / "terminals")
     owner = registry.create("Isolated copy output")
     identity = owner.identity
@@ -2342,6 +2343,7 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
             assert app.input_mode and app.client is not None and app.client.lease
             nonce = identity.session_id[:10]
             input_literal = f"한글-{nonce}"
+            ascii_marker_file = tmp_path / f"f-{nonce}.txt"
             expected = (
                 f"jtt_copy_ascii_{nonce}_end",
                 f"JTT_COPY_INPUT_{input_literal}_END",
@@ -2350,8 +2352,9 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 f"JTT_FINAL_{nonce}_END",
             )
             commands = (
-                ("write-output ('jtt_copy_ascii_' + '"
-                 f"{nonce}" + "' + '_end')", expected[0]),
+                ("[System.IO.File]::WriteAllText('" + ascii_marker_file.name
+                 + "','" + nonce + "'); [Console]::WriteLine('jtt_copy_ascii_' + '"
+                 + nonce + "' + '_end')", expected[0]),
                 ("Write-Output ('JTT_COPY_INPUT_' + '"
                  f"{input_literal}" + "' + '_END')", expected[1]),
                 ("Write-Output (([string]([char]0xD55C) + "
@@ -2366,6 +2369,7 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
             client = app.client
             original_send = client.send
             accepted_inputs = []
+            accepted_payload = bytearray()
 
             def record_send(data):
                 from ju0_terminal_tower.terminal.manager import TerminalError
@@ -2399,6 +2403,7 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                     "returned": True,
                     "accepted_bytes": accepted,
                 })
+                accepted_payload.extend(data)
                 accepted_inputs.append(outcome)
                 return accepted
 
@@ -2434,27 +2439,39 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 }, sort_keys=True),
             )
 
-            async def wait_for_raw_output(marker, after_sequence):
+            async def collect_output_and_screen(marker, after_sequence):
                 raw = bytearray()
                 last_update = None
                 deadline = time.monotonic() + 20
                 marker_bytes = marker.encode("utf-8")
+                raw_marker_seen = False
+                screen_observation = app._right_observation
+                screen_marker_seen = False
+                screen_identity_matches = False
                 while time.monotonic() < deadline:
                     # Serialize this diagnostic poll with the app's observer;
-                    # poll bytes prove ConPTY output while observe() separately
-                    # proves the rendered snapshot reached the UI.
+                    # one bounded window gathers both output and UI evidence.
                     last_update = await app._backend_call(client.poll)
                     raw.extend(last_update.output)
                     compact = bytes(raw).replace(b"\r", b"").replace(b"\n", b"")
-                    if marker_bytes in compact:
-                        return last_update, bytes(raw)
+                    raw_marker_seen = marker_bytes in compact
+                    screen_observation = app._right_observation
+                    if (screen_observation is not None
+                            and screen_observation[1] > after_sequence):
+                        screen_text = "".join(
+                            _plain_screen_text(screen_observation[3]).split()
+                        )
+                        screen_marker_seen = marker in screen_text
+                        screen_identity_matches = (
+                            screen_observation[0] == _mini_identity_key(identity)
+                        )
+                    if raw_marker_seen and screen_marker_seen:
+                        break
                     await pilot.pause(0.02)
-                raise AssertionError(
-                    "ConPTY output marker was not observed: "
-                    f"sequence={getattr(last_update, 'sequence', None)!r}; "
-                    f"snapshot_sequence={getattr(last_update, 'snapshot_sequence', None)!r}; "
-                    f"gap={getattr(last_update, 'gap', None)!r}; "
-                    f"bytes={len(raw)}; advanced={bool(last_update and last_update.sequence > after_sequence)}"
+                return (
+                    last_update, bytes(raw), raw_marker_seen,
+                    screen_observation, screen_marker_seen,
+                    screen_identity_matches,
                 )
 
             for index, (command, marker) in enumerate(commands):
@@ -2464,6 +2481,7 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 assert prior_observation is not None
                 prior_sequence = prior_observation[1]
                 prior_count = len(accepted_inputs)
+                prior_payload_size = len(accepted_payload)
                 selected_before_send = app.selected_identity
                 visible_before_send = (
                     app.sessions.get(selected_before_send.session_id)
@@ -2551,6 +2569,12 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                     )
                 send_attempts = accepted_inputs[prior_count:]
                 if index == 0:
+                    sent_payload = bytes(accepted_payload[prior_payload_size:])
+                    assert sent_payload == encoded, (
+                        "Textual key events did not deliver the exact ASCII "
+                        "script command and Enter bytes"
+                    )
+                    record_property("copy_ascii_input_bytes_match_command", True)
                     assert len(send_attempts) == len(encoded), (
                         "Textual key events did not each receive a terminal "
                         "send acknowledgement"
@@ -2571,34 +2595,83 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                         "accepted_bytes": len(encoded),
                         "terminal_error": None,
                     }
-                raw_update, raw_output = await wait_for_raw_output(
-                    marker, prior_sequence
-                )
+                (
+                    raw_update, raw_output, raw_marker_seen,
+                    screen_observation, screen_marker_seen,
+                    screen_identity_matches,
+                ) = await collect_output_and_screen(marker, prior_sequence)
                 compact_raw_output = raw_output.replace(b"\r", b"").replace(
                     b"\n", b""
                 )
-                assert marker.encode("utf-8") in compact_raw_output
-                assert raw_update.sequence > prior_sequence
-                assert not raw_update.gap
+                raw_marker_seen = marker.encode("utf-8") in compact_raw_output
+                ascii_marker_value = None
+                if index == 0:
+                    try:
+                        ascii_marker_value = ascii_marker_file.read_text(
+                            encoding="ascii"
+                        ).strip()
+                    except (OSError, UnicodeError):
+                        ascii_marker_value = None
+                    record_property(
+                        "copy_ascii_command_side_effect_matches_nonce",
+                        ascii_marker_value == nonce,
+                    )
+                raw_sequence = (
+                    getattr(raw_update, "sequence", None)
+                    if raw_update is not None else None
+                )
+                raw_snapshot_sequence = (
+                    getattr(raw_update, "snapshot_sequence", None)
+                    if raw_update is not None else None
+                )
+                raw_gap = getattr(raw_update, "gap", None) if raw_update is not None else None
+                screen_sequence = (
+                    screen_observation[1] if screen_observation is not None else None
+                )
+                record_property(
+                    f"copy_input_{index}_observation_summary",
+                    json.dumps({
+                        "ascii_side_effect_value_matches": (
+                            ascii_marker_value == nonce if index == 0 else None
+                        ),
+                        "raw_output_marker_seen": raw_marker_seen,
+                        "raw_sequence": raw_sequence,
+                        "raw_snapshot_sequence": raw_snapshot_sequence,
+                        "raw_gap": raw_gap,
+                        "raw_payload_bytes": len(raw_output),
+                        "screen_marker_seen": screen_marker_seen,
+                        "screen_sequence": screen_sequence,
+                        "screen_observation_identity_matches": screen_identity_matches,
+                    }, sort_keys=True),
+                )
+                if index == 0:
+                    assert ascii_marker_value == nonce, (
+                        "ASCII UI command execution was not proven by its "
+                        "independent test-owned file side effect"
+                    )
+                assert raw_marker_seen, (
+                    "command execution evidence was collected, but the expected "
+                    "ConPTY output marker was not observed"
+                )
+                assert raw_update is not None and raw_sequence > prior_sequence
+                assert not raw_gap
                 record_property(
                     f"copy_input_{index}_raw_output",
                     json.dumps({
                         "output_marker_observed": True,
                         "sequence_before": prior_sequence,
-                        "sequence_after": raw_update.sequence,
-                        "snapshot_sequence": raw_update.snapshot_sequence,
-                        "gap": raw_update.gap,
+                        "sequence_after": raw_sequence,
+                        "snapshot_sequence": raw_snapshot_sequence,
+                        "gap": raw_gap,
                         "raw_byte_count": len(raw_output),
                     }, sort_keys=True),
                 )
-                await _wait_for_ui_state(
-                    pilot,
-                    lambda marker=marker: app._right_observation is not None
-                    and app._right_observation[1] > prior_sequence
-                    and marker in "".join(
-                        _plain_screen_text(app._right_observation[3]).split()
-                    ),
-                    f"PowerShell output sequence advanced for {marker}", timeout=20,
+                assert screen_marker_seen, (
+                    "ConPTY output was observed, but the matching RIGHT screen "
+                    "snapshot was not observed"
+                )
+                assert screen_identity_matches, (
+                    "RIGHT screen observation did not match the selected session identity"
                 )
                 observed_sequence = app._right_observation[1]
                 record_property(
