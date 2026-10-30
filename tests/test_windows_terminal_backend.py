@@ -761,8 +761,14 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(tmp_path, monke
     assert "JTT_JOB_TREE_" not in outer_command
     processes = []
     try:
-        _wait(client, lambda update: update.screen is not None
-              and "JTT>" in _screen_text(update.screen))
+        expected_prompt = _expected_prompt_path(work, 100)
+        initial = _wait(
+            client,
+            lambda update: update.screen is not None
+            and expected_prompt in _compact_screen_text(update.screen),
+        )
+        assert (initial.columns, initial.lines) == (100, 30)
+        assert expected_prompt in _compact_screen_text(initial.screen)
         assert client.acquire()
         client.send((outer_command + "\r").encode("ascii"))
         marker = _wait(
@@ -1685,7 +1691,7 @@ def test_native_powershell_prompt_tracks_long_current_location(
 
 
 def _r02_worker_copy(tmp_path, monkeypatch, active_diagnostics):
-    """Instrument a temporary copy of the worker without changing runtime code."""
+    """Select an explicit private worker copy and pass only test-owned env values."""
     from tmux_agent_tower.terminal import windows_manager
 
     source_root = Path(windows_manager.__file__).resolve().parents[2]
@@ -1707,113 +1713,16 @@ def _r02_worker_copy(tmp_path, monkeypatch, active_diagnostics):
 
     worker = diagnostic_root / "tmux_agent_tower" / "terminal" / "_windows_worker.py"
     source = worker.read_text(encoding="utf-8")
-
-    write_anchor = "                        terminal.write(text)\n"
-    write_instrumentation = '''                        _r02_write_result = None
-                        _r02_write_error = None
-                        try:
-                            _r02_write_result = terminal.write(text)
-                        except Exception as _r02_exc:
-                            _r02_write_error = type(_r02_exc).__name__
-                            raise
-                        finally:
-                            try:
-                                _r02_log = os.environ.get("JTT_R02_WRITE_LOG")
-                                if _r02_log:
-                                    _r02_record = {
-                                        "at_monotonic": time.monotonic(),
-                                        "worker_pid": os.getpid(),
-                                        "input_bytes": len(data),
-                                        "input_hex": data.hex(),
-                                        "write_result_type": type(
-                                            _r02_write_result
-                                        ).__name__,
-                                        "write_result": repr(_r02_write_result),
-                                        "write_error": _r02_write_error,
-                                    }
-                                    with open(_r02_log, "a", encoding="utf-8") as _r02_stream:
-                                        _r02_stream.write(
-                                            json.dumps(_r02_record, sort_keys=True) + "\\n"
-                                        )
-                            except Exception:
-                                pass
-'''
-    if source.count(write_anchor) != 1:
-        raise AssertionError("worker PTY.write instrumentation anchor changed")
-    source = source.replace(write_anchor, write_instrumentation, 1)
-
-    read_state_anchor = "        output = deque()\n"
-    read_state = (
-        read_state_anchor
-        + '        _r02_read_trace = {"chunks": [], "bytes": 0, "truncated": False}\n'
-    )
-    if source.count(read_state_anchor) != 1:
-        raise AssertionError("worker output trace instrumentation anchor changed")
-    source = source.replace(read_state_anchor, read_state, 1)
-
-    read_anchor = "                        if data:\n                            encoded = data.encode(\"utf-8\", errors=\"strict\")\n"
-    read_instrumentation = '''                        if data:
-                            _r02_encoded = data.encode("utf-8", errors="strict")
-                            if (len(_r02_read_trace["chunks"]) < 512
-                                    and _r02_read_trace["bytes"] + len(_r02_encoded)
-                                    <= 131072):
-                                _r02_read_trace["chunks"].append({
-                                    "time": time.monotonic(), "text": data,
-                                })
-                                _r02_read_trace["bytes"] += len(_r02_encoded)
-                            else:
-                                _r02_read_trace["truncated"] = True
-                            encoded = _r02_encoded
-'''
-    if source.count(read_anchor) != 1:
-        raise AssertionError("worker PTY.read instrumentation anchor changed")
-    source = source.replace(read_anchor, read_instrumentation, 1)
-
     environment_anchor = '        shell_env["TERM"] = "xterm"\n'
-    environment_instrumentation = environment_anchor + '''        for _r02_key in (
-            "JTT_R02_META_FILE", "JTT_R02_N", "JTT_R02_MARKER",
+    environment_forward = environment_anchor + '''        for _r02_key in (
+            "JTT_R02_N", "JTT_R02_MARKER",
         ):
             if _r02_key in os.environ:
                 shell_env[_r02_key] = os.environ[_r02_key]
 '''
     if source.count(environment_anchor) != 1:
-        raise AssertionError("worker environment instrumentation anchor changed")
-    source = source.replace(environment_anchor, environment_instrumentation, 1)
-
-    bootstrap_anchor = (
-        '        "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "\n'
-        '        "$OutputEncoding=[Console]::OutputEncoding; "\n'
-    )
-    bootstrap_instrumentation = bootstrap_anchor + '''        "if ($env:JTT_R02_META_FILE) { try { "
-        "$r02=@{ pid=$PID; version=$PSVersionTable.PSVersion.ToString(); "
-        "edition=$PSVersionTable.PSEdition; "
-        "cwd=$PWD.Path; "
-        "input_encoding=[Console]::InputEncoding.WebName; "
-        "input_codepage=[Console]::InputEncoding.CodePage; "
-        "output_encoding=[Console]::OutputEncoding.WebName; "
-        "output_codepage=[Console]::OutputEncoding.CodePage; "
-        "columns=$Host.UI.RawUI.WindowSize.Width; "
-        "lines=$Host.UI.RawUI.WindowSize.Height }; "
-        "[System.IO.File]::WriteAllText($env:JTT_R02_META_FILE, "
-        "($r02 | ConvertTo-Json -Compress)) } catch {} }; "
-'''
-    if source.count(bootstrap_anchor) != 1:
-        raise AssertionError("PowerShell bootstrap instrumentation anchor changed")
-    source = source.replace(bootstrap_anchor, bootstrap_instrumentation, 1)
-
-    flush_anchor = "            reader.join(timeout=1)\n"
-    flush_instrumentation = flush_anchor + '''            try:
-                _r02_read_log = os.environ.get("JTT_R02_READ_LOG")
-                if _r02_read_log:
-                    Path(_r02_read_log).write_text(
-                        json.dumps(_r02_read_trace, sort_keys=True), encoding="utf-8"
-                    )
-            except Exception:
-                pass
-'''
-    if source.count(flush_anchor) != 1:
-        raise AssertionError("worker read trace flush anchor changed")
-    source = source.replace(flush_anchor, flush_instrumentation, 1)
+        raise AssertionError("R02 diagnostic environment anchor changed")
+    source = source.replace(environment_anchor, environment_forward, 1)
     worker.write_text(source, encoding="utf-8")
 
     original_environment = windows_manager._worker_environment
@@ -1847,7 +1756,6 @@ def _r02_process_state(manager, identity):
         identity.shell_pid, expected_start=identity.shell_start,
     )
     return {
-        "pid": identity.shell_pid,
         "expected_start_matches": created == identity.shell_start,
         "alive": bool(alive and created == identity.shell_start),
         "image_matches": image.casefold() == identity.shell_path.casefold(),
@@ -1855,14 +1763,13 @@ def _r02_process_state(manager, identity):
 
 
 def _r02_attach_client_trace(client, manager, roots):
-    """Trace one test-owned client's input acknowledgements and poll results."""
+    """Trace only test-owned state categories, sequence, and monotonic time."""
     trace = {
         "send_calls": [],
         "line_submissions": [],
         "polls": [],
         "command_echo_seen": False,
-        "powershell_error_observations": [],
-        "last_screen": "",
+        "powershell_error_seen": False,
         "last_poll": None,
     }
     original_send = client.send
@@ -1870,44 +1777,32 @@ def _r02_attach_client_trace(client, manager, roots):
 
     def traced_send(payload):
         record = {
-            "at": time.monotonic(),
-            "bytes": len(payload),
-            "payload_hex": payload.hex(),
+            "monotonic_ns": time.monotonic_ns(),
+            "byte_count": len(payload),
+            "returned": False,
+            "acknowledged_bytes": None,
+            "error_category": None,
         }
         is_terminator = payload in (b"\r", b"\n", b"\r\n")
-        is_line_submission = is_terminator or (
-            len(payload) > 1 and payload.endswith((b"\r", b"\n"))
-        )
-        if is_line_submission:
-            record["phase"] = (
-                "preparation_command"
-                if b"JTT_PATH_INPUT_READY_" in payload
-                else "followup_command"
-            )
-        elif len(payload) == 1:
-            record["phase"] = "character_input"
-        else:
-            record["phase"] = "bulk_input"
-        identity = client.identity
-        if is_line_submission:
-            record["process_before"] = _r02_process_state(manager, identity)
+        record["phase"] = "line_terminator" if is_terminator else "input"
         try:
             acknowledged = original_send(payload)
-            record["acknowledged_bytes"] = acknowledged
+            record.update({
+                "returned": True,
+                "acknowledged_bytes": int(acknowledged),
+            })
             return acknowledged
         except Exception as exc:
-            record["send_error"] = type(exc).__name__
+            record["error_category"] = type(exc).__name__
             raise
         finally:
-            record["elapsed_seconds"] = round(time.monotonic() - record["at"], 6)
-            if is_line_submission:
-                record["process_after"] = _r02_process_state(manager, identity)
+            record["monotonic_ns"] = time.monotonic_ns()
+            if is_terminator:
                 trace["line_submissions"].append(dict(record))
             trace["send_calls"].append(dict(record))
 
     def traced_poll():
         update = original_poll()
-        received_at = time.monotonic()
         screen_text = (
             _compact_screen_text(update.screen)
             if update.screen is not None else ""
@@ -1920,118 +1815,18 @@ def _r02_attach_client_trace(client, manager, roots):
             "Cannot find path", "Exception",
         )
         if any(token in screen_text or token in output_text for token in error_tokens):
-            trace["powershell_error_observations"].append({
-                "sequence": update.sequence,
-                "output": _r02_redact(output_text, roots),
-                "screen": _r02_redact(screen_text[-1200:], roots),
-            })
-        trace["last_screen"] = screen_text
-        trace["last_poll"] = _r02_poll_record(update, received_at)
+            trace["powershell_error_seen"] = True
+        trace["last_poll"] = _r02_poll_record(update)
         if (update.output or not trace["polls"]
                 or trace["polls"][-1]["sequence"] != update.sequence
                 or trace["polls"][-1]["snapshot_sequence"]
                 != update.snapshot_sequence):
-            record = _r02_poll_record(update, received_at)
-            record.update({
-                "output_repr_redacted": _r02_redact(output_text, roots),
-                "screen_repr_redacted": _r02_redact(screen_text[-1600:], roots),
-                "command_echo_seen": trace["command_echo_seen"],
-            })
-            trace["polls"].append(record)
+            trace["polls"].append(_r02_poll_record(update))
         return update
 
     client.send = traced_send
     client.poll = traced_poll
     return trace
-
-
-@pytest.fixture(autouse=True)
-def r02_trace_original_long_location_failure(request, tmp_path, monkeypatch):
-    """Add observation only; keep the original failing test and assertions intact."""
-    if request.node.originalname != "test_native_powershell_prompt_tracks_long_current_location":
-        yield
-        return
-
-    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
-    from tmux_agent_tower.terminal import windows_manager
-
-    diagnostic_dir = tmp_path / "r02-original-e2e"
-    diagnostic_dir.mkdir()
-    paths = {
-        "JTT_R02_META_FILE": diagnostic_dir / "powershell-meta.json",
-        "JTT_R02_N": uuid.uuid4().hex,
-        "JTT_R02_WRITE_LOG": diagnostic_dir / "pty-write.jsonl",
-        "JTT_R02_READ_LOG": diagnostic_dir / "pty-read.json",
-    }
-    active = {key: str(value) for key, value in paths.items()}
-    manager = _r02_worker_copy(tmp_path, monkeypatch, active)
-    originals = manager.TerminalRegistry.create
-    captured = []
-    roots = (tmp_path, os.environ.get("USERPROFILE", ""))
-
-    def traced_create(registry, *args, **kwargs):
-        client = originals(registry, *args, **kwargs)
-        captured.append({
-            "client": client,
-            "registry": registry,
-            "identity": client.identity,
-            "trace": _r02_attach_client_trace(client, manager, roots),
-        })
-        return client
-
-    monkeypatch.setattr(manager.TerminalRegistry, "create", traced_create)
-    try:
-        yield
-    finally:
-        for item in captured:
-            client = item["client"]
-            identity = item["identity"]
-            try:
-                item["trace"]["process_at_fixture_teardown"] = (
-                    _r02_process_state(manager, identity)
-                )
-            except Exception as exc:
-                item["trace"]["process_at_fixture_teardown"] = (
-                    f"unavailable:{type(exc).__name__}"
-                )
-            item["trace"]["identity"] = {
-                "session_id_present": bool(identity.session_id),
-                "generation_present": bool(identity.generation),
-                "shell_pid": identity.shell_pid,
-                "shell_start_present": bool(identity.shell_start),
-                "shell_path": identity.shell_path,
-            }
-            item["trace"]["runtime_metadata"] = "not_recorded"
-            metadata_path = Path(paths["JTT_R02_META_FILE"])
-            if metadata_path.is_file():
-                try:
-                    item["trace"]["runtime_metadata"] = json.loads(
-                        metadata_path.read_text(encoding="utf-8")
-                    )
-                except (OSError, ValueError, UnicodeError):
-                    item["trace"]["runtime_metadata"] = "invalid_or_unavailable"
-            write_path = Path(paths["JTT_R02_WRITE_LOG"])
-            if write_path.is_file():
-                try:
-                    write_records = [
-                        json.loads(line) for line in
-                        write_path.read_text(encoding="utf-8").splitlines() if line
-                    ]
-                    item["trace"]["worker_writes"] = write_records
-                except (OSError, ValueError, UnicodeError):
-                    item["trace"]["worker_writes"] = "invalid_or_unavailable"
-            read_path = Path(paths["JTT_R02_READ_LOG"])
-            if read_path.is_file():
-                try:
-                    read_trace = json.loads(read_path.read_text(encoding="utf-8"))
-                    item["trace"]["worker_read_api"] = (
-                        "pywinpty.PTY.read returned str; utf8 re-encoding only"
-                    )
-                    item["trace"]["worker_read_trace"] = read_trace
-                except (OSError, ValueError, UnicodeError):
-                    item["trace"]["worker_read_trace"] = "invalid_or_unavailable"
-            safe = _r02_safe_diagnostic(item["trace"], roots)
-            print("R02_ORIGINAL_E2E_TRACE " + json.dumps(safe, sort_keys=True))
 
 
 def _r02_redact(value, roots):
@@ -2047,20 +1842,17 @@ def _r02_redact(value, roots):
     return text
 
 
-def _r02_poll_record(update, received_at):
+def _r02_poll_record(update):
     return {
-        "time": received_at,
+        "monotonic_ns": time.monotonic_ns(),
         "sequence": update.sequence,
         "snapshot_sequence": update.snapshot_sequence,
         "state": update.state,
         "renderer": update.renderer_state,
-        "columns": update.columns,
-        "lines": update.lines,
         "synced": update.synced,
         "gap": update.gap,
         "more": update.more,
-        "output_bytes": len(update.output),
-        "output_sha256": hashlib.sha256(update.output).hexdigest(),
+        "output_present": bool(update.output),
     }
 
 
@@ -2203,9 +1995,7 @@ def test_r02_long_location_command_terminator_replicas(tmp_path, monkeypatch):
             else:
                 result["marker_command_echo_before_submit"] = "NO"
 
-            submit_at = time.monotonic()
-            result["submitted_at_monotonic"] = submit_at
-            result["terminator_hex"] = terminator.hex()
+            submit_at = time.monotonic_ns()
             result["terminator_ack"] = client.send(terminator)
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
@@ -2240,22 +2030,13 @@ def test_r02_long_location_command_terminator_replicas(tmp_path, monkeypatch):
             result["post_submit_process"] = _r02_process_state(manager, identity)
             post_submit_events = [
                 event for event in trace["polls"]
-                if event["time"] >= submit_at
+                if event["monotonic_ns"] >= submit_at
             ]
-            result["post_submit_output_bytes"] = sum(
-                event["output_bytes"] for event in post_submit_events
-            )
-            result["post_submit_output_repr"] = "".join(
-                event["output_repr_redacted"] for event in post_submit_events
+            result["post_submit_output_observed"] = any(
+                event["output_present"] for event in post_submit_events
             )
             result["final_sequence"] = trace["last_poll"]
-            result["powershell_error_observations"] = (
-                trace["powershell_error_observations"]
-            )
-            result["screen_repr"] = _r02_redact(
-                trace["last_screen"],
-                (tmp_path, os.environ.get("USERPROFILE", "")),
-            )
+            result["powershell_error_seen"] = trace["powershell_error_seen"]
             result["client_trace"] = trace
         except Exception as exc:
             result["error"] = type(exc).__name__
@@ -2294,40 +2075,44 @@ def test_r02_long_location_command_terminator_replicas(tmp_path, monkeypatch):
                     )
                 except Exception as exc:
                     result["cleanup"] = f"STOP_ERROR_{type(exc).__name__}"
-            if metadata_path.is_file():
-                try:
-                    result["runtime_metadata"] = json.loads(
-                        metadata_path.read_text(encoding="utf-8")
-                    )
-                except (OSError, ValueError, UnicodeError):
-                    result["runtime_metadata"] = "invalid_or_unavailable"
-            if write_log.is_file():
-                try:
-                    result["worker_write_records"] = [
-                        json.loads(line)
-                        for line in write_log.read_text(encoding="utf-8").splitlines()
-                        if line
-                    ]
-                except (OSError, ValueError, UnicodeError):
-                    result["worker_write_records"] = "invalid_or_unavailable"
-            if read_log.is_file():
-                try:
-                    result["worker_read_api"] = (
-                        "pywinpty.PTY.read str; UTF-8 re-encoding, not native bytes"
-                    )
-                    result["worker_read_trace"] = json.loads(
-                        read_log.read_text(encoding="utf-8")
-                    )
-                except (OSError, ValueError, UnicodeError):
-                    result["worker_read_trace"] = "invalid_or_unavailable"
-            safe = _r02_safe_diagnostic(
-                result, (tmp_path, os.environ.get("USERPROFILE", ""))
-            )
-            print("R02_LONG_PATH_REPLICA " + json.dumps(safe, sort_keys=True))
+            print("R02_LONG_PATH_REPLICA " + json.dumps({
+                "nonce": nonce[:12],
+                "terminator": result["terminator"],
+                "initial_prompt_seen": result["initial_prompt_seen"],
+                "marker_command_echo_before_submit": result.get(
+                    "marker_command_echo_before_submit", "UNKNOWN"
+                ),
+                "execution": result["execution"],
+                "marker": result["marker"],
+                "screen_result_path": result["screen_result_path"],
+                "new_prompt": result["new_prompt"],
+                "post_submit_output_observed": result.get(
+                    "post_submit_output_observed", False
+                ),
+                "post_submit_process": result.get("post_submit_process"),
+                "sequence": (
+                    (result.get("final_sequence") or {}).get("sequence")
+                ),
+                "snapshot_sequence": (
+                    (result.get("final_sequence") or {}).get("snapshot_sequence")
+                ),
+                "worker_running": (
+                    (result.get("final_sequence") or {}).get("state") == "running"
+                ),
+                "renderer_ready": (
+                    (result.get("final_sequence") or {}).get("renderer") == "ready"
+                ),
+                "synced": (result.get("final_sequence") or {}).get("synced"),
+                "gap": (result.get("final_sequence") or {}).get("gap"),
+                "cleanup": result["cleanup"],
+                "error_category": result.get("error"),
+            }, sort_keys=True))
         results.append(result)
 
     assert [item["terminator"] for item in results] == ["CR", "CRLF"]
-    assert all(item["cleanup"] == "STOPPED" for item in results), results
+    assert all(item["cleanup"] == "STOPPED" for item in results), (
+        "one or more test-owned diagnostic sessions did not stop cleanly"
+    )
 
 
 def test_r02_powershell_input_and_terminator_diagnostic_matrix(tmp_path, monkeypatch):
@@ -2444,7 +2229,6 @@ def test_r02_powershell_input_and_terminator_diagnostic_matrix(tmp_path, monkeyp
 
             def capture_poll():
                 nonlocal latest
-                received_at = time.monotonic()
                 update = original_poll()
                 latest = update
                 if update.output:
@@ -2454,7 +2238,7 @@ def test_r02_powershell_input_and_terminator_diagnostic_matrix(tmp_path, monkeyp
                         or poll_events[-1]["sequence"] != update.sequence
                         or poll_events[-1]["snapshot_sequence"]
                         != update.snapshot_sequence):
-                    poll_events.append(_r02_poll_record(update, received_at))
+                    poll_events.append(_r02_poll_record(update))
                 return update
 
             client.poll = capture_poll
@@ -2823,7 +2607,30 @@ def test_r02_powershell_input_and_terminator_diagnostic_matrix(tmp_path, monkeyp
         safe_input_records.extend(dict(record) for record in other_records)
         result["input_records"] = safe_input_records
         summaries.append(result)
-        print("R02_DIAGNOSTIC " + json.dumps(result, sort_keys=True))
+        print("R02_DIAGNOSTIC " + json.dumps({
+            "nonce": nonce[:12],
+            "case": case_name,
+            "delivery": delivery,
+            "terminator": terminator_name,
+            "initial_screen_observed": initial is not None,
+            "initial_size": result["initial_columns_lines"],
+            "command_echo_observed": result["command_echo"],
+            "execution": result["command_execution"],
+            "marker_file": result["marker_file"],
+            "result_path_observed": result["result_path_in_screen"],
+            "new_prompt_observed": result["new_prompt"],
+            "input_send_count": len(result["input_records"]),
+            "input_acknowledged_bytes": sum(
+                int(record.get("acknowledged_bytes", 0))
+                for record in result["input_records"]
+            ),
+            "final_sequence": result["final_sequence"],
+            "snapshot_sequence": result["final_snapshot_sequence"],
+            "synced": result["final_synced"],
+            "gap": result["final_gap"],
+            "error_category": result["final_error"],
+            "cleanup": result["cleanup"],
+        }, sort_keys=True))
 
     assert len(summaries) == 6
     assert {item["case"] for item in summaries} == {
@@ -2831,11 +2638,12 @@ def test_r02_powershell_input_and_terminator_diagnostic_matrix(tmp_path, monkeyp
         for delivery in ("character", "bulk")
         for terminator in ("CR", "LF", "CRLF")
     }
-    assert all(item["cleanup"] == "STOPPED" for item in summaries), summaries
+    assert all(item["cleanup"] == "STOPPED" for item in summaries), (
+        "one or more test-owned diagnostic sessions did not stop cleanly"
+    )
 
 
-def _r02_startup_stage_worker_copy(
-        tmp_path, monkeypatch, trace_dir, nonce, expected_prompt, path_marker):
+def _r02_startup_stage_worker_copy(tmp_path, monkeypatch, active_diagnostics):
     """Instrument only a private worker copy; the original worker remains untouched."""
     from tmux_agent_tower.terminal import windows_manager
 
@@ -2857,16 +2665,12 @@ def _r02_startup_stage_worker_copy(
     worker = package_copy / "terminal" / "_windows_worker.py"
     source = worker.read_text(encoding="utf-8")
 
-    marker_helper = '''def _r02_startup_mark(stage, **details):
+    marker_helper = '''def _r02_startup_mark(stage, status="observed"):
     root = os.environ.get("JTT_STARTUP_TRACE_DIR")
     nonce = os.environ.get("JTT_STARTUP_NONCE")
     if not root or not nonce:
         return
-    record = {
-        "stage": stage, "nonce": nonce, "worker_pid": os.getpid(),
-        "utc_ms": int(time.time() * 1000),
-    }
-    record.update(details)
+    record = {"stage": stage, "nonce": nonce, "status": status}
     path = Path(root) / (nonce + "." + stage + ".json")
     try:
         with path.open("x", encoding="utf-8") as stream:
@@ -2881,6 +2685,18 @@ def _r02_startup_stage_worker_copy(
     if source.count(import_anchor) != 1:
         raise AssertionError("startup diagnostic import anchor changed")
     source = source.replace(import_anchor, import_anchor + "\n" + marker_helper, 1)
+
+    assign_anchor = (
+        "            assign_owned_job(job, shell_handle, win32job, win32api,\n"
+        "                             win32event, win32con)\n"
+    )
+    if source.count(assign_anchor) != 1:
+        raise AssertionError("startup diagnostic Job assignment anchor changed")
+    source = source.replace(
+        assign_anchor,
+        assign_anchor + '            _r02_startup_mark("job_assignment_confirmed")\n',
+        1,
+    )
 
     environment_anchor = '        shell_env["TERM"] = "xterm"\n'
     environment_forward = environment_anchor + '''        for _r02_key in (
@@ -2899,29 +2715,43 @@ def _r02_startup_stage_worker_copy(
         raise AssertionError("startup diagnostic release gate anchor changed")
     source = source.replace(
         release_anchor,
-        release_anchor + '            _r02_startup_mark("worker_release_gate")\n',
+        release_anchor + '            _r02_startup_mark("worker_release_gate_signaled")\n',
+        1,
+    )
+
+    renderer_anchor = (
+        '        stream.feed("\\x1b[0m")\n'
+    )
+    if source.count(renderer_anchor) != 1:
+        raise AssertionError("startup diagnostic renderer initialization anchor changed")
+    source = source.replace(
+        renderer_anchor,
+        renderer_anchor + '        _r02_startup_mark("renderer_initialized")\n',
+        1,
+    )
+
+    running_anchor = (
+        '                runtime._atomic_metadata(metadata_path, metadata)\n'
+        '\n            def read_output():\n'
+    )
+    if source.count(running_anchor) != 1:
+        raise AssertionError("startup diagnostic running-state anchor changed")
+    source = source.replace(
+        running_anchor,
+        '                runtime._atomic_metadata(metadata_path, metadata)\n'
+        '            _r02_startup_mark("worker_running_published")\n'
+        '\n            def read_output():\n',
         1,
     )
 
     ps_helper = (
         "function global:__jttStartupMark { "
-        "param([string]$stage,[string]$detail=''); "
+        "param([string]$stage,[string]$status='observed'); "
         "if (!$env:JTT_STARTUP_TRACE_DIR -or !$env:JTT_STARTUP_NONCE) { return }; "
         "try { $path=Join-Path $env:JTT_STARTUP_TRACE_DIR "
         "($env:JTT_STARTUP_NONCE+'.'+$stage+'.json'); "
         "if (Test-Path -LiteralPath $path) { return }; "
-        "$record=@{nonce=$env:JTT_STARTUP_NONCE;stage=$stage;pid=$PID;"
-        "utc_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()}; "
-        "if ($stage -eq 'bootstrap_initialized') { "
-        "$record.powershell_version=$PSVersionTable.PSVersion.ToString(); "
-        "$record.powershell_edition=$PSVersionTable.PSEdition; "
-        "$record.columns=$Host.UI.RawUI.WindowSize.Width; "
-        "$record.lines=$Host.UI.RawUI.WindowSize.Height; "
-        "$record.input_codepage=[Console]::InputEncoding.CodePage }; "
-        "if ($stage -eq 'prompt_return') { "
-        "$record.prompt_matches_expected=($detail -eq "
-        "$env:JTT_STARTUP_EXPECTED_PROMPT); "
-        "$record.prompt_length=$detail.Length }; "
+        "$record=@{nonce=$env:JTT_STARTUP_NONCE;stage=$stage;status=$status}; "
         "[System.IO.File]::WriteAllText($path,($record|ConvertTo-Json -Compress)) "
         "} catch {} }; "
     )
@@ -2938,11 +2768,7 @@ def _r02_startup_stage_worker_copy(
         ('        "$r.Dispose(); $a.Dispose(); "\n',
          "__jttStartupMark 'child_gate_passed'; "),
         ('        "Remove-Module PSReadLine -ErrorAction SilentlyContinue; "\n',
-         "__jttStartupMark 'bootstrap_initialized' "
-         "($PSVersionTable.PSVersion.ToString()+'|'+"
-         "$Host.UI.RawUI.WindowSize.Width+'|'+"
-         "$Host.UI.RawUI.WindowSize.Height+'|'+"
-         "[Console]::InputEncoding.CodePage); "),
+         "__jttStartupMark 'bootstrap_initialized'; "),
         ('        "function global:prompt { "\n',
          "__jttStartupMark 'prompt_invoked'; "),
     ):
@@ -2955,7 +2781,8 @@ def _r02_startup_stage_worker_copy(
     prompt_end = '        "}; \'PS \'+$path+\'> \' }"\n'
     prompt_replacement = (
         "}; $jttPromptReturn='PS '+$path+'> '; "
-        "__jttStartupMark 'prompt_return' $jttPromptReturn; "
+        "__jttStartupMark 'prompt_return' $(if ($jttPromptReturn -eq "
+        "$env:JTT_STARTUP_EXPECTED_PROMPT) {'match'} else {'mismatch'}); "
         "$jttPromptReturn }; __jttStartupMark 'prompt_registered'"
     )
     if source.count(prompt_end) != 1:
@@ -3035,10 +2862,7 @@ def _r02_startup_stage_worker_copy(
     def diagnostic_environment(session_dir):
         env = original_environment(session_dir)
         env.update({
-            "JTT_STARTUP_TRACE_DIR": str(trace_dir),
-            "JTT_STARTUP_NONCE": nonce,
-            "JTT_STARTUP_EXPECTED_PROMPT": expected_prompt + " ",
-            "JTT_STARTUP_MARKER": str(path_marker),
+            key: str(value) for key, value in active_diagnostics.items()
         })
         return env
 
@@ -3050,193 +2874,173 @@ def _r02_startup_stage_worker_copy(
 
 def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
         tmp_path, monkeypatch):
-    """Compare a plain session with a separately instrumented worker copy."""
+    # Compare product startup at short/long cwd, then trace a separate worker copy.
     import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
     from tmux_agent_tower.terminal import TerminalRegistry, windows_manager
+    import tempfile
 
     case_root = tmp_path / "r02-startup02"
-    start = case_root / "work" / ("segment_" + "a" * 24) / ("segment_" + "b" * 24)
-    destination = start / "dest"
-    destination.mkdir(parents=True)
-    assert 100 < len(str(start)) < 230
-    monkeypatch.chdir(start)
-    expected_start_prompt = _expected_prompt_path(start, 100)
-    expected_destination_prompt = _expected_prompt_path(destination, 100)
-    nonce = uuid.uuid4().hex
+    long_start = case_root / "long" / ("segment_" + "a" * 24) / ("segment_" + "b" * 24)
+    assert len(str(long_start)) > 64
+    assert 100 < len(str(long_start)) < 230
+    short_root = Path(tempfile.mkdtemp(prefix="jt", dir=tempfile.gettempdir()))
+    short_start = short_root / "short"
+    cases = (("short_untruncated", short_start), ("long_truncated", long_start))
+    if len(str(short_start)) > 64:
+        shutil.rmtree(short_root)
+        raise AssertionError("runner TEMP cannot provide an untruncated short cwd")
 
-    def identity_record(identity, manager):
+    def identity_is_session_owned(identity, manager):
         created, image, alive = manager._process_facts(
             identity.shell_pid, expected_start=identity.shell_start,
         )
-        return {
-            "session_id": identity.session_id,
-            "generation": identity.generation,
-            "supervisor_pid": identity.supervisor_pid,
-            "supervisor_start": identity.supervisor_start,
-            "shell_pid": identity.shell_pid,
-            "shell_start": identity.shell_start,
-            "shell_start_matches": created == identity.shell_start,
-            "shell_image_matches": image.casefold() == identity.shell_path.casefold(),
-            "shell_alive": bool(alive and created == identity.shell_start),
-        }
+        return bool(
+            identity.session_id and identity.generation
+            and identity.shell_pid > 0 and identity.shell_start
+            and created == identity.shell_start
+            and image.casefold() == identity.shell_path.casefold()
+            and alive
+        )
 
-    def run_original():
-        registry = TerminalRegistry(case_root / "original-jtt-home" / "terminals")
-        client = registry.create("R02 original uninstrumented startup")
+    product_results = []
+    short_root_cleanup_verified = False
+    for label, start_path in cases:
+        destination = start_path / "dest"
+        destination.mkdir(parents=True)
+        monkeypatch.chdir(start_path)
+        expected_prompt = _expected_prompt_path(start_path, 100)
+        registry = TerminalRegistry(
+            case_root / f"product-{label}-home" / "terminals"
+        )
+        client = registry.create("R02 product-worker prompt comparison")
         identity = client.identity
-        result = {
-            "run": "original_uninstrumented",
-            "identity": identity_record(identity, windows_manager),
-            "initial_size": [100, 30],
-            "first_prompt": "UNKNOWN",
-            "prompt_in_poll_output": False,
-            "prompt_in_client_snapshot": False,
-            "sequence": None,
-            "snapshot_sequence": None,
-            "synced": None,
-            "gap": None,
-            "powershell": "UNKNOWN",
-            "cleanup": "NOT_ATTEMPTED",
-        }
+        output_tail = ""
+        last = None
+        identity_valid_at_startup = False
+        prompt_output = False
+        prompt_snapshot = False
         try:
             deadline = time.monotonic() + 15
-            collected_output = ""
             while time.monotonic() < deadline:
-                update = client.poll()
-                collected_output += update.output.decode("utf-8", errors="replace")
-                visible = bool(
-                    update.screen is not None
-                    and expected_start_prompt in _compact_screen_text(update.screen)
-                )
-                if visible:
-                    result.update({
-                        "first_prompt": "YES",
-                        "prompt_in_poll_output": expected_start_prompt in collected_output,
-                        "prompt_in_client_snapshot": True,
-                        "sequence": update.sequence,
-                        "snapshot_sequence": update.snapshot_sequence,
-                        "synced": update.synced,
-                        "gap": update.gap,
-                    })
+                last = client.poll()
+                if last.output:
+                    output_tail = (output_tail + last.output.decode(
+                        "utf-8", errors="replace"
+                    ))[-8192:]
+                    prompt_output = expected_prompt in output_tail
+                if (last.screen is not None and last.synced
+                        and last.state == "running"
+                        and expected_prompt in _compact_screen_text(last.screen)):
+                    prompt_snapshot = True
                     break
                 time.sleep(0.02)
-            if result["first_prompt"] == "YES" and client.acquire():
-                version_nonce = uuid.uuid4().hex[:10]
-                marker = f"JTT_STARTUP_VERSION_{version_nonce}_END"
-                command = (
-                    "[Console]::WriteLine('JTT_STARTUP_VERSION_' + '"
-                    + version_nonce
-                    + "' + '_END|' + $PSVersionTable.PSVersion.ToString() + '|' + "
-                    "$Host.UI.RawUI.WindowSize.Width + 'x' + "
-                    "$Host.UI.RawUI.WindowSize.Height + '|' + "
-                    "[Console]::InputEncoding.CodePage)"
-                )
-                assert marker not in command
-                client.send((command + "\r").encode("ascii"))
-                deadline = time.monotonic() + 10
-                output_text = ""
-                while time.monotonic() < deadline:
-                    update = client.poll()
-                    output_text += update.output.decode("utf-8", errors="replace")
-                    match = re.search(
-                        rf"{re.escape(marker)}\|([0-9.]+)\|(\d+x\d+)\|(\d+)",
-                        output_text,
-                    )
-                    if match:
-                        result["powershell"] = {
-                            "version": match.group(1),
-                            "columns_lines": match.group(2),
-                            "input_codepage": int(match.group(3)),
-                        }
-                        break
-                    time.sleep(0.02)
-            return result
+            identity_valid_at_startup = identity_is_session_owned(
+                identity, windows_manager
+            )
         finally:
             client.close()
             registry.stop(
                 identity.session_id, expected_generation=identity.generation,
                 expected_shell_pid=identity.shell_pid,
             )
-            created, _image, alive = windows_manager._process_facts(
-                identity.shell_pid, expected_start=identity.shell_start,
+        created, _image, alive = windows_manager._process_facts(
+            identity.shell_pid, expected_start=identity.shell_start,
+        )
+        registry_empty = not registry.list_sessions()
+        if label == "short_untruncated":
+            short_root_cleanup_verified = (
+                created == identity.shell_start and not alive and registry_empty
             )
-            result["cleanup"] = "STOPPED" if not alive else "PROCESS_STILL_ALIVE"
-            result["shell_identity_matched_before_stop"] = (
-                result["identity"]["shell_start_matches"]
-            )
-            result["registry_entries_after_cleanup"] = len(registry.list_sessions())
+        product_results.append({
+            "case": label,
+            "nonce": uuid.uuid4().hex,
+            "worker_source": "product",
+            "launch_mode": "-NoExit -Command",
+            "planned_initial_size": "100x30",
+            "session_identity_valid": identity_valid_at_startup,
+            "prompt_present_in_pty_read": prompt_output,
+            "prompt_present_in_client_snapshot": prompt_snapshot,
+            "worker_running": bool(last is not None and last.state == "running"),
+            "renderer_ready": bool(
+                last is not None and last.renderer_state == "ready"
+                and last.screen is not None
+            ),
+            "sequence": last.sequence if last is not None else None,
+            "snapshot_sequence": (
+                last.snapshot_sequence if last is not None else None
+            ),
+            "sequence_snapshot_current": bool(
+                last is not None and last.sequence == last.snapshot_sequence
+            ),
+            "gap": bool(last.gap) if last is not None else None,
+            "initial_size_matches": bool(
+                last is not None and (last.columns, last.lines) == (100, 30)
+            ),
+            "owned_shell_exited_after_stop": bool(
+                created == identity.shell_start and not alive
+            ),
+            "registry_empty_after_stop": registry_empty,
+        })
+        print("R02_PRODUCT_STARTUP " + json.dumps(product_results[-1], sort_keys=True))
 
-    original_result = run_original()
-    print(
-        "STARTUP02_ORIGINAL_UNMODIFIED "
-        + json.dumps(original_result, sort_keys=True),
-        flush=True,
+    active_diagnostics = {}
+    diagnostic_manager = _r02_startup_stage_worker_copy(
+        tmp_path, monkeypatch, active_diagnostics,
     )
-
-    trace_dir = case_root / "private-trace"
+    _label, start_path = cases[1]
+    destination = start_path / "dest"
+    expected_prompt = _expected_prompt_path(start_path, 100)
+    expected_destination_prompt = _expected_prompt_path(destination, 100)
+    trace_dir = case_root / "private-trace-instrumented-copy"
     windows_manager._ensure_private_directory(trace_dir)
     windows_manager._private_acl(trace_dir, directory=True)
-
-    def secure_private_marker(path):
-        windows_manager._private_acl(path, directory=False, apply=True)
-        windows_manager._private_acl(path, directory=False)
-
-    permission_probe = trace_dir / (nonce + ".acl-probe")
-    permission_probe.write_text(nonce, encoding="ascii")
-    secure_private_marker(permission_probe)
-    assert permission_probe.read_text(encoding="ascii") == nonce
-    permission_probe.unlink()
-
-    path_marker = trace_dir / (nonce + ".path-executed")
-    diagnostic_manager = _r02_startup_stage_worker_copy(
-        tmp_path, monkeypatch, trace_dir, nonce,
-        expected_start_prompt, path_marker,
-    )
-    registry = TerminalRegistry(
-        case_root / "instrumented-jtt-home" / "terminals"
-    )
-    client = registry.create("R02 instrumented startup replica")
+    nonce = uuid.uuid4().hex
+    path_marker = trace_dir / f"{nonce}.path-executed"
+    active_diagnostics.clear()
+    active_diagnostics.update({
+        "JTT_STARTUP_TRACE_DIR": trace_dir,
+        "JTT_STARTUP_NONCE": nonce,
+        "JTT_STARTUP_EXPECTED_PROMPT": expected_prompt + " ",
+        "JTT_STARTUP_MARKER": path_marker,
+    })
+    monkeypatch.chdir(start_path)
+    registry = TerminalRegistry(case_root / "instrumented-copy-home" / "terminals")
+    client = registry.create("R02 explicitly instrumented diagnostic copy")
     identity = client.identity
-    replica = {
-        "run": "instrumented_replica",
-        "identity": identity_record(identity, diagnostic_manager),
-        "initial_size": [100, 30],
-        "first_prompt": "UNKNOWN",
-        "prompt_in_poll_output": False,
-        "prompt_in_client_snapshot": False,
-        "sequence": None,
-        "snapshot_sequence": None,
-        "synced": None,
-        "gap": None,
-        "path_change": "NOT_ATTEMPTED",
-        "cleanup": "NOT_ATTEMPTED",
-        "marker_directory_private": True,
-        "marker_write_preflight": True,
-    }
+    identity_valid_at_startup = identity_is_session_owned(
+        identity, diagnostic_manager
+    )
+    initial = None
+    raw_tail = ""
+    path_marker_matches = False
+    path_result_observed = False
+    destination_prompt_observed = False
+    path_sequence_current = False
+    path_output_tail = ""
     try:
         deadline = time.monotonic() + 15
-        collected_output = ""
         while time.monotonic() < deadline:
             update = client.poll()
-            collected_output += update.output.decode("utf-8", errors="replace")
-            visible = bool(
-                update.screen is not None
-                and expected_start_prompt in _compact_screen_text(update.screen)
-            )
-            if visible:
-                replica.update({
-                    "first_prompt": "YES",
-                    "prompt_in_poll_output": expected_start_prompt in collected_output,
-                    "prompt_in_client_snapshot": True,
-                    "sequence": update.sequence,
-                    "snapshot_sequence": update.snapshot_sequence,
-                    "synced": update.synced,
-                    "gap": update.gap,
-                })
+            if update.output:
+                raw_tail = (raw_tail + update.output.decode(
+                    "utf-8", errors="replace"
+                ))[-8192:]
+            if (update.screen is not None and update.synced
+                    and update.state == "running"
+                    and expected_prompt in _compact_screen_text(update.screen)):
+                initial = update
+                client_marker = trace_dir / f"{nonce}.client_snapshot_prompt.json"
+                with client_marker.open("x", encoding="ascii") as stream:
+                    json.dump({
+                        "nonce": nonce,
+                        "stage": "client_snapshot_prompt",
+                        "status": "observed",
+                    }, stream, sort_keys=True)
+                    stream.flush()
                 break
             time.sleep(0.02)
 
-        if replica["first_prompt"] == "YES" and client.acquire():
+        if initial is not None and client.acquire():
             result_marker = f"JTT_STARTUP_PATH_RESULT_{nonce}_END"
             command = (
                 "Set-Location 'dest'; "
@@ -3245,104 +3049,143 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
                 "$env:JTT_STARTUP_NONCE + '_END'); $PWD.Path"
             )
             assert result_marker not in command
-            client.send((command + "\r\n").encode("utf-8"))
+            encoded = (command + "\r\n").encode("utf-8")
+            sent = client.send(encoded) == len(encoded)
+            output_seen = False
+            last = None
             deadline = time.monotonic() + 15
-            output_text = ""
-            next_prompt_seen = False
-            path_marker_acl_valid = False
-            last_update = None
             while time.monotonic() < deadline:
-                last_update = client.poll()
-                output_text += last_update.output.decode("utf-8", errors="replace")
+                last = client.poll()
+                if last.output:
+                    path_output_tail = (
+                        path_output_tail + last.output.decode(
+                            "utf-8", errors="replace"
+                        )
+                    )[-4096:]
+                output_seen = result_marker in path_output_tail
                 screen = (
-                    _compact_screen_text(last_update.screen)
-                    if last_update.screen is not None else ""
+                    _compact_screen_text(last.screen)
+                    if last.screen is not None else ""
                 )
-                if path_marker.is_file() and not path_marker_acl_valid:
-                    secure_private_marker(path_marker)
-                    path_marker_acl_valid = True
-                next_prompt_seen = expected_destination_prompt in screen
-                if (result_marker in output_text and path_marker_acl_valid
-                        and next_prompt_seen):
+                destination_prompt_observed = expected_destination_prompt in screen
+                if path_marker.is_file():
+                    windows_manager._private_acl(
+                        path_marker, directory=False, apply=True
+                    )
+                    windows_manager._private_acl(path_marker, directory=False)
+                    path_marker_matches = (
+                        path_marker.read_text(encoding="ascii") == nonce
+                    )
+                if output_seen and path_marker_matches and destination_prompt_observed:
                     break
                 time.sleep(0.02)
-            path_marker_status = "UNKNOWN"
-            if path_marker_acl_valid and path_marker.is_file():
-                path_marker_status = (
-                    "YES"
-                    if path_marker.read_text(encoding="ascii") == nonce
-                    else "NO"
-                )
-            replica["path_change"] = {
-                "unique_output_marker": result_marker in output_text,
-                "nonce_file_status": path_marker_status,
-                "nonce_file_acl_valid": path_marker_acl_valid,
-                "destination_prompt": next_prompt_seen,
-                "sequence": getattr(last_update, "sequence", None),
-                "snapshot_sequence": getattr(last_update, "snapshot_sequence", None),
-            }
+            path_result_observed = output_seen and sent
+            path_sequence_current = bool(
+                last is not None and last.sequence == last.snapshot_sequence
+                and not last.gap
+            )
+        else:
+            sent = False
+            last = initial
 
-        stages = (
-            "worker_release_gate", "child_gate_passed", "bootstrap_initialized",
-            "prompt_registered", "prompt_invoked", "prompt_return",
-            "pty_read_prompt", "pyte_screen_prompt",
+        stage_names = (
+            "renderer_initialized",
+            "job_assignment_confirmed",
+            "worker_release_gate_signaled",
+            "worker_running_published",
+            "child_gate_passed",
+            "bootstrap_initialized",
+            "prompt_registered",
+            "prompt_invoked",
+            "prompt_return",
+            "pty_read_prompt",
+            "pyte_screen_prompt",
+            "client_snapshot_prompt",
         )
-        stage_results = {}
-        for stage in stages:
-            marker_file = trace_dir / f"{nonce}.{stage}.json"
-            if not marker_file.is_file():
-                stage_results[stage] = {
-                    "status": "UNKNOWN",
-                    "evidence": "marker_absent_is_not_stage_failure",
-                }
+        stages = {}
+        for stage in stage_names:
+            marker = trace_dir / f"{nonce}.{stage}.json"
+            if not marker.is_file():
+                stages[stage] = None
                 continue
             try:
-                secure_private_marker(marker_file)
-                record = json.loads(marker_file.read_text(encoding="utf-8"))
-                status = "YES" if record.get("nonce") == nonce else "UNKNOWN"
-                stage_results[stage] = {
-                    "status": status,
-                    "marker_acl_valid": True,
-                    "pid": record.get("pid", record.get("worker_pid")),
-                    "utc_ms": record.get("utc_ms"),
-                }
-                if stage == "bootstrap_initialized":
-                    stage_results[stage].update({
-                        key: record.get(key) for key in (
-                            "powershell_version", "powershell_edition",
-                            "columns", "lines", "input_codepage",
-                        )
-                    })
-                if stage == "prompt_return":
-                    stage_results[stage]["prompt_matches_expected"] = record.get(
-                        "prompt_matches_expected", False
+                windows_manager._private_acl(marker, directory=False, apply=True)
+                windows_manager._private_acl(marker, directory=False)
+                record = json.loads(marker.read_text(encoding="ascii"))
+                valid = (
+                    record.get("nonce") == nonce
+                    and record.get("stage") == stage
+                    and record.get("status") in (
+                        "observed", "match", "mismatch",
                     )
+                )
+                status = record.get("status") if valid else None
+                stages[stage] = (
+                    status in ("observed", "match")
+                    if status in ("observed", "match", "mismatch") else None
+                )
             except (OSError, ValueError, UnicodeError):
-                stage_results[stage] = {
-                    "status": "UNKNOWN", "evidence": "marker_unreadable",
-                }
-        replica["stages"] = stage_results
-        replica["marker_directory_private"] = windows_manager.is_private_directory(
-            trace_dir
-        )
+                stages[stage] = None
     finally:
         client.close()
         registry.stop(
             identity.session_id, expected_generation=identity.generation,
             expected_shell_pid=identity.shell_pid,
         )
-        _created, _image, alive = diagnostic_manager._process_facts(
+        created, _image, alive = diagnostic_manager._process_facts(
             identity.shell_pid, expected_start=identity.shell_start,
         )
-        replica["cleanup"] = "STOPPED" if not alive else "PROCESS_STILL_ALIVE"
-        replica["shell_identity_matched_before_stop"] = (
-            replica["identity"]["shell_start_matches"]
+        instrumented_result = {
+            "case": "long",
+            "nonce": nonce,
+            "worker_source": "explicit_instrumented_copy_not_product_evidence",
+            "launch_mode": "-NoExit -Command",
+            "planned_initial_size": "100x30",
+            "session_identity_valid": identity_valid_at_startup,
+            "prompt_present_in_pty_read": expected_prompt in raw_tail,
+            "prompt_present_in_client_snapshot": initial is not None,
+            "worker_running": bool(initial is not None and initial.state == "running"),
+            "renderer_ready": bool(
+                initial is not None and initial.renderer_state == "ready"
+                and initial.screen is not None
+            ),
+            "sequence": initial.sequence if initial is not None else None,
+            "snapshot_sequence": (
+                initial.snapshot_sequence if initial is not None else None
+            ),
+            "sequence_snapshot_current": bool(
+                initial is not None and initial.sequence == initial.snapshot_sequence
+            ),
+            "gap": bool(initial.gap) if initial is not None else None,
+            "initial_size_matches": bool(
+                initial is not None and (initial.columns, initial.lines) == (100, 30)
+            ),
+            "path_command_sent_and_output_observed": path_result_observed,
+            "path_marker_matches": path_marker_matches,
+            "destination_prompt_observed": destination_prompt_observed,
+            "path_sequence_current": path_sequence_current,
+            "path_sequence": last.sequence if last is not None else None,
+            "path_snapshot_sequence": (
+                last.snapshot_sequence if last is not None else None
+            ),
+            "stages": stages,
+            "owned_shell_exited_after_stop": bool(
+                created == identity.shell_start and not alive
+            ),
+            "registry_empty_after_stop": not registry.list_sessions(),
+            "trace_directory_private": windows_manager.is_private_directory(trace_dir),
+        }
+        print("R02_INSTRUMENTED_COPY_STARTUP " + json.dumps(
+            instrumented_result, sort_keys=True
+        ), flush=True)
+        assert instrumented_result["owned_shell_exited_after_stop"], (
+            "test-owned instrumented PowerShell did not stop"
         )
-        replica["registry_entries_after_cleanup"] = len(registry.list_sessions())
-        print(
-            "STARTUP02_INSTRUMENTED_REPLICA "
-            + json.dumps(replica, sort_keys=True),
-            flush=True,
+        assert instrumented_result["registry_empty_after_stop"], (
+            "test-owned instrumented registry was not empty after stop"
         )
-        assert not alive, "isolated diagnostic PowerShell remained alive after stop"
-        assert len(registry.list_sessions()) == 0
+    if not short_root_cleanup_verified:
+        raise AssertionError(
+            "short-cwd test-owned shell and registry cleanup was not confirmed"
+        )
+    shutil.rmtree(short_root)

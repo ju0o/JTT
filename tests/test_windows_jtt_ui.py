@@ -2263,7 +2263,7 @@ def test_native_windows_paste_event_enters_selected_powershell(tmp_path):
 
 @pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
 def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, record_property):
     # Patch the module that defines the already-imported app class. Earlier
     # tests may also import the shared namespace under its legacy name, so a
     # package-name import here can target a second module object in a full run.
@@ -2329,23 +2329,132 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
             accepted_inputs = []
 
             def record_send(data):
-                accepted = original_send(data)
-                accepted_inputs.append((data, accepted))
+                from ju0_terminal_tower.terminal.manager import TerminalError
+
+                outcome = {
+                    "attempted": True,
+                    "byte_count": len(data),
+                    "returned": False,
+                    "accepted_bytes": None,
+                    "terminal_error": None,
+                }
+                try:
+                    accepted = original_send(data)
+                except TerminalError as exc:
+                    category = str(exc)
+                    if category not in {
+                        "input_lease_required", "stream_gap", "stale_identity",
+                        "renderer_unavailable", "terminal input response is invalid",
+                    }:
+                        category = "terminal_error_other"
+                    outcome["terminal_error"] = category
+                    accepted_inputs.append(outcome)
+                    raise
+                except Exception as exc:
+                    outcome["terminal_error"] = type(exc).__name__
+                    accepted_inputs.append(outcome)
+                    raise
+                outcome.update({
+                    "returned": True,
+                    "accepted_bytes": accepted,
+                })
+                accepted_inputs.append(outcome)
                 return accepted
 
             monkeypatch.setattr(client, "send", record_send)
-            for command, marker in commands:
+            import json
+
+            for index, (command, marker) in enumerate(commands):
                 assert marker not in command
                 encoded = (command + "\r").encode("utf-8")
                 prior_observation = app._right_observation
                 assert prior_observation is not None
                 prior_sequence = prior_observation[1]
                 prior_count = len(accepted_inputs)
-                await app._send_bytes(encoded)
+                selected_before_send = app.selected_identity
+                visible_before_send = (
+                    app.sessions.get(selected_before_send.session_id)
+                    if selected_before_send is not None else None
+                )
+                send_predicates = {
+                    "input_mode": bool(app.input_mode),
+                    "right_panel_index": app._panel_index == 2,
+                    "right_widget_focused": (
+                        getattr(app.focused, "id", None) == "live"
+                    ),
+                    "client_present": app.client is not None,
+                    "client_is_current": app.client is client,
+                    "lease_owned": bool(client.lease),
+                    "selected_identity_present": selected_before_send is not None,
+                    "selection_matches": (
+                        selected_before_send is not None
+                        and app._selection_matches(selected_before_send)
+                    ),
+                    "visible_session_present": visible_before_send is not None,
+                    "visible_identity_matches": (
+                        selected_before_send is not None
+                        and visible_before_send is not None
+                        and _same_identity(selected_before_send, visible_before_send)
+                    ),
+                    "client_identity_matches": (
+                        selected_before_send is not None
+                        and _same_identity(selected_before_send, client.identity)
+                    ),
+                    "last_output_sequence": prior_sequence,
+                }
+                record_property(
+                    f"copy_input_{index}_pre_send",
+                    json.dumps(send_predicates, sort_keys=True),
+                )
+                input_error_category = None
+                try:
+                    await app._send_bytes(encoded)
+                except Exception as exc:
+                    from ju0_terminal_tower.terminal.manager import TerminalError
+
+                    if isinstance(exc, TerminalError):
+                        category = str(exc)
+                        input_error_category = (
+                            category if category in {
+                                "input_lease_required", "stream_gap",
+                                "stale_identity", "renderer_unavailable",
+                                "terminal input response is invalid",
+                            } else "terminal_error_other"
+                        )
+                    else:
+                        input_error_category = type(exc).__name__
+                    raise
+                finally:
+                    send_attempts = accepted_inputs[prior_count:]
+                    record_property(
+                        f"copy_input_{index}_send_result",
+                        json.dumps({
+                            "client_send_called": bool(send_attempts),
+                            "send_outcome": (
+                                send_attempts[-1] if send_attempts else None
+                            ),
+                            "input_error_category": input_error_category,
+                            "last_output_sequence": (
+                                app._right_observation[1]
+                                if app._right_observation is not None else None
+                            ),
+                            "output_sequence_advanced": (
+                                app._right_observation is not None
+                                and app._right_observation[1] > prior_sequence
+                            ),
+                        }, sort_keys=True),
+                    )
+                send_attempts = accepted_inputs[prior_count:]
                 assert len(accepted_inputs) == prior_count + 1, (
                     "UI input did not receive a terminal send acknowledgement"
                 )
-                assert accepted_inputs[-1] == (encoded, len(encoded))
+                assert accepted_inputs[-1] == {
+                    "attempted": True,
+                    "byte_count": len(encoded),
+                    "returned": True,
+                    "accepted_bytes": len(encoded),
+                    "terminal_error": None,
+                }
                 await _wait_for_ui_state(
                     pilot,
                     lambda marker=marker: app._right_observation is not None
@@ -2355,9 +2464,52 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                     ),
                     f"PowerShell output sequence advanced for {marker}", timeout=20,
                 )
+                observed_sequence = app._right_observation[1]
+                record_property(
+                    f"copy_input_{index}_output",
+                    json.dumps({
+                        "sequence_advanced": observed_sequence > prior_sequence,
+                        "sequence_before": prior_sequence,
+                        "sequence_after": observed_sequence,
+                        "expected_output_observed": True,
+                    }, sort_keys=True),
+                )
             await app.leave_input_mode()
             ui_observation_before_copy = app._right_observation
             assert ui_observation_before_copy is not None
+            selected = app.selected_identity
+            visible = (
+                app.sessions.get(selected.session_id)
+                if selected is not None else None
+            )
+            copy_predicates = {
+                "not_busy": not app._busy,
+                "identity_present": selected is not None,
+                "client_present": app.client is not None,
+                "client_is_current": app.client is client,
+                "selection_matches": (
+                    selected is not None and app._selection_matches(selected)
+                ),
+                "selected_running": (
+                    selected is not None and selected.state == "running"
+                ),
+                "visible_present": visible is not None,
+                "visible_running": (
+                    visible is not None and visible.state == "running"
+                ),
+                "visible_identity_matches": (
+                    selected is not None and visible is not None
+                    and _same_identity(selected, visible)
+                ),
+                "client_identity_matches": (
+                    selected is not None and _same_identity(selected, client.identity)
+                ),
+                "lease_owned": bool(client.lease),
+            }
+            record_property(
+                "copy_target_predicates",
+                json.dumps(copy_predicates, sort_keys=True),
+            )
             copy_time_observations = []
             copy_observation_scope = ContextVar(
                 "jtt_explicit_copy_observation", default=None
@@ -2390,8 +2542,38 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
             await _wait_for_ui_state(
                 pilot, lambda: bool(copied), "explicit copy chord payload",
             )
-            assert copy_time_observations, "copy did not capture a fresh observation"
+            assert len(copy_time_observations) == 1, (
+                "explicit copy must use one scoped observation"
+            )
             copy_observation = copy_time_observations[0]
+            payload = copied[-1]
+            copy_evidence = {
+                "observation_synced": copy_observation.synced,
+                "observation_running": copy_observation.state == "running",
+                "observation_has_screen": copy_observation.screen is not None,
+                "observation_session_matches": (
+                    copy_observation.session_id == identity.session_id
+                ),
+                "observation_generation_matches": (
+                    copy_observation.generation == identity.generation
+                ),
+                "observation_shell_pid_matches": (
+                    copy_observation.shell_pid == identity.shell_pid
+                ),
+                "observation_sequence_current": (
+                    copy_observation.sequence >= ui_observation_before_copy[1]
+                ),
+                "payload_is_exact_observed_screen": (
+                    copy_observation.screen is not None
+                    and payload == windows_ui._screen_clipboard_text(
+                        copy_observation.screen
+                    )
+                ),
+            }
+            record_property(
+                "copy_observation_predicates",
+                json.dumps(copy_evidence, sort_keys=True),
+            )
             assert copy_observation.synced
             assert copy_observation.state == "running"
             assert copy_observation.screen is not None
@@ -2403,7 +2585,6 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 _plain_screen_text(copy_observation.screen).split()
             )
             assert all(marker in observed_copy_text for marker in expected)
-            payload = copied[-1]
             assert payload == windows_ui._screen_clipboard_text(copy_observation.screen)
             compact_payload = "".join(payload.split())
             assert all(marker in compact_payload for marker in expected)
