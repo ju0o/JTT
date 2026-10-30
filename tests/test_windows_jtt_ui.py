@@ -99,6 +99,106 @@ def test_native_conpty_run_path_finalization_preserves_diagnostic_and_cleanup_ev
     spec.loader.exec_module(backend_test_module)
     finalize = backend_test_module._finalize_conpty_path_result
     allows_followup = backend_test_module._conpty_path_allows_followup
+    input_chunks = backend_test_module._conpty_input_chunks
+    error_categories = backend_test_module._conpty_powershell_error_categories
+    prompt_after_marker = backend_test_module._conpty_prompt_returned_after_marker
+    parser_evidence = backend_test_module._owned_job_parser_preflight_evidence
+    start_process_evidence = backend_test_module._owned_job_start_process_evidence
+    worker_skip_status = backend_test_module._conpty_worker_scenario_skip_status
+
+    assert input_chunks("Write-Output 'OK'", "single_write") == [
+        "Write-Output 'OK'\r"
+    ]
+    assert input_chunks("Write-Output '한글'", "per_key") == [
+        *"Write-Output '한글'", "\r"
+    ]
+    assert sum(len(part.encode("utf-8")) for part in input_chunks(
+        "Write-Output '한글'", "per_key"
+    )) == len("Write-Output '한글'\r".encode("utf-8"))
+    with pytest.raises(ValueError):
+        input_chunks("Write-Output 'OK'", "unknown")
+
+    echoed_throw = (
+        "PS C:\\test> if ($x) { throw 'JTT diagnostic state mismatch' }\r\n"
+    )
+    assert error_categories(echoed_throw) == []
+    assert error_categories("Set-Location : Cannot find path 'x'\r\n") == [
+        "Set-Location"
+    ]
+    assert not prompt_after_marker(
+        "JTT_DONE_END\r\nPS C:\\test> Write-Output 'next'\r\n",
+        "JTT_DONE_END",
+    )
+    assert prompt_after_marker(
+        "JTT_DONE_END\r\nPS C:\\test> \r\n", "JTT_DONE_END"
+    )
+
+    valid_parser = parser_evidence(
+        "launcher.ps1|VALID;child.ps1|VALID",
+        "JTT_PARSE_OK_END",
+        script_count=2,
+        success_marker="JTT_PARSE_OK_END",
+        write_error_marker="JTT_PARSE_WRITE_ERROR",
+    )
+    assert valid_parser["status"] == "ALL_SCRIPTS_PARSE"
+    invalid_parser = parser_evidence(
+        "launcher.ps1|INVALID|1|UnexpectedToken;child.ps1|VALID",
+        "JTT_PARSE_OK_END",
+        script_count=2,
+        success_marker="JTT_PARSE_OK_END",
+        write_error_marker="JTT_PARSE_WRITE_ERROR",
+    )
+    assert invalid_parser["status"] == "PARSE_ERRORS_RECORDED"
+    parser_write_failure = parser_evidence(
+        "ABSENT",
+        "JTT_PARSE_WRITE_ERROR|UnauthorizedAccessException|WriteFailure"
+        "\r\nJTT_PARSE_WRITE_ERROR_END",
+        script_count=2,
+        success_marker="JTT_PARSE_OK_END",
+        write_error_marker="JTT_PARSE_WRITE_ERROR",
+    )
+    assert parser_write_failure["status"] == "STAGE_WRITE_FAILED"
+    assert parser_write_failure["stage_write_exception_category"] == (
+        "UnauthorizedAccessException"
+    )
+    not_reached = parser_evidence(
+        "ABSENT", b"", script_count=2, success_marker="JTT_PARSE_OK_END",
+        write_error_marker="JTT_PARSE_WRITE_ERROR",
+    )
+    assert not_reached["status"] == "MARKER_NOT_OBSERVED"
+
+    start_process_failure = start_process_evidence(
+        "ABSENT",
+        "JTT_OWNED_STAGE_WRITE_ERROR|start_process|OSError|StageWriteFailed\r\n"
+        "JTT_OWNED_START_PROCESS_ERROR|Win32Exception|StartProcessFailed\r\n",
+    )
+    assert start_process_failure["call_outcome"] == "EXCEPTION"
+    assert start_process_failure["exception_category"] == "Win32Exception"
+    assert start_process_failure["stage_file_write_outcome"] == "FAILED"
+    assert start_process_failure["stage_write_exception_category"] == "OSError"
+    child_created_write_fallback = start_process_evidence(
+        "child_created_but_stage_write_error|321|OSError|StageWriteFailed",
+        "JTT_OWNED_CHILD_PROCESS_CREATED|321\r\n"
+        "JTT_OWNED_STAGE_WRITE_ERROR|child_created|OSError|StageWriteFailed\r\n",
+    )
+    assert child_created_write_fallback["call_outcome"] == "CHILD_CREATED"
+    assert child_created_write_fallback["stage_file_write_outcome"] == (
+        "INITIAL_WRITE_FAILED_FALLBACK_RECORDED"
+    )
+    child_created_write_failure = start_process_evidence(
+        "ABSENT",
+        "JTT_OWNED_CHILD_PROCESS_CREATED|321\r\n"
+        "JTT_OWNED_STAGE_WRITE_ERROR|child_created|OSError|StageWriteFailed\r\n",
+    )
+    assert child_created_write_failure["call_outcome"] == "CHILD_CREATED"
+    assert child_created_write_failure["stage_file_write_outcome"] == "FAILED"
+    assert child_created_write_failure["stage_write_error_stage"] == "child_created"
+    assert worker_skip_status(
+        {"cleanup_confirmed": True}, {"cleanup_confirmed": False}
+    ) == "NOT_RUN_PREVIOUS_WORKER_CLEANUP_UNCONFIRMED"
+    assert worker_skip_status(
+        {"cleanup_confirmed": False}, {"cleanup_confirmed": False}
+    ) == "NOT_RUN_DIRECT_CLEANUP_UNCONFIRMED"
 
     backend_tree = ast.parse(backend_test_path.read_text(encoding="utf-8"))
     comparison_test = next(

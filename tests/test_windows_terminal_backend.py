@@ -53,6 +53,196 @@ def _conpty_path_allows_followup(result):
     )
 
 
+def _conpty_worker_scenario_skip_status(direct_result, previous_worker_result):
+    """Report which owner failed cleanup before a Worker scenario was skipped."""
+    if not _conpty_path_allows_followup(direct_result):
+        return "NOT_RUN_DIRECT_CLEANUP_UNCONFIRMED"
+    if (
+        previous_worker_result is not None
+        and not _conpty_path_allows_followup(previous_worker_result)
+    ):
+        return "NOT_RUN_PREVIOUS_WORKER_CLEANUP_UNCONFIRMED"
+    return None
+
+
+def _conpty_input_chunks(command, delivery_mode, *, terminator="\r"):
+    """Build one test command's writes without retrying incomplete delivery."""
+    if delivery_mode == "single_write":
+        return [command + terminator]
+    if delivery_mode == "per_key":
+        return [*command, terminator]
+    raise ValueError("unknown ConPTY diagnostic input delivery mode")
+
+
+def _conpty_powershell_error_categories(text):
+    """Classify recognizable PowerShell error lines, never echoed command text."""
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    patterns = (
+        ("ParserError", r"(?m)^\s*(?:ParserError|At line:\d+ char:\d+)\b"),
+        ("Set-Location", r"(?m)^\s*Set-Location\s*:\s"),
+        ("Start-Process", r"(?m)^\s*Start-Process\s*:\s"),
+        ("Cannot find path", r"(?m)^\s*Cannot find path\b"),
+        ("FullyQualifiedErrorId", r"(?m)^\s*FullyQualifiedErrorId\s*:\s"),
+        ("Write-Error", r"(?m)^\s*Write-Error\s*:\s"),
+    )
+    return [category for category, pattern in patterns if re.search(pattern, cleaned)]
+
+
+def _conpty_prompt_returned_after_marker(text, marker):
+    """Require a fresh prompt line after command output, not the input echo."""
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    position = cleaned.rfind(marker)
+    if position < 0:
+        return False
+    trailing = cleaned[position + len(marker):]
+    return any(
+        re.fullmatch(r"PS\s+.+?>\s*", line.strip()) is not None
+        for line in trailing.replace("\r", "\n").split("\n")
+    )
+
+
+def _owned_job_parser_preflight_evidence(
+        stage_text, output, *, script_count, success_marker, write_error_marker):
+    """Separate parser errors, stage-write failures, and an unobserved command."""
+    if isinstance(output, str):
+        output = output.encode("utf-8", errors="replace")
+    success_seen = success_marker.encode("ascii") in output
+    write_error_pattern = re.escape(write_error_marker.encode("ascii"))
+    write_error_match = re.search(
+        write_error_pattern + rb"\|([^\r\n]+)", output
+    )
+    write_error_fields = (
+        write_error_match.group(1).decode("utf-8", errors="replace").split("|", 1)
+        if write_error_match else []
+    )
+    entries = stage_text.split(";") if stage_text not in {"ABSENT", ""} else []
+    if write_error_match:
+        status = "STAGE_WRITE_FAILED"
+    elif not success_seen:
+        status = "MARKER_NOT_OBSERVED"
+    elif len(entries) != script_count:
+        status = "STAGE_MISSING_OR_INCOMPLETE"
+    elif any("|INVALID|" in entry for entry in entries):
+        status = "PARSE_ERRORS_RECORDED"
+    elif all(entry.endswith("|VALID") for entry in entries):
+        status = "ALL_SCRIPTS_PARSE"
+    else:
+        status = "STAGE_CONTENT_UNKNOWN"
+    return {
+        "status": status,
+        "success_marker_seen": success_seen,
+        "stage_write_error_marker_seen": write_error_match is not None,
+        "stage_write_exception_category": (
+            write_error_fields[0] if write_error_fields else None
+        ),
+        "stage_write_error_id": (
+            write_error_fields[1] if len(write_error_fields) > 1 else None
+        ),
+        "entries": entries,
+        "all_scripts_parse": status == "ALL_SCRIPTS_PARSE",
+    }
+
+
+def _owned_job_start_process_evidence(launcher_stage, raw_output):
+    """Separate Start-Process outcome from persistence of its stage record."""
+    if isinstance(raw_output, str):
+        raw_output = raw_output.encode("utf-8", errors="replace")
+    stage_parts = launcher_stage.split("|")
+    child_match = re.search(
+        rb"JTT_OWNED_CHILD_PROCESS_CREATED\|([0-9]+)", raw_output
+    )
+    exception_match = re.search(
+        rb"JTT_OWNED_START_PROCESS_ERROR\|([^|\r\n]+)\|([^\r\n]+)",
+        raw_output,
+    )
+    write_error_match = re.search(
+        rb"JTT_OWNED_STAGE_WRITE_ERROR\|([^|\r\n]+)\|"
+        rb"([^|\r\n]+)\|([^\r\n]+)",
+        raw_output,
+    )
+
+    if child_match:
+        call_outcome = "CHILD_CREATED"
+        exception_category = exception_id = None
+    elif exception_match:
+        call_outcome = "EXCEPTION"
+        exception_category = exception_match.group(1).decode(
+            "utf-8", errors="replace"
+        )
+        exception_id = exception_match.group(2).decode("utf-8", errors="replace")
+    elif stage_parts[0] in {
+        "child_process_created", "child_created_but_stage_write_error",
+    }:
+        call_outcome = "CHILD_CREATED"
+        exception_category = exception_id = None
+    elif stage_parts[0] == "start_process_error":
+        call_outcome = "EXCEPTION"
+        exception_category = stage_parts[1] if len(stage_parts) > 1 else None
+        exception_id = stage_parts[2] if len(stage_parts) > 2 else None
+    else:
+        call_outcome = "UNKNOWN"
+        exception_category = exception_id = None
+
+    write_error_stage = (
+        write_error_match.group(1).decode("ascii", errors="replace")
+        if write_error_match else None
+    )
+    if (
+        write_error_match
+        and write_error_stage == "child_created"
+        and stage_parts[0] == "child_created_but_stage_write_error"
+    ):
+        stage_write_outcome = "INITIAL_WRITE_FAILED_FALLBACK_RECORDED"
+        stage_write_exception_category = write_error_match.group(2).decode(
+            "utf-8", errors="replace"
+        )
+        stage_write_error_id = write_error_match.group(3).decode(
+            "utf-8", errors="replace"
+        )
+    elif write_error_match and write_error_stage in {"start_process", "child_created"}:
+        stage_write_outcome = "FAILED"
+        stage_write_exception_category = write_error_match.group(2).decode(
+            "utf-8", errors="replace"
+        )
+        stage_write_error_id = write_error_match.group(3).decode(
+            "utf-8", errors="replace"
+        )
+    elif stage_parts[0] in {
+        "child_process_created", "child_created_but_stage_write_error",
+        "start_process_error",
+    }:
+        stage_write_outcome = (
+            "INITIAL_WRITE_FAILED_FALLBACK_RECORDED"
+            if stage_parts[0] == "child_created_but_stage_write_error"
+            else "CONFIRMED"
+        )
+        stage_write_exception_category = stage_write_error_id = None
+    else:
+        stage_write_outcome = "UNKNOWN"
+        stage_write_exception_category = stage_write_error_id = None
+
+    returned_pid = (
+        stage_parts[1]
+        if stage_parts[0] in {
+            "child_process_created", "child_created_but_stage_write_error",
+        } and len(stage_parts) > 1 else
+        child_match.group(1).decode("ascii") if child_match else None
+    )
+    return {
+        "call_outcome": call_outcome,
+        "exception_category": exception_category,
+        "exception_id": exception_id,
+        "returned_pid_is_decimal": bool(returned_pid and returned_pid.isdecimal()),
+        "returned_pid": returned_pid,
+        "stage_file_write_outcome": stage_write_outcome,
+        "stage_write_exception_category": stage_write_exception_category,
+        "stage_write_error_id": stage_write_error_id,
+        "stage_write_error_stage": write_error_stage,
+        "start_process_exception_marker_seen": exception_match is not None,
+        "child_creation_marker_seen": child_match is not None,
+    }
+
+
 class _ConptyPathAbort(Exception):
     """Stop one diagnostic path while still finalizing its cleanup evidence."""
 
@@ -825,8 +1015,13 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
     marker_path = str(marker_file).replace("'", "''")
     launcher_entry_file = tmp_path / "owned-job-launcher-entry.txt"
     launcher_entry_path = str(launcher_entry_file).replace("'", "''")
+    launcher_before_file = tmp_path / "owned-job-before-start-process.txt"
+    launcher_before_path = str(launcher_before_file).replace("'", "''")
     launcher_stage_file = tmp_path / "owned-job-launcher-stage.txt"
     launcher_stage_path = str(launcher_stage_file).replace("'", "''")
+    parser_stage_file = tmp_path / "owned-job-parser-stage.txt"
+    parser_script_file = work / "owned-job-parser-preflight.ps1"
+    parser_script_path = str(parser_script_file).replace("'", "''")
     child_stage_file = tmp_path / "owned-job-child-stage.txt"
     child_stage_path = str(child_stage_file).replace("'", "''")
     grandchild_launch_file = tmp_path / "owned-job-grandchild-launch.txt"
@@ -909,6 +1104,7 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
     launcher_script = "\n".join((
         "$ErrorActionPreference = 'Stop'",
         "$__jtt_entry = '" + launcher_entry_path + "'",
+        "$__jtt_before = '" + launcher_before_path + "'",
         "$__jtt_stage = '" + launcher_stage_path + "'",
         "$__jtt_script = '" + child_script_path + "'",
         "try { [System.IO.File]::WriteAllText($__jtt_entry,"
@@ -919,6 +1115,12 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         "}",
         "[Console]::WriteLine('JTT_'+'OWNED_START_'+ '" + nonce + "'+'_END')",
         "$child = $null",
+        "try { [System.IO.File]::WriteAllText($__jtt_before,"
+        "'before_start_process|'+[string]$PID) } catch {",
+        "$failure=$_.Exception.GetType().Name+'|' +$_.FullyQualifiedErrorId",
+        "[Console]::WriteLine('JTT_OWNED_STAGE_WRITE_ERROR|before_start_process|'+$failure)",
+        "throw",
+        "}",
         "try {",
         "$child=Start-Process -ErrorAction Stop -PassThru -WindowStyle Hidden "
         "-FilePath (Join-Path $PSHOME 'powershell.exe') "
@@ -944,6 +1146,59 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         "}",
     )) + "\n"
     launcher_script_file.write_text(launcher_script, encoding="utf-8-sig")
+    parser_files = (
+        launcher_script_file, child_script_file, grandchild_script_file,
+        parser_script_file,
+    )
+    parser_script = "\n".join((
+        "$ErrorActionPreference = 'Stop'",
+        "$__jtt_files = @(" + ",".join(
+            "'" + str(path).replace("'", "''") + "'"
+            for path in parser_files
+        ) + ")",
+        "$__jtt_results = @()",
+        "foreach ($__jtt_file in $__jtt_files) {",
+        "$__jtt_tokens=$null; $__jtt_errors=$null",
+        "[void][System.Management.Automation.Language.Parser]::ParseFile("
+        "$__jtt_file,[ref]$__jtt_tokens,[ref]$__jtt_errors)",
+        "$__jtt_name=[System.IO.Path]::GetFileName($__jtt_file)",
+        "if ($__jtt_errors.Count -eq 0) {",
+        "$__jtt_results += ($__jtt_name+'|VALID')",
+        "} else {",
+        "$__jtt_error_id=[string]$__jtt_errors[0].ErrorId",
+        "$__jtt_results += ($__jtt_name+'|INVALID|'"
+        "+[string]$__jtt_errors.Count+'|'+$__jtt_error_id)",
+        "}",
+        "}",
+        "try { [System.IO.File]::WriteAllText('"
+        + str(parser_stage_file).replace("'", "''")
+        + "',($__jtt_results -join ';')) } catch {",
+        "$__jtt_write_failure=$_.Exception.GetType().Name+'|'"
+        "+$_.FullyQualifiedErrorId",
+        "[Console]::WriteLine('JTT_OWNED_PARSE_STAGE_WRITE_ERROR_"
+        + nonce + "|'+$__jtt_write_failure)",
+        "[Console]::WriteLine('JTT_OWNED_PARSE_STAGE_WRITE_ERROR_END_"
+        + nonce + "')",
+        "return",
+        "}",
+        "[Console]::WriteLine('JTT_OWNED_PARSE_'+'" + nonce + "'+'_END')",
+    )) + "\n"
+    parser_script_file.write_text(parser_script, encoding="utf-8-sig")
+    parser_command = ".\\owned-job-parser-preflight.ps1"
+    parser_marker = f"JTT_OWNED_PARSE_{nonce}_END"
+    parser_write_error_marker = f"JTT_OWNED_PARSE_STAGE_WRITE_ERROR_{nonce}"
+    parser_write_error_end = f"JTT_OWNED_PARSE_STAGE_WRITE_ERROR_END_{nonce}"
+    assert parser_marker not in parser_command
+    assert len(parser_command) < 512
+
+    def read_stage(path):
+        try:
+            return path.read_text(encoding="utf-8-sig").strip()
+        except FileNotFoundError:
+            return "ABSENT"
+        except (OSError, UnicodeError) as exc:
+            return "READ_ERROR|" + type(exc).__name__
+
     outer_command = ".\\owned-job-launcher.ps1"
     assert command_started_marker not in outer_command
     assert tree_marker_prefix not in outer_command
@@ -956,8 +1211,11 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
                 == os.path.normcase(os.path.abspath(str(work)))
             ),
             "launcher_script_exists": launcher_script_file.is_file(),
+            "parser_script_exists": parser_script_file.is_file(),
             "launcher_stage_parent_exists": launcher_stage_file.parent.is_dir(),
             "launcher_entry_parent_exists": launcher_entry_file.parent.is_dir(),
+            "launcher_before_stage_parent_exists": launcher_before_file.parent.is_dir(),
+            "parser_stage_parent_exists": parser_stage_file.parent.is_dir(),
             "child_script_exists": child_script_file.is_file(),
             "grandchild_script_exists": grandchild_script_file.is_file(),
         }, sort_keys=True),
@@ -977,7 +1235,7 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
             "UnauthorizedAccessException", "Start-Process",
             "Cannot find path", "JTT_OWNED_STAGE_WRITE_ERROR",
             "JTT_OWNED_START_PROCESS_ERROR", "JTT_OWNED_CHILD_ERROR",
-            "JTT_OWNED_GRANDCHILD_ERROR", "JTT_OWNED_CHILD_PROCESS_CREATED",
+            "JTT_OWNED_GRANDCHILD_ERROR",
         )
         return [category for category in categories if category in text]
 
@@ -991,6 +1249,66 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         assert (initial.columns, initial.lines) == (100, 30)
         assert expected_prompt in _compact_screen_text(initial.screen)
         assert client.acquire()
+        parser_encoded_command = (parser_command + "\r").encode("ascii")
+        parser_ack = client.send(parser_encoded_command)
+        record_property(
+            "owned_job_parser_preflight_command_ack",
+            parser_ack,
+        )
+        assert parser_ack == len(parser_encoded_command)
+        parser_output = bytearray()
+        parser_update = None
+        parser_deadline = time.monotonic() + 15
+        while time.monotonic() < parser_deadline:
+            parser_update = client.poll()
+            parser_output.extend(parser_update.output)
+            compact_parser_output = bytes(parser_output).replace(b"\r", b"").replace(
+                b"\n", b""
+            )
+            if (
+                parser_marker.encode("ascii") in compact_parser_output
+                or parser_write_error_end.encode("ascii") in compact_parser_output
+            ):
+                break
+            time.sleep(0.02)
+        parser_stage = read_stage(parser_stage_file)
+        parser_evidence = _owned_job_parser_preflight_evidence(
+            parser_stage,
+            bytes(parser_output),
+            script_count=len(parser_files),
+            success_marker=parser_marker,
+            write_error_marker=parser_write_error_marker,
+        )
+        record_property(
+            "owned_job_powershell_parser_results",
+            json.dumps({
+                "stage": parser_stage,
+                **parser_evidence,
+                "script_count": len(parser_files),
+                "parser_command_echo_observed": (
+                    parser_command.encode("ascii") in bytes(parser_output)
+                ),
+                "parser_failure_marker_observed": (
+                    parser_write_error_end.encode("ascii")
+                    in bytes(parser_output)
+                ),
+            }, sort_keys=True),
+        )
+        assert parser_evidence["status"] == "ALL_SCRIPTS_PARSE", (
+            "PowerShell parser preflight did not confirm every test script; "
+            f"status={parser_evidence['status']!r}; stage={parser_stage!r}; "
+            f"write_error_category={parser_evidence['stage_write_exception_category']!r}"
+        )
+        parser_prompt_update = _wait(
+            client,
+            lambda update: update.screen is not None
+            and _conpty_prompt_returned_after_marker(
+                _screen_text(update.screen), parser_marker
+            ),
+        )
+        assert _conpty_prompt_returned_after_marker(
+            _screen_text(parser_prompt_update.screen), parser_marker
+        ), "PowerShell parser command did not return to a prompt"
         encoded_command = (outer_command + "\r").encode("ascii")
         assert client.send(encoded_command) == len(encoded_command)
 
@@ -1036,32 +1354,32 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
                 "see categorized parser/startup evidence"
             )
 
-        def read_stage(path):
-            try:
-                return path.read_text(encoding="utf-8-sig").strip()
-            except FileNotFoundError:
-                return "ABSENT"
-            except (OSError, UnicodeError) as exc:
-                return "READ_ERROR|" + type(exc).__name__
-
         launcher_deadline = time.monotonic() + 15
         launcher_stage = "ABSENT"
         launcher_entry = "ABSENT"
+        launcher_before = "ABSENT"
         while time.monotonic() < launcher_deadline:
             launcher_entry = read_stage(launcher_entry_file)
+            launcher_before = read_stage(launcher_before_file)
             launcher_stage = read_stage(launcher_stage_file)
+            observed_output = bytes(raw_output).decode("utf-8", errors="replace")
             if launcher_stage.startswith((
                 "child_process_created|", "child_created_but_stage_write_error|",
                 "start_process_error|",
                 "READ_ERROR|",
-            )) or "JTT_OWNED_STAGE_WRITE_ERROR" in bytes(raw_output).decode(
-                "utf-8", errors="replace"
+            )) or "JTT_OWNED_START_PROCESS_ERROR|" in observed_output or any(
+                marker in observed_output for marker in (
+                    "JTT_OWNED_STAGE_WRITE_ERROR|launcher_entry|",
+                    "JTT_OWNED_STAGE_WRITE_ERROR|before_start_process|",
+                    "JTT_OWNED_STAGE_WRITE_ERROR|child_created|",
+                )
             ):
                 break
             last_update = client.poll()
             raw_output.extend(last_update.output)
             time.sleep(0.02)
         launcher_entry_parts = launcher_entry.split("|")
+        launcher_before_parts = launcher_before.split("|")
         record_property(
             "owned_job_launcher_entry_stage",
             launcher_entry_parts[0] if launcher_entry_parts else "ABSENT",
@@ -1069,6 +1387,23 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         record_property(
             "owned_job_launcher_entry_pid_is_decimal",
             len(launcher_entry_parts) == 2 and launcher_entry_parts[1].isdecimal(),
+        )
+        record_property(
+            "owned_job_start_process_pre_call_stage",
+            launcher_before_parts[0] if launcher_before_parts else "ABSENT",
+        )
+        record_property(
+            "owned_job_start_process_pre_call_pid_is_decimal",
+            len(launcher_before_parts) == 2
+            and launcher_before_parts[1].isdecimal(),
+        )
+        record_property(
+            "owned_job_start_process_pre_call_pid_matches_launcher",
+            len(launcher_entry_parts) == 2
+            and len(launcher_before_parts) == 2
+            and launcher_entry_parts[1].isdecimal()
+            and launcher_before_parts[1].isdecimal()
+            and launcher_entry_parts[1] == launcher_before_parts[1],
         )
         launcher_parts = launcher_stage.split("|")
         record_property(
@@ -1082,41 +1417,96 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
                 if category == "JTT_OWNED_STAGE_WRITE_ERROR"
             ]),
         )
-        child_process_created_match = re.search(
-            rb"JTT_OWNED_CHILD_PROCESS_CREATED\|([0-9]+)", bytes(raw_output)
+        stage_write_error_stages = []
+        for line in bytes(raw_output).decode("utf-8", errors="replace").splitlines():
+            marker_prefix = "JTT_OWNED_STAGE_WRITE_ERROR|"
+            if line.startswith(marker_prefix):
+                fields = line[len(marker_prefix):].split("|", 1)
+                if fields:
+                    stage_write_error_stages.append(fields[0])
+        record_property(
+            "owned_job_stage_write_outcomes",
+            json.dumps({
+                "launcher_entry": (
+                    "CONFIRMED" if launcher_entry_parts[0] == "launcher_entered"
+                    else "NOT_CONFIRMED"
+                ),
+                "immediately_before_start_process": (
+                    "CONFIRMED"
+                    if launcher_before_parts[0] == "before_start_process"
+                    else "NOT_CONFIRMED"
+                ),
+                "reported_write_error_stages": stage_write_error_stages,
+            }, sort_keys=True),
+        )
+        start_process_evidence = _owned_job_start_process_evidence(
+            launcher_stage, bytes(raw_output)
+        )
+        record_property(
+            "owned_job_start_process_call_outcome",
+            start_process_evidence["call_outcome"],
+        )
+        record_property(
+            "owned_job_start_process_exception_category",
+            start_process_evidence["exception_category"] or "NONE",
+        )
+        record_property(
+            "owned_job_start_process_exception_id",
+            start_process_evidence["exception_id"] or "NONE",
+        )
+        record_property(
+            "owned_job_start_process_stage_file_write_outcome",
+            start_process_evidence["stage_file_write_outcome"],
+        )
+        record_property(
+            "owned_job_start_process_stage_write_exception_category",
+            start_process_evidence["stage_write_exception_category"] or "NONE",
+        )
+        record_property(
+            "owned_job_start_process_stage_write_error_id",
+            start_process_evidence["stage_write_error_id"] or "NONE",
         )
         record_property(
             "owned_job_start_process_outcome_marker_seen",
-            child_process_created_match is not None
-            or launcher_parts[0] == "start_process_error",
+            start_process_evidence["call_outcome"] != "UNKNOWN",
+        )
+        record_property(
+            "owned_job_child_creation_marker_pid_is_decimal",
+            start_process_evidence["returned_pid_is_decimal"],
         )
         assert launcher_entry_parts[0] == "launcher_entered", (
             "PowerShell command marker was seen but launcher entry file did not "
             f"confirm script entry ({launcher_entry_parts[0] if launcher_entry_parts else 'ABSENT'})"
         )
-        if (launcher_parts[0] not in {
-                "child_process_created", "child_created_but_stage_write_error",
-        } and child_process_created_match is None):
+        assert (
+            len(launcher_before_parts) == 2
+            and launcher_before_parts[0] == "before_start_process"
+            and launcher_before_parts[1].isdecimal()
+            and launcher_before_parts[1] == launcher_entry_parts[1]
+        ), (
+            "launcher entry was confirmed but the owned test did not confirm "
+            "the immediately-before-Start-Process stage; "
+            f"observed={launcher_before!r}"
+        )
+        if (
+            start_process_evidence["call_outcome"] != "CHILD_CREATED"
+            or not start_process_evidence["returned_pid_is_decimal"]
+        ):
             record_property(
                 "owned_job_start_process_error_category",
-                launcher_parts[1] if len(launcher_parts) > 1 else "UNKNOWN",
+                start_process_evidence["exception_category"] or "UNKNOWN",
             )
             record_property(
                 "owned_job_start_process_error_id",
-                launcher_parts[2] if len(launcher_parts) > 2 else "UNKNOWN",
+                start_process_evidence["exception_id"] or "UNKNOWN",
             )
             raise AssertionError(
-                "Start-Process stage did not confirm child creation; "
-                f"observed={launcher_parts[0] if launcher_parts else 'ABSENT'}"
+                "Start-Process call did not confirm child creation; "
+                f"outcome={start_process_evidence['call_outcome']}; "
+                f"exception_category={start_process_evidence['exception_category']!r}; "
+                f"stage_file_write={start_process_evidence['stage_file_write_outcome']}"
             )
-        launcher_child_pid = (
-            launcher_parts[1]
-            if launcher_parts[0] in {
-                "child_process_created", "child_created_but_stage_write_error",
-            } and len(launcher_parts) > 1 else
-            child_process_created_match.group(1).decode("ascii")
-            if child_process_created_match is not None else ""
-        )
+        launcher_child_pid = start_process_evidence["returned_pid"] or ""
         record_property("owned_job_launcher_child_pid_is_decimal",
                         launcher_child_pid.isdecimal())
         assert launcher_child_pid.isdecimal(), (
@@ -2196,9 +2586,11 @@ def test_native_conpty_input_execution_path_comparison(
     def ps_quote(value):
         return str(value).replace("'", "''")
 
-    def case_specs(label, home):
+    def case_specs(label, home, scenario):
         marker = f"JTT_EXEC_{label}_{nonce}_END"
-        marker_file = start / f"{label.lower()}-{home.name}.marker"
+        marker_file = start / (
+            f"{label.lower()}-{home.name}-{scenario}.marker"
+        )
         marker_path = ps_quote(
             marker_file if label == "PATH_CHANGE" else marker_file.name
         )
@@ -2223,8 +2615,12 @@ def test_native_conpty_input_execution_path_comparison(
         elif label == "MULTI_STEP":
             first_marker = f"JTT_MULTI_STEP1_{nonce}_END"
             final_marker = f"JTT_MULTI_STEP2_{nonce}_END"
-            first_file = start / f"multi-step1-{home.name}.marker"
-            final_file = start / f"multi-step2-{home.name}.marker"
+            first_file = start / (
+                f"multi-step1-{home.name}-{scenario}.marker"
+            )
+            final_file = start / (
+                f"multi-step2-{home.name}-{scenario}.marker"
+            )
             commands = [
                 (
                     "$global:JTTInputDiag='" + nonce + "'; "
@@ -2233,6 +2629,7 @@ def test_native_conpty_input_execution_path_comparison(
                     "[Console]::WriteLine('JTT_MULTI_STEP1_'+ '" + nonce + "'+'_END')",
                     first_marker,
                     "step1|" + nonce,
+                    first_file,
                 ),
                 (
                     "if ($global:JTTInputDiag -ne '" + nonce
@@ -2242,6 +2639,7 @@ def test_native_conpty_input_execution_path_comparison(
                     "[Console]::WriteLine('JTT_MULTI_STEP2_'+ '" + nonce + "'+'_END')",
                     final_marker,
                     "step2|" + nonce,
+                    final_file,
                 ),
             ]
         elif label == "UNICODE_INPUT":
@@ -2267,8 +2665,24 @@ def test_native_conpty_input_execution_path_comparison(
             )]
         else:
             raise AssertionError("unknown ConPTY comparison case")
-        assert all(expected not in command for command, expected, _value in commands)
-        return commands
+        if label != "MULTI_STEP":
+            commands = [(*command, marker_file) for command in commands]
+        assert all(
+            expected not in command
+            for command, expected, _value, _command_marker_file in commands
+        )
+        delivery_mode = (
+            "per_key"
+            if label == "PATH_CHANGE" and scenario == "path_after_ascii_per_key"
+            else "single_write"
+        )
+        return [
+            (
+                command, expected, expected_value, delivery_mode,
+                command_marker_file,
+            )
+            for command, expected, expected_value, command_marker_file in commands
+        ]
 
     def compact(value):
         return value.replace("\r", "").replace("\n", "")
@@ -2279,30 +2693,36 @@ def test_native_conpty_input_execution_path_comparison(
             for line in text.splitlines()
         )
 
-    def powershell_error_categories(text):
-        return [
-            token for token in (
-                "ParserError", "FullyQualifiedErrorId", "Write-Error",
-                "Set-Location :", "Start-Process :", "Cannot find path",
-                "JTT diagnostic state mismatch",
-            )
-            if token in text
-        ]
-
     def read_marker(marker_file):
         try:
             return marker_file.read_text(encoding="utf-8").strip()
         except (OSError, UnicodeError):
             return None
 
-    def run_path(*, direct):
+    case_plans = {
+        "baseline": (
+            "SHORT_ASCII", "LONG_ASCII", "MULTI_STEP",
+            "UNICODE_INPUT", "PATH_CHANGE",
+        ),
+        "unicode_first": ("UNICODE_INPUT",),
+        "ascii_then_unicode": ("SHORT_ASCII", "UNICODE_INPUT"),
+        "path_standalone_single_write": ("PATH_CHANGE",),
+        "path_after_ascii_per_key": ("SHORT_ASCII", "PATH_CHANGE"),
+    }
+
+    def run_path(*, direct, scenario="baseline"):
+        if scenario not in case_plans:
+            raise ValueError("unknown ConPTY comparison scenario")
         path_name = "direct_pywinpty" if direct else "jtt_worker"
         result = {
             "path": path_name,
+            "scenario": scenario,
             "status": "NOT_STARTED",
             "launch": {
                 "executable": str(windows_manager._powershell_executable()),
                 "initial_size": [100, 30],
+                "working_directory": str(start),
+                "working_directory_length": len(str(start)),
                 "working_directory_matches": True,
                 "direct_arguments": (
                     ["-NoLogo", "-NoProfile", "-NoExit"] if direct else None
@@ -2317,8 +2737,8 @@ def test_native_conpty_input_execution_path_comparison(
                     "JTT_HOME is a distinct test-owned root per path"
                 ),
                 "comparison_scope": (
-                    "initial prompt observed separately; compare only command "
-                    "execution after each path startup"
+                    "each scenario owns a clean test shell; prompt return is "
+                    "recorded after each proven command before the next input"
                 ),
                 "environment_values_logged": False,
             },
@@ -2379,7 +2799,9 @@ def test_native_conpty_input_execution_path_comparison(
         try:
             result["status"] = "STARTING"
             if direct:
-                session_dir = direct_home / "terminals" / ("direct-" + nonce)
+                session_dir = direct_home / "terminals" / (
+                    "direct-" + nonce + "-" + scenario
+                )
                 template_env = windows_manager._worker_environment(session_dir)
                 shell_keys = (
                     "SystemRoot", "WINDIR", "PATH", "LOCALAPPDATA", "APPDATA",
@@ -2508,28 +2930,22 @@ def test_native_conpty_input_execution_path_comparison(
 
             baseline_proven = False
             stop_cases = False
-            for label in (
-                "SHORT_ASCII", "LONG_ASCII", "MULTI_STEP",
-                "UNICODE_INPUT", "PATH_CHANGE",
-            ):
+            for label in case_plans[scenario]:
                 if stop_cases:
                     result["cases"].append({
                         "case": label,
                         "status": "NOT_RUN_PREVIOUS_EXECUTION_UNPROVEN",
                     })
                     continue
-                steps = case_specs(label, direct_home if direct else worker_home)
+                steps = case_specs(
+                    label, direct_home if direct else worker_home, scenario
+                )
                 case_result = {"case": label, "steps": []}
                 result["cases"].append(case_result)
-                for step_index, (command, expected, expected_file_value) in enumerate(steps):
-                    marker_file = start / (
-                        f"{label.lower()}-{(direct_home if direct else worker_home).name}.marker"
-                        if label != "MULTI_STEP"
-                        else (
-                            f"multi-step{step_index + 1}-"
-                            f"{(direct_home if direct else worker_home).name}.marker"
-                        )
-                    )
+                for step_index, (
+                    command, expected, expected_file_value, delivery_mode,
+                    marker_file,
+                ) in enumerate(steps):
                     try:
                         marker_file.unlink(missing_ok=True)
                     except OSError as exc:
@@ -2546,6 +2962,14 @@ def test_native_conpty_input_execution_path_comparison(
                         "output_marker_in_pty_or_poll": False,
                         "output_marker_in_pyte_or_worker_screen": False,
                         "powershell_error_categories": [],
+                        "input_mode": delivery_mode,
+                        "input_terminator": "CR",
+                        "working_directory_before_command": str(start),
+                        "expected_working_directory_after_command": (
+                            str(destination) if label == "PATH_CHANGE" else str(start)
+                        ),
+                        "prompt_returned_after_execution": False,
+                        "prompt_returned_before_next_command": False,
                     }
                     case_result["steps"].append(step)
                     result["last_observation_stage"] = "pre_input_drain"
@@ -2556,38 +2980,77 @@ def test_native_conpty_input_execution_path_comparison(
                         getattr(latest, "sequence", None)
                         if not direct else None
                     )
+                    chunks = _conpty_input_chunks(command, delivery_mode)
+                    write_acks = []
+                    for chunk in chunks:
+                        result["last_observation_stage"] = (
+                            "direct_pty_write" if direct else "worker_client_send"
+                        )
+                        chunk_bytes = len(chunk.encode("utf-8"))
+                        api = (
+                            "PTY.write(str)" if direct
+                            else "TerminalClient.send(utf8 bytes)"
+                        )
+                        try:
+                            if direct:
+                                written = pty.write(chunk)
+                                chunk_complete = (
+                                    type(written) is int
+                                    and written in {len(chunk), chunk_bytes}
+                                )
+                            else:
+                                written = client.send(chunk.encode("utf-8"))
+                                chunk_complete = (
+                                    type(written) is int and written == chunk_bytes
+                                )
+                        except Exception as exc:
+                            write_acks.append({
+                                "exception_category": type(exc).__name__,
+                                "utf8_payload_bytes": chunk_bytes,
+                                "python_characters": len(chunk),
+                                "acknowledged_without_retry": False,
+                            })
+                            break
+                        write_acks.append({
+                            "reported_return": written,
+                            "utf8_payload_bytes": chunk_bytes,
+                            "python_characters": len(chunk),
+                            "acknowledged_without_retry": chunk_complete,
+                        })
+                        if not chunk_complete:
+                            break
                     payload = command + "\r"
-                    result["last_observation_stage"] = (
-                        "direct_pty_write" if direct else "worker_client_send"
+                    reported_returns = [
+                        item["reported_return"] for item in write_acks
+                        if type(item["reported_return"]) is int
+                    ]
+                    reported_total = (
+                        sum(reported_returns)
+                        if len(reported_returns) == len(write_acks) else None
                     )
-                    if direct:
-                        written = pty.write(payload)
-                        ack = {
-                            "reported_return": written,
-                            "utf8_payload_bytes": len(payload.encode("utf-8")),
-                            "python_characters": len(payload),
-                            "equals_byte_count": (
-                                type(written) is int
-                                and written == len(payload.encode("utf-8"))
-                            ),
-                            "equals_character_count": (
-                                type(written) is int and written == len(payload)
-                            ),
-                            "api": "PTY.write(str)",
-                        }
-                    else:
-                        written = client.send(payload.encode("utf-8"))
-                        ack = {
-                            "reported_return": written,
-                            "utf8_payload_bytes": len(payload.encode("utf-8")),
-                            "python_characters": len(payload),
-                            "equals_byte_count": (
-                                type(written) is int
-                                and written == len(payload.encode("utf-8"))
-                            ),
-                            "api": "TerminalClient.send(utf8 bytes)",
-                        }
-                    step["input_ack"] = ack
+                    ack_complete = (
+                        len(write_acks) == len(chunks)
+                        and all(item["acknowledged_without_retry"] for item in write_acks)
+                    )
+                    step["input_ack"] = {
+                        "reported_return": reported_total,
+                        "utf8_payload_bytes": len(payload.encode("utf-8")),
+                        "python_characters": len(payload),
+                        "equals_byte_count": (
+                            reported_total == len(payload.encode("utf-8"))
+                        ),
+                        "equals_character_count": reported_total == len(payload),
+                        "write_count": len(write_acks),
+                        "write_results": write_acks,
+                        "all_writes_acknowledged_without_retry": ack_complete,
+                        "input_mode": delivery_mode,
+                        "api": api,
+                    }
+                    if any("exception_category" in item for item in write_acks):
+                        step["status"] = "INPUT_ACK_UNCONFIRMED"
+                        case_result["status"] = "INPUT_ACK_UNCONFIRMED"
+                        stop_cases = True
+                        break
 
                     def complete(raw_text, screen_text):
                         value = read_marker(marker_file)
@@ -2608,7 +3071,7 @@ def test_native_conpty_input_execution_path_comparison(
                         step["output_marker_in_pty_or_poll"] = raw_marker
                         step["output_marker_in_pyte_or_worker_screen"] = screen_marker
                         step["powershell_error_categories"] = (
-                            powershell_error_categories(raw_delta)
+                            _conpty_powershell_error_categories(raw_delta)
                         )
                         if label == "UNICODE_INPUT":
                             raw_unicode_count = raw_delta.count("한글")
@@ -2626,9 +3089,20 @@ def test_native_conpty_input_execution_path_comparison(
 
                     result["last_observation_stage"] = "observe_input_echo_and_execution"
                     raw_text, screen_text = wait_for(
-                        complete, 8
+                        lambda raw, screen: (
+                            complete(raw, screen)
+                            and _conpty_prompt_returned_after_marker(
+                                raw[raw_offset:], expected
+                            )
+                        ),
+                        8,
                     )
-                    complete(raw_text, screen_text)
+                    execution_proven = complete(raw_text, screen_text)
+                    prompt_returned = _conpty_prompt_returned_after_marker(
+                        raw_text[raw_offset:], expected
+                    )
+                    step["prompt_returned_after_execution"] = prompt_returned
+                    step["prompt_returned_before_next_command"] = prompt_returned
                     step["terminal_state"] = (
                         getattr(latest, "state", None) if not direct else "direct"
                     )
@@ -2682,14 +3156,18 @@ def test_native_conpty_input_execution_path_comparison(
                             else "unknown"
                         )
                     step["status"] = (
-                        "EXECUTION_PROVEN" if complete(raw_text, screen_text)
+                        "EXECUTION_PROVEN" if execution_proven
                         else "EXECUTION_UNPROVEN"
                     )
                     if label == "SHORT_ASCII" and step_index == 0:
                         baseline_proven = step["status"] == "EXECUTION_PROVEN"
                         result["short_ascii_execution_proven"] = baseline_proven
-                    if step["status"] != "EXECUTION_PROVEN":
-                        case_result["status"] = "EXECUTION_UNPROVEN"
+                    if step["status"] != "EXECUTION_PROVEN" or not prompt_returned:
+                        case_result["status"] = (
+                            "EXECUTION_UNPROVEN"
+                            if step["status"] != "EXECUTION_PROVEN"
+                            else "PROMPT_RETURN_UNOBSERVED"
+                        )
                         stop_cases = True
                         break
                 else:
@@ -2781,18 +3259,49 @@ def test_native_conpty_input_execution_path_comparison(
 
         return _finalize_conpty_path_result(result)
 
-    direct = run_path(direct=True)
-    direct_cleanup_confirmed = _conpty_path_allows_followup(direct)
-    if direct_cleanup_confirmed:
-        worker = run_path(direct=False)
-    else:
-        worker = {
-            "path": "jtt_worker",
-            "status": "NOT_RUN_DIRECT_CLEANUP_UNCONFIRMED",
-            "cleanup_confirmed": False,
-            "cases": [],
-        }
-    evidence = {"direct": direct, "worker": worker}
+    scenarios = tuple(case_plans)
+    direct_runs = {}
+    for index, scenario in enumerate(scenarios):
+        previous = direct_runs.get(scenarios[index - 1]) if index else None
+        if previous is not None and not _conpty_path_allows_followup(previous):
+            direct_runs[scenario] = {
+                "path": "direct_pywinpty",
+                "scenario": scenario,
+                "status": "NOT_RUN_PREVIOUS_CLEANUP_UNCONFIRMED",
+                "cleanup_confirmed": False,
+                "cases": [],
+            }
+        else:
+            direct_runs[scenario] = run_path(direct=True, scenario=scenario)
+    worker_runs = {}
+    for index, scenario in enumerate(scenarios):
+        direct_run = direct_runs[scenario]
+        previous_worker = worker_runs.get(scenarios[index - 1]) if index else None
+        skip_status = _conpty_worker_scenario_skip_status(
+            direct_run, previous_worker
+        )
+        if skip_status is None:
+            worker_runs[scenario] = run_path(direct=False, scenario=scenario)
+        else:
+            worker_runs[scenario] = {
+                "path": "jtt_worker",
+                "scenario": scenario,
+                "status": skip_status,
+                "cleanup_confirmed": False,
+                "cases": [],
+            }
+    direct = direct_runs["baseline"]
+    worker = worker_runs["baseline"]
+    evidence = {
+        "direct": direct,
+        "worker": worker,
+        "direct_additional_scenarios": {
+            key: value for key, value in direct_runs.items() if key != "baseline"
+        },
+        "worker_additional_scenarios": {
+            key: value for key, value in worker_runs.items() if key != "baseline"
+        },
+    }
     record_property(
         "conpty_input_execution_comparison",
         json.dumps(evidence, ensure_ascii=True, sort_keys=True),
@@ -2818,6 +3327,10 @@ def test_native_conpty_input_execution_path_comparison(
         assert case.get("status") == "EXECUTION_PROVEN", (
             f"PRODUCT_WORKER_{label}_EXECUTION_UNPROVEN; see structured evidence"
         )
+        assert all(
+            step.get("prompt_returned_before_next_command") is True
+            for step in case.get("steps", [])
+        ), f"PRODUCT_WORKER_{label}_PROMPT_RETURN_UNOBSERVED; see structured evidence"
     if direct.get("status") == "DIAGNOSTIC_TOOL_ERROR":
         raise AssertionError(
             "DIAGNOSTIC_TOOL_ERROR at "
@@ -2834,9 +3347,64 @@ def test_native_conpty_input_execution_path_comparison(
     for label in (
         "LONG_ASCII", "MULTI_STEP", "UNICODE_INPUT", "PATH_CHANGE",
     ):
-        assert direct_cases.get(label, {}).get("status") == "EXECUTION_PROVEN", (
+        case = direct_cases.get(label, {})
+        assert case.get("status") == "EXECUTION_PROVEN", (
             f"DIRECT_REFERENCE_{label}_EXECUTION_UNPROVEN; see structured evidence"
         )
+        assert all(
+            step.get("prompt_returned_before_next_command") is True
+            for step in case.get("steps", [])
+        ), f"DIRECT_REFERENCE_{label}_PROMPT_RETURN_UNOBSERVED; see structured evidence"
+
+    for path_name, runs in (
+        ("DIRECT_REFERENCE", direct_runs), ("PRODUCT_WORKER", worker_runs),
+    ):
+        for scenario in (
+            "unicode_first", "ascii_then_unicode",
+            "path_standalone_single_write",
+            "path_after_ascii_per_key",
+        ):
+            run = runs[scenario]
+            assert run.get("status") == "COMPLETE", (
+                f"{path_name}_{scenario.upper()}_INCOMPLETE; see structured evidence"
+            )
+            case_results = {
+                item.get("case"): item for item in run.get("cases", [])
+                if item.get("case")
+            }
+            expected_labels = (
+                ("UNICODE_INPUT",)
+                if scenario == "unicode_first"
+                else ("SHORT_ASCII", "UNICODE_INPUT")
+                if scenario == "ascii_then_unicode"
+                else ("PATH_CHANGE",) if scenario == "path_standalone_single_write"
+                else ("SHORT_ASCII", "PATH_CHANGE")
+            )
+            for label in expected_labels:
+                case = case_results.get(label, {})
+                assert case.get("status") == "EXECUTION_PROVEN", (
+                    f"{path_name}_{scenario.upper()}_{label}_UNPROVEN; "
+                    "see structured evidence"
+                )
+                assert all(
+                    step.get("prompt_returned_before_next_command") is True
+                    for step in case.get("steps", [])
+                ), (
+                    f"{path_name}_{scenario.upper()}_{label}_PROMPT_UNOBSERVED; "
+                    "see structured evidence"
+                )
+        after_ascii_case = {
+            item.get("case"): item for item in runs["path_after_ascii_per_key"].get(
+                "cases", []
+            ) if item.get("case")
+        }.get("PATH_CHANGE", {})
+        assert after_ascii_case.get("steps", [{}])[0].get("input_mode") == "per_key"
+        standalone_case = {
+            item.get("case"): item for item in runs[
+                "path_standalone_single_write"
+            ].get("cases", []) if item.get("case")
+        }.get("PATH_CHANGE", {})
+        assert standalone_case.get("steps", [{}])[0].get("input_mode") == "single_write"
 
 
 @pytest.mark.parametrize("columns,lines", [(80, 24), (160, 44)])
