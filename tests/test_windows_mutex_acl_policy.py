@@ -8,6 +8,7 @@ import uuid
 
 import pytest
 
+import ju0_terminal_tower  # noqa: F401 - installs the guarded namespace
 from tmux_agent_tower.terminal import TerminalError
 from tmux_agent_tower.terminal import windows_manager as runtime
 

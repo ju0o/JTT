@@ -249,6 +249,9 @@ def test_native_powershell_create_io_resize_detach_reconnect_stop(tmp_path, monk
                           expected_generation=identity.generation,
                           expected_shell_pid=identity.shell_pid + 1)
         assert _process_same(identity.shell_pid, identity.shell_start)
+        surviving = registry.list_sessions()
+        assert len(surviving) == 1
+        assert surviving[0] == identity
         registry.stop(identity.session_id,
                       expected_generation=identity.generation,
                       expected_shell_pid=identity.shell_pid)
@@ -753,7 +756,7 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(tmp_path, monke
         "while(-not [System.IO.File]::Exists('" + marker_path + "')) "
         "{ Start-Sleep -Milliseconds 25 }; "
         "$ids=[System.IO.File]::ReadAllText('" + marker_path + "'); "
-        "[Console]::WriteLine('JTT_JOB_TREE_'+$ids+'_END')"
+        "[Console]::WriteLine('JTT_'+'JOB_TREE_'+$ids+'_END')"
     )
     assert "JTT_JOB_TREE_" not in outer_command
     processes = []

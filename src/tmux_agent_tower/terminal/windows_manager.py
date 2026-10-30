@@ -1086,11 +1086,11 @@ def _confirmed_windows_stop_identity(metadata: dict[str, Any], session_id: str,
             or not SESSION_ID_RE.fullmatch(metadata["generation"])
             or (expected_generation is not None
                 and metadata.get("generation") != str(expected_generation))):
-        raise TerminalError("terminal identity changed before cleanup retry")
+        raise TerminalError("terminal identity changed before stop")
     identity = _identity(metadata)
     if (expected_shell_pid is not None
             and identity.shell_pid != int(expected_shell_pid)):
-        raise TerminalError("terminal identity changed before cleanup retry")
+        raise TerminalError("terminal identity changed before stop")
     if (identity.supervisor_pid <= 0 or not identity.supervisor_start
             or identity.shell_pid <= 0 or not identity.shell_start):
         raise TerminalError("terminal process identity is incomplete")

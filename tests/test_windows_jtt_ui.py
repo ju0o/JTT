@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 import importlib
 import io
 import sys
@@ -2286,38 +2287,124 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
             )
             assert app.selected_identity is not None
             assert _same_identity(identity, app.selected_identity)
+
+            def initial_prompt_visible():
+                observation = app._right_observation
+                if observation is None:
+                    return False
+                return any(
+                    line.strip().startswith("PS ")
+                    and line.strip().endswith(">")
+                    and len(line.strip()) > len("PS >")
+                    for line in _plain_screen_text(observation[3]).splitlines()
+                )
+
+            await _wait_for_ui_state(
+                pilot, initial_prompt_visible,
+                "initial PowerShell prompt before copy input", timeout=20,
+            )
             await app.enter_input_mode()
             assert app.input_mode and app.client is not None and app.client.lease
             nonce = identity.session_id[:10]
+            input_literal = f"한글-{nonce}"
             expected = (
-                f"한글-JTT_COPY_{nonce}-OK",
+                f"JTT_COPY_INPUT_{input_literal}_END",
+                f"한글-JTT_COPY_OUTPUT_{nonce}-OK",
                 f"JTT_ERROR_{nonce}_END",
                 f"JTT_FINAL_{nonce}_END",
             )
             commands = (
-                (f"Write-Output ('한글-' + 'JTT_COPY_{nonce}' + '-OK')", expected[0]),
-                (f"Write-Error ('JTT_ERROR_' + '{nonce}' + '_END')", expected[1]),
-                (f"Write-Output ('JTT_FINAL_' + '{nonce}' + '_END')", expected[2]),
+                ("Write-Output ('JTT_COPY_INPUT_' + '"
+                 f"{input_literal}" + "' + '_END')", expected[0]),
+                ("Write-Output (([string]([char]0xD55C) + "
+                 "[string]([char]0xAE00)) + "
+                 f"'-JTT_COPY_OUTPUT_{nonce}-OK')", expected[1]),
+                (f"Write-Error ('JTT_ERROR_' + '{nonce}' + '_END')", expected[2]),
+                (f"Write-Output ('JTT_FINAL_' + '{nonce}' + '_END')", expected[3]),
             )
+            assert input_literal in commands[0][0]
+            assert expected[0] not in commands[0][0]
+            client = app.client
+            original_send = client.send
+            accepted_inputs = []
+
+            def record_send(data):
+                accepted = original_send(data)
+                accepted_inputs.append((data, accepted))
+                return accepted
+
+            monkeypatch.setattr(client, "send", record_send)
             for command, marker in commands:
                 assert marker not in command
-                await app._send_bytes((command + "\r").encode("utf-8"))
+                encoded = (command + "\r").encode("utf-8")
+                prior_observation = app._right_observation
+                assert prior_observation is not None
+                prior_sequence = prior_observation[1]
+                prior_count = len(accepted_inputs)
+                await app._send_bytes(encoded)
+                assert len(accepted_inputs) == prior_count + 1, (
+                    "UI input did not receive a terminal send acknowledgement"
+                )
+                assert accepted_inputs[-1] == (encoded, len(encoded))
                 await _wait_for_ui_state(
                     pilot,
                     lambda marker=marker: app._right_observation is not None
+                    and app._right_observation[1] > prior_sequence
                     and marker in "".join(
                         _plain_screen_text(app._right_observation[3]).split()
                     ),
-                    f"generated PowerShell output {marker}", timeout=20,
+                    f"PowerShell output sequence advanced for {marker}", timeout=20,
                 )
             await app.leave_input_mode()
+            ui_observation_before_copy = app._right_observation
+            assert ui_observation_before_copy is not None
+            copy_time_observations = []
+            copy_observation_scope = ContextVar(
+                "jtt_explicit_copy_observation", default=None
+            )
+            original_observe = client.observe
+
+            def capture_copy_observation():
+                observation = original_observe()
+                active_capture = copy_observation_scope.get()
+                if active_capture is not None:
+                    active_capture.append(observation)
+                return observation
+
+            monkeypatch.setattr(client, "observe", capture_copy_observation)
+            original_copy = app._copy_right_screen
+
+            async def capture_explicit_copy_observation():
+                token = copy_observation_scope.set(copy_time_observations)
+                try:
+                    await original_copy()
+                finally:
+                    copy_observation_scope.reset(token)
+
+            monkeypatch.setattr(
+                app, "_copy_right_screen", capture_explicit_copy_observation
+            )
             # Windows Terminal may reserve Ctrl+Shift+C for its host copy
             # command; exercise JTT's explicit copy fallback through its prefix.
             await pilot.press("ctrl+g", "c")
             await _wait_for_ui_state(
                 pilot, lambda: bool(copied), "explicit copy chord payload",
             )
+            assert copy_time_observations, "copy did not capture a fresh observation"
+            copy_observation = copy_time_observations[0]
+            assert copy_observation.synced
+            assert copy_observation.state == "running"
+            assert copy_observation.screen is not None
+            assert copy_observation.session_id == identity.session_id
+            assert copy_observation.generation == identity.generation
+            assert copy_observation.shell_pid == identity.shell_pid
+            assert copy_observation.sequence >= ui_observation_before_copy[1]
+            observed_copy_text = "".join(
+                _plain_screen_text(copy_observation.screen).split()
+            )
+            assert all(marker in observed_copy_text for marker in expected)
             payload = copied[-1]
+            assert payload == windows_ui._screen_clipboard_text(copy_observation.screen)
             compact_payload = "".join(payload.split())
             assert all(marker in compact_payload for marker in expected)
             assert "\r\n" in payload
