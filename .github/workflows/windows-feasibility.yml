@@ -159,8 +159,8 @@ jobs:
           python -c "import platform; print(platform.platform())"
       - name: Prepare test-owned result directory
         run: New-Item -ItemType Directory -Force test-results | Out-Null
-      - name: Run strict prompt/path E2E and isolated CR/CRLF diagnostic
-        run: python -m pytest -q -s tests/test_windows_terminal_backend.py::test_native_powershell_prompt_tracks_long_current_location tests/test_windows_terminal_backend.py::test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy tests/test_windows_terminal_backend.py::test_r02_long_location_command_terminator_replicas --junitxml=test-results/r02-original-prompt.xml
+      - name: Run original prompt/path E2E and direct/worker input comparison
+        run: python -m pytest -q -s tests/test_windows_terminal_backend.py::test_native_conpty_input_execution_path_comparison tests/test_windows_terminal_backend.py::test_native_powershell_prompt_tracks_long_current_location tests/test_windows_terminal_backend.py::test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy --junitxml=test-results/r02-original-prompt.xml
       - name: Preserve R02 result
         if: always()
         uses: actions/upload-artifact@v4

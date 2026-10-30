@@ -2343,22 +2343,26 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
             nonce = identity.session_id[:10]
             input_literal = f"한글-{nonce}"
             expected = (
+                f"jtt_copy_ascii_{nonce}_end",
                 f"JTT_COPY_INPUT_{input_literal}_END",
                 f"한글-JTT_COPY_OUTPUT_{nonce}-OK",
                 f"JTT_ERROR_{nonce}_END",
                 f"JTT_FINAL_{nonce}_END",
             )
             commands = (
+                ("write-output ('jtt_copy_ascii_' + '"
+                 f"{nonce}" + "' + '_end')", expected[0]),
                 ("Write-Output ('JTT_COPY_INPUT_' + '"
-                 f"{input_literal}" + "' + '_END')", expected[0]),
+                 f"{input_literal}" + "' + '_END')", expected[1]),
                 ("Write-Output (([string]([char]0xD55C) + "
                  "[string]([char]0xAE00)) + "
-                 f"'-JTT_COPY_OUTPUT_{nonce}-OK')", expected[1]),
-                (f"Write-Error ('JTT_ERROR_' + '{nonce}' + '_END')", expected[2]),
-                (f"Write-Output ('JTT_FINAL_' + '{nonce}' + '_END')", expected[3]),
+                 f"'-JTT_COPY_OUTPUT_{nonce}-OK')", expected[2]),
+                (f"Write-Error ('JTT_ERROR_' + '{nonce}' + '_END')", expected[3]),
+                (f"Write-Output ('JTT_FINAL_' + '{nonce}' + '_END')", expected[4]),
             )
-            assert input_literal in commands[0][0]
             assert expected[0] not in commands[0][0]
+            assert expected[1] not in commands[1][0]
+            assert input_literal in commands[1][0]
             client = app.client
             original_send = client.send
             accepted_inputs = []
@@ -2400,6 +2404,35 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
 
             monkeypatch.setattr(client, "send", record_send)
             import json
+
+            record_property(
+                "copy_right_focus_before_wait",
+                json.dumps({
+                    "input_mode": bool(app.input_mode),
+                    "right_panel_index": app._panel_index == 2,
+                    "focused_widget_id": getattr(app.focused, "id", None),
+                    "live_widget_has_focus": app.query_one("#live").has_focus,
+                    "lease_owned": bool(client.lease),
+                    "selected_identity_matches_client": (
+                        app.selected_identity is not None
+                        and _same_identity(app.selected_identity, client.identity)
+                    ),
+                }, sort_keys=True),
+            )
+            await _wait_for_ui_state(
+                pilot,
+                lambda: app._panel_index == 2
+                and getattr(app.focused, "id", None) == "live",
+                "RIGHT terminal focus after input lease acquisition",
+            )
+            record_property(
+                "copy_right_focus_after_wait",
+                json.dumps({
+                    "right_panel_index": app._panel_index == 2,
+                    "focused_widget_id": getattr(app.focused, "id", None),
+                    "live_widget_has_focus": app.query_one("#live").has_focus,
+                }, sort_keys=True),
+            )
 
             async def wait_for_raw_output(marker, after_sequence):
                 raw = bytearray()
@@ -2467,8 +2500,17 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                     json.dumps(send_predicates, sort_keys=True),
                 )
                 input_error_category = None
+                delivery_path = "app._send_bytes"
                 try:
-                    await app._send_bytes(encoded)
+                    if index == 0:
+                        delivery_path = "Textual on_key via Pilot.press"
+                        await pilot.press(*(
+                            "space" if character == " " else character
+                            for character in command
+                        ))
+                        await pilot.press("enter")
+                    else:
+                        await app._send_bytes(encoded)
                 except Exception as exc:
                     from ju0_terminal_tower.terminal.manager import TerminalError
 
@@ -2496,6 +2538,7 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                                 send_attempts[-1] if send_attempts else None
                             ),
                             "input_error_category": input_error_category,
+                            "delivery_path": delivery_path,
                             "last_output_sequence": (
                                 app._right_observation[1]
                                 if app._right_observation is not None else None
@@ -2507,16 +2550,27 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                         }, sort_keys=True),
                     )
                 send_attempts = accepted_inputs[prior_count:]
-                assert len(accepted_inputs) == prior_count + 1, (
-                    "UI input did not receive a terminal send acknowledgement"
-                )
-                assert accepted_inputs[-1] == {
-                    "attempted": True,
-                    "byte_count": len(encoded),
-                    "returned": True,
-                    "accepted_bytes": len(encoded),
-                    "terminal_error": None,
-                }
+                if index == 0:
+                    assert len(send_attempts) == len(encoded), (
+                        "Textual key events did not each receive a terminal "
+                        "send acknowledgement"
+                    )
+                    assert all(
+                        outcome["returned"] and outcome["accepted_bytes"] == 1
+                        and outcome["byte_count"] == 1
+                        for outcome in send_attempts
+                    ), "Textual key event input was not fully acknowledged"
+                else:
+                    assert len(send_attempts) == 1, (
+                        "UI input did not receive a terminal send acknowledgement"
+                    )
+                    assert send_attempts[0] == {
+                        "attempted": True,
+                        "byte_count": len(encoded),
+                        "returned": True,
+                        "accepted_bytes": len(encoded),
+                        "terminal_error": None,
+                    }
                 raw_update, raw_output = await wait_for_raw_output(
                     marker, prior_sequence
                 )

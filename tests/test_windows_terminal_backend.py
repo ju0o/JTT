@@ -722,7 +722,8 @@ def _process_same(pid, created):
     return alive and actual_created == created
 
 
-def _retain_test_process_handle(pid, expected_created, expected_image):
+def _retain_test_process_handle(
+        pid, expected_created, expected_image, *, allow_terminate=False):
     """Open only a PID emitted by this test and retain its verified handle."""
     import win32api
     import win32con
@@ -730,8 +731,13 @@ def _retain_test_process_handle(pid, expected_created, expected_image):
     import win32process
     from tmux_agent_tower.terminal.windows_manager import _process_image
 
+    access = win32con.PROCESS_QUERY_LIMITED_INFORMATION | win32con.SYNCHRONIZE
+    if allow_terminate:
+        # Used only for the direct ConPTY PowerShell this test spawned. The
+        # handle is identity-checked below before it can authorize cleanup.
+        access |= win32con.PROCESS_TERMINATE
     handle = win32api.OpenProcess(
-        win32con.PROCESS_QUERY_LIMITED_INFORMATION | win32con.SYNCHRONIZE,
+        access,
         False, int(pid),
     )
     try:
@@ -765,6 +771,7 @@ def _retained_process_handle_signaled(handle):
 def test_native_stop_terminates_nested_children_in_the_owned_job(
         tmp_path, monkeypatch, record_property):
     import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    import win32job
     from tmux_agent_tower.terminal import TerminalRegistry, windows_manager
     from tmux_agent_tower.terminal.windows_manager import (
         _powershell_executable,
@@ -779,32 +786,54 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
     identity = client.identity
     marker_file = tmp_path / "owned-job-pids.txt"
     marker_path = str(marker_file).replace("'", "''")
+    child_stage_file = tmp_path / "owned-job-child-stage.txt"
+    child_stage_path = str(child_stage_file).replace("'", "''")
+    grandchild_stage_file = tmp_path / "owned-job-grandchild-stage.txt"
+    grandchild_stage_path = str(grandchild_stage_file).replace("'", "''")
+    child_script_file = work / "owned-job-child.ps1"
+    child_script_path = str(child_script_file).replace("'", "''")
+    grandchild_script_file = work / "owned-job-grandchild.ps1"
+    grandchild_script_path = str(grandchild_script_file).replace("'", "''")
     nonce = uuid.uuid4().hex[:10]
     command_started_marker = f"JTT_OWNED_START_{nonce}_END"
     tree_marker_prefix = f"JTT_OWNED_TREE_{nonce}_"
-    child_script = (
-        "$grand=Start-Process -PassThru -WindowStyle Hidden "
-        "-FilePath ($PSHOME+'\\powershell.exe') "
-        "-ArgumentList @('-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 60'); "
-        "[System.IO.File]::WriteAllText('" + marker_path + "',"
-        "([string]$PID+','+[string]$grand.Id)); Start-Sleep -Seconds 60"
+    # Keep process creation as a short staged script. The previous test put a
+    # nested PowerShell script, base64 payload, and Start-Process argument
+    # quoting into one interactive line, so a started outer command did not
+    # tell us whether child creation or command-line parsing had failed.
+    grandchild_script_file.write_text(
+        "\n".join((
+            "[System.IO.File]::WriteAllText('" + grandchild_stage_path + "',[string]$PID)",
+            "Start-Sleep -Seconds 60",
+        )) + "\n",
+        encoding="utf-8-sig",
     )
-    encoded_child = base64.b64encode(
-        child_script.encode("utf-16le")
-    ).decode("ascii")
+    child_script_file.write_text(
+        "\n".join((
+            "[System.IO.File]::WriteAllText('" + child_stage_path + "','child_started')",
+            "$grand=Start-Process -ErrorAction Stop -PassThru -WindowStyle Hidden "
+            "-FilePath (Join-Path $PSHOME 'powershell.exe') "
+            "-ArgumentList ('-NoLogo -NoProfile -File \"" + grandchild_script_path + "\"')",
+            "$deadline=[DateTime]::UtcNow.AddSeconds(10)",
+            "while (-not [System.IO.File]::Exists('" + grandchild_stage_path + "') "
+            "-and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 25 }",
+            "$grand_stage=[System.IO.File]::ReadAllText('" + grandchild_stage_path + "').Trim()",
+            "if ($grand_stage -ne [string]$grand.Id) { throw 'grandchild stage identity mismatch' }",
+            "[System.IO.File]::WriteAllText('" + marker_path + "',"
+            "([string]$PID+','+[string]$grand.Id))",
+            "Start-Sleep -Seconds 60",
+        )) + "\n",
+        encoding="utf-8-sig",
+    )
     outer_command = (
         "[Console]::WriteLine('JTT_'+'OWNED_START_'+ '" + nonce + "'+'_END'); "
-        "$e='" + encoded_child + "'; "
-        "$child=Start-Process -PassThru -WindowStyle Hidden "
-        "-FilePath ($PSHOME+'\\powershell.exe') "
-        "-ArgumentList @('-NoLogo','-NoProfile','-EncodedCommand',$e); "
-        "while(-not [System.IO.File]::Exists('" + marker_path + "')) "
-        "{ Start-Sleep -Milliseconds 25 }; "
-        "$ids=[System.IO.File]::ReadAllText('" + marker_path + "'); "
-        "[Console]::WriteLine('JTT_'+'OWNED_TREE_'+ '" + nonce + "'+'_'+$ids+'_END')"
+        "$null=Start-Process -PassThru -WindowStyle Hidden "
+        "-FilePath (Join-Path $PSHOME 'powershell.exe') "
+        "-ArgumentList ('-NoLogo -NoProfile -File \"" + child_script_path + "\"')"
     )
     assert command_started_marker not in outer_command
     assert tree_marker_prefix not in outer_command
+    assert len(outer_command) < 512
     processes = []
     stop_evidence = {}
     raw_output = bytearray()
@@ -851,20 +880,83 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         assert command_started_marker in _screen_text(start_update.screen)
         record_property("owned_job_command_started", True)
 
+        child_started_deadline = time.monotonic() + 15
+        child_stage = "ABSENT"
+        while time.monotonic() < child_started_deadline:
+            if child_stage_file.is_file():
+                try:
+                    observed_stage = child_stage_file.read_text(
+                        encoding="utf-8-sig"
+                    ).strip()
+                except (OSError, UnicodeError):
+                    observed_stage = ""
+                if observed_stage == "child_started":
+                    child_stage = observed_stage
+                    break
+            last_update = client.poll()
+            raw_output.extend(last_update.output)
+            time.sleep(0.02)
+        record_property("owned_job_child_stage", child_stage)
+        assert child_stage == "child_started", (
+            "PowerShell started the outer command but the test-owned child "
+            "script did not start"
+        )
+
+        grandchild_deadline = time.monotonic() + 15
+        grandchild_pid_text = ""
+        while time.monotonic() < grandchild_deadline:
+            if grandchild_stage_file.is_file():
+                try:
+                    grandchild_pid_text = grandchild_stage_file.read_text(
+                        encoding="ascii"
+                    ).strip()
+                except (OSError, UnicodeError):
+                    grandchild_pid_text = ""
+                if grandchild_pid_text.isdecimal():
+                    break
+            last_update = client.poll()
+            raw_output.extend(last_update.output)
+            time.sleep(0.02)
+        record_property(
+            "owned_job_grandchild_started_marker_status",
+            "VALID" if grandchild_pid_text.isdecimal() else "ABSENT_OR_INVALID",
+        )
+        assert grandchild_pid_text.isdecimal(), (
+            "test-owned child started but the grandchild script did not publish "
+            "its own PID marker"
+        )
+
         file_deadline = time.monotonic() + 15
-        while not marker_file.is_file() and time.monotonic() < file_deadline:
+        pid_values = []
+        marker_status = "ABSENT"
+        while time.monotonic() < file_deadline:
+            if marker_file.is_file():
+                marker_status = "MALFORMED_OR_PARTIAL"
+                try:
+                    candidate_values = marker_file.read_text(
+                        encoding="ascii"
+                    ).strip().split(",")
+                except (OSError, UnicodeError):
+                    candidate_values = []
+                if (len(candidate_values) == 2
+                        and all(value.isdecimal() for value in candidate_values)):
+                    pid_values = candidate_values
+                    marker_status = "VALID"
+                    break
             last_update = client.poll()
             raw_output.extend(last_update.output)
             time.sleep(0.02)
         record_property("owned_job_creation_marker_present", marker_file.is_file())
-        assert marker_file.is_file(), (
-            "PowerShell command started, but the test-owned child PID marker file was not created"
-        )
-        pid_values = marker_file.read_text(encoding="ascii").strip().split(",")
-        assert len(pid_values) == 2 and all(value.isdecimal() for value in pid_values), (
-            "test-owned process creation marker was malformed"
+        record_property("owned_job_creation_marker_status", marker_status)
+        assert pid_values, (
+            "test-owned child stage started, but valid child/grandchild PID "
+            f"identity data was not produced ({marker_status})"
         )
         child_pid, grandchild_pid = (int(value) for value in pid_values)
+        assert grandchild_pid == int(grandchild_pid_text), (
+            "parent-reported grandchild PID did not match the grandchild's "
+            "independent startup marker"
+        )
         assert len({child_pid, grandchild_pid, identity.shell_pid}) == 3
         expected_image = os.path.normcase(os.path.abspath(str(_powershell_executable())))
         for pid in (child_pid, grandchild_pid):
@@ -873,6 +965,25 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
             assert image == expected_image
             handle = _retain_test_process_handle(pid, created, expected_image)
             processes.append((pid, created, handle))
+        membership = []
+        for pid, created, handle in processes:
+            in_windows_job = bool(win32job.IsProcessInJob(handle, None))
+            membership.append({
+                "pid": pid,
+                "creation_time": created,
+                "in_a_windows_job": in_windows_job,
+            })
+            assert in_windows_job, (
+                f"test-owned descendant {pid} was not observed in a Windows Job"
+            )
+        record_property(
+            "owned_job_descendant_job_membership",
+            json.dumps(membership, sort_keys=True),
+        )
+        record_property(
+            "owned_job_descendant_membership_scope",
+            "IsProcessInJob with NULL job handle checks any Job; exact JTT Job membership is corroborated by confirmed empty Job accounting and retained descendant handles signaled after that session's Stop",
+        )
         record_property(
             "owned_job_process_identities",
             json.dumps([
@@ -881,7 +992,28 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
             ], sort_keys=True),
         )
 
+        expected_prompt = _expected_prompt_path(work, 100)
+        prompt_update = collect_until(
+            lambda item, _output: item.screen is not None
+            and any(line.strip() == expected_prompt
+                    for line in _screen_text(item.screen).splitlines()),
+            "PowerShell prompt after test-owned child launcher returns",
+        )
+        assert prompt_update.screen is not None
         tree_marker = f"{tree_marker_prefix}{child_pid},{grandchild_pid}_END"
+        tree_report_command = (
+            "$ids=[System.IO.File]::ReadAllText('" + marker_path + "'); "
+            "[Console]::WriteLine('JTT_'+'OWNED_TREE_'+ '" + nonce
+            + "' +'_'+$ids+'_END')"
+        )
+        assert tree_marker not in tree_report_command
+        tree_report_input = (tree_report_command + "\r").encode("ascii")
+        tree_report_written = client.send(tree_report_input)
+        record_property(
+            "owned_job_tree_report_input_acknowledged",
+            tree_report_written == len(tree_report_input),
+        )
+        assert tree_report_written == len(tree_report_input)
         tree_update = collect_until(
             lambda _item, output: tree_marker.encode("ascii")
             in output.replace(b"\r", b"").replace(b"\n", b""),
@@ -1685,6 +1817,462 @@ def test_native_input_reply_sequence_does_not_ack_unread_output(tmp_path):
                 identity.session_id, expected_generation=identity.generation,
                 expected_shell_pid=identity.shell_pid,
             )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
+def test_native_conpty_input_execution_path_comparison(
+        tmp_path, monkeypatch, record_property):
+    """Compare direct pywinpty writes with the JTT worker's same PS inputs."""
+    import ju0_terminal_tower  # noqa: F401 - installs guarded namespace
+    import pyte
+    import win32api
+    import win32con
+    import win32event
+    from winpty import Backend, PTY
+    from tmux_agent_tower.terminal import TerminalRegistry, windows_manager
+
+    root = tmp_path / "jtt-conpty-input-rootcause"
+    start = root / "long-start" / ("segment-a" * 3) / ("segment-b" * 3)
+    start.mkdir(parents=True)
+    assert 100 < len(str(start)) < 230
+    monkeypatch.chdir(start)
+
+    def make_case(label, nonce, marker_file):
+        expected = f"JTT_EXEC_{label}_{nonce}_END"
+        marker_path = str(marker_file).replace("'", "''")
+        file_marker = (
+            "[System.IO.File]::WriteAllText('" + marker_path + "','" + nonce + "')"
+        )
+        if label == "SHORT_ASCII":
+            lines = [file_marker + "; [Console]::WriteLine('JTT_'+'EXEC_SHORT_ASCII_'+" +
+                     f"'{nonce}'+'_END')"]
+        elif label == "LONG_ASCII":
+            lines = ["$__jtt_padding='" + ("x" * 640) + "'; "
+                     + file_marker + "; "
+                     "[Console]::WriteLine('JTT_'+'EXEC_LONG_ASCII_'+"
+                     f"'{nonce}'+'_END')"]
+        elif label == "UNICODE_INPUT":
+            lines = ["Write-Output '한글'; " + file_marker + "; "
+                     "[Console]::WriteLine('JTT_' + "
+                     "'EXEC_UNICODE_INPUT_' + " + f"'{nonce}' + '_END')"]
+        elif label == "MULTILINE":
+            lines = ["& {", file_marker,
+                     "[Console]::WriteLine('JTT_'+'EXEC_MULTILINE_'+"
+                     f"'{nonce}'+'_END')", "}"]
+        else:
+            raise AssertionError("unknown ConPTY comparison case")
+        assert expected not in "\n".join(lines)
+        return expected, lines
+
+    def compact(text):
+        return text.replace("\r", "").replace("\n", "")
+
+    def has_prompt(text):
+        return any(line.lstrip().startswith("PS ") and ">" in line
+                   for line in text.splitlines())
+
+    def error_categories(text):
+        return [token for token in (
+            "ParserError", "Write-Error", "Set-Location :", "Start-Process :",
+            "Cannot find path", "Exception", "FullyQualifiedErrorId",
+        ) if token in text]
+
+    def cleanup_is_confirmed(item):
+        if item.get("cleanup") == "PROCESS_NOT_STARTED":
+            return (
+                item.get("spawn_result") is False
+                and item.get("spawn_pid_state") == "ABSENT"
+            )
+        return (
+            item.get("cleanup") in {
+                "TERMINATED_BY_RETAINED_HANDLE",
+                "ALREADY_EXITED_ON_RETAINED_HANDLE",
+                "REGISTRY_STOP_COMPLETED",
+            }
+            and item.get("retained_handle_signaled_after_cleanup") is True
+        )
+
+    def run_case(label, expected, lines, *, direct, marker_file, nonce):
+        result = {
+            "path": "direct_pywinpty_conpty" if direct else "jtt_worker",
+            "case": label, "write_results": [], "input_error_categories": [],
+            "intermediate_input_echo": [],
+            "startup_prompt_seen": False, "command_echo_seen": False,
+            "execution_file_marker_present": False,
+            "execution_file_marker_matches_nonce": False,
+            "execution_marker_in_raw_output": False,
+            "execution_marker_in_pyte_screen": False,
+            "powershell_error_categories": [], "cleanup": "NOT_ATTEMPTED",
+        }
+        pty = client = registry = process_handle = None
+        identity = None
+        raw_text_parts = []
+        raw_worker_bytes = bytearray()
+        stream_screen = pyte.Screen(100, 30) if direct else None
+        stream = pyte.Stream(stream_screen) if direct else None
+        latest = None
+
+        def read_execution_marker(marker_file, nonce):
+            try:
+                value = marker_file.read_text(encoding="ascii").strip()
+            except (OSError, UnicodeError):
+                return False, False
+            return True, value == nonce
+
+        def observe():
+            nonlocal latest
+            if direct:
+                try:
+                    text = pty.read(blocking=False)
+                except Exception as exc:
+                    result["read_error_category"] = type(exc).__name__
+                    text = ""
+                if text:
+                    raw_text_parts.append(text)
+                    stream.feed(text)
+                screen_text = "\n".join(
+                    "".join(stream_screen.buffer[y][x].data
+                            for x in range(stream_screen.columns))
+                    for y in range(stream_screen.lines)
+                )
+                raw_text = "".join(raw_text_parts)
+                latest = {"state": "NOT_APPLICABLE_DIRECT_PTY", "sequence": None,
+                          "snapshot_sequence": None, "synced": None, "gap": None}
+            else:
+                latest = client.poll()
+                raw_worker_bytes.extend(latest.output)
+                raw_text = raw_worker_bytes.decode("utf-8", errors="replace")
+                screen_text = (
+                    _compact_screen_text(latest.screen)
+                    if latest.screen is not None else ""
+                )
+            return raw_text, screen_text
+
+        try:
+            if direct:
+                shell_env = {
+                    key: os.environ[key] for key in (
+                        "SystemRoot", "WINDIR", "PATH", "LOCALAPPDATA", "APPDATA",
+                        "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP",
+                    ) if key in os.environ
+                }
+                shell_env.setdefault("SystemRoot", r"C:\Windows")
+                shell_env.setdefault("WINDIR", shell_env["SystemRoot"])
+                shell_env.setdefault("PATH", str(Path(shell_env["SystemRoot"]) / "System32"))
+                shell_env["JTT_HOME"] = str(
+                    root / (label.lower() + "-worker-home")
+                )
+                shell_env["TERM"] = "xterm"
+                pty = PTY(100, 30, backend=Backend.ConPTY)
+                spawned = pty.spawn(
+                    str(windows_manager._powershell_executable()),
+                    cmdline=subprocess.list2cmdline(["-NoLogo", "-NoProfile", "-NoExit"]),
+                    cwd=str(start),
+                    env="\0".join(f"{key}={value}" for key, value in shell_env.items()) + "\0",
+                )
+                result["spawn_result"] = bool(spawned)
+                pid_value = pty.pid
+                if pid_value is None:
+                    result["spawn_pid_state"] = "ABSENT"
+                    if not spawned:
+                        result["cleanup"] = "PROCESS_NOT_STARTED"
+                        return result
+                    result["spawn_pid_state"] = "UNKNOWN_AFTER_SUCCESS_RETURN"
+                    return result
+                pid = int(pid_value)
+                result["spawn_pid_state"] = "PRESENT"
+                created, _image, alive = windows_manager._process_facts(pid)
+                process_handle = _retain_test_process_handle(
+                    pid, created, windows_manager._powershell_executable(),
+                    allow_terminate=True,
+                )
+                result["process_identity"] = {
+                    "pid": pid, "creation_time_recorded": bool(created),
+                    "creation_time": created,
+                    "expected_image_verified": True,
+                }
+                result["process_alive_before_input"] = bool(alive)
+                if not spawned:
+                    result["spawn_anomaly"] = "false_return_with_test_owned_pid"
+                    return result
+            else:
+                registry = TerminalRegistry(
+                    root / (label.lower() + "-worker-home") / "terminals"
+                )
+                client = registry.create("isolated ConPTY input comparison")
+                identity = client.identity
+                process_handle = _retain_test_process_handle(
+                    identity.shell_pid, identity.shell_start, identity.shell_path
+                )
+                result["process_identity"] = {
+                    "pid": identity.shell_pid,
+                    "creation_time_recorded": bool(identity.shell_start),
+                    "creation_time": identity.shell_start,
+                    "session_id": identity.session_id,
+                    "generation": identity.generation,
+                    "session_generation_recorded": bool(identity.generation),
+                    "expected_image_verified": True,
+                }
+
+            startup_deadline = time.monotonic() + 5
+            while time.monotonic() < startup_deadline:
+                raw_text, _screen_text = observe()
+                result["startup_prompt_seen"] = has_prompt(raw_text)
+                if direct:
+                    if result["startup_prompt_seen"]:
+                        break
+                elif latest.state == "running" and result["startup_prompt_seen"]:
+                    break
+                time.sleep(0.02)
+
+            if not direct:
+                result["worker_state_before_input"] = latest.state if latest else None
+                if latest is None or latest.state != "running":
+                    result["input_error_categories"].append("worker_not_running")
+                    return result
+                if not client.acquire():
+                    result["input_error_categories"].append("input_lease_unavailable")
+                    return result
+
+            for line_index, line in enumerate(lines):
+                payload_text = line + "\r"
+                payload = payload_text.encode("utf-8")
+                try:
+                    written = pty.write(payload_text) if direct else client.send(payload)
+                except Exception as exc:
+                    result["input_error_categories"].append(type(exc).__name__)
+                    break
+                result["write_results"].append({
+                    "reported_return": written,
+                    "expected_utf8_bytes": len(payload),
+                    "expected_python_characters": len(payload_text),
+                    "equals_utf8_byte_count": (
+                        type(written) is int and written == len(payload)
+                    ),
+                    "source": "PTY.write" if direct else "worker PTY.write ACK",
+                })
+                if line_index + 1 < len(lines):
+                    echo_deadline = time.monotonic() + 5
+                    echo_seen = False
+                    while time.monotonic() < echo_deadline:
+                        echo_raw, echo_screen = observe()
+                        if (line in compact(echo_raw)
+                                or line in compact(echo_screen)):
+                            echo_seen = True
+                            break
+                        time.sleep(0.02)
+                    result["intermediate_input_echo"].append({
+                        "line_index": line_index,
+                        "echo_seen_before_next_input": echo_seen,
+                    })
+                    if not echo_seen:
+                        result["input_error_categories"].append(
+                            "input_echo_not_observed_before_next_multiline_input"
+                        )
+                        break
+
+            deadline = time.monotonic() + 8
+            marker_file_present = False
+            marker_matches_nonce = False
+            while time.monotonic() < deadline:
+                raw_text, screen_text = observe()
+                marker_file_present, marker_matches_nonce = read_execution_marker(
+                    marker_file, nonce
+                )
+                output_marker_seen = (
+                    expected in compact(raw_text)
+                    or expected in compact(screen_text)
+                )
+                if output_marker_seen and marker_file_present and marker_matches_nonce:
+                    break
+                if result["input_error_categories"]:
+                    break
+                time.sleep(0.02)
+            raw_text, screen_text = observe()
+            marker_file_present, marker_matches_nonce = read_execution_marker(
+                marker_file, nonce
+            )
+            result.update({
+                "command_echo_seen": all(
+                    line in compact(raw_text) or line in compact(screen_text)
+                    for line in lines
+                ),
+                "execution_file_marker_present": marker_file_present,
+                "execution_file_marker_matches_nonce": marker_matches_nonce,
+                "execution_marker_in_raw_output": expected in compact(raw_text),
+                "execution_marker_in_pyte_screen": expected in compact(screen_text),
+                "pywinpty_api_text_characters": len(raw_text) if direct else None,
+                "worker_poll_payload_bytes": (
+                    len(raw_worker_bytes) if not direct else None
+                ),
+                "output_measurement_source": (
+                    "pywinpty.PTY.read returned Python str; no native bytes exposed"
+                    if direct else "decoded worker poll payload bytes"
+                ),
+                "state": latest.state if latest is not None else None,
+                "renderer": getattr(latest, "renderer_state", None),
+                "sequence": getattr(latest, "sequence", None),
+                "snapshot_sequence": getattr(latest, "snapshot_sequence", None),
+                "synced": getattr(latest, "synced", None),
+                "gap": getattr(latest, "gap", None),
+                "powershell_error_categories": error_categories(raw_text + screen_text),
+            })
+            if direct:
+                try:
+                    wait_result = win32event.WaitForSingleObject(process_handle, 0)
+                    result["process_state_after_input"] = (
+                        "alive" if wait_result == win32con.WAIT_TIMEOUT
+                        else "exited" if wait_result == win32con.WAIT_OBJECT_0
+                        else "unknown"
+                    )
+                except Exception as exc:
+                    result["process_state_after_input"] = "unknown"
+                    result["process_state_check_error_category"] = type(exc).__name__
+            return result
+        except Exception as exc:
+            result["exception_category"] = type(exc).__name__
+            return result
+        finally:
+            if direct and process_handle is not None:
+                try:
+                    if win32event.WaitForSingleObject(process_handle, 0) == win32con.WAIT_TIMEOUT:
+                        try:
+                            win32api.TerminateProcess(process_handle, 0)
+                        except Exception as exc:
+                            result["cleanup_error_category"] = type(exc).__name__
+                        exited = win32event.WaitForSingleObject(process_handle, 5000)
+                        result["cleanup"] = (
+                            "TERMINATED_BY_RETAINED_HANDLE"
+                            if exited == win32con.WAIT_OBJECT_0 else "EXIT_UNCONFIRMED"
+                        )
+                    else:
+                        result["cleanup"] = "ALREADY_EXITED_ON_RETAINED_HANDLE"
+                    result["retained_handle_signaled_after_cleanup"] = (
+                        win32event.WaitForSingleObject(process_handle, 0)
+                        == win32con.WAIT_OBJECT_0
+                    )
+                except Exception as exc:
+                    result["cleanup_error_category"] = type(exc).__name__
+                    try:
+                        result["retained_handle_signaled_after_cleanup"] = (
+                            win32event.WaitForSingleObject(process_handle, 0)
+                            == win32con.WAIT_OBJECT_0
+                        )
+                        if result["retained_handle_signaled_after_cleanup"]:
+                            result["cleanup"] = "ALREADY_EXITED_ON_RETAINED_HANDLE"
+                    except Exception as wait_exc:
+                        result["cleanup_wait_error_category"] = type(wait_exc).__name__
+                finally:
+                    process_handle.Close()
+            if direct and pty is not None:
+                try:
+                    pty.close()
+                except Exception as exc:
+                    result["pty_close_error_category"] = type(exc).__name__
+            if not direct and client is not None:
+                try:
+                    client.close()
+                except Exception as exc:
+                    result["client_close_error_category"] = type(exc).__name__
+            if not direct and registry is not None and identity is not None:
+                try:
+                    registry.stop(
+                        identity.session_id,
+                        expected_generation=identity.generation,
+                        expected_shell_pid=identity.shell_pid,
+                    )
+                    result["cleanup"] = "REGISTRY_STOP_COMPLETED"
+                except Exception as exc:
+                    result["cleanup"] = "STOP_FAILED_EVIDENCE_RETAINED"
+                    result["cleanup_error_category"] = type(exc).__name__
+            if not direct and process_handle is not None:
+                try:
+                    result["retained_handle_signaled_after_cleanup"] = (
+                        win32event.WaitForSingleObject(process_handle, 0)
+                        == win32con.WAIT_OBJECT_0
+                    )
+                except Exception as exc:
+                    result["retained_handle_check_error_category"] = type(exc).__name__
+                finally:
+                    process_handle.Close()
+
+    evidence = []
+    baseline_execution_proven = False
+    unconfirmed_cleanup = None
+    nonce = uuid.uuid4().hex[:10]
+    for index, label in enumerate(("SHORT_ASCII", "LONG_ASCII", "UNICODE_INPUT", "MULTILINE")):
+        if index and not baseline_execution_proven:
+            evidence.append({
+                "case": label,
+                "status": "NOT_RUN_SHORT_ASCII_EXECUTION_UNPROVEN",
+            })
+            continue
+        direct_marker_file = root / (label.lower() + "-direct.marker")
+        worker_marker_file = root / (label.lower() + "-worker.marker")
+        (root / (label.lower() + "-worker-home")).mkdir(parents=True)
+        expected, direct_lines = make_case(label, nonce, direct_marker_file)
+        _worker_expected, worker_lines = make_case(label, nonce, worker_marker_file)
+        direct = run_case(
+            label, expected, direct_lines, direct=True,
+            marker_file=direct_marker_file, nonce=nonce,
+        )
+        case_evidence = {"case": label, "direct": direct}
+        if not cleanup_is_confirmed(direct):
+            case_evidence["worker"] = {
+                "status": "NOT_RUN_DIRECT_TEST_PROCESS_CLEANUP_UNCONFIRMED"
+            }
+            evidence.append(case_evidence)
+            unconfirmed_cleanup = "direct_pywinpty_conpty"
+            break
+        worker = run_case(
+            label, expected, worker_lines, direct=False,
+            marker_file=worker_marker_file, nonce=nonce,
+        )
+        case_evidence["worker"] = worker
+        evidence.append(case_evidence)
+        if not cleanup_is_confirmed(worker):
+            unconfirmed_cleanup = "jtt_worker"
+            break
+        if index == 0:
+            baseline_execution_proven = all((
+                direct.get("execution_file_marker_matches_nonce"),
+                worker.get("execution_file_marker_matches_nonce"),
+            ))
+    for item in evidence:
+        record_property(
+            "conpty_input_comparison_" + str(item["case"]).lower(),
+            json.dumps(item, sort_keys=True),
+        )
+    print("CONPTY_INPUT_EXECUTION_COMPARISON " + json.dumps(evidence, sort_keys=True))
+    assert unconfirmed_cleanup is None, (
+        "stopped further test-owned process creation because cleanup could not "
+        f"be confirmed for {unconfirmed_cleanup}; see structured evidence"
+    )
+    assert baseline_execution_proven, (
+        "short-ASCII command completion was not independently proven through "
+        "both direct ConPTY and the JTT worker; see structured evidence"
+    )
+    for item in evidence:
+        if item.get("status"):
+            continue
+        for path in ("direct", "worker"):
+            assert item[path].get("execution_marker_in_raw_output"), (
+                f"{item['case']} marker missing from {path} output"
+            )
+            assert item[path].get("execution_file_marker_matches_nonce"), (
+                f"{item['case']} independent execution marker missing for {path}"
+            )
+            assert item[path].get("execution_marker_in_pyte_screen"), (
+                f"{item['case']} marker missing from {path} screen"
+            )
+            assert item[path].get("retained_handle_signaled_after_cleanup"), (
+                f"{item['case']} {path} test-owned shell cleanup is unconfirmed"
+            )
+            assert item[path].get("cleanup") in {
+                "TERMINATED_BY_RETAINED_HANDLE",
+                "ALREADY_EXITED_ON_RETAINED_HANDLE",
+                "REGISTRY_STOP_COMPLETED",
+            }
 
 
 @pytest.mark.parametrize("columns,lines", [(80, 24), (160, 44)])
