@@ -20,6 +20,43 @@ import pytest
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="native Windows required")
 
 
+def _finalize_conpty_path_result(result):
+    """Snapshot path, error, and post-finally cleanup evidence for diagnostics."""
+    finalized = dict(result)
+    finalized["finalization"] = {
+        "status": finalized.get("status"),
+        "diagnostic_error_stage": finalized.get("diagnostic_error_stage"),
+        "diagnostic_error_category": finalized.get("diagnostic_error_category"),
+        "cleanup": finalized.get("cleanup"),
+        "cleanup_confirmed": bool(finalized.get("cleanup_confirmed")),
+        "cleanup_error_category": finalized.get("cleanup_error_category"),
+        "cleanup_handle_close_error_category": finalized.get(
+            "cleanup_handle_close_error_category"
+        ),
+        "client_close_error_category": finalized.get("client_close_error_category"),
+        "retained_handle_signaled_after_cleanup": finalized.get(
+            "retained_handle_signaled_after_cleanup"
+        ),
+    }
+    return finalized
+
+
+def _conpty_path_allows_followup(result):
+    """Allow the worker comparison only when direct-path cleanup is complete."""
+    return bool(result.get("cleanup_confirmed")) and not any(
+        result.get(key)
+        for key in (
+            "cleanup_error_category",
+            "cleanup_handle_close_error_category",
+            "client_close_error_category",
+        )
+    )
+
+
+class _ConptyPathAbort(Exception):
+    """Stop one diagnostic path while still finalizing its cleanup evidence."""
+
+
 def test_worker_interpreter_preserves_process_identity(tmp_path):
     import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
     from tmux_agent_tower.terminal.windows_manager import (
@@ -786,6 +823,8 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
     identity = client.identity
     marker_file = tmp_path / "owned-job-pids.txt"
     marker_path = str(marker_file).replace("'", "''")
+    launcher_entry_file = tmp_path / "owned-job-launcher-entry.txt"
+    launcher_entry_path = str(launcher_entry_file).replace("'", "''")
     launcher_stage_file = tmp_path / "owned-job-launcher-stage.txt"
     launcher_stage_path = str(launcher_stage_file).replace("'", "''")
     child_stage_file = tmp_path / "owned-job-child-stage.txt"
@@ -814,8 +853,12 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
             "Start-Sleep -Seconds 60",
             "} catch {",
             "$failure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId",
-            "[System.IO.File]::WriteAllText('" + grandchild_stage_path
-            + "','grandchild_error|'+$failure)",
+            "try { [System.IO.File]::WriteAllText('" + grandchild_stage_path
+            + "','grandchild_error|'+$failure) } catch {",
+            "$writeFailure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId",
+            "[Console]::WriteLine('JTT_OWNED_STAGE_WRITE_ERROR|grandchild_error|'+$writeFailure)",
+            "}",
+            "[Console]::WriteLine('JTT_OWNED_GRANDCHILD_ERROR|'+$failure)",
             "throw",
             "}",
         )) + "\n",
@@ -852,33 +895,73 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
             "} catch {",
             "$failure=$stage+'|'+$_.Exception.GetType().Name+'|'"
             "+$_.FullyQualifiedErrorId",
-            "[System.IO.File]::WriteAllText('" + child_stage_path
-            + "','child_error|'+$failure)",
+            "try { [System.IO.File]::WriteAllText('" + child_stage_path
+            + "','child_error|'+$failure) } catch {",
+            "$writeFailure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId",
+            "[Console]::WriteLine('JTT_OWNED_STAGE_WRITE_ERROR|child_error|'+$writeFailure)",
+            "}",
+            "[Console]::WriteLine('JTT_OWNED_CHILD_ERROR|'+$failure)",
             "throw",
             "}",
         )) + "\n",
         encoding="utf-8-sig",
     )
-    outer_command = (
-        "[Console]::WriteLine('JTT_'+'OWNED_START_'+ '" + nonce + "'+'_END'); "
-        "$__jtt_stage='" + launcher_stage_path + "'; "
-        "$__jtt_script='" + child_script_path + "'; "
-        "try { $child=Start-Process -ErrorAction Stop -PassThru -WindowStyle Hidden "
+    launcher_script = "\n".join((
+        "$ErrorActionPreference = 'Stop'",
+        "$__jtt_entry = '" + launcher_entry_path + "'",
+        "$__jtt_stage = '" + launcher_stage_path + "'",
+        "$__jtt_script = '" + child_script_path + "'",
+        "try { [System.IO.File]::WriteAllText($__jtt_entry,"
+        "'launcher_entered|'+[string]$PID) } catch {",
+        "$failure=$_.Exception.GetType().Name+'|' +$_.FullyQualifiedErrorId",
+        "[Console]::WriteLine('JTT_OWNED_STAGE_WRITE_ERROR|launcher_entry|'+$failure)",
+        "throw",
+        "}",
+        "[Console]::WriteLine('JTT_'+'OWNED_START_'+ '" + nonce + "'+'_END')",
+        "$child = $null",
+        "try {",
+        "$child=Start-Process -ErrorAction Stop -PassThru -WindowStyle Hidden "
         "-FilePath (Join-Path $PSHOME 'powershell.exe') "
-        "-ArgumentList ('-NoLogo -NoProfile -File \"'+$__jtt_script+'\"') } catch { "
-        "$failure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId; "
-        "[System.IO.File]::WriteAllText($__jtt_stage,'start_process_error|'+$failure); "
-        "$child=$null }; "
-        "if ($null -ne $child) { try { [System.IO.File]::WriteAllText($__jtt_stage,"
-        "'child_process_created|'+[string]$child.Id) } catch { "
-        "[System.IO.File]::WriteAllText($__jtt_stage,"
-        "'child_created_but_stage_write_error|'+$_.Exception.GetType().Name) } }"
-    )
-    launcher_script_file.write_text(outer_command + "\n", encoding="utf-8-sig")
+        "-ArgumentList ('-NoLogo -NoProfile -File \"'+$__jtt_script+'\"')",
+        "} catch {",
+        "$failure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId",
+        "try { [System.IO.File]::WriteAllText($__jtt_stage,"
+        "'start_process_error|'+$failure) } catch {",
+        "$writeFailure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId",
+        "[Console]::WriteLine('JTT_OWNED_STAGE_WRITE_ERROR|start_process|'+$writeFailure)",
+        "}",
+        "[Console]::WriteLine('JTT_OWNED_START_PROCESS_ERROR|'+$failure)",
+        "return",
+        "}",
+        "[Console]::WriteLine('JTT_OWNED_CHILD_PROCESS_CREATED|'+[string]$child.Id)",
+        "try { [System.IO.File]::WriteAllText($__jtt_stage,"
+        "'child_process_created|'+[string]$child.Id) } catch {",
+        "$writeFailure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId",
+        "try { [System.IO.File]::WriteAllText($__jtt_stage,"
+        "'child_created_but_stage_write_error|'+[string]$child.Id+'|'+$writeFailure) "
+        "} catch { }",
+        "[Console]::WriteLine('JTT_OWNED_STAGE_WRITE_ERROR|child_created|'+$writeFailure)",
+        "}",
+    )) + "\n"
+    launcher_script_file.write_text(launcher_script, encoding="utf-8-sig")
     outer_command = ".\\owned-job-launcher.ps1"
     assert command_started_marker not in outer_command
     assert tree_marker_prefix not in outer_command
     assert len(outer_command) < 512
+    record_property(
+        "owned_job_preflight",
+        json.dumps({
+            "working_directory_matches": (
+                os.path.normcase(os.path.abspath(os.getcwd()))
+                == os.path.normcase(os.path.abspath(str(work)))
+            ),
+            "launcher_script_exists": launcher_script_file.is_file(),
+            "launcher_stage_parent_exists": launcher_stage_file.parent.is_dir(),
+            "launcher_entry_parent_exists": launcher_entry_file.parent.is_dir(),
+            "child_script_exists": child_script_file.is_file(),
+            "grandchild_script_exists": grandchild_script_file.is_file(),
+        }, sort_keys=True),
+    )
     processes = []
     stop_evidence = {}
     raw_output = bytearray()
@@ -886,6 +969,18 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
     preserved_client = None
     preserved_identity = None
     preserved_shell_handle = None
+
+    def safe_powershell_error_categories(data):
+        text = data.decode("utf-8", errors="replace")
+        categories = (
+            "ParserError", "PSSecurityException", "ExecutionPolicy",
+            "UnauthorizedAccessException", "Start-Process",
+            "Cannot find path", "JTT_OWNED_STAGE_WRITE_ERROR",
+            "JTT_OWNED_START_PROCESS_ERROR", "JTT_OWNED_CHILD_ERROR",
+            "JTT_OWNED_GRANDCHILD_ERROR", "JTT_OWNED_CHILD_PROCESS_CREATED",
+        )
+        return [category for category in categories if category in text]
+
     try:
         expected_prompt = _expected_prompt_path(work, 100)
         initial = _wait(
@@ -914,38 +1009,94 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
                 f"sequence={getattr(last_update, 'sequence', None)!r}; "
                 f"snapshot_sequence={getattr(last_update, 'snapshot_sequence', None)!r}; "
                 f"raw_bytes={len(raw_output)}; marker_file={marker_file.is_file()}"
+                f"; error_categories={safe_powershell_error_categories(bytes(raw_output))!r}"
             )
 
         start_update = collect_until(
-            lambda _item, output: command_started_marker.encode("ascii")
-            in output.replace(b"\r", b"").replace(b"\n", b""),
-            "PowerShell command execution marker",
+            lambda _item, output: (
+                command_started_marker.encode("ascii")
+                in output.replace(b"\r", b"").replace(b"\n", b"")
+                or bool(safe_powershell_error_categories(output))
+            ),
+            "PowerShell launcher marker or categorized startup error",
         )
-        assert start_update.screen is not None
-        assert command_started_marker in _screen_text(start_update.screen)
-        record_property("owned_job_command_started", True)
+        compact_start_output = bytes(raw_output).replace(b"\r", b"").replace(b"\n", b"")
+        command_started = command_started_marker.encode("ascii") in compact_start_output
+        record_property("owned_job_command_started", command_started)
+        record_property(
+            "owned_job_initial_powershell_error_categories",
+            json.dumps(safe_powershell_error_categories(bytes(raw_output))),
+        )
+        if command_started:
+            assert start_update.screen is not None
+            assert command_started_marker in _screen_text(start_update.screen)
+        else:
+            raise AssertionError(
+                "PowerShell launcher did not emit its command marker; "
+                "see categorized parser/startup evidence"
+            )
 
         def read_stage(path):
             try:
                 return path.read_text(encoding="utf-8-sig").strip()
-            except (OSError, UnicodeError):
-                return ""
+            except FileNotFoundError:
+                return "ABSENT"
+            except (OSError, UnicodeError) as exc:
+                return "READ_ERROR|" + type(exc).__name__
 
         launcher_deadline = time.monotonic() + 15
         launcher_stage = "ABSENT"
+        launcher_entry = "ABSENT"
         while time.monotonic() < launcher_deadline:
+            launcher_entry = read_stage(launcher_entry_file)
             launcher_stage = read_stage(launcher_stage_file)
-            if launcher_stage:
+            if launcher_stage.startswith((
+                "child_process_created|", "child_created_but_stage_write_error|",
+                "start_process_error|",
+                "READ_ERROR|",
+            )) or "JTT_OWNED_STAGE_WRITE_ERROR" in bytes(raw_output).decode(
+                "utf-8", errors="replace"
+            ):
                 break
             last_update = client.poll()
             raw_output.extend(last_update.output)
             time.sleep(0.02)
+        launcher_entry_parts = launcher_entry.split("|")
+        record_property(
+            "owned_job_launcher_entry_stage",
+            launcher_entry_parts[0] if launcher_entry_parts else "ABSENT",
+        )
+        record_property(
+            "owned_job_launcher_entry_pid_is_decimal",
+            len(launcher_entry_parts) == 2 and launcher_entry_parts[1].isdecimal(),
+        )
         launcher_parts = launcher_stage.split("|")
         record_property(
             "owned_job_launcher_stage",
             launcher_parts[0] if launcher_parts else "ABSENT",
         )
-        if launcher_parts[0] != "child_process_created":
+        record_property(
+            "owned_job_launcher_stage_write_error_categories",
+            json.dumps([
+                category for category in safe_powershell_error_categories(bytes(raw_output))
+                if category == "JTT_OWNED_STAGE_WRITE_ERROR"
+            ]),
+        )
+        child_process_created_match = re.search(
+            rb"JTT_OWNED_CHILD_PROCESS_CREATED\|([0-9]+)", bytes(raw_output)
+        )
+        record_property(
+            "owned_job_start_process_outcome_marker_seen",
+            child_process_created_match is not None
+            or launcher_parts[0] == "start_process_error",
+        )
+        assert launcher_entry_parts[0] == "launcher_entered", (
+            "PowerShell command marker was seen but launcher entry file did not "
+            f"confirm script entry ({launcher_entry_parts[0] if launcher_entry_parts else 'ABSENT'})"
+        )
+        if (launcher_parts[0] not in {
+                "child_process_created", "child_created_but_stage_write_error",
+        } and child_process_created_match is None):
             record_property(
                 "owned_job_start_process_error_category",
                 launcher_parts[1] if len(launcher_parts) > 1 else "UNKNOWN",
@@ -958,7 +1109,14 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
                 "Start-Process stage did not confirm child creation; "
                 f"observed={launcher_parts[0] if launcher_parts else 'ABSENT'}"
             )
-        launcher_child_pid = launcher_parts[-1]
+        launcher_child_pid = (
+            launcher_parts[1]
+            if launcher_parts[0] in {
+                "child_process_created", "child_created_but_stage_write_error",
+            } and len(launcher_parts) > 1 else
+            child_process_created_match.group(1).decode("ascii")
+            if child_process_created_match is not None else ""
+        )
         record_property("owned_job_launcher_child_pid_is_decimal",
                         launcher_child_pid.isdecimal())
         assert launcher_child_pid.isdecimal(), (
@@ -984,7 +1142,7 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         child_stage = "ABSENT"
         while time.monotonic() < child_started_deadline:
             child_stage = read_stage(child_stage_file)
-            if child_stage:
+            if child_stage != "ABSENT":
                 break
             last_update = client.poll()
             raw_output.extend(last_update.output)
@@ -993,6 +1151,15 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         record_property(
             "owned_job_child_stage",
             child_parts[0] if child_parts else "ABSENT",
+        )
+        record_property(
+            "owned_job_child_output_error_categories",
+            json.dumps([
+                category for category in safe_powershell_error_categories(bytes(raw_output))
+                if category in {
+                    "JTT_OWNED_STAGE_WRITE_ERROR", "JTT_OWNED_CHILD_ERROR",
+                }
+            ]),
         )
         if child_parts[0] == "child_error":
             record_property(
@@ -1021,7 +1188,7 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         grandchild_launch = "ABSENT"
         while time.monotonic() < grandchild_launch_deadline:
             grandchild_launch = read_stage(grandchild_launch_file)
-            if grandchild_launch:
+            if grandchild_launch != "ABSENT":
                 break
             last_update = client.poll()
             raw_output.extend(last_update.output)
@@ -1071,12 +1238,21 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         grandchild_stage = ""
         while time.monotonic() < grandchild_deadline:
             grandchild_stage = read_stage(grandchild_stage_file)
-            if grandchild_stage:
+            if grandchild_stage != "ABSENT":
                 break
             last_update = client.poll()
             raw_output.extend(last_update.output)
             time.sleep(0.02)
         grandchild_stage_parts = grandchild_stage.split("|")
+        record_property(
+            "owned_job_grandchild_output_error_categories",
+            json.dumps([
+                category for category in safe_powershell_error_categories(bytes(raw_output))
+                if category in {
+                    "JTT_OWNED_STAGE_WRITE_ERROR", "JTT_OWNED_GRANDCHILD_ERROR",
+                }
+            ]),
+        )
         if grandchild_stage_parts[0] == "grandchild_error":
             record_property(
                 "owned_job_grandchild_error_category",
@@ -2252,7 +2428,7 @@ def test_native_conpty_input_execution_path_comparison(
                         else "OWNERSHIP_UNKNOWN"
                     )
                     result["cleanup_confirmed"] = not spawned
-                    return result
+                    raise _ConptyPathAbort()
                 pid = int(pid_value)
                 created, image, alive = windows_manager._process_facts(pid)
                 process_handle = _retain_test_process_handle(
@@ -2270,7 +2446,7 @@ def test_native_conpty_input_execution_path_comparison(
                 result["alive_before_input"] = bool(alive)
                 if not spawned or not result["process_identity_verified"]:
                     result["status"] = "SPAWN_OR_IDENTITY_FAILURE"
-                    return result
+                    raise _ConptyPathAbort()
             else:
                 registry = TerminalRegistry(worker_home / "terminals")
                 result["last_observation_stage"] = "worker_registry_create"
@@ -2325,10 +2501,10 @@ def test_native_conpty_input_execution_path_comparison(
             if not direct:
                 if latest is None or latest.state != "running":
                     result["status"] = "WORKER_NOT_RUNNING"
-                    return result
+                    raise _ConptyPathAbort()
                 if not client.acquire():
                     result["status"] = "LEASE_NOT_ACQUIRED"
-                    return result
+                    raise _ConptyPathAbort()
 
             baseline_proven = False
             stop_cases = False
@@ -2523,6 +2699,10 @@ def test_native_conpty_input_execution_path_comparison(
                 else "COMPLETE" if not stop_cases
                 else "EXECUTION_UNPROVEN"
             )
+        except _ConptyPathAbort:
+            # Preserve the status set at the abort point while still running
+            # the owned-resource cleanup block below.
+            pass
         except Exception as exc:
             result["status"] = "DIAGNOSTIC_TOOL_ERROR" if direct else "PATH_ERROR"
             result["diagnostic_error_stage"] = result.get(
@@ -2550,7 +2730,10 @@ def test_native_conpty_input_execution_path_comparison(
                     result["cleanup"] = "CLEANUP_ERROR"
                     result["cleanup_error_category"] = type(exc).__name__
                 finally:
-                    process_handle.Close()
+                    try:
+                        process_handle.Close()
+                    except Exception as exc:
+                        result["cleanup_handle_close_error_category"] = type(exc).__name__
                     process_handle = None
                     # pywinpty 3.1.1 exposes no PTY.close() method. Release the
                     # wrapper only after the retained process handle is checked.
@@ -2591,10 +2774,15 @@ def test_native_conpty_input_execution_path_comparison(
                         result["cleanup_confirmed"] = False
                         result["cleanup_error_category"] = type(exc).__name__
                     finally:
-                        process_handle.Close()
+                        try:
+                            process_handle.Close()
+                        except Exception as exc:
+                            result["cleanup_handle_close_error_category"] = type(exc).__name__
+
+        return _finalize_conpty_path_result(result)
 
     direct = run_path(direct=True)
-    direct_cleanup_confirmed = bool(direct.get("cleanup_confirmed"))
+    direct_cleanup_confirmed = _conpty_path_allows_followup(direct)
     if direct_cleanup_confirmed:
         worker = run_path(direct=False)
     else:

@@ -84,6 +84,108 @@ def test_pty_input_ack_requires_the_complete_utf8_byte_count_without_retry():
     assert failed.calls == [text]
 
 
+def test_native_conpty_run_path_finalization_preserves_diagnostic_and_cleanup_evidence():
+    """Exercise the diagnostic result contract without starting processes."""
+    import ast
+    import importlib.util
+    from pathlib import Path
+
+    backend_test_path = Path(__file__).with_name("test_windows_terminal_backend.py")
+    spec = importlib.util.spec_from_file_location(
+        "jtt_windows_backend_test_helpers", backend_test_path,
+    )
+    assert spec is not None and spec.loader is not None
+    backend_test_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(backend_test_module)
+    finalize = backend_test_module._finalize_conpty_path_result
+    allows_followup = backend_test_module._conpty_path_allows_followup
+
+    backend_tree = ast.parse(backend_test_path.read_text(encoding="utf-8"))
+    comparison_test = next(
+        node for node in backend_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "test_native_conpty_input_execution_path_comparison"
+    )
+    run_path = next(
+        node for node in comparison_test.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_path"
+    )
+    cleanup_try = next(
+        node for node in run_path.body
+        if isinstance(node, ast.Try) and node.finalbody
+    )
+    final_return = run_path.body[-1]
+    assert isinstance(final_return, ast.Return)
+    assert isinstance(final_return.value, ast.Call)
+    assert isinstance(final_return.value.func, ast.Name)
+    assert final_return.value.func.id == "_finalize_conpty_path_result"
+    assert run_path.body.index(cleanup_try) < run_path.body.index(final_return)
+    assert not any(
+        isinstance(node, ast.Return)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "result"
+        for node in ast.walk(cleanup_try)
+    ), "run_path must not return before post-finally result finalization"
+
+    normal = finalize({
+        "status": "COMPLETE",
+        "cleanup": "REGISTRY_STOP_COMPLETED",
+        "cleanup_confirmed": True,
+        "retained_handle_signaled_after_cleanup": True,
+    })
+    assert normal["finalization"] == {
+        "status": "COMPLETE",
+        "diagnostic_error_stage": None,
+        "diagnostic_error_category": None,
+        "cleanup": "REGISTRY_STOP_COMPLETED",
+        "cleanup_confirmed": True,
+        "cleanup_error_category": None,
+        "cleanup_handle_close_error_category": None,
+        "client_close_error_category": None,
+        "retained_handle_signaled_after_cleanup": True,
+    }
+    assert allows_followup(normal)
+
+    diagnostic_error = finalize({
+        "status": "DIAGNOSTIC_TOOL_ERROR",
+        "diagnostic_error_stage": "direct_pyte_feed",
+        "diagnostic_error_category": "TypeError",
+        "cleanup": "TERMINATED_OR_EXITED_ON_RETAINED_HANDLE",
+        "cleanup_confirmed": True,
+        "cleanup_error_category": None,
+        "cleanup_handle_close_error_category": None,
+        "client_close_error_category": None,
+    })
+    assert diagnostic_error["finalization"]["status"] == "DIAGNOSTIC_TOOL_ERROR"
+    assert diagnostic_error["finalization"]["diagnostic_error_stage"] == "direct_pyte_feed"
+    assert diagnostic_error["finalization"]["diagnostic_error_category"] == "TypeError"
+    assert diagnostic_error["finalization"]["cleanup_confirmed"] is True
+    assert allows_followup(diagnostic_error)
+
+    cleanup_failure = finalize({
+        "status": "EXECUTION_UNPROVEN",
+        "cleanup": "STOP_FAILED_EVIDENCE_RETAINED",
+        "cleanup_confirmed": False,
+        "cleanup_error_category": "TerminalError",
+        "cleanup_handle_close_error_category": "OSError",
+        "client_close_error_category": None,
+        "retained_handle_signaled_after_cleanup": False,
+    })
+    assert cleanup_failure["finalization"]["cleanup"] == "STOP_FAILED_EVIDENCE_RETAINED"
+    assert cleanup_failure["finalization"]["cleanup_confirmed"] is False
+    assert cleanup_failure["finalization"]["cleanup_error_category"] == "TerminalError"
+    assert cleanup_failure["finalization"]["cleanup_handle_close_error_category"] == "OSError"
+    assert cleanup_failure["finalization"]["retained_handle_signaled_after_cleanup"] is False
+    assert not allows_followup(cleanup_failure)
+    close_failure_after_exit = finalize({
+        "status": "COMPLETE",
+        "cleanup": "TERMINATED_OR_EXITED_ON_RETAINED_HANDLE",
+        "cleanup_confirmed": True,
+        "cleanup_handle_close_error_category": "OSError",
+    })
+    assert not allows_followup(close_failure_after_exit)
+
+
 def _plain_screen_text(screen: TerminalScreen) -> str:
     return "\n".join("".join(cell.text for cell in row) for row in screen.rows)
 
@@ -2344,6 +2446,9 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
             nonce = identity.session_id[:10]
             input_literal = f"한글-{nonce}"
             ascii_marker_file = tmp_path / f"f-{nonce}.txt"
+            unicode_side_effect_file = tmp_path / f"u-{nonce}.txt"
+            unicode_execution_marker = f"JTT_COPY_UNICODE_EXEC_{nonce}_END"
+            unicode_echo_probe = f"JTT_COPY_INPUT_ECHO_{nonce}"
             expected = (
                 f"jtt_copy_ascii_{nonce}_end",
                 f"JTT_COPY_INPUT_{input_literal}_END",
@@ -2355,8 +2460,11 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 ("[System.IO.File]::WriteAllText('" + ascii_marker_file.name
                  + "','" + nonce + "'); [Console]::WriteLine('jtt_copy_ascii_' + '"
                  + nonce + "' + '_end')", expected[0]),
-                ("Write-Output ('JTT_COPY_INPUT_' + '"
-                 f"{input_literal}" + "' + '_END')", expected[1]),
+                ("[System.IO.File]::WriteAllText('" + unicode_side_effect_file.name
+                 + "','" + nonce + "'); $global:JTT_COPY_INPUT_ECHO='"
+                 + unicode_echo_probe + "'; [Console]::WriteLine('JTT_COPY_UNICODE_EXEC_' + '"
+                 + nonce + "' + '_END'); Write-Output ('JTT_COPY_INPUT_' + '"
+                 + f"{input_literal}" + "' + '_END')", expected[1]),
                 ("Write-Output (([string]([char]0xD55C) + "
                  "[string]([char]0xAE00)) + "
                  f"'-JTT_COPY_OUTPUT_{nonce}-OK')", expected[2]),
@@ -2365,6 +2473,7 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
             )
             assert expected[0] not in commands[0][0]
             assert expected[1] not in commands[1][0]
+            assert unicode_execution_marker not in commands[1][0]
             assert input_literal in commands[1][0]
             client = app.client
             original_send = client.send
@@ -2439,7 +2548,9 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 }, sort_keys=True),
             )
 
-            async def collect_output_and_screen(marker, after_sequence):
+            async def collect_output_and_screen(
+                marker, after_sequence, *, input_echo_probe=None
+            ):
                 raw = bytearray()
                 last_update = None
                 deadline = time.monotonic() + 20
@@ -2448,6 +2559,8 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 screen_observation = app._right_observation
                 screen_marker_seen = False
                 screen_identity_matches = False
+                input_echo_raw_seen = False
+                input_echo_screen_seen = False
                 while time.monotonic() < deadline:
                     # Serialize this diagnostic poll with the app's observer;
                     # one bounded window gathers both output and UI evidence.
@@ -2455,6 +2568,11 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                     raw.extend(last_update.output)
                     compact = bytes(raw).replace(b"\r", b"").replace(b"\n", b"")
                     raw_marker_seen = marker_bytes in compact
+                    if input_echo_probe is not None:
+                        normalized_raw = b"".join(raw.split())
+                        input_echo_raw_seen = input_echo_raw_seen or (
+                            input_echo_probe.encode("ascii") in normalized_raw
+                        )
                     screen_observation = app._right_observation
                     if (screen_observation is not None
                             and screen_observation[1] > after_sequence):
@@ -2462,6 +2580,10 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                             _plain_screen_text(screen_observation[3]).split()
                         )
                         screen_marker_seen = marker in screen_text
+                        if input_echo_probe is not None:
+                            input_echo_screen_seen = input_echo_screen_seen or (
+                                input_echo_probe in screen_text
+                            )
                         screen_identity_matches = (
                             screen_observation[0] == _mini_identity_key(identity)
                         )
@@ -2471,7 +2593,8 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 return (
                     last_update, bytes(raw), raw_marker_seen,
                     screen_observation, screen_marker_seen,
-                    screen_identity_matches,
+                    screen_identity_matches, input_echo_raw_seen,
+                    input_echo_screen_seen,
                 )
 
             for index, (command, marker) in enumerate(commands):
@@ -2565,16 +2688,38 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                                 app._right_observation is not None
                                 and app._right_observation[1] > prior_sequence
                             ),
+                            "utf8_payload_bytes": len(encoded),
+                            "utf8_payload_characters": len(command) + 1,
+                            "utf8_payload_contains_non_ascii": any(
+                                value > 0x7f for value in encoded
+                            ),
+                            "protocol_confirmed_pty_write_bytes": (
+                                sum(
+                                    int(item["accepted_bytes"] or 0)
+                                    for item in send_attempts
+                                ) if send_attempts and all(
+                                    item["returned"]
+                                    and item["accepted_bytes"] is not None
+                                    for item in send_attempts
+                                ) else None
+                            ),
+                            "pty_write_return_source": (
+                                "worker input ACK; _write_terminal_input returns only "
+                                "the exact PTY.write byte count"
+                            ),
                         }, sort_keys=True),
                     )
                 send_attempts = accepted_inputs[prior_count:]
+                sent_payload = bytes(accepted_payload[prior_payload_size:])
+                assert sent_payload == encoded, (
+                    f"UI input {index} bytes did not match the exact UTF-8 "
+                    "command payload"
+                )
+                record_property(
+                    f"copy_input_{index}_accepted_payload_bytes_match_utf8",
+                    True,
+                )
                 if index == 0:
-                    sent_payload = bytes(accepted_payload[prior_payload_size:])
-                    assert sent_payload == encoded, (
-                        "Textual key events did not deliver the exact ASCII "
-                        "script command and Enter bytes"
-                    )
-                    record_property("copy_ascii_input_bytes_match_command", True)
                     assert len(send_attempts) == len(encoded), (
                         "Textual key events did not each receive a terminal "
                         "send acknowledgement"
@@ -2598,13 +2743,18 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 (
                     raw_update, raw_output, raw_marker_seen,
                     screen_observation, screen_marker_seen,
-                    screen_identity_matches,
-                ) = await collect_output_and_screen(marker, prior_sequence)
+                    screen_identity_matches, input_echo_raw_seen,
+                    input_echo_screen_seen,
+                ) = await collect_output_and_screen(
+                    marker, prior_sequence,
+                    input_echo_probe=(unicode_echo_probe if index == 1 else None),
+                )
                 compact_raw_output = raw_output.replace(b"\r", b"").replace(
                     b"\n", b""
                 )
                 raw_marker_seen = marker.encode("utf-8") in compact_raw_output
                 ascii_marker_value = None
+                unicode_side_effect_value = None
                 if index == 0:
                     try:
                         ascii_marker_value = ascii_marker_file.read_text(
@@ -2616,6 +2766,13 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                         "copy_ascii_command_side_effect_matches_nonce",
                         ascii_marker_value == nonce,
                     )
+                elif index == 1:
+                    try:
+                        unicode_side_effect_value = unicode_side_effect_file.read_text(
+                            encoding="ascii"
+                        ).strip()
+                    except (OSError, UnicodeError):
+                        unicode_side_effect_value = None
                 raw_sequence = (
                     getattr(raw_update, "sequence", None)
                     if raw_update is not None else None
@@ -2628,6 +2785,25 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                 screen_sequence = (
                     screen_observation[1] if screen_observation is not None else None
                 )
+                raw_text_for_categories = raw_output.decode(
+                    "utf-8", errors="replace"
+                )
+                powershell_error_categories = [
+                    category for category in (
+                        "ParserError", "PSSecurityException", "ExecutionPolicy",
+                        "UnauthorizedAccessException", "Write-Error",
+                        "Cannot find path", "Set-Location :",
+                    ) if category in raw_text_for_categories
+                ]
+                unicode_execution_raw_seen = (
+                    unicode_execution_marker.encode("ascii")
+                    in compact_raw_output
+                ) if index == 1 else None
+                unicode_execution_screen_seen = (
+                    unicode_execution_marker in "".join(
+                        _plain_screen_text(screen_observation[3]).split()
+                    ) if screen_observation is not None else False
+                ) if index == 1 else None
                 record_property(
                     f"copy_input_{index}_observation_summary",
                     json.dumps({
@@ -2642,12 +2818,37 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                         "screen_marker_seen": screen_marker_seen,
                         "screen_sequence": screen_sequence,
                         "screen_observation_identity_matches": screen_identity_matches,
+                        "powershell_error_categories": powershell_error_categories,
+                        "unicode_execution_side_effect_matches": (
+                            unicode_side_effect_value == nonce if index == 1 else None
+                        ),
+                        "unicode_execution_marker_raw_seen": unicode_execution_raw_seen,
+                        "unicode_execution_marker_screen_seen": unicode_execution_screen_seen,
+                        "unicode_input_echo_probe_raw_seen": (
+                            input_echo_raw_seen if index == 1 else None
+                        ),
+                        "unicode_input_echo_probe_screen_seen": (
+                            input_echo_screen_seen if index == 1 else None
+                        ),
                     }, sort_keys=True),
                 )
                 if index == 0:
                     assert ascii_marker_value == nonce, (
                         "ASCII UI command execution was not proven by its "
                         "independent test-owned file side effect"
+                    )
+                if index == 1:
+                    assert unicode_side_effect_value == nonce, (
+                        "Unicode-input command execution was not proven by its "
+                        "independent test-owned file side effect"
+                    )
+                    assert unicode_execution_raw_seen, (
+                        "Unicode-input command side effect was present but its "
+                        "ASCII execution marker was absent from ConPTY output"
+                    )
+                    assert unicode_execution_screen_seen, (
+                        "Unicode-input command execution marker was not reflected "
+                        "in the matching RIGHT screen"
                     )
                 assert raw_marker_seen, (
                     "command execution evidence was collected, but the expected "
