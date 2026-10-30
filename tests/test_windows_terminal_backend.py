@@ -999,7 +999,7 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         tmp_path, monkeypatch, record_property):
     import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
     import win32job
-    from tmux_agent_tower.terminal import TerminalRegistry, windows_manager
+    from tmux_agent_tower.terminal import TerminalRegistry
     from tmux_agent_tower.terminal.windows_manager import (
         _powershell_executable,
         _process_facts,
@@ -1017,6 +1017,8 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
     launcher_entry_path = str(launcher_entry_file).replace("'", "''")
     launcher_before_file = tmp_path / "owned-job-before-start-process.txt"
     launcher_before_path = str(launcher_before_file).replace("'", "''")
+    launcher_after_file = tmp_path / "owned-job-after-start-process.txt"
+    launcher_after_path = str(launcher_after_file).replace("'", "''")
     launcher_stage_file = tmp_path / "owned-job-launcher-stage.txt"
     launcher_stage_path = str(launcher_stage_file).replace("'", "''")
     parser_stage_file = tmp_path / "owned-job-parser-stage.txt"
@@ -1035,6 +1037,8 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
     grandchild_script_path = str(grandchild_script_file).replace("'", "''")
     nonce = uuid.uuid4().hex[:10]
     command_started_marker = f"JTT_OWNED_START_{nonce}_END"
+    start_process_before_marker = f"JTT_OWNED_START_PROCESS_BEFORE_{nonce}_END"
+    start_process_finally_marker = f"JTT_OWNED_START_PROCESS_FINALLY_{nonce}_END"
     tree_marker_prefix = f"JTT_OWNED_TREE_{nonce}_"
     # Keep process creation as a short staged script. The previous test put a
     # nested PowerShell script, base64 payload, and Start-Process argument
@@ -1105,6 +1109,7 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         "$ErrorActionPreference = 'Stop'",
         "$__jtt_entry = '" + launcher_entry_path + "'",
         "$__jtt_before = '" + launcher_before_path + "'",
+        "$__jtt_after = '" + launcher_after_path + "'",
         "$__jtt_stage = '" + launcher_stage_path + "'",
         "$__jtt_script = '" + child_script_path + "'",
         "try { [System.IO.File]::WriteAllText($__jtt_entry,"
@@ -1121,11 +1126,16 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         "[Console]::WriteLine('JTT_OWNED_STAGE_WRITE_ERROR|before_start_process|'+$failure)",
         "throw",
         "}",
+        "[Console]::WriteLine('JTT_OWNED_START_PROCESS_BEFORE_'+'"
+        + nonce + "'+'_END')",
+        "$__jtt_call_state = 'ENTERED'",
         "try {",
         "$child=Start-Process -ErrorAction Stop -PassThru -WindowStyle Hidden "
         "-FilePath (Join-Path $PSHOME 'powershell.exe') "
         "-ArgumentList ('-NoLogo -NoProfile -File \"'+$__jtt_script+'\"')",
+        "$__jtt_call_state = 'RETURNED'",
         "} catch {",
+        "$__jtt_call_state = 'EXCEPTION'",
         "$failure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId",
         "try { [System.IO.File]::WriteAllText($__jtt_stage,"
         "'start_process_error|'+$failure) } catch {",
@@ -1134,6 +1144,13 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         "}",
         "[Console]::WriteLine('JTT_OWNED_START_PROCESS_ERROR|'+$failure)",
         "return",
+        "} finally {",
+        "try { [System.IO.File]::WriteAllText($__jtt_after,$__jtt_call_state) } catch {",
+        "$writeFailure=$_.Exception.GetType().Name+'|'+$_.FullyQualifiedErrorId",
+        "[Console]::WriteLine('JTT_OWNED_STAGE_WRITE_ERROR|start_process_finally|'+$writeFailure)",
+        "}",
+        "[Console]::WriteLine('JTT_OWNED_START_PROCESS_FINALLY_'+'"
+        + nonce + "'+'_END|'+$__jtt_call_state)",
         "}",
         "[Console]::WriteLine('JTT_OWNED_CHILD_PROCESS_CREATED|'+[string]$child.Id)",
         "try { [System.IO.File]::WriteAllText($__jtt_stage,"
@@ -1215,6 +1232,7 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
             "launcher_stage_parent_exists": launcher_stage_file.parent.is_dir(),
             "launcher_entry_parent_exists": launcher_entry_file.parent.is_dir(),
             "launcher_before_stage_parent_exists": launcher_before_file.parent.is_dir(),
+            "launcher_after_stage_parent_exists": launcher_after_file.parent.is_dir(),
             "parser_stage_parent_exists": parser_stage_file.parent.is_dir(),
             "child_script_exists": child_script_file.is_file(),
             "grandchild_script_exists": grandchild_script_file.is_file(),
@@ -1358,16 +1376,24 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
         launcher_stage = "ABSENT"
         launcher_entry = "ABSENT"
         launcher_before = "ABSENT"
+        launcher_after = "ABSENT"
         while time.monotonic() < launcher_deadline:
             launcher_entry = read_stage(launcher_entry_file)
             launcher_before = read_stage(launcher_before_file)
+            launcher_after = read_stage(launcher_after_file)
             launcher_stage = read_stage(launcher_stage_file)
             observed_output = bytes(raw_output).decode("utf-8", errors="replace")
             if launcher_stage.startswith((
                 "child_process_created|", "child_created_but_stage_write_error|",
                 "start_process_error|",
                 "READ_ERROR|",
-            )) or "JTT_OWNED_START_PROCESS_ERROR|" in observed_output or any(
+            )) or launcher_after == "EXCEPTION" or any(
+                marker in observed_output for marker in (
+                    "JTT_OWNED_START_PROCESS_ERROR|",
+                    "JTT_OWNED_STAGE_WRITE_ERROR|start_process_finally|",
+                    start_process_finally_marker + "|EXCEPTION",
+                )
+            ) or any(
                 marker in observed_output for marker in (
                     "JTT_OWNED_STAGE_WRITE_ERROR|launcher_entry|",
                     "JTT_OWNED_STAGE_WRITE_ERROR|before_start_process|",
@@ -1424,6 +1450,85 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
                 fields = line[len(marker_prefix):].split("|", 1)
                 if fields:
                     stage_write_error_stages.append(fields[0])
+        observed_output_text = bytes(raw_output).decode(
+            "utf-8", errors="replace"
+        )
+        start_process_finally_state = (
+            launcher_after if launcher_after in {"RETURNED", "EXCEPTION"}
+            else "RETURNED" if start_process_finally_marker + "|RETURNED"
+            in observed_output_text
+            else "EXCEPTION" if start_process_finally_marker + "|EXCEPTION"
+            in observed_output_text
+            else "UNKNOWN"
+        )
+        start_process_before_seen = (
+            start_process_before_marker in observed_output_text
+        )
+        start_process_finally_seen = (
+            start_process_finally_marker in observed_output_text
+        )
+        child_pid_output_seen = re.search(
+            r"JTT_OWNED_CHILD_PROCESS_CREATED\|[0-9]+",
+            observed_output_text,
+        ) is not None
+        shell_alive_after_call_window = _process_same(
+            identity.shell_pid, identity.shell_start
+        )
+        if start_process_finally_state == "RETURNED" and (
+            launcher_stage.startswith("child_process_created|")
+            or child_pid_output_seen
+        ):
+            start_process_boundary = "RETURNED_CHILD_PID_RECORDED"
+        elif start_process_finally_state == "RETURNED" and launcher_stage.startswith(
+            "child_created_but_stage_write_error|"
+        ):
+            start_process_boundary = "RETURNED_CHILD_PID_STAGE_WRITE_FAILED"
+        elif start_process_finally_state == "RETURNED":
+            start_process_boundary = "RETURNED_WITHOUT_CHILD_STAGE_EVIDENCE"
+        elif start_process_finally_state == "EXCEPTION":
+            start_process_boundary = "EXCEPTION_OBSERVED"
+        elif start_process_before_seen and shell_alive_after_call_window:
+            start_process_boundary = "OUTCOME_NOT_OBSERVED_SHELL_STILL_ALIVE"
+        elif start_process_before_seen and not shell_alive_after_call_window:
+            start_process_boundary = "SHELL_EXITED_BEFORE_OUTCOME_OBSERVED"
+        else:
+            start_process_boundary = "UNKNOWN"
+        record_property(
+            "owned_job_start_process_before_call_marker_seen",
+            start_process_before_seen,
+        )
+        record_property(
+            "owned_job_start_process_finally_marker_seen",
+            start_process_finally_seen,
+        )
+        record_property(
+            "owned_job_child_pid_output_marker_seen",
+            child_pid_output_seen,
+        )
+        record_property(
+            "owned_job_start_process_finally_file_outcome",
+            launcher_after,
+        )
+        record_property(
+            "owned_job_start_process_finally_state",
+            start_process_finally_state,
+        )
+        record_property(
+            "owned_job_start_process_boundary_classification",
+            start_process_boundary,
+        )
+        record_property(
+            "owned_job_shell_alive_after_start_process_observation",
+            shell_alive_after_call_window,
+        )
+        record_property(
+            "owned_job_prompt_returned_after_start_process_boundary",
+            _conpty_prompt_returned_after_marker(
+                observed_output_text,
+                start_process_finally_marker if start_process_finally_seen
+                else start_process_before_marker,
+            ),
+        )
         record_property(
             "owned_job_stage_write_outcomes",
             json.dumps({
@@ -1434,6 +1539,11 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(
                 "immediately_before_start_process": (
                     "CONFIRMED"
                     if launcher_before_parts[0] == "before_start_process"
+                    else "NOT_CONFIRMED"
+                ),
+                "after_start_process_finally": (
+                    "CONFIRMED" if launcher_after in {"RETURNED", "EXCEPTION"}
+                    else "OUTPUT_MARKER_ONLY" if start_process_finally_seen
                     else "NOT_CONFIRMED"
                 ),
                 "reported_write_error_stages": stage_write_error_stages,
@@ -2588,13 +2698,21 @@ def test_native_conpty_input_execution_path_comparison(
 
     def case_specs(label, home, scenario):
         marker = f"JTT_EXEC_{label}_{nonce}_END"
-        marker_file = start / (
-            f"{label.lower()}-{home.name}-{scenario}.marker"
+        marker_files = {
+            "SHORT_ASCII": start / f"short-ascii-{nonce}.marker",
+            "UNICODE_INPUT": start / f"u-{nonce}.txt",
+            "UNICODE_OUTPUT_ONLY": start / f"unicode-output-{nonce}.marker",
+            "PATH_CHANGE": start / f"path-change-{nonce}.marker",
+        }
+        marker_file = marker_files.get(
+            label,
+            start / f"{label.lower()}-{home.name}-{scenario}.marker",
         )
         marker_path = ps_quote(
             marker_file if label == "PATH_CHANGE" else marker_file.name
         )
         marker_value = nonce
+        unicode_output_marker = None
         if label == "SHORT_ASCII":
             commands = [(
                 "[System.IO.File]::WriteAllText('" + marker_path + "','"
@@ -2643,11 +2761,28 @@ def test_native_conpty_input_execution_path_comparison(
                 ),
             ]
         elif label == "UNICODE_INPUT":
+            marker = f"JTT_COPY_UNICODE_EXEC_{nonce}_END"
+            input_echo_probe = f"JTT_COPY_INPUT_ECHO_{nonce}"
+            unicode_output_marker = f"JTT_COPY_INPUT_한글-{nonce}_END"
             commands = [(
-                "Write-Output '한글'; [System.IO.File]::WriteAllText('"
-                + marker_path + "','" + nonce
-                + "'); [Console]::WriteLine('JTT_EXEC_'+'UNICODE_INPUT_'+"
-                + "'" + nonce + "'+'_END')",
+                "[System.IO.File]::WriteAllText('" + marker_path + "','"
+                + nonce + "'); $global:JTT_COPY_INPUT_ECHO='"
+                + input_echo_probe + "'; "
+                "[Console]::WriteLine('JTT_COPY_UNICODE_EXEC_' + '"
+                + nonce + "' + '_END'); Write-Output ('JTT_COPY_INPUT_' + '"
+                + "한글-" + nonce + "' + '_END')",
+                marker,
+                marker_value,
+            )]
+        elif label == "UNICODE_OUTPUT_ONLY":
+            unicode_output_marker = f"JTT_OUTPUT_ONLY_한글_{nonce}_END"
+            commands = [(
+                "[System.IO.File]::WriteAllText('" + marker_path + "','"
+                + nonce + "'); Write-Output ('JTT_OUTPUT_ONLY_' + "
+                "([string][char]0xD55C + [string][char]0xAE00) + '_' + '"
+                + nonce + "' + '_END'); "
+                "[Console]::WriteLine('JTT_EXEC_UNICODE_OUTPUT_ONLY_' + '"
+                + nonce + "' + '_END')",
                 marker,
                 marker_value,
             )]
@@ -2671,15 +2806,19 @@ def test_native_conpty_input_execution_path_comparison(
             expected not in command
             for command, expected, _value, _command_marker_file in commands
         )
+        per_key_scenarios = {
+            "ascii_then_unicode_per_key", "path_after_ascii_per_key",
+        }
         delivery_mode = (
             "per_key"
-            if label == "PATH_CHANGE" and scenario == "path_after_ascii_per_key"
+            if scenario in per_key_scenarios
+            and label in {"UNICODE_INPUT", "PATH_CHANGE"}
             else "single_write"
         )
         return [
             (
                 command, expected, expected_value, delivery_mode,
-                command_marker_file,
+                command_marker_file, unicode_output_marker,
             )
             for command, expected, expected_value, command_marker_file in commands
         ]
@@ -2706,9 +2845,25 @@ def test_native_conpty_input_execution_path_comparison(
         ),
         "unicode_first": ("UNICODE_INPUT",),
         "ascii_then_unicode": ("SHORT_ASCII", "UNICODE_INPUT"),
+        "ascii_then_unicode_per_key": ("SHORT_ASCII", "UNICODE_INPUT"),
+        "ascii_then_unicode_crlf": ("SHORT_ASCII", "UNICODE_INPUT"),
+        "unicode_output_only": ("UNICODE_OUTPUT_ONLY",),
         "path_standalone_single_write": ("PATH_CHANGE",),
+        "path_standalone_single_write_crlf": ("PATH_CHANGE",),
+        "path_after_ascii_single_write": ("SHORT_ASCII", "PATH_CHANGE"),
         "path_after_ascii_per_key": ("SHORT_ASCII", "PATH_CHANGE"),
     }
+
+    def input_terminator(label, scenario):
+        if (
+            label == "UNICODE_INPUT"
+            and scenario == "ascii_then_unicode_crlf"
+        ) or (
+            label == "PATH_CHANGE"
+            and scenario == "path_standalone_single_write_crlf"
+        ):
+            return "\r\n"
+        return "\r"
 
     def run_path(*, direct, scenario="baseline"):
         if scenario not in case_plans:
@@ -2944,7 +3099,7 @@ def test_native_conpty_input_execution_path_comparison(
                 result["cases"].append(case_result)
                 for step_index, (
                     command, expected, expected_file_value, delivery_mode,
-                    marker_file,
+                    marker_file, unicode_output_marker,
                 ) in enumerate(steps):
                     try:
                         marker_file.unlink(missing_ok=True)
@@ -2957,13 +3112,23 @@ def test_native_conpty_input_execution_path_comparison(
                         "step": step_index + 1,
                         "input_ack": None,
                         "command_echo_seen": False,
+                        "command_echo_in_pty_or_poll": False,
+                        "command_echo_in_screen": False,
+                        "screen_prompt_returned_after_execution": False,
+                        "expected_path_output_in_pty_or_poll": None,
+                        "expected_path_output_in_screen": None,
                         "side_effect_file_present": False,
                         "side_effect_file_matches": False,
                         "output_marker_in_pty_or_poll": False,
                         "output_marker_in_pyte_or_worker_screen": False,
+                        "unicode_output_marker_in_pty_or_poll": False,
+                        "unicode_output_marker_in_screen": False,
                         "powershell_error_categories": [],
                         "input_mode": delivery_mode,
-                        "input_terminator": "CR",
+                        "input_terminator": (
+                            "CRLF" if input_terminator(label, scenario) == "\r\n"
+                            else "CR"
+                        ),
                         "working_directory_before_command": str(start),
                         "expected_working_directory_after_command": (
                             str(destination) if label == "PATH_CHANGE" else str(start)
@@ -2980,7 +3145,10 @@ def test_native_conpty_input_execution_path_comparison(
                         getattr(latest, "sequence", None)
                         if not direct else None
                     )
-                    chunks = _conpty_input_chunks(command, delivery_mode)
+                    terminator = input_terminator(label, scenario)
+                    chunks = _conpty_input_chunks(
+                        command, delivery_mode, terminator=terminator
+                    )
                     write_acks = []
                     for chunk in chunks:
                         result["last_observation_stage"] = (
@@ -3019,7 +3187,7 @@ def test_native_conpty_input_execution_path_comparison(
                         })
                         if not chunk_complete:
                             break
-                    payload = command + "\r"
+                    payload = command + terminator
                     reported_returns = [
                         item["reported_return"] for item in write_acks
                         if type(item["reported_return"]) is int
@@ -3044,6 +3212,17 @@ def test_native_conpty_input_execution_path_comparison(
                         "write_results": write_acks,
                         "all_writes_acknowledged_without_retry": ack_complete,
                         "input_mode": delivery_mode,
+                        "terminator": step["input_terminator"],
+                        "payload_sha256": hashlib.sha256(
+                            payload.encode("utf-8")
+                        ).hexdigest(),
+                        "payload_template_sha256": hashlib.sha256(
+                            payload.replace(nonce, "<NONCE>").encode("utf-8")
+                        ).hexdigest(),
+                        "command_body_template_sha256": hashlib.sha256(
+                            command.replace(nonce, "<NONCE>").encode("utf-8")
+                        ).hexdigest(),
+                        "nonce_length": len(nonce),
                         "api": api,
                     }
                     if any("exception_category" in item for item in write_acks):
@@ -3057,10 +3236,30 @@ def test_native_conpty_input_execution_path_comparison(
                         raw_delta = raw_text[raw_offset:]
                         raw_marker = expected in compact(raw_delta)
                         screen_marker = expected in compact(screen_text)
-                        step["command_echo_seen"] = (
+                        step["command_echo_in_pty_or_poll"] = (
                             command in compact(raw_delta)
-                            or command in compact(screen_text)
                         )
+                        step["command_echo_in_screen"] = (
+                            command in compact(screen_text)
+                        )
+                        step["command_echo_seen"] = (
+                            step["command_echo_in_pty_or_poll"]
+                            or step["command_echo_in_screen"]
+                        )
+                        step["screen_prompt_returned_after_execution"] = (
+                            _conpty_prompt_returned_after_marker(
+                                screen_text, expected
+                            )
+                        )
+                        if label == "PATH_CHANGE":
+                            step["expected_path_output_in_pty_or_poll"] = (
+                                expected_file_value.casefold()
+                                in compact(raw_delta).casefold()
+                            )
+                            step["expected_path_output_in_screen"] = (
+                                expected_file_value.casefold()
+                                in compact(screen_text).casefold()
+                            )
                         step["side_effect_file_present"] = value is not None
                         step["side_effect_file_matches"] = (
                             value == expected_file_value
@@ -3070,6 +3269,13 @@ def test_native_conpty_input_execution_path_comparison(
                         )
                         step["output_marker_in_pty_or_poll"] = raw_marker
                         step["output_marker_in_pyte_or_worker_screen"] = screen_marker
+                        if unicode_output_marker is not None:
+                            step["unicode_output_marker_in_pty_or_poll"] = (
+                                unicode_output_marker in compact(raw_delta)
+                            )
+                            step["unicode_output_marker_in_screen"] = (
+                                unicode_output_marker in compact(screen_text)
+                            )
                         step["powershell_error_categories"] = (
                             _conpty_powershell_error_categories(raw_delta)
                         )
@@ -3081,10 +3287,6 @@ def test_native_conpty_input_execution_path_comparison(
                         return (
                             step["side_effect_file_matches"]
                             and raw_marker and screen_marker
-                            and (
-                                label != "UNICODE_INPUT"
-                                or step.get("unicode_output_raw_occurrences", 0) >= 2
-                            )
                         )
 
                     result["last_observation_stage"] = "observe_input_echo_and_execution"
@@ -3361,8 +3563,11 @@ def test_native_conpty_input_execution_path_comparison(
     ):
         for scenario in (
             "unicode_first", "ascii_then_unicode",
+            "ascii_then_unicode_per_key", "ascii_then_unicode_crlf",
+            "unicode_output_only",
             "path_standalone_single_write",
-            "path_after_ascii_per_key",
+            "path_standalone_single_write_crlf",
+            "path_after_ascii_single_write", "path_after_ascii_per_key",
         ):
             run = runs[scenario]
             assert run.get("status") == "COMPLETE", (
@@ -3372,14 +3577,25 @@ def test_native_conpty_input_execution_path_comparison(
                 item.get("case"): item for item in run.get("cases", [])
                 if item.get("case")
             }
-            expected_labels = (
-                ("UNICODE_INPUT",)
-                if scenario == "unicode_first"
-                else ("SHORT_ASCII", "UNICODE_INPUT")
-                if scenario == "ascii_then_unicode"
-                else ("PATH_CHANGE",) if scenario == "path_standalone_single_write"
-                else ("SHORT_ASCII", "PATH_CHANGE")
-            )
+            expected_labels = {
+                "unicode_first": ("UNICODE_INPUT",),
+                "ascii_then_unicode": ("SHORT_ASCII", "UNICODE_INPUT"),
+                "ascii_then_unicode_per_key": (
+                    "SHORT_ASCII", "UNICODE_INPUT",
+                ),
+                "ascii_then_unicode_crlf": (
+                    "SHORT_ASCII", "UNICODE_INPUT",
+                ),
+                "unicode_output_only": ("UNICODE_OUTPUT_ONLY",),
+                "path_standalone_single_write": ("PATH_CHANGE",),
+                "path_standalone_single_write_crlf": ("PATH_CHANGE",),
+                "path_after_ascii_single_write": (
+                    "SHORT_ASCII", "PATH_CHANGE",
+                ),
+                "path_after_ascii_per_key": (
+                    "SHORT_ASCII", "PATH_CHANGE",
+                ),
+            }[scenario]
             for label in expected_labels:
                 case = case_results.get(label, {})
                 assert case.get("status") == "EXECUTION_PROVEN", (
@@ -3399,12 +3615,665 @@ def test_native_conpty_input_execution_path_comparison(
             ) if item.get("case")
         }.get("PATH_CHANGE", {})
         assert after_ascii_case.get("steps", [{}])[0].get("input_mode") == "per_key"
+        after_ascii_single_write_case = {
+            item.get("case"): item for item in runs[
+                "path_after_ascii_single_write"
+            ].get("cases", []) if item.get("case")
+        }.get("PATH_CHANGE", {})
+        assert after_ascii_single_write_case.get("steps", [{}])[0].get(
+            "input_mode"
+        ) == "single_write"
         standalone_case = {
             item.get("case"): item for item in runs[
                 "path_standalone_single_write"
             ].get("cases", []) if item.get("case")
         }.get("PATH_CHANGE", {})
         assert standalone_case.get("steps", [{}])[0].get("input_mode") == "single_write"
+        standalone_crlf_case = {
+            item.get("case"): item for item in runs[
+                "path_standalone_single_write_crlf"
+            ].get("cases", []) if item.get("case")
+        }.get("PATH_CHANGE", {})
+        assert standalone_crlf_case.get("steps", [{}])[0].get(
+            "input_terminator"
+        ) == "CRLF"
+        unicode_after_ascii_single = {
+            item.get("case"): item for item in runs[
+                "ascii_then_unicode"
+            ].get("cases", []) if item.get("case")
+        }.get("UNICODE_INPUT", {}).get("steps", [{}])[0]
+        unicode_after_ascii_per_key = {
+            item.get("case"): item for item in runs[
+                "ascii_then_unicode_per_key"
+            ].get("cases", []) if item.get("case")
+        }.get("UNICODE_INPUT", {}).get("steps", [{}])[0]
+        assert unicode_after_ascii_single.get("input_mode") == "single_write"
+        assert unicode_after_ascii_per_key.get("input_mode") == "per_key"
+        unicode_after_ascii_crlf = {
+            item.get("case"): item for item in runs[
+                "ascii_then_unicode_crlf"
+            ].get("cases", []) if item.get("case")
+        }.get("UNICODE_INPUT", {}).get("steps", [{}])[0]
+        assert unicode_after_ascii_crlf.get("input_terminator") == "CRLF"
+
+    def input_step(runs, scenario, label):
+        case = next(
+            item for item in runs[scenario].get("cases", [])
+            if item.get("case") == label
+        )
+        return case["steps"][0]
+
+    def assert_same_command_body(*steps):
+        hashes = {
+            step["input_ack"]["command_body_template_sha256"]
+            for step in steps
+        }
+        assert len(hashes) == 1, (
+            "A/B input variants changed more than the declared delivery or "
+            "terminator factor"
+        )
+
+    for runs in (direct_runs, worker_runs):
+        unicode_first = input_step(runs, "unicode_first", "UNICODE_INPUT")
+        unicode_single = input_step(runs, "ascii_then_unicode", "UNICODE_INPUT")
+        unicode_per_key = input_step(
+            runs, "ascii_then_unicode_per_key", "UNICODE_INPUT"
+        )
+        unicode_crlf = input_step(
+            runs, "ascii_then_unicode_crlf", "UNICODE_INPUT"
+        )
+        assert_same_command_body(
+            unicode_first, unicode_single, unicode_per_key, unicode_crlf
+        )
+        assert unicode_single["input_ack"]["payload_template_sha256"] == (
+            unicode_per_key["input_ack"]["payload_template_sha256"]
+        )
+        assert unicode_crlf["input_ack"]["utf8_payload_bytes"] == (
+            unicode_single["input_ack"]["utf8_payload_bytes"] + 1
+        )
+        assert unicode_crlf["input_ack"]["terminator"] == "CRLF"
+
+        path_standalone = input_step(
+            runs, "path_standalone_single_write", "PATH_CHANGE"
+        )
+        path_standalone_crlf = input_step(
+            runs, "path_standalone_single_write_crlf", "PATH_CHANGE"
+        )
+        path_after_ascii = input_step(
+            runs, "path_after_ascii_single_write", "PATH_CHANGE"
+        )
+        path_after_ascii_per_key = input_step(
+            runs, "path_after_ascii_per_key", "PATH_CHANGE"
+        )
+        assert_same_command_body(
+            path_standalone, path_standalone_crlf,
+            path_after_ascii, path_after_ascii_per_key,
+        )
+        assert path_standalone["input_ack"]["payload_template_sha256"] == (
+            path_after_ascii["input_ack"]["payload_template_sha256"]
+        )
+        assert path_after_ascii["input_ack"]["payload_template_sha256"] == (
+            path_after_ascii_per_key["input_ack"]["payload_template_sha256"]
+        )
+        assert path_standalone_crlf["input_ack"]["utf8_payload_bytes"] == (
+            path_standalone["input_ack"]["utf8_payload_bytes"] + 1
+        )
+
+    for scenario, label in (
+        ("unicode_first", "UNICODE_INPUT"),
+        ("ascii_then_unicode", "UNICODE_INPUT"),
+        ("unicode_output_only", "UNICODE_OUTPUT_ONLY"),
+        ("path_standalone_single_write", "PATH_CHANGE"),
+    ):
+        direct_step = input_step(direct_runs, scenario, label)
+        worker_step = input_step(worker_runs, scenario, label)
+        assert direct_step["input_ack"]["payload_template_sha256"] == (
+            worker_step["input_ack"]["payload_template_sha256"]
+        ), "Direct and Worker comparison payloads differ unexpectedly"
+
+
+@pytest.mark.parametrize("columns,lines", [(80, 24), (160, 44)])
+def test_r02_product_worker_post_resize_input_factor_diagnostic(
+        tmp_path, monkeypatch, record_property, columns, lines):
+    """Compare resized Worker sessions with one input variable changed per case."""
+    import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
+    from tmux_agent_tower.terminal import TerminalRegistry
+
+    variants = (
+        ("single_write_cr", "single_write", "\r"),
+        ("single_write_crlf", "single_write", "\r\n"),
+        ("per_key_cr", "per_key", "\r"),
+    )
+    results = []
+    evidence_setting = os.environ.get("JTT_R02_EVIDENCE_PATH")
+
+    def observe_until(
+            client, marker, expected_prompt, *, expected_path=None,
+            expected_size=None, expected_side_effect=None,
+            expected_input_echo=None, marker_file=None):
+        raw = bytearray()
+        last = None
+        side_effect_value = None
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            last = client.poll()
+            raw.extend(last.output)
+            if marker_file is not None and marker_file.is_file():
+                try:
+                    side_effect_value = marker_file.read_text(
+                        encoding="utf-8"
+                    ).strip()
+                except (OSError, UnicodeError):
+                    side_effect_value = "READ_ERROR"
+            compact_raw = bytes(raw).replace(b"\r", b"").replace(b"\n", b"")
+            marker_after = (
+                marker.encode("ascii") in compact_raw
+                and expected_prompt.encode("utf-8")
+                in compact_raw[compact_raw.rfind(marker.encode("ascii")) + len(marker):]
+            )
+            if marker_after:
+                break
+            time.sleep(0.02)
+        raw_bytes = bytes(raw)
+        raw_compact = raw_bytes.replace(b"\r", b"").replace(b"\n", b"")
+        screen = last.screen if last is not None else None
+        screen_text = _compact_screen_text(screen) if screen is not None else ""
+        screen_compact = screen_text.replace("\r", "").replace("\n", "")
+        marker_index = raw_compact.rfind(marker.encode("ascii"))
+        raw_prompt = bool(
+            marker_index >= 0
+            and expected_prompt.encode("utf-8")
+            in raw_compact[marker_index + len(marker.encode("ascii")):]
+        )
+        screen_marker_index = screen_compact.rfind(marker)
+        screen_prompt = bool(
+            screen_marker_index >= 0
+            and screen_compact.find(
+                expected_prompt, screen_marker_index + len(marker)
+            ) >= 0
+        )
+        return {
+            "raw_output_bytes": len(raw_bytes),
+            "raw_output_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            "raw_marker_seen": marker.encode("ascii") in raw_compact,
+            "raw_expected_prompt_after_marker": raw_prompt,
+            "screen_marker_seen": marker in screen_compact,
+            "screen_expected_prompt_after_marker": screen_prompt,
+            "raw_expected_path_seen": (
+                expected_path.encode("utf-8") in raw_compact
+                if expected_path is not None else None
+            ),
+            "screen_expected_path_seen": (
+                expected_path.casefold() in screen_compact.casefold()
+                if expected_path is not None else None
+            ),
+            "raw_expected_size_seen": (
+                expected_size.encode("ascii") in raw_compact
+                if expected_size is not None else None
+            ),
+            "screen_expected_size_seen": (
+                expected_size.casefold() in screen_compact.casefold()
+                if expected_size is not None else None
+            ),
+            "raw_input_echo_seen": (
+                expected_input_echo in compact_raw.decode(
+                    "utf-8", errors="replace"
+                ) if expected_input_echo is not None else None
+            ),
+            "screen_input_echo_seen": (
+                expected_input_echo in screen_compact
+                if expected_input_echo is not None else None
+            ),
+            "side_effect_value_matches": (
+                side_effect_value is not None
+                and expected_side_effect is not None
+                and side_effect_value != "READ_ERROR"
+                and os.path.normcase(side_effect_value)
+                == os.path.normcase(expected_side_effect)
+            ) if marker_file is not None else None,
+            "side_effect_read_error": side_effect_value == "READ_ERROR",
+            "powershell_error_categories": _conpty_powershell_error_categories(
+                raw_bytes.decode("utf-8", errors="replace")
+            ),
+            "state": getattr(last, "state", None),
+            "renderer_state": getattr(last, "renderer_state", None),
+            "columns_lines": [
+                getattr(last, "columns", None), getattr(last, "lines", None),
+            ] if last is not None else None,
+            "sequence": getattr(last, "sequence", None),
+            "snapshot_sequence": getattr(last, "snapshot_sequence", None),
+            "gap": getattr(last, "gap", None),
+            "synced": getattr(last, "synced", None),
+        }
+
+    def poll_until(client, predicate, timeout):
+        deadline = time.monotonic() + timeout
+        last = None
+        while time.monotonic() < deadline:
+            last = client.poll()
+            if predicate(last):
+                return last, True
+            time.sleep(0.02)
+        return last, False
+
+    def update_summary(update):
+        if update is None:
+            return None
+        return {
+            "state": getattr(update, "state", None),
+            "renderer_state": getattr(update, "renderer_state", None),
+            "columns_lines": [
+                getattr(update, "columns", None), getattr(update, "lines", None),
+            ],
+            "sequence": getattr(update, "sequence", None),
+            "snapshot_sequence": getattr(update, "snapshot_sequence", None),
+            "gap": getattr(update, "gap", None),
+            "synced": getattr(update, "synced", None),
+            "more": getattr(update, "more", None),
+        }
+
+    for variant_name, delivery_mode, terminator in variants:
+        case_root = tmp_path / f"{columns}x{lines}-{variant_name}"
+        work = case_root / "work"
+        destination = work / "dest"
+        marker_file = work / "path-result.txt"
+        nonce = uuid.uuid4().hex[:10]
+        registry = None
+        client = None
+        identity = None
+        shell_handle = None
+        current_stage = "variant_setup"
+        result = {
+            "scenario": "r02_post_resize_input_factor",
+            "variant": variant_name,
+            "session_nonce": nonce,
+            "viewport_under_test": [columns, lines],
+            "initial_worker_size": [100, 30],
+            "working_directory_length": len(str(work)),
+            "delivery_mode": delivery_mode,
+            "terminator": "CRLF" if terminator == "\r\n" else "CR",
+            "status": "NOT_STARTED",
+            "failure_category": None,
+            "failure_stage": None,
+            "error_stage": None,
+            "error_category": None,
+            "evidence_file_error_category": None,
+            "cleanup": "NOT_ATTEMPTED",
+        }
+
+        def emit_stage(stage):
+            result["stage"] = stage
+            evidence = {
+                "scenario": result["scenario"],
+                "variant": result["variant"],
+                "session_nonce": result["session_nonce"],
+                **result,
+            }
+            if evidence_setting:
+                try:
+                    expected_relative = Path("test-results") / "r02-input-factor.jsonl"
+                    if Path(evidence_setting) != expected_relative:
+                        raise ValueError("unexpected diagnostic evidence path")
+                    evidence_dir = Path("test-results")
+                    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
+                        raise OSError("test-owned evidence directory unavailable")
+                    evidence_path = evidence_dir / "r02-input-factor.jsonl"
+                    if evidence_path.is_symlink():
+                        raise OSError("test-owned evidence file must not be a symlink")
+                    with evidence_path.open("a", encoding="utf-8", newline="\n") as stream:
+                        stream.write(json.dumps(
+                            evidence, ensure_ascii=True, sort_keys=True, default=str
+                        ))
+                        stream.write("\n")
+                        stream.flush()
+                except Exception as exc:
+                    result["evidence_file_error_category"] = type(exc).__name__
+                    evidence["evidence_file_error_category"] = type(exc).__name__
+            print(
+                "R02_POST_RESIZE_INPUT_FACTOR "
+                + json.dumps(
+                    evidence, ensure_ascii=True, sort_keys=True, default=str
+                ),
+                flush=True,
+            )
+
+        emit_stage("variant_start")
+        try:
+            current_stage = "create_test_directories"
+            work.mkdir(parents=True)
+            destination.mkdir()
+            monkeypatch.chdir(work)
+            current_stage = "create_worker"
+            registry = TerminalRegistry(case_root / "isolated-jtt-home" / "terminals")
+            client = registry.create("R02 post-resize input factor diagnostic")
+            identity = client.identity
+            shell_handle = _retain_test_process_handle(
+                identity.shell_pid, identity.shell_start, identity.shell_path
+            )
+            result["owned_session_identity_present"] = bool(
+                identity.session_id and identity.generation
+                and identity.shell_pid and identity.shell_start
+            )
+            emit_stage("worker_created")
+            if not result["owned_session_identity_present"]:
+                result["status"] = "SESSION_IDENTITY_UNPROVEN"
+                result["failure_category"] = "diagnostic_apparatus"
+                result["failure_stage"] = current_stage
+                raise _ConptyPathAbort()
+            current_stage = "initial_prompt_observation"
+            initial_prompt = _expected_prompt_path(work, 100)
+            initial, initial_seen = poll_until(
+                client,
+                lambda item: item.screen is not None
+                and initial_prompt in _compact_screen_text(item.screen),
+                15,
+            )
+            result["initial_prompt_seen"] = initial_seen
+            result["initial_observation"] = update_summary(initial)
+            result["initial_observed_size"] = (
+                [initial.columns, initial.lines] if initial is not None else None
+            )
+            emit_stage("initial_prompt_observed")
+            if not initial_seen:
+                result["status"] = "INITIAL_PROMPT_UNPROVEN"
+                result["failure_category"] = "shell_ready_observation"
+                result["failure_stage"] = current_stage
+                raise _ConptyPathAbort()
+            if result["initial_observed_size"] != [100, 30]:
+                result["status"] = "INITIAL_SIZE_UNEXPECTED"
+                result["failure_category"] = "resize_observation"
+                result["failure_stage"] = current_stage
+                raise _ConptyPathAbort()
+            current_stage = "input_lease_acquisition"
+            assert client.acquire()
+            result["input_lease_acquired"] = True
+            emit_stage("initial_prompt_and_lease_observed")
+
+            current_stage = "resize_observation"
+            resize_return = client.resize(columns, lines)
+            result["resize_request_completed_without_error"] = True
+            result["resize_method_return"] = {
+                "return_type": type(resize_return).__name__,
+                "return_value": (
+                    resize_return
+                    if type(resize_return) in (bool, int, str) else None
+                ),
+            }
+            resized, resize_seen = poll_until(
+                client,
+                lambda item: item.screen is not None and item.synced
+                and not item.more and item.sequence == item.snapshot_sequence
+                and (item.columns, item.lines) == (columns, lines),
+                15,
+            )
+            result["resize_observed_before_input"] = (
+                [resized.columns, resized.lines] if resized is not None else None
+            )
+            result["resize_observation"] = update_summary(resized)
+            result["resize_observed"] = resize_seen
+            emit_stage("resize_observed_without_shell_input")
+            if not resize_seen:
+                result["status"] = "RESIZE_OBSERVATION_UNPROVEN"
+                result["failure_category"] = "resize_observation"
+                result["failure_stage"] = current_stage
+                raise _ConptyPathAbort()
+
+            current_stage = "target_command_prepare"
+            path_marker = f"JTT_R02_PATH_{nonce}_END"
+            command = (
+                "Set-Location 'dest'; "
+                "$__jtt_size=$Host.UI.RawUI.WindowSize; "
+                "$__jtt_report=$PWD.Path + '|' + "
+                "([string]$__jtt_size.Width) + 'x' + "
+                "([string]$__jtt_size.Height); "
+                "[System.IO.File]::WriteAllText('path-result.txt',$__jtt_report); "
+                "[Console]::WriteLine('JTT_R02_PATH_' + '"
+                + nonce + "' + '_END|' + "
+                "([string]$__jtt_size.Width) + 'x' + "
+                "([string]$__jtt_size.Height))"
+            )
+            expected_size = f"{columns}x{lines}"
+            expected_side_effect = f"{destination}|{expected_size}"
+            result["path_command_length"] = len(command)
+            result["path_command_sha256"] = hashlib.sha256(
+                command.replace(nonce, "<NONCE>").encode("ascii")
+            ).hexdigest()
+            result["command_uses_test_owned_relative_destination"] = (
+                "Set-Location 'dest'" in command
+            )
+            result["input_attempted"] = True
+            result["input_echo_raw_seen"] = None
+            result["input_echo_screen_seen"] = None
+            result["input_acknowledged_bytes"] = 0
+            result["input_write_count"] = 0
+            result["input_payload_bytes"] = len(
+                (command + terminator).encode("ascii")
+            )
+            result["input_payload_sha256"] = hashlib.sha256(
+                (command.replace(nonce, "<NONCE>") + terminator).encode("ascii")
+            ).hexdigest()
+            result["command_body_template_sha256"] = hashlib.sha256(
+                command.replace(nonce, "<NONCE>").encode("ascii")
+            ).hexdigest()
+            emit_stage("target_command_prepared")
+            chunks = _conpty_input_chunks(command, delivery_mode, terminator=terminator)
+            write_results = []
+            result["input_write_results"] = write_results
+            result["input_delivery"] = "SENDING"
+            current_stage = "target_input_send"
+            emit_stage("target_input_send_started")
+            for chunk_index, chunk in enumerate(chunks, start=1):
+                payload = chunk.encode("ascii")
+                try:
+                    written = client.send(payload)
+                except Exception as exc:
+                    write_results.append({
+                        "exception_category": type(exc).__name__,
+                        "payload_bytes": len(payload),
+                    })
+                    result["error_stage"] = "target_input_send"
+                    result["error_category"] = type(exc).__name__
+                    write_complete = False
+                else:
+                    write_complete = written == len(payload)
+                    write_results.append({
+                        "returned_bytes": written,
+                        "payload_bytes": len(payload),
+                        "complete": write_complete,
+                    })
+                result["input_write_count"] = len(write_results)
+                result["input_acknowledged_bytes"] = sum(
+                    item.get("returned_bytes", 0) for item in write_results
+                    if type(item.get("returned_bytes")) is int
+                )
+                if chunk_index % 16 == 0 or chunk_index == len(chunks) or not write_complete:
+                    emit_stage("target_input_send_progress")
+                if not write_complete:
+                    break
+            result["all_input_writes_complete"] = (
+                len(write_results) == len(chunks)
+                and all(item.get("complete") is True for item in write_results)
+            )
+            result["input_delivery"] = (
+                "ACK_COMPLETE"
+                if result["all_input_writes_complete"] else "ACK_INCOMPLETE"
+            )
+            emit_stage("target_input_acknowledged")
+            if result["all_input_writes_complete"]:
+                result["status"] = "WAITING_FOR_EXECUTION_EVIDENCE"
+                current_stage = "target_execution_and_output_observation"
+                observation = observe_until(
+                    client, path_marker,
+                    _expected_prompt_path(destination, columns),
+                    expected_path=str(destination),
+                    expected_size=expected_size,
+                    expected_side_effect=expected_side_effect,
+                    expected_input_echo=command,
+                    marker_file=marker_file,
+                )
+                result["execution_side_effect_matches"] = observation[
+                    "side_effect_value_matches"
+                ]
+                result["input_echo_raw_seen"] = observation[
+                    "raw_input_echo_seen"
+                ]
+                result["input_echo_screen_seen"] = observation[
+                    "screen_input_echo_seen"
+                ]
+                result.update({
+                    key: value for key, value in observation.items()
+                    if key != "side_effect_value_matches"
+                })
+                result["raw_path_result_seen"] = observation[
+                    "raw_expected_path_seen"
+                ]
+                result["screen_path_result_seen"] = observation[
+                    "screen_expected_path_seen"
+                ]
+                result["shell_reported_size_raw_seen"] = observation[
+                    "raw_expected_size_seen"
+                ]
+                result["shell_reported_size_screen_seen"] = observation[
+                    "screen_expected_size_seen"
+                ]
+                result["side_effect_read_error"] = observation[
+                    "side_effect_read_error"
+                ]
+                result["powershell_error_categories"] = observation[
+                    "powershell_error_categories"
+                ]
+            else:
+                result["status"] = "INPUT_ACK_INCOMPLETE"
+                result["failure_category"] = "input_delivery"
+                result["failure_stage"] = current_stage
+            if result.get("all_input_writes_complete"):
+                result["status"] = (
+                    "EXECUTION_AND_OUTPUT_PROVEN"
+                    if result.get("execution_side_effect_matches")
+                    and result.get("raw_marker_seen")
+                    and result.get("screen_marker_seen")
+                    and result.get("raw_expected_size_seen")
+                    and result.get("screen_expected_size_seen")
+                    and result.get("raw_expected_prompt_after_marker")
+                    and result.get("screen_expected_prompt_after_marker")
+                    else "EXECUTION_OR_OUTPUT_UNPROVEN"
+                )
+                if result["status"] != "EXECUTION_AND_OUTPUT_PROVEN":
+                    result["failure_stage"] = current_stage
+                    if result.get("side_effect_read_error"):
+                        result["failure_category"] = "diagnostic_apparatus"
+                    elif not result.get("execution_side_effect_matches"):
+                        result["failure_category"] = (
+                            "powershell_command_error"
+                            if result.get("powershell_error_categories")
+                            else "command_execution_unproven"
+                        )
+                    elif not result.get("raw_marker_seen"):
+                        result["failure_category"] = "raw_output_observation"
+                    elif not result.get("screen_marker_seen"):
+                        result["failure_category"] = "screen_render_observation"
+                    elif not result.get("raw_expected_size_seen"):
+                        result["failure_category"] = "shell_resize_observation"
+                    elif not result.get("screen_expected_size_seen"):
+                        result["failure_category"] = "screen_resize_observation"
+                    else:
+                        result["failure_category"] = "prompt_observation"
+                emit_stage("target_output_observed")
+        except _ConptyPathAbort:
+            if not result.get("failure_category"):
+                result["failure_category"] = "diagnostic_apparatus"
+        except Exception as exc:
+            result["status"] = "DIAGNOSTIC_ERROR"
+            result["error_stage"] = current_stage
+            result["failure_stage"] = current_stage
+            result["error_category"] = type(exc).__name__
+            result["failure_category"] = {
+                "initial_prompt_observation": "shell_ready_observation",
+                "input_lease_acquisition": "input_lease_setup",
+                "resize_observation": "resize_observation",
+                "target_execution_and_output_observation": "output_observation",
+            }.get(current_stage, "diagnostic_apparatus")
+        finally:
+            current_stage = "cleanup"
+            if client is not None:
+                try:
+                    client.close()
+                except Exception as exc:
+                    result["client_close_error_category"] = type(exc).__name__
+            if registry is not None and identity is not None:
+                try:
+                    registry.stop(
+                        identity.session_id,
+                        expected_generation=identity.generation,
+                        expected_shell_pid=identity.shell_pid,
+                    )
+                    result["stop_returned_for_exact_identity"] = True
+                    result["cleanup"] = (
+                        "CONFIRMED"
+                        if shell_handle is not None
+                        and _retained_process_handle_signaled(shell_handle)
+                        else "STOP_RETURNED_PROCESS_STILL_ALIVE"
+                    )
+                except Exception as exc:
+                    result["cleanup"] = "STOP_ERROR"
+                    result["cleanup_error_category"] = type(exc).__name__
+                finally:
+                    if shell_handle is not None:
+                        try:
+                            shell_handle.Close()
+                        except Exception as exc:
+                            result["cleanup_handle_close_error_category"] = (
+                                type(exc).__name__
+                            )
+            if identity is not None and result["cleanup"] != "CONFIRMED":
+                result["failure_category"] = "cleanup"
+                result["failure_stage"] = "cleanup"
+            if result.get("evidence_file_error_category"):
+                result["failure_category"] = "diagnostic_evidence"
+                result["failure_stage"] = "evidence_write"
+            emit_stage("cleanup_complete")
+        results.append(result)
+
+    record_property(
+        "r02_post_resize_input_factor_matrix",
+        json.dumps(results, sort_keys=True, default=str),
+    )
+    print(
+        "R02_POST_RESIZE_INPUT_FACTOR_MATRIX "
+        + json.dumps(results, sort_keys=True, default=str),
+        flush=True,
+    )
+    if all(item.get("status") == "EXECUTION_AND_OUTPUT_PROVEN" for item in results):
+        body_hashes = {
+            item["command_body_template_sha256"] for item in results
+        }
+        assert len(body_hashes) == 1, (
+            "R02 input variants changed command content as well as the declared factor"
+        )
+        by_variant = {item["variant"]: item for item in results}
+        cr = by_variant["single_write_cr"]
+        crlf = by_variant["single_write_crlf"]
+        per_key = by_variant["per_key_cr"]
+        assert cr["input_payload_bytes"] == per_key["input_payload_bytes"]
+        assert crlf["input_payload_bytes"] == cr["input_payload_bytes"] + 1
+        assert cr["input_write_count"] == crlf["input_write_count"] == 1
+        assert per_key["input_write_count"] == cr["path_command_length"] + 1
+    assert all(item["cleanup"] == "CONFIRMED" for item in results), (
+        "one or more test-owned R02 diagnostic sessions did not stop; see evidence"
+    )
+    assert all(
+        "cleanup_handle_close_error_category" not in item for item in results
+    ), "one or more test-owned retained handles did not close"
+    assert all(
+        "client_close_error_category" not in item for item in results
+    ), "one or more test-owned diagnostic clients did not close"
+    assert all(item.get("status") == "EXECUTION_AND_OUTPUT_PROVEN" for item in results), (
+        "R02 post-resize input variant did not prove side effect, output, screen, "
+        "and prompt; see structured evidence"
+    )
+    assert all(not item.get("evidence_file_error_category") for item in results), (
+        "one or more R02 diagnostic JSON evidence records could not be written"
+    )
 
 
 @pytest.mark.parametrize("columns,lines", [(80, 24), (160, 44)])

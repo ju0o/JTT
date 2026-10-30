@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
+import hashlib
 import importlib
 import io
 import sys
@@ -109,9 +110,15 @@ def test_native_conpty_run_path_finalization_preserves_diagnostic_and_cleanup_ev
     assert input_chunks("Write-Output 'OK'", "single_write") == [
         "Write-Output 'OK'\r"
     ]
+    assert input_chunks(
+        "Write-Output 'OK'", "single_write", terminator="\r\n"
+    ) == ["Write-Output 'OK'\r\n"]
     assert input_chunks("Write-Output '한글'", "per_key") == [
         *"Write-Output '한글'", "\r"
     ]
+    assert input_chunks(
+        "Write-Output '한글'", "per_key", terminator="\r\n"
+    ) == [*"Write-Output '한글'", "\r\n"]
     assert sum(len(part.encode("utf-8")) for part in input_chunks(
         "Write-Output '한글'", "per_key"
     )) == len("Write-Output '한글'\r".encode("utf-8"))
@@ -2792,6 +2799,33 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                             "utf8_payload_characters": len(command) + 1,
                             "utf8_payload_contains_non_ascii": any(
                                 value > 0x7f for value in encoded
+                            ),
+                            "payload_sha256": hashlib.sha256(encoded).hexdigest(),
+                            "payload_template_sha256": hashlib.sha256(
+                                (command.replace(nonce, "<NONCE>") + "\r")
+                                .encode("utf-8")
+                            ).hexdigest(),
+                            "terminator": "CR",
+                            "input_delivery_mode": (
+                                "single_write" if index == 1
+                                else "per_key_then_enter"
+                            ),
+                            "working_directory_length": len(str(tmp_path)),
+                            "ui_viewport_size": [
+                                getattr(app.size, "width", None),
+                                getattr(app.size, "height", None),
+                            ],
+                            "terminal_screen_size": [
+                                getattr(prior_observation[3], "columns", None),
+                                getattr(prior_observation[3], "lines", None),
+                            ],
+                            "worker_start_argument_profile": [
+                                "-NoLogo", "-NoProfile", "-NoExit", "-Command",
+                                "<product bootstrap gate script>",
+                            ],
+                            "worker_argument_profile_source": (
+                                "_windows_worker.py:_bootstrap_script argv; "
+                                "source-derived, not process-commandline observation"
                             ),
                             "protocol_confirmed_pty_write_bytes": (
                                 sum(
