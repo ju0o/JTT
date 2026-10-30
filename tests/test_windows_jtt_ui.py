@@ -49,6 +49,41 @@ def _screen_lines(*lines: str) -> TerminalScreen:
     return TerminalScreen(rows, 0, max(0, len(rows) - 1), True)
 
 
+def test_pty_input_ack_requires_the_complete_utf8_byte_count_without_retry():
+    from tmux_agent_tower.terminal._windows_worker import (
+        _InputDeliveryUnconfirmed,
+        _write_terminal_input,
+    )
+
+    class FakePty:
+        def __init__(self, result):
+            self.result = result
+            self.calls = []
+
+        def write(self, text):
+            self.calls.append(text)
+            if isinstance(self.result, Exception):
+                raise self.result
+            return self.result
+
+    text = "Write-Output '한글'"
+    payload_bytes = len(text.encode("utf-8"))
+    complete = FakePty(payload_bytes)
+    assert _write_terminal_input(complete, text, payload_bytes) == payload_bytes
+    assert complete.calls == [text]
+
+    for incomplete_result in (0, payload_bytes - 1, None):
+        partial = FakePty(incomplete_result)
+        with pytest.raises(_InputDeliveryUnconfirmed):
+            _write_terminal_input(partial, text, payload_bytes)
+        assert partial.calls == [text]
+
+    failed = FakePty(OSError("injected PTY write failure"))
+    with pytest.raises(_InputDeliveryUnconfirmed):
+        _write_terminal_input(failed, text, payload_bytes)
+    assert failed.calls == [text]
+
+
 def _plain_screen_text(screen: TerminalScreen) -> str:
     return "\n".join("".join(cell.text for cell in row) for row in screen.rows)
 
@@ -2345,6 +2380,8 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                     if category not in {
                         "input_lease_required", "stream_gap", "stale_identity",
                         "renderer_unavailable", "terminal input response is invalid",
+                        "input_delivery_unconfirmed",
+                        "terminal input delivery could not be confirmed",
                     }:
                         category = "terminal_error_other"
                     outcome["terminal_error"] = category
@@ -2363,6 +2400,29 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
 
             monkeypatch.setattr(client, "send", record_send)
             import json
+
+            async def wait_for_raw_output(marker, after_sequence):
+                raw = bytearray()
+                last_update = None
+                deadline = time.monotonic() + 20
+                marker_bytes = marker.encode("utf-8")
+                while time.monotonic() < deadline:
+                    # Serialize this diagnostic poll with the app's observer;
+                    # poll bytes prove ConPTY output while observe() separately
+                    # proves the rendered snapshot reached the UI.
+                    last_update = await app._backend_call(client.poll)
+                    raw.extend(last_update.output)
+                    compact = bytes(raw).replace(b"\r", b"").replace(b"\n", b"")
+                    if marker_bytes in compact:
+                        return last_update, bytes(raw)
+                    await pilot.pause(0.02)
+                raise AssertionError(
+                    "ConPTY output marker was not observed: "
+                    f"sequence={getattr(last_update, 'sequence', None)!r}; "
+                    f"snapshot_sequence={getattr(last_update, 'snapshot_sequence', None)!r}; "
+                    f"gap={getattr(last_update, 'gap', None)!r}; "
+                    f"bytes={len(raw)}; advanced={bool(last_update and last_update.sequence > after_sequence)}"
+                )
 
             for index, (command, marker) in enumerate(commands):
                 assert marker not in command
@@ -2419,6 +2479,8 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                                 "input_lease_required", "stream_gap",
                                 "stale_identity", "renderer_unavailable",
                                 "terminal input response is invalid",
+                                "input_delivery_unconfirmed",
+                                "terminal input delivery could not be confirmed",
                             } else "terminal_error_other"
                         )
                     else:
@@ -2455,6 +2517,26 @@ def test_native_windows_ui_explicit_copy_captures_unicode_multiline_and_error(
                     "accepted_bytes": len(encoded),
                     "terminal_error": None,
                 }
+                raw_update, raw_output = await wait_for_raw_output(
+                    marker, prior_sequence
+                )
+                compact_raw_output = raw_output.replace(b"\r", b"").replace(
+                    b"\n", b""
+                )
+                assert marker.encode("utf-8") in compact_raw_output
+                assert raw_update.sequence > prior_sequence
+                assert not raw_update.gap
+                record_property(
+                    f"copy_input_{index}_raw_output",
+                    json.dumps({
+                        "output_marker_observed": True,
+                        "sequence_before": prior_sequence,
+                        "sequence_after": raw_update.sequence,
+                        "snapshot_sequence": raw_update.snapshot_sequence,
+                        "gap": raw_update.gap,
+                        "raw_byte_count": len(raw_output),
+                    }, sort_keys=True),
+                )
                 await _wait_for_ui_state(
                     pilot,
                     lambda marker=marker: app._right_observation is not None

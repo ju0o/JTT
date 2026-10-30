@@ -1397,9 +1397,11 @@ class TerminalClient:
         if not response.get("ok"):
             reason = str(response.get("error") or "terminal request rejected")
             if reason in ("stale_identity", "session_exited", "input_lease_required",
-                          "stream_gap", "lease_expired", "renderer_unavailable"):
+                          "stream_gap", "lease_expired", "renderer_unavailable",
+                          "input_delivery_unconfirmed"):
                 self.lease = False
-                if reason in ("stale_identity", "stream_gap", "renderer_unavailable"):
+                if reason in ("stale_identity", "stream_gap", "renderer_unavailable",
+                              "input_delivery_unconfirmed"):
                     self.synced = False
             raise TerminalError(reason)
         if (response.get("session_id") != self.identity.session_id
@@ -1493,11 +1495,18 @@ class TerminalClient:
         if not response.get("synced") or not response.get("renderer_available"):
             self.synced = self.lease = False
             raise TerminalError("stream_gap")
+        written = response.get("written")
+        if type(written) is not int or written != len(data):
+            # The worker's acknowledgement contains no output. A partial or
+            # malformed input acknowledgement is ambiguous, so fail closed
+            # without resending bytes that may already have reached the PTY.
+            self.synced = self.lease = False
+            raise TerminalError("terminal input delivery could not be confirmed")
         # The input acknowledgement carries a producer head but no output
         # bytes. Keep it separate from _output_cursor so a later stream-gap
         # check cannot mistake unread data for delivered data.
         self.synced = True
-        return int(response.get("written", 0))
+        return written
 
     def resize(self, columns: int, lines: int) -> None:
         if (isinstance(columns, bool) or isinstance(lines, bool)

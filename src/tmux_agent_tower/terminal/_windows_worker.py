@@ -42,6 +42,21 @@ def _set_stage(value):
     _STAGE = value
 
 
+class _InputDeliveryUnconfirmed(RuntimeError):
+    """A PTY write did not confirm the complete UTF-8 request payload."""
+
+
+def _write_terminal_input(terminal, text, expected_bytes):
+    """Return only a verified PTY byte count; never retry an ambiguous write."""
+    try:
+        written = terminal.write(text)
+    except Exception as exc:
+        raise _InputDeliveryUnconfirmed from exc
+    if type(written) is not int or written != expected_bytes:
+        raise _InputDeliveryUnconfirmed
+    return written
+
+
 def _load_runtime():
     package_root = Path(__file__).resolve().parents[1]
     source_root = package_root.parent
@@ -686,9 +701,18 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                             return base(error="invalid_input")
                         if not data or len(data) > 8192:
                             return base(error="invalid_input")
-                        terminal.write(text)
+                        try:
+                            written = _write_terminal_input(terminal, text, len(data))
+                        except _InputDeliveryUnconfirmed:
+                            # A failed or partial PTY write may already have
+                            # delivered a prefix. Releasing the exclusive
+                            # lease fails closed; retransmitting could duplicate
+                            # shell input, so the request is never retried here.
+                            lease_owner = None
+                            lease_deadline = 0.0
+                            return base(error="input_delivery_unconfirmed")
                         lease_deadline = now + LEASE_SECONDS
-                        return base(ok=True, written=len(data), lease=True)
+                        return base(ok=True, written=written, lease=True)
                     columns, lines = request.get("columns"), request.get("lines")
                     if (isinstance(columns, bool) or isinstance(lines, bool)
                             or not isinstance(columns, int) or not isinstance(lines, int)

@@ -722,9 +722,50 @@ def _process_same(pid, created):
     return alive and actual_created == created
 
 
-def test_native_stop_terminates_nested_children_in_the_owned_job(tmp_path, monkeypatch):
+def _retain_test_process_handle(pid, expected_created, expected_image):
+    """Open only a PID emitted by this test and retain its verified handle."""
+    import win32api
+    import win32con
+    import win32event
+    import win32process
+    from tmux_agent_tower.terminal.windows_manager import _process_image
+
+    handle = win32api.OpenProcess(
+        win32con.PROCESS_QUERY_LIMITED_INFORMATION | win32con.SYNCHRONIZE,
+        False, int(pid),
+    )
+    try:
+        if win32event.WaitForSingleObject(handle, 0) != win32con.WAIT_TIMEOUT:
+            raise AssertionError("test-owned process was not alive before Stop")
+        created = str(win32process.GetProcessTimes(handle)["CreationTime"])
+        if created != str(expected_created):
+            raise AssertionError("test-owned process creation identity changed")
+        image = _process_image(handle)
+        if image != os.path.normcase(os.path.abspath(expected_image)):
+            raise AssertionError("test-owned process image identity changed")
+        return handle
+    except BaseException:
+        handle.Close()
+        raise
+
+
+def _retained_process_handle_signaled(handle):
+    """Confirm exit on a handle retained before Stop, without PID re-query."""
+    import win32con
+    import win32event
+
+    result = win32event.WaitForSingleObject(handle, 0)
+    if result == win32con.WAIT_OBJECT_0:
+        return True
+    if result == win32con.WAIT_TIMEOUT:
+        return False
+    raise AssertionError("retained test-owned process handle returned unknown state")
+
+
+def test_native_stop_terminates_nested_children_in_the_owned_job(
+        tmp_path, monkeypatch, record_property):
     import ju0_terminal_tower  # noqa: F401 - installs the guarded shared namespace
-    from tmux_agent_tower.terminal import TerminalRegistry
+    from tmux_agent_tower.terminal import TerminalRegistry, windows_manager
     from tmux_agent_tower.terminal.windows_manager import (
         _powershell_executable,
         _process_facts,
@@ -738,6 +779,9 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(tmp_path, monke
     identity = client.identity
     marker_file = tmp_path / "owned-job-pids.txt"
     marker_path = str(marker_file).replace("'", "''")
+    nonce = uuid.uuid4().hex[:10]
+    command_started_marker = f"JTT_OWNED_START_{nonce}_END"
+    tree_marker_prefix = f"JTT_OWNED_TREE_{nonce}_"
     child_script = (
         "$grand=Start-Process -PassThru -WindowStyle Hidden "
         "-FilePath ($PSHOME+'\\powershell.exe') "
@@ -749,6 +793,7 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(tmp_path, monke
         child_script.encode("utf-16le")
     ).decode("ascii")
     outer_command = (
+        "[Console]::WriteLine('JTT_'+'OWNED_START_'+ '" + nonce + "'+'_END'); "
         "$e='" + encoded_child + "'; "
         "$child=Start-Process -PassThru -WindowStyle Hidden "
         "-FilePath ($PSHOME+'\\powershell.exe') "
@@ -756,10 +801,17 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(tmp_path, monke
         "while(-not [System.IO.File]::Exists('" + marker_path + "')) "
         "{ Start-Sleep -Milliseconds 25 }; "
         "$ids=[System.IO.File]::ReadAllText('" + marker_path + "'); "
-        "[Console]::WriteLine('JTT_'+'JOB_TREE_'+$ids+'_END')"
+        "[Console]::WriteLine('JTT_'+'OWNED_TREE_'+ '" + nonce + "'+'_'+$ids+'_END')"
     )
-    assert "JTT_JOB_TREE_" not in outer_command
+    assert command_started_marker not in outer_command
+    assert tree_marker_prefix not in outer_command
     processes = []
+    stop_evidence = {}
+    raw_output = bytearray()
+    last_update = None
+    preserved_client = None
+    preserved_identity = None
+    preserved_shell_handle = None
     try:
         expected_prompt = _expected_prompt_path(work, 100)
         initial = _wait(
@@ -770,45 +822,180 @@ def test_native_stop_terminates_nested_children_in_the_owned_job(tmp_path, monke
         assert (initial.columns, initial.lines) == (100, 30)
         assert expected_prompt in _compact_screen_text(initial.screen)
         assert client.acquire()
-        client.send((outer_command + "\r").encode("ascii"))
-        marker = _wait(
-            client,
-            lambda update: update.screen is not None
-            and "JTT_JOB_TREE_" in _screen_text(update.screen),
+        encoded_command = (outer_command + "\r").encode("ascii")
+        assert client.send(encoded_command) == len(encoded_command)
+
+        def collect_until(predicate, description, timeout=15):
+            nonlocal last_update
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                last_update = client.poll()
+                raw_output.extend(last_update.output)
+                if predicate(last_update, bytes(raw_output)):
+                    return last_update
+                time.sleep(0.02)
+            raise AssertionError(
+                f"owned Job stage not observed: {description}; "
+                f"state={getattr(last_update, 'state', None)!r}; "
+                f"sequence={getattr(last_update, 'sequence', None)!r}; "
+                f"snapshot_sequence={getattr(last_update, 'snapshot_sequence', None)!r}; "
+                f"raw_bytes={len(raw_output)}; marker_file={marker_file.is_file()}"
+            )
+
+        start_update = collect_until(
+            lambda _item, output: command_started_marker.encode("ascii")
+            in output.replace(b"\r", b"").replace(b"\n", b""),
+            "PowerShell command execution marker",
         )
-        screen = _screen_text(marker.screen)
-        match = re.search(r"JTT_JOB_TREE_(\d+),(\d+)_END", screen)
-        assert match, "PowerShell did not report the nested Job process IDs"
-        for pid in (int(match.group(1)), int(match.group(2))):
+        assert start_update.screen is not None
+        assert command_started_marker in _screen_text(start_update.screen)
+        record_property("owned_job_command_started", True)
+
+        file_deadline = time.monotonic() + 15
+        while not marker_file.is_file() and time.monotonic() < file_deadline:
+            last_update = client.poll()
+            raw_output.extend(last_update.output)
+            time.sleep(0.02)
+        record_property("owned_job_creation_marker_present", marker_file.is_file())
+        assert marker_file.is_file(), (
+            "PowerShell command started, but the test-owned child PID marker file was not created"
+        )
+        pid_values = marker_file.read_text(encoding="ascii").strip().split(",")
+        assert len(pid_values) == 2 and all(value.isdecimal() for value in pid_values), (
+            "test-owned process creation marker was malformed"
+        )
+        child_pid, grandchild_pid = (int(value) for value in pid_values)
+        assert len({child_pid, grandchild_pid, identity.shell_pid}) == 3
+        expected_image = os.path.normcase(os.path.abspath(str(_powershell_executable())))
+        for pid in (child_pid, grandchild_pid):
             created, image, alive = _process_facts(pid)
             assert alive and created
-            expected_image = os.path.normcase(
-                os.path.abspath(str(_powershell_executable()))
-            )
             assert image == expected_image
-            processes.append((pid, created))
+            handle = _retain_test_process_handle(pid, created, expected_image)
+            processes.append((pid, created, handle))
+        record_property(
+            "owned_job_process_identities",
+            json.dumps([
+                {"pid": pid, "creation_time": created, "image_matches": True}
+                for pid, created, _handle in processes
+            ], sort_keys=True),
+        )
 
+        tree_marker = f"{tree_marker_prefix}{child_pid},{grandchild_pid}_END"
+        tree_update = collect_until(
+            lambda _item, output: tree_marker.encode("ascii")
+            in output.replace(b"\r", b"").replace(b"\n", b""),
+            "ConPTY output containing test-owned process IDs",
+        )
+        assert tree_update.screen is not None
+        assert tree_marker in _screen_text(tree_update.screen)
+
+        # Keep a second JTT-owned session alive across the explicit Stop to
+        # prove that cleanup is limited to the selected session's Job.
+        preserved_client = registry.create("Unrelated owned Job preservation")
+        preserved_identity = preserved_client.identity
+        preserved_prompt = _expected_prompt_path(work, 100)
+        preserved_initial = _wait(
+            preserved_client,
+            lambda update: update.screen is not None
+            and update.state == "running"
+            and preserved_prompt in _compact_screen_text(update.screen),
+        )
+        assert preserved_initial.screen is not None
+        preserved_shell_handle = _retain_test_process_handle(
+            preserved_identity.shell_pid,
+            preserved_identity.shell_start,
+            preserved_identity.shell_path,
+        )
+        for pid, created, handle in processes:
+            assert not _retained_process_handle_signaled(handle), (
+                f"test-owned Job descendant {pid} exited before Stop"
+            )
+        record_property("owned_job_children_alive_immediately_before_stop", len(processes))
+        record_property("unrelated_jtt_session_running_before_stop", True)
+
+        original_remove = windows_manager._remove_session_files
+
+        def capture_stop_accounting(path, **kwargs):
+            metadata = windows_manager._read_metadata(
+                path / windows_manager.SESSION_META
+            )
+            stop_evidence["job_processes_empty"] = metadata.get(
+                "job_processes_empty"
+            )
+            return original_remove(path, **kwargs)
+
+        monkeypatch.setattr(
+            windows_manager, "_remove_session_files", capture_stop_accounting
+        )
         registry.stop(
             identity.session_id, expected_generation=identity.generation,
             expected_shell_pid=identity.shell_pid,
         )
-        for pid, created in processes:
-            actual_created, _image, alive = _process_facts(pid)
-            assert not alive or actual_created != created, (
-                f"owned Job descendant {pid} remained after explicit Stop"
+        assert stop_evidence.get("job_processes_empty") is True, (
+            "Stop did not preserve the worker's confirmed empty Job accounting state"
+        )
+        for pid, created, handle in processes:
+            assert _retained_process_handle_signaled(handle), (
+                f"owned Job descendant {pid} (created {created}) remained after explicit Stop"
             )
+        assert not _retained_process_handle_signaled(preserved_shell_handle), (
+            "explicit Stop terminated the unrelated test-owned JTT session"
+        )
+        preserved_after_stop = preserved_client.poll()
+        assert (
+            preserved_after_stop.state == "running"
+            and preserved_after_stop.screen is not None
+            and preserved_prompt in _compact_screen_text(preserved_after_stop.screen)
+        ), "unrelated test-owned JTT session did not remain usable after Stop"
+        _preserved_dir, preserved_metadata = windows_manager._validate_identity(
+            registry.root, preserved_identity.session_id
+        )
+        current_preserved_identity = windows_manager._identity(preserved_metadata)
+        assert (
+            windows_manager._terminal_identity_key(current_preserved_identity)
+            == windows_manager._terminal_identity_key(preserved_identity)
+        ), "unrelated test-owned JTT session identity changed during Stop"
         assert not (registry.root / identity.session_id).exists()
+        record_property("owned_job_active_processes_zero", True)
+        record_property("owned_job_retained_child_handles_signaled", len(processes))
+        record_property("unrelated_jtt_session_alive_after_stop", True)
+        record_property("unrelated_jtt_session_identity_preserved", True)
     finally:
+        record_property("owned_job_marker_file_present_at_teardown", marker_file.is_file())
+        record_property("owned_job_process_handle_count_at_teardown", len(processes))
+        record_property(
+            "owned_job_stop_accounting_at_teardown",
+            str(stop_evidence.get("job_processes_empty", "unknown")),
+        )
         try:
             client.close()
         finally:
-            if (registry.root / identity.session_id).exists():
-                registry.stop(
-                    identity.session_id,
-                    expected_generation=identity.generation,
-                    expected_shell_pid=identity.shell_pid,
-                )
-
+            try:
+                if (registry.root / identity.session_id).exists():
+                    registry.stop(
+                        identity.session_id,
+                        expected_generation=identity.generation,
+                        expected_shell_pid=identity.shell_pid,
+                    )
+            finally:
+                try:
+                    if preserved_client is not None:
+                        preserved_client.close()
+                finally:
+                    try:
+                        if (preserved_identity is not None
+                                and (registry.root / preserved_identity.session_id).exists()):
+                            registry.stop(
+                                preserved_identity.session_id,
+                                expected_generation=preserved_identity.generation,
+                                expected_shell_pid=preserved_identity.shell_pid,
+                            )
+                    finally:
+                        for _pid, _created, handle in processes:
+                            handle.Close()
+                        if preserved_shell_handle is not None:
+                            preserved_shell_handle.Close()
 
 def test_job_assignment_failure_terminates_only_retained_child_handle():
     from ju0_terminal_tower.terminal._windows_worker import assign_owned_job
@@ -1985,7 +2172,7 @@ def test_r02_long_location_command_terminator_replicas(tmp_path, monkeypatch):
             result["command_under_test"] = location_command
             result["marker_command_is_separate_replica"] = True
             for character in marker_command:
-                client.send(character.encode("ascii"))
+                assert client.send(character.encode("ascii")) == 1
             echo_deadline = time.monotonic() + 15
             while time.monotonic() < echo_deadline:
                 item = client.poll()
@@ -1997,6 +2184,7 @@ def test_r02_long_location_command_terminator_replicas(tmp_path, monkeypatch):
 
             submit_at = time.monotonic_ns()
             result["terminator_ack"] = client.send(terminator)
+            assert result["terminator_ack"] == len(terminator)
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 item = client.poll()
@@ -2914,12 +3102,17 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
         )
         client = registry.create("R02 product-worker prompt comparison")
         identity = client.identity
+        shell_handle = None
+        shell_exit_confirmed = False
         output_tail = ""
         last = None
         identity_valid_at_startup = False
         prompt_output = False
         prompt_snapshot = False
         try:
+            shell_handle = _retain_test_process_handle(
+                identity.shell_pid, identity.shell_start, identity.shell_path
+            )
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
                 last = client.poll()
@@ -2938,18 +3131,26 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
                 identity, windows_manager
             )
         finally:
-            client.close()
-            registry.stop(
-                identity.session_id, expected_generation=identity.generation,
-                expected_shell_pid=identity.shell_pid,
-            )
-        created, _image, alive = windows_manager._process_facts(
-            identity.shell_pid, expected_start=identity.shell_start,
-        )
+            try:
+                client.close()
+            finally:
+                try:
+                    registry.stop(
+                        identity.session_id, expected_generation=identity.generation,
+                        expected_shell_pid=identity.shell_pid,
+                    )
+                finally:
+                    if shell_handle is not None:
+                        try:
+                            shell_exit_confirmed = _retained_process_handle_signaled(
+                                shell_handle
+                            )
+                        finally:
+                            shell_handle.Close()
         registry_empty = not registry.list_sessions()
         if label == "short_untruncated":
             short_root_cleanup_verified = (
-                created == identity.shell_start and not alive and registry_empty
+                shell_exit_confirmed and registry_empty
             )
         product_results.append({
             "case": label,
@@ -2976,9 +3177,7 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
             "initial_size_matches": bool(
                 last is not None and (last.columns, last.lines) == (100, 30)
             ),
-            "owned_shell_exited_after_stop": bool(
-                created == identity.shell_start and not alive
-            ),
+            "owned_shell_exited_after_stop": shell_exit_confirmed,
             "registry_empty_after_stop": registry_empty,
         })
         print("R02_PRODUCT_STARTUP " + json.dumps(product_results[-1], sort_keys=True))
@@ -3010,6 +3209,8 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
     identity_valid_at_startup = identity_is_session_owned(
         identity, diagnostic_manager
     )
+    shell_handle = None
+    shell_exit_confirmed = False
     initial = None
     raw_tail = ""
     path_marker_matches = False
@@ -3018,6 +3219,9 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
     path_sequence_current = False
     path_output_tail = ""
     try:
+        shell_handle = _retain_test_process_handle(
+            identity.shell_pid, identity.shell_start, identity.shell_path
+        )
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             update = client.poll()
@@ -3127,14 +3331,22 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
             except (OSError, ValueError, UnicodeError):
                 stages[stage] = None
     finally:
-        client.close()
-        registry.stop(
-            identity.session_id, expected_generation=identity.generation,
-            expected_shell_pid=identity.shell_pid,
-        )
-        created, _image, alive = diagnostic_manager._process_facts(
-            identity.shell_pid, expected_start=identity.shell_start,
-        )
+        try:
+            client.close()
+        finally:
+            try:
+                registry.stop(
+                    identity.session_id, expected_generation=identity.generation,
+                    expected_shell_pid=identity.shell_pid,
+                )
+            finally:
+                if shell_handle is not None:
+                    try:
+                        shell_exit_confirmed = _retained_process_handle_signaled(
+                            shell_handle
+                        )
+                    finally:
+                        shell_handle.Close()
         instrumented_result = {
             "case": "long",
             "nonce": nonce,
@@ -3169,9 +3381,7 @@ def test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy(
                 last.snapshot_sequence if last is not None else None
             ),
             "stages": stages,
-            "owned_shell_exited_after_stop": bool(
-                created == identity.shell_start and not alive
-            ),
+            "owned_shell_exited_after_stop": shell_exit_confirmed,
             "registry_empty_after_stop": not registry.list_sessions(),
             "trace_directory_private": windows_manager.is_private_directory(trace_dir),
         }
