@@ -83,17 +83,7 @@ def _conpty_command_template(value, test_start, nonce):
 
 def _conpty_powershell_error_categories(text):
     """Classify PowerShell error records without treating echoed input as errors."""
-    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
-    lines = []
-    for line in cleaned.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        # ConPTY echoes commands after the prompt; continuation prompts may
-        # echo a multiline command on following rows. Do not classify either.
-        if re.match(r"^\s*PS\s+.+?>", line):
-            continue
-        if re.match(r"^\s*>>(?:\s|$)", line):
-            continue
-        lines.append(line)
-    diagnostic_text = "\n".join(lines)
+    diagnostic_text = _conpty_output_without_input_echo(text)
     patterns = (
         (
             "ParserError",
@@ -129,6 +119,82 @@ def _conpty_powershell_error_categories(text):
         category for category, pattern in patterns
         if re.search(pattern, diagnostic_text)
     ]
+
+
+def _conpty_output_without_input_echo(text):
+    """Remove prompt and continuation input lines before reading diagnostic output."""
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    lines = []
+    for line in cleaned.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        # ConPTY echoes commands after the prompt; continuation prompts may
+        # echo a multiline command on following rows. Do not classify either.
+        if re.match(r"^\s*PS\s+.+?>", line):
+            continue
+        if re.match(r"^\s*>>(?:\s|$)", line):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _r02_checkpoint_observation(
+        expected_value, observed_value, *, is_error_stage=False,
+        read_error_category=None, write_error_category=None):
+    """Classify checkpoint evidence without treating absence as non-execution."""
+    matches = False
+    if observed_value is not None:
+        if is_error_stage:
+            fields = observed_value.split("|", 2)
+            matches = (
+                len(fields) == 3
+                and fields[0] == expected_value
+                and bool(fields[1])
+                and bool(fields[2])
+            )
+        else:
+            matches = observed_value == expected_value
+
+    if write_error_category:
+        state = "EVIDENCE_WRITE_ERROR"
+    elif read_error_category:
+        state = "EVIDENCE_READ_ERROR"
+    elif matches:
+        state = "OBSERVED"
+    else:
+        state = "UNKNOWN"
+    return {
+        "state": state,
+        "present": observed_value is not None,
+        "matches": matches,
+        "read_error_category": read_error_category,
+        "write_error_category": write_error_category,
+    }
+
+
+def _r02_ps_quote(value):
+    return str(value).replace("'", "''")
+
+
+def _r02_ps_concat_literal(value, split_token="WRITE_ERROR_"):
+    """Split emitted diagnostic tokens so echoed input cannot mimic output."""
+    split_at = value.find(split_token)
+    if split_at <= 0:
+        raise ValueError("diagnostic token must contain a non-leading split token")
+    return (
+        "'" + _r02_ps_quote(value[:split_at]) + "' + '"
+        + _r02_ps_quote(value[split_at:]) + "'"
+    )
+
+
+def _r02_expected_location_guard(expected_path):
+    """Build a PowerShell guard that verifies the normalized expected path."""
+    expected = _r02_ps_quote(expected_path)
+    return (
+        "$__jtt_actual=[System.IO.Path]::GetFullPath($PWD.Path); "
+        "$__jtt_expected=[System.IO.Path]::GetFullPath('" + expected + "'); "
+        "if (-not [System.String]::Equals($__jtt_actual,$__jtt_expected,"
+        "[System.StringComparison]::OrdinalIgnoreCase)) { "
+        "throw 'JTT_EXPECTED_LOCATION_MISMATCH' }"
+    )
 
 
 def _r02_failure_categories(
@@ -2890,6 +2956,11 @@ def _run_native_conpty_input_execution_comparison(
     destination = start / "destination"
     start.mkdir(parents=True)
     destination.mkdir()
+    checkpoint_root = start / ".jtt-r02-checkpoints"
+    checkpoint_root.mkdir()
+    resolved_start = start.resolve()
+    assert not checkpoint_root.is_symlink()
+    assert checkpoint_root.resolve().is_relative_to(resolved_start)
     monkeypatch.chdir(start)
     nonce = uuid.uuid4().hex[:10]
     direct_home = root / "direct-home"
@@ -2902,7 +2973,93 @@ def _run_native_conpty_input_execution_comparison(
     worker_home.mkdir()
 
     def ps_quote(value):
-        return str(value).replace("'", "''")
+        return _r02_ps_quote(value)
+
+    def checkpoint_contract(label, stages):
+        stage_meanings = {
+            "COMMAND_ENTRY": "POWERSHELL_COMMAND_BODY_ENTERED",
+            "BEFORE_LOCATION": "SET_LOCATION_NOT_YET_RUN",
+            "AFTER_LOCATION": "EXPECTED_LOCATION_VERIFIED",
+            "AFTER_OUTPUT": "OUTPUT_API_CALL_RETURNED",
+            "ERROR": "POWERSHELL_ERROR_OBSERVED",
+        }
+        contract = {}
+        for stage in stages:
+            marker_path = checkpoint_root / (
+                f"{label.lower()}-{stage.lower()}-{nonce}.marker"
+            )
+            if (not marker_path.is_absolute()
+                    or not marker_path.resolve(strict=False).is_relative_to(
+                        resolved_start
+                    )):
+                raise AssertionError(
+                    "R02 checkpoint path escaped the test-owned working tree"
+                )
+            contract[stage] = {
+                "path": marker_path,
+                "value": f"JTT_R02_{label}_{stage}_{nonce}",
+                "write_error_prefix": (
+                    f"JTT_R02_EVIDENCE_WRITE_ERROR_{label}_{stage}_{nonce}_"
+                ),
+                "meaning": stage_meanings[stage],
+            }
+        return contract
+
+    def checkpoint_write(contract, stage):
+        checkpoint = contract[stage]
+        return (
+            "try { [System.IO.File]::WriteAllText('"
+            + ps_quote(checkpoint["path"]) + "','"
+            + ps_quote(checkpoint["value"]) + "') } catch { "
+            "$__jtt_checkpoint_write_error=$_; "
+            "try { [System.Console]::Error.WriteLine("
+            + _r02_ps_concat_literal(checkpoint["write_error_prefix"])
+            + " + $__jtt_checkpoint_write_error.Exception.GetType().FullName) "
+            "} catch {}; throw $__jtt_checkpoint_write_error.Exception }"
+        )
+
+    def checkpoint_write_error(contract):
+        checkpoint = contract["ERROR"]
+        return (
+            "try { [System.IO.File]::WriteAllText('"
+            + ps_quote(checkpoint["path"]) + "','"
+            + ps_quote(checkpoint["value"]) + "|' + $__jtt_error_type + '|' + "
+            "$__jtt_error_id) } catch { "
+            "$__jtt_error_evidence_write_failure=$_; "
+            "try { [System.Console]::Error.WriteLine("
+            + _r02_ps_concat_literal(checkpoint["write_error_prefix"])
+            + " + $__jtt_error_evidence_write_failure.Exception.GetType().FullName) "
+            "} catch {} }"
+        )
+
+    def path_output_line():
+        return (
+            "[Console]::WriteLine('JTT_PATH_OUTPUT_' + $PWD.Path + '_' + '"
+            + nonce + "' + '_END')"
+        )
+
+    def path_change_body(
+            label, location_command, marker_path, expected_path, checkpoints):
+        return (
+            "try { "
+            + checkpoint_write(checkpoints, "COMMAND_ENTRY") + "; "
+            + checkpoint_write(checkpoints, "BEFORE_LOCATION") + "; "
+            + location_command + "; "
+            + _r02_expected_location_guard(expected_path) + "; "
+            + checkpoint_write(checkpoints, "AFTER_LOCATION") + "; "
+            + "$__jtt_actual=$PWD.Path; "
+            + "[System.IO.File]::WriteAllText('" + marker_path
+            + "',$__jtt_actual); "
+            + path_output_line() + "; "
+            + checkpoint_write(checkpoints, "AFTER_OUTPUT") + "; "
+            + "[Console]::WriteLine('JTT_EXEC_'+ '" + label + "_' + '"
+            + nonce + "' + '_END')"
+            + " } catch { $__jtt_error=$_; "
+            + "$__jtt_error_type=$__jtt_error.Exception.GetType().FullName; "
+            + "$__jtt_error_id=$__jtt_error.FullyQualifiedErrorId; "
+            + checkpoint_write_error(checkpoints) + "; "
+            + "throw $__jtt_error.Exception }"
+        )
 
     def case_specs(label, home, scenario):
         marker = f"JTT_EXEC_{label}_{nonce}_END"
@@ -2924,16 +3081,15 @@ def _run_native_conpty_input_execution_comparison(
         marker_value = nonce
         unicode_output_marker = None
         path_output_marker = None
-
-        def path_output_line():
-            return (
-                "[Console]::WriteLine('JTT_PATH_OUTPUT_' + $PWD.Path + '_' + '"
-                + nonce + "' + '_END')"
-            )
+        checkpoints = {}
+        script_contents = None
+        relative_location_command = None
 
         if label == "SHORT_ASCII":
+            checkpoints = checkpoint_contract(label, ("COMMAND_ENTRY",))
             commands = [(
-                "[System.IO.File]::WriteAllText('" + marker_path + "','"
+                checkpoint_write(checkpoints, "COMMAND_ENTRY") + "; "
+                + "[System.IO.File]::WriteAllText('" + marker_path + "','"
                 + nonce + "'); [Console]::WriteLine('JTT_EXEC_'+'SHORT_ASCII_'+"
                 + "'" + nonce + "'+'_END')",
                 marker,
@@ -3007,44 +3163,63 @@ def _run_native_conpty_input_execution_comparison(
         elif label == "PATH_CHANGE":
             expected_path = str(destination)
             path_output_marker = f"JTT_PATH_OUTPUT_{expected_path}_{nonce}_END"
+            checkpoints = checkpoint_contract(
+                label, ("COMMAND_ENTRY", "BEFORE_LOCATION", "AFTER_LOCATION",
+                        "AFTER_OUTPUT", "ERROR")
+            )
+            relative_location_command = None
             commands = [(
-                "Set-Location '" + ps_quote(destination) + "'; "
-                "$__jtt_actual=$PWD.Path; "
-                "[System.IO.File]::WriteAllText('" + marker_path
-                + "',$__jtt_actual); "
-                + path_output_line() + "; "
-                "[Console]::WriteLine('JTT_EXEC_'+'PATH_CHANGE_'+"
-                + "'" + nonce + "'+'_END')",
+                path_change_body(
+                    label,
+                    "Set-Location '" + ps_quote(destination) + "' -ErrorAction Stop",
+                    marker_path, expected_path, checkpoints,
+                ),
                 marker,
                 expected_path,
             )]
         elif label == "SHORT_PATH_CHANGE":
             expected_path = str(destination)
             path_output_marker = f"JTT_PATH_OUTPUT_{expected_path}_{nonce}_END"
+            checkpoints = checkpoint_contract(
+                label, ("COMMAND_ENTRY", "BEFORE_LOCATION", "AFTER_LOCATION",
+                        "AFTER_OUTPUT", "ERROR")
+            )
+            relative_location_command = (
+                "Set-Location '" + ps_quote(destination.name)
+                + "' -ErrorAction Stop"
+            )
             commands = [(
-                "Set-Location 'dest'; "
-                "[IO.File]::WriteAllText('" + marker_path + "',$PWD.Path); "
-                + path_output_line() + "; "
-                "[Console]::WriteLine('JTT_EXEC_'+'SHORT_PATH_CHANGE_'+"
-                + "'" + nonce + "'+'_END')",
+                path_change_body(
+                    label, relative_location_command, marker_path,
+                    expected_path,
+                    checkpoints,
+                ),
                 marker,
                 expected_path,
             )]
         elif label == "SCRIPT_PATH_CHANGE":
             expected_path = str(destination)
             path_output_marker = f"JTT_PATH_OUTPUT_{expected_path}_{nonce}_END"
+            checkpoints = checkpoint_contract(
+                label, ("COMMAND_ENTRY", "BEFORE_LOCATION", "AFTER_LOCATION",
+                        "AFTER_OUTPUT", "ERROR")
+            )
+            relative_location_command = (
+                "Set-Location '" + ps_quote(destination.name)
+                + "' -ErrorAction Stop"
+            )
             script_marker = (
                 "JTT_EXEC_SCRIPT_PATH_CHANGE_" + nonce + "_END"
             )
-            script_contents = (
-                "Set-Location 'dest'; "
-                "[IO.File]::WriteAllText('" + marker_path + "',$PWD.Path); "
-                + path_output_line() + "; "
-                "[Console]::WriteLine('JTT_EXEC_'+'SCRIPT_PATH_CHANGE_'+"
-                + "'" + nonce + "'+'_END')"
+            script_contents = path_change_body(
+                label, relative_location_command, marker_path,
+                expected_path,
+                checkpoints,
             )
             assert script_marker not in script_contents
             assert path_output_marker not in script_contents
+            assert relative_location_command in script_contents
+            assert script_path.parent.resolve() == resolved_start
             script_path.write_text(script_contents, encoding="utf-8")
             command = "& '.\\" + script_path.name + "'"
             commands = [(command, marker, expected_path)]
@@ -3073,10 +3248,46 @@ def _run_native_conpty_input_execution_comparison(
             and label in {"UNICODE_INPUT", "PATH_CHANGE"}
             else "single_write"
         )
+        relative_destination_matches = False
+        if relative_location_command is not None:
+            if label == "SCRIPT_PATH_CHANGE":
+                relative_destination_matches = (
+                    relative_location_command in (script_contents or "")
+                )
+            else:
+                relative_destination_matches = (
+                    relative_location_command in commands[0][0]
+                )
+        assert (
+            relative_destination_matches
+            if label in {"SHORT_PATH_CHANGE", "SCRIPT_PATH_CHANGE"}
+            else relative_location_command is None
+        )
+        case_metadata = {
+            "relative_destination_name": (
+                destination.name
+                if label in {"SHORT_PATH_CHANGE", "SCRIPT_PATH_CHANGE"}
+                else None
+            ),
+            "relative_location_command": relative_location_command,
+            "relative_destination_matches_fixture": (
+                relative_destination_matches
+                if relative_location_command is not None else None
+            ),
+            "relative_location_is_in_script": (
+                label == "SCRIPT_PATH_CHANGE"
+                and relative_destination_matches
+            ),
+            "script_resolves_under_test_working_directory": (
+                label == "SCRIPT_PATH_CHANGE"
+                and script_path.parent.resolve() == resolved_start
+            ),
+        }
         return [
             (
                 command, expected, expected_value, delivery_mode,
                 command_marker_file, unicode_output_marker, path_output_marker,
+                checkpoints, case_metadata,
             )
             for command, expected, expected_value, command_marker_file in commands
         ]
@@ -3095,9 +3306,15 @@ def _run_native_conpty_input_execution_comparison(
 
     def read_marker(marker_file):
         try:
-            return marker_file.read_text(encoding="utf-8").strip()
-        except (OSError, UnicodeError):
-            return None
+            if marker_file.is_symlink():
+                raise OSError("test-owned marker path is a symlink")
+            if not marker_file.resolve(strict=False).is_relative_to(resolved_start):
+                raise OSError("test-owned marker path escaped its root")
+            return marker_file.read_text(encoding="utf-8").strip(), None
+        except FileNotFoundError:
+            return None, None
+        except (OSError, UnicodeError) as exc:
+            return None, type(exc).__name__
 
     case_plans = _R02_INPUT_CASE_PLANS
 
@@ -3347,11 +3564,26 @@ def _run_native_conpty_input_execution_comparison(
                 for step_index, (
                     command, expected, expected_file_value, delivery_mode,
                     marker_file, unicode_output_marker, path_output_marker,
+                    checkpoints, case_metadata,
                 ) in enumerate(steps):
                     try:
                         marker_file.unlink(missing_ok=True)
+                        for checkpoint in checkpoints.values():
+                            checkpoint_path = checkpoint["path"]
+                            if checkpoint_path.is_symlink():
+                                raise OSError("checkpoint marker path is a symlink")
+                            if (not checkpoint_path.resolve(strict=False)
+                                    .is_relative_to(resolved_start)):
+                                raise OSError(
+                                    "checkpoint marker escaped test-owned directory"
+                                )
+                            checkpoint_path.unlink(missing_ok=True)
                     except OSError as exc:
-                        case_result["status"] = "TEST_MARKER_PREPARATION_ERROR"
+                        case_result["status"] = (
+                            "TEST_MARKER_PREPARATION_ERROR"
+                            if not checkpoints else
+                            "TEST_CHECKPOINT_PREPARATION_ERROR"
+                        )
                         case_result["marker_prepare_error_category"] = type(exc).__name__
                         stop_cases = True
                         break
@@ -3387,8 +3619,35 @@ def _run_native_conpty_input_execution_comparison(
                         "command_body_utf8_bytes": len(command.encode("utf-8")),
                         "command_body_is_ascii": command.isascii(),
                         "command_uses_test_owned_relative_destination": (
-                            "Set-Location 'dest'" in command
+                            bool(case_metadata[
+                                "relative_destination_matches_fixture"
+                            ])
                         ),
+                        "relative_destination_name": case_metadata[
+                            "relative_destination_name"
+                        ],
+                        "relative_location_command": case_metadata[
+                            "relative_location_command"
+                        ],
+                        "relative_location_is_in_script": case_metadata[
+                            "relative_location_is_in_script"
+                        ],
+                        "script_resolves_under_test_working_directory": (
+                            case_metadata[
+                                "script_resolves_under_test_working_directory"
+                            ]
+                        ),
+                        "checkpoint_contract": {
+                            stage: {
+                                "absolute_path": str(checkpoint["path"]),
+                                "path_under_test_working_directory": (
+                                    checkpoint["path"].resolve(strict=False)
+                                    .is_relative_to(resolved_start)
+                                ),
+                                "expected_value": checkpoint["value"],
+                            }
+                            for stage, checkpoint in checkpoints.items()
+                        },
                         "command_invokes_test_owned_script": (
                             label == "SCRIPT_PATH_CHANGE"
                             and command.startswith("& '.\\")
@@ -3408,6 +3667,25 @@ def _run_native_conpty_input_execution_comparison(
                             "present": True,
                             "bytes": len(script_bytes),
                             "sha256": hashlib.sha256(script_bytes).hexdigest(),
+                            "resolves_under_test_working_directory": (
+                                script_path.parent.resolve() == resolved_start
+                            ),
+                            "relative_destination_name": case_metadata[
+                                "relative_destination_name"
+                            ],
+                            "relative_destination_command_matches_fixture": (
+                                case_metadata[
+                                    "relative_destination_matches_fixture"
+                                ]
+                            ),
+                            "relative_invocation_matches_script_name": (
+                                command == "& '.\\" + script_path.name + "'"
+                            ),
+                            "script_body_contains_checkpoint_values": all(
+                                checkpoint["value"].encode("utf-8") in script_bytes
+                                for stage, checkpoint in checkpoints.items()
+                                if stage != "ERROR"
+                            ),
                             "input_invocation_contains_full_marker": (
                                 expected in command
                                 or (
@@ -3536,8 +3814,99 @@ def _run_native_conpty_input_execution_comparison(
                         break
 
                     def complete(raw_text, screen_text):
-                        value = read_marker(marker_file)
                         raw_delta = raw_text[raw_offset:]
+                        diagnostic_output = compact(
+                            _conpty_output_without_input_echo(raw_delta)
+                        )
+                        step["powershell_error_categories"] = (
+                            _conpty_powershell_error_categories(raw_delta)
+                        )
+                        step["powershell_error_observed_in_raw_output"] = bool(
+                            step["powershell_error_categories"]
+                        )
+                        value, marker_read_error_category = read_marker(marker_file)
+                        checkpoint_observations = {}
+                        for stage, checkpoint in checkpoints.items():
+                            checkpoint_value = None
+                            read_error_category = None
+                            try:
+                                if checkpoint["path"].is_symlink():
+                                    raise OSError(
+                                        "checkpoint marker path is a symlink"
+                                    )
+                                if not checkpoint["path"].resolve(
+                                        strict=False).is_relative_to(resolved_start):
+                                    raise OSError(
+                                        "checkpoint marker escaped test root"
+                                    )
+                                checkpoint_value = checkpoint["path"].read_text(
+                                    encoding="utf-8"
+                                ).strip()
+                            except FileNotFoundError:
+                                pass
+                            except (OSError, UnicodeError) as exc:
+                                read_error_category = type(exc).__name__
+                            expected_checkpoint_value = checkpoint["value"]
+                            is_error_stage = stage == "ERROR"
+                            write_error_category = None
+                            write_error_match = re.search(
+                                re.escape(checkpoint["write_error_prefix"])
+                                + r"([A-Za-z0-9_.+`]+)",
+                                diagnostic_output,
+                            )
+                            if write_error_match:
+                                write_error_category = write_error_match.group(1)
+                            observation = _r02_checkpoint_observation(
+                                expected_checkpoint_value,
+                                checkpoint_value,
+                                is_error_stage=is_error_stage,
+                                read_error_category=read_error_category,
+                                write_error_category=write_error_category,
+                            )
+                            observation["absolute_path"] = str(checkpoint["path"])
+                            observation["meaning"] = checkpoint["meaning"]
+                            observation["path_under_test_working_directory"] = (
+                                checkpoint["path"].resolve(strict=False)
+                                .is_relative_to(resolved_start)
+                            )
+                            if is_error_stage and observation["matches"]:
+                                error_fields = checkpoint_value.split("|", 2)
+                                observation["powershell_exception_type"] = (
+                                    error_fields[1] if len(error_fields) > 1 else None
+                                )
+                                observation["powershell_error_id"] = (
+                                    error_fields[2] if len(error_fields) > 2 else None
+                                )
+                            checkpoint_observations[stage] = observation
+                        step["checkpoint_markers"] = checkpoint_observations
+                        required_checkpoint_stages = (
+                            stage for stage in checkpoints if stage != "ERROR"
+                        )
+                        step["checkpoint_success_stages_observed"] = all(
+                            checkpoint_observations[stage]["state"] == "OBSERVED"
+                            for stage in required_checkpoint_stages
+                        )
+                        step["powershell_error_checkpoint_state"] = (
+                            checkpoint_observations.get("ERROR", {}).get(
+                                "state", "UNKNOWN"
+                            )
+                        )
+                        step["checkpoint_evidence_write_error_observed"] = any(
+                            observation["write_error_category"] is not None
+                            for observation in checkpoint_observations.values()
+                        )
+                        step["checkpoint_evidence_read_error_observed"] = any(
+                            observation["read_error_category"] is not None
+                            for observation in checkpoint_observations.values()
+                        )
+                        step["side_effect_marker_state"] = (
+                            "EVIDENCE_READ_ERROR"
+                            if marker_read_error_category
+                            else "UNKNOWN"
+                        )
+                        step["side_effect_marker_read_error_category"] = (
+                            marker_read_error_category
+                        )
                         raw_marker = expected in compact(raw_delta)
                         screen_marker = expected in compact(screen_text)
                         step["command_echo_in_pty_or_poll"] = (
@@ -3605,6 +3974,10 @@ def _run_native_conpty_input_execution_comparison(
                             else bool(value) and os.path.normcase(value)
                             == os.path.normcase(expected_file_value)
                         )
+                        if step["side_effect_file_matches"]:
+                            step["side_effect_marker_state"] = "OBSERVED"
+                        elif not marker_read_error_category:
+                            step["side_effect_marker_state"] = "UNKNOWN"
                         step["command_execution_proven"] = bool(
                             step["side_effect_file_matches"]
                         )
@@ -3710,9 +4083,6 @@ def _run_native_conpty_input_execution_comparison(
                             "SCREEN_PROMPT_VISIBLE" if screen_prompt_visible
                             else "SCREEN_PROMPT_UNOBSERVED"
                         )
-                        step["powershell_error_categories"] = (
-                            _conpty_powershell_error_categories(raw_delta)
-                        )
                         if label == "UNICODE_INPUT":
                             raw_unicode_count = raw_delta.count("한글")
                             screen_unicode_count = screen_text.count("한글")
@@ -3724,6 +4094,16 @@ def _run_native_conpty_input_execution_comparison(
                             and step["prompt_status"] == "PROMPT_RETURNED"
                             and step["screen_prompt_status"] == "SCREEN_PROMPT_VISIBLE"
                             and step["prompt_returned_after_expected_marker"]
+                            and step["checkpoint_success_stages_observed"]
+                            and step["powershell_error_checkpoint_state"]
+                            != "OBSERVED"
+                            and not step[
+                                "checkpoint_evidence_write_error_observed"
+                            ]
+                            and not step[
+                                "checkpoint_evidence_read_error_observed"
+                            ]
+                            and not step["powershell_error_categories"]
                         )
 
                     result["last_observation_stage"] = "observe_input_echo_and_execution"
@@ -4011,9 +4391,23 @@ def _run_native_conpty_input_execution_comparison(
         )
         if scenario == "short_path_change_standalone":
             assert step["command_uses_test_owned_relative_destination"]
+            assert step["relative_destination_name"] == destination.name
+            assert step["relative_destination_matches_fixture"] is True
         if scenario == "script_path_change_standalone":
             assert step["command_invokes_test_owned_script"]
             script_info = step["command_file"]
+            assert script_info[
+                "resolves_under_test_working_directory"
+            ] is True
+            assert script_info[
+                "relative_destination_command_matches_fixture"
+            ] is True
+            assert script_info[
+                "relative_invocation_matches_script_name"
+            ] is True
+            assert script_info[
+                "script_body_contains_checkpoint_values"
+            ] is True
             assert not script_info["input_invocation_contains_full_marker"]
             assert not script_info["script_body_contains_full_markers"]
         return
