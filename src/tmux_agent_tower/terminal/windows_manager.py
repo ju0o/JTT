@@ -17,6 +17,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import zlib
@@ -39,6 +40,12 @@ from .manager import (
     _identity,
     _terminal_identity_key,
     _validate_name,
+)
+from .windows_ipc import (
+    FILE_FLAG_OVERLAPPED,
+    OverlappedPipeTransport,
+    PipeIoCapacityError,
+    PipeIoTimeout,
 )
 
 
@@ -1009,6 +1016,11 @@ class TerminalRegistry:
             raise TerminalError("terminal identity changed before stop")
         if expected_shell_pid is not None and identity.shell_pid != int(expected_shell_pid):
             raise TerminalError("terminal identity changed before stop")
+        if identity.state == "stopping":
+            raise TerminalError(
+                "terminal stop outcome is unknown; registry retained",
+                diagnostic={"stage": "metadata", "exception": "stop_already_in_progress"},
+            )
         # Stop replies include an owned-process exit confirmation bounded by
         # the worker's shell wait and Job drain deadlines. Use the same
         # explicit Stop budget instead of the shorter observer default.
@@ -1016,7 +1028,15 @@ class TerminalRegistry:
         try:
             if _terminal_identity_key(client.identity) != _terminal_identity_key(identity):
                 raise TerminalError("terminal identity changed before stop")
-            client._request("stop")
+            try:
+                client._request("stop")
+            except TerminalError as exc:
+                if client.stop_outcome_unknown:
+                    raise TerminalError(
+                        "terminal stop outcome is unknown; registry retained",
+                        diagnostic=client.stop_failure_diagnostic,
+                    ) from exc
+                raise
         finally:
             client.close()
         deadline = time.monotonic() + STOP_TIMEOUT
@@ -1321,7 +1341,7 @@ def _identity_payload(identity: TerminalIdentity) -> dict[str, Any]:
 
 
 class TerminalClient:
-    """Synchronous, bounded client for one owner-SID named-pipe connection."""
+    """Deadline-bound client for one owner-SID named-pipe connection."""
 
     def __init__(self, root: Path, session_dir: Path, identity: TerminalIdentity,
                  pipe_name: str, *, timeout: float = 3.0):
@@ -1340,33 +1360,55 @@ class TerminalClient:
         self._output_cursor = 0
         self._client_id = uuid.uuid4().hex
         self._closed = False
+        self._request_lock = threading.Lock()
+        self._transport = None
+        self.stop_outcome_unknown = False
+        self.stop_failure_diagnostic = None
         try:
             timeout_ms = max(1, min(30000, int(float(timeout) * 1000)))
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise TerminalError("terminal connection timeout is invalid") from exc
+        io_timeout = timeout_ms / 1000.0
+        pipe_handle = None
         try:
             win32pipe.WaitNamedPipe(pipe_name, timeout_ms)
-            self._pipe = win32file.CreateFile(
+            pipe_handle = win32file.CreateFile(
                 pipe_name, win32con.GENERIC_READ | win32con.GENERIC_WRITE, 0,
-                None, win32con.OPEN_EXISTING, 0, None,
+                None, win32con.OPEN_EXISTING,
+                getattr(win32con, "FILE_FLAG_OVERLAPPED", FILE_FLAG_OVERLAPPED), None,
             )
             win32pipe.SetNamedPipeHandleState(
-                self._pipe, win32pipe.PIPE_READMODE_MESSAGE, None, None
+                pipe_handle, win32pipe.PIPE_READMODE_MESSAGE, None, None
             )
-            if _named_pipe_server_pid(self._pipe) != identity.supervisor_pid:
+            if _named_pipe_server_pid(pipe_handle) != identity.supervisor_pid:
                 raise TerminalError("terminal named pipe server identity is stale")
+            self._transport = OverlappedPipeTransport(
+                pipe_handle, timeout=io_timeout, max_read_bytes=MAX_FRAME
+            )
+            pipe_handle = None  # transport now owns the exact client handle
             self._request("hello")
         except Exception as exc:
-            if hasattr(self, "_pipe"):
-                self._pipe.Close()
+            if self._transport is not None:
+                self._transport.close()
+            elif pipe_handle is not None:
+                pipe_handle.Close()
             self._closed = True
             if isinstance(exc, TerminalError):
                 raise
             raise TerminalError("terminal supervisor connection failed") from exc
 
     def _request(self, operation: str, **fields: Any) -> dict[str, Any]:
+        with self._request_lock:
+            return self._request_locked(operation, **fields)
+
+    def _request_locked(self, operation: str, **fields: Any) -> dict[str, Any]:
         if self._closed:
             raise TerminalError("terminal client is closed")
+        if operation == "stop" and self.stop_outcome_unknown:
+            raise TerminalError(
+                "terminal stop outcome is unknown; registry retained",
+                diagnostic=self.stop_failure_diagnostic,
+            )
         if operation in ("acquire", "input", "resize", "stop"):
             try:
                 _session_dir, metadata = _validate_identity(self._root, self.identity.session_id)
@@ -1384,18 +1426,57 @@ class TerminalClient:
         frame = json.dumps(request, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         if len(frame) > MAX_REQUEST_FRAME:
             raise TerminalError("terminal request is too large")
-        import win32file
         try:
-            win32file.WriteFile(self._pipe, frame)
-            _status, payload = win32file.ReadFile(self._pipe, MAX_FRAME)
+            payload = self._transport.exchange(frame)
             response = json.loads(payload.decode("utf-8"))
+        except PipeIoTimeout as exc:
+            self.state, self.synced, self.lease = "unavailable", False, False
+            self._transport.poison()
+            if operation == "stop":
+                self.stop_outcome_unknown = True
+                self.stop_failure_diagnostic = {
+                    "stage": exc.stage,
+                    "exception": "io_timeout_" + exc.cancel_state.replace(":", "_"),
+                }
+                if self._transport.close_error:
+                    self.stop_failure_diagnostic["cleanup_exception"] = self._transport.close_error
+                raise TerminalError(
+                    "terminal stop outcome is unknown; registry retained",
+                    diagnostic=self.stop_failure_diagnostic,
+                ) from exc
+            raise TerminalError("terminal supervisor connection timed out") from exc
         except Exception as exc:
             self.state, self.synced, self.lease = "unavailable", False, False
+            self._transport.poison()
+            if operation == "stop" and (
+                    not isinstance(exc, PipeIoCapacityError)
+                    or exc.request_may_have_been_sent):
+                self.stop_outcome_unknown = True
+                self.stop_failure_diagnostic = {
+                    "stage": "pipe_exchange", "exception": "io_result_unknown",
+                }
+                if self._transport.close_error:
+                    self.stop_failure_diagnostic["cleanup_exception"] = self._transport.close_error
             raise TerminalError("terminal supervisor connection failed") from exc
         if not isinstance(response, dict):
+            self._transport.poison()
+            if operation == "stop":
+                self.stop_outcome_unknown = True
+                self.stop_failure_diagnostic = {
+                    "stage": "response", "exception": "invalid_response",
+                }
             raise TerminalError("terminal response is invalid")
         if not response.get("ok"):
             reason = str(response.get("error") or "terminal request rejected")
+            if operation == "stop" and response.get("state") in ("stopping", "exited"):
+                self.stop_outcome_unknown = True
+                self.stop_failure_diagnostic = {
+                    "stage": "stop_response", "exception": "outcome_not_confirmed",
+                }
+                raise TerminalError(
+                    "terminal stop outcome is unknown; registry retained",
+                    diagnostic=self.stop_failure_diagnostic,
+                )
             if reason in ("stale_identity", "session_exited", "input_lease_required",
                           "stream_gap", "lease_expired", "renderer_unavailable",
                           "input_delivery_unconfirmed"):
@@ -1407,6 +1488,12 @@ class TerminalClient:
         if (response.get("session_id") != self.identity.session_id
                 or response.get("generation") != self.identity.generation):
             self.synced = self.lease = False
+            self._transport.poison()
+            if operation == "stop":
+                self.stop_outcome_unknown = True
+                self.stop_failure_diagnostic = {
+                    "stage": "response_identity", "exception": "identity_mismatch",
+                }
             raise TerminalError("stale_identity")
         self.state = str(response.get("state", self.state))
         if "lease" in response:
@@ -1522,15 +1609,16 @@ class TerminalClient:
         self._request("resize", columns=columns, lines=lines, after=self._output_cursor)
 
     def close(self) -> None:
-        if self._closed:
-            return
-        if self.lease:
-            try:
-                self._request("release")
-            except TerminalError:
-                pass
-        self._closed, self.lease, self.synced = True, False, False
-        self._pipe.Close()
+        with self._request_lock:
+            if self._closed:
+                return
+            if self.lease:
+                try:
+                    self._request_locked("release")
+                except TerminalError:
+                    pass
+            self._closed, self.lease, self.synced = True, False, False
+            self._transport.close()
 
     def __enter__(self) -> "TerminalClient":
         return self

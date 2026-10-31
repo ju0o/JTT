@@ -74,18 +74,141 @@ def _conpty_input_chunks(command, delivery_mode, *, terminator="\r"):
     raise ValueError("unknown ConPTY diagnostic input delivery mode")
 
 
-def _conpty_powershell_error_categories(text):
-    """Classify recognizable PowerShell error lines, never echoed command text."""
-    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
-    patterns = (
-        ("ParserError", r"(?m)^\s*(?:ParserError|At line:\d+ char:\d+)\b"),
-        ("Set-Location", r"(?m)^\s*Set-Location\s*:\s"),
-        ("Start-Process", r"(?m)^\s*Start-Process\s*:\s"),
-        ("Cannot find path", r"(?m)^\s*Cannot find path\b"),
-        ("FullyQualifiedErrorId", r"(?m)^\s*FullyQualifiedErrorId\s*:\s"),
-        ("Write-Error", r"(?m)^\s*Write-Error\s*:\s"),
+def _conpty_command_template(value, test_start, nonce):
+    """Normalize only test-owned paths and nonce for cross-job A/B comparison."""
+    return value.replace(str(test_start), "<JTT_TEST_START>").replace(
+        nonce, "<NONCE>"
     )
-    return [category for category, pattern in patterns if re.search(pattern, cleaned)]
+
+
+def _conpty_powershell_error_categories(text):
+    """Classify PowerShell error records without treating echoed input as errors."""
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    lines = []
+    for line in cleaned.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        # ConPTY echoes commands after the prompt; continuation prompts may
+        # echo a multiline command on following rows. Do not classify either.
+        if re.match(r"^\s*PS\s+.+?>", line):
+            continue
+        if re.match(r"^\s*>>(?:\s|$)", line):
+            continue
+        lines.append(line)
+    diagnostic_text = "\n".join(lines)
+    patterns = (
+        (
+            "ParserError",
+            r"(?im)^\s*\+?\s*CategoryInfo\s*:\s*ParserError\b",
+        ),
+        (
+            "PSSecurityException",
+            r"(?im)^\s*\+?\s*CategoryInfo\s*:\s*SecurityError\b.*"
+            r"\bPSSecurityException\b",
+        ),
+        (
+            "ExecutionPolicy",
+            r"(?im)^\s*&\s*:\s*File\b.*cannot be loaded because "
+            r"running scripts is disabled\b",
+        ),
+        (
+            "UnauthorizedAccessException",
+            r"(?im)^\s*\+?\s*CategoryInfo\s*:\s*.*"
+            r"\bUnauthorizedAccessException\b|"
+            r"^\s*\+?\s*FullyQualifiedErrorId\s*:\s*UnauthorizedAccess\b",
+        ),
+        ("Set-Location", r"(?im)^\s*Set-Location\s*:\s"),
+        ("Start-Process", r"(?im)^\s*Start-Process\s*:\s"),
+        ("Cannot find path", r"(?im)^\s*Cannot find path\b"),
+        ("CommandNotFoundException", r"(?im)^\s*\+?\s*CategoryInfo\s*:\s*.*\bCommandNotFoundException\b"),
+        ("ParameterBindingException", r"(?im)^\s*\+?\s*CategoryInfo\s*:\s*.*\bParameterBindingException\b"),
+        ("InvalidOperationException", r"(?im)^\s*\+?\s*CategoryInfo\s*:\s*.*\bInvalidOperationException\b"),
+        ("Write-Error", r"(?im)^\s*Write-Error\s*:\s"),
+        ("FullyQualifiedErrorId", r"(?im)^\s*\+?\s*FullyQualifiedErrorId\s*:\s"),
+        ("PowerShellErrorRecord", r"(?im)^\s*\+?\s*CategoryInfo\s*:\s"),
+    )
+    return [
+        category for category, pattern in patterns
+        if re.search(pattern, diagnostic_text)
+    ]
+
+
+def _r02_failure_categories(
+        product_command=None, diagnostic_evidence=None, cleanup=None):
+    """Keep product, diagnostic-write, and cleanup failures independently visible."""
+    return {
+        "product_command": product_command,
+        "diagnostic_evidence": diagnostic_evidence,
+        "cleanup": cleanup,
+    }
+
+
+_R02_BASELINE_INPUT_SCENARIOS = (
+    "baseline",
+    "unicode_first",
+    "ascii_then_unicode",
+    "ascii_then_unicode_per_key",
+    "ascii_then_unicode_crlf",
+    "unicode_output_only",
+    "path_standalone_single_write",
+    "path_standalone_single_write_crlf",
+    "path_after_ascii_single_write",
+    "path_after_ascii_per_key",
+)
+_R02_BASELINE_INPUT_GROUPS = (
+    ("baseline", ("baseline",)),
+    ("unicode", (
+        "unicode_first",
+        "ascii_then_unicode",
+        "ascii_then_unicode_per_key",
+        "ascii_then_unicode_crlf",
+        "unicode_output_only",
+    )),
+    ("path", (
+        "path_standalone_single_write",
+        "path_standalone_single_write_crlf",
+        "path_after_ascii_single_write",
+        "path_after_ascii_per_key",
+    )),
+)
+_R02_UNICODE_FACTOR_SCENARIOS = (
+    "unicode_first",
+    "ascii_then_unicode",
+    "ascii_then_unicode_per_key",
+    "ascii_then_unicode_crlf",
+)
+_R02_PATH_FACTOR_SCENARIOS = (
+    "path_standalone_single_write",
+    "path_standalone_single_write_crlf",
+    "path_after_ascii_single_write",
+    "path_after_ascii_per_key",
+)
+_R02_DIRECT_WORKER_COMPARE_SCENARIOS = (
+    ("unicode_first", "UNICODE_INPUT"),
+    ("ascii_then_unicode", "UNICODE_INPUT"),
+    ("unicode_output_only", "UNICODE_OUTPUT_ONLY"),
+    ("path_standalone_single_write", "PATH_CHANGE"),
+)
+_R02_INPUT_CASE_PLANS = {
+    "short_ascii_standalone": ("SHORT_ASCII",),
+    "baseline": (
+        "SHORT_ASCII", "LONG_ASCII", "MULTI_STEP",
+        "UNICODE_INPUT", "PATH_CHANGE",
+    ),
+    "unicode_first": ("UNICODE_INPUT",),
+    "ascii_then_unicode": ("SHORT_ASCII", "UNICODE_INPUT"),
+    "ascii_then_unicode_per_key": ("SHORT_ASCII", "UNICODE_INPUT"),
+    "ascii_then_unicode_crlf": ("SHORT_ASCII", "UNICODE_INPUT"),
+    "unicode_output_only": ("UNICODE_OUTPUT_ONLY",),
+    "short_path_change_standalone": ("SHORT_PATH_CHANGE",),
+    "script_path_change_standalone": ("SCRIPT_PATH_CHANGE",),
+    "path_standalone_single_write": ("PATH_CHANGE",),
+    "path_standalone_single_write_crlf": ("PATH_CHANGE",),
+    "path_after_ascii_single_write": ("SHORT_ASCII", "PATH_CHANGE"),
+    "path_after_ascii_per_key": ("SHORT_ASCII", "PATH_CHANGE"),
+}
+_R02_ADDITIONAL_AB_SCENARIOS = (
+    "short_path_change_standalone",
+    "script_path_change_standalone",
+)
 
 
 def _conpty_prompt_returned_after_marker(text, marker):
@@ -99,6 +222,87 @@ def _conpty_prompt_returned_after_marker(text, marker):
         re.fullmatch(r"PS\s+.+?>\s*", line.strip()) is not None
         for line in trailing.replace("\r", "\n").split("\n")
     )
+
+
+def _conpty_prompt_seen(text):
+    """Detect a PowerShell prompt independently of any command output marker."""
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    lines = cleaned.replace("\r", "\n").split("\n")
+    for index, line in enumerate(lines):
+        candidate = line.strip()
+        if not candidate.startswith("PS "):
+            continue
+        for offset, continuation in enumerate(lines[index:index + 16]):
+            if offset:
+                next_part = continuation.strip()
+                if next_part.startswith("PS "):
+                    break
+                candidate += next_part
+            if ">" in candidate:
+                if not candidate.rsplit(">", 1)[1].strip():
+                    return True
+                break
+            if len(candidate) > 2048:
+                break
+    return False
+
+
+def _conpty_prompt_seen_after_marker(text, marker):
+    """Detect a prompt after fresh output, including a wrapped long path."""
+    cleaned = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    position = cleaned.rfind(marker)
+    return position >= 0 and _conpty_prompt_seen(cleaned[position + len(marker):])
+
+
+_R02_EVIDENCE_RELATIVE_PATH = Path("test-results") / "r02-input-factor.jsonl"
+_R02_EVIDENCE_FILENAME = "r02-input-factor.jsonl"
+
+
+def _resolve_r02_evidence_path(setting, initial_cwd):
+    """Anchor the sole allowed evidence path before a diagnostic chdir."""
+    if not setting:
+        return None
+    if Path(setting) != _R02_EVIDENCE_RELATIVE_PATH:
+        raise ValueError("unexpected diagnostic evidence path")
+
+    root = Path(initial_cwd).resolve(strict=True)
+    evidence_dir = root / "test-results"
+    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
+        raise OSError("test-owned evidence directory unavailable")
+    resolved_dir = evidence_dir.resolve(strict=True)
+    if resolved_dir != evidence_dir or resolved_dir.parent != root:
+        raise OSError("test-owned evidence directory changed identity")
+
+    evidence_path = resolved_dir / _R02_EVIDENCE_FILENAME
+    if evidence_path.is_symlink():
+        raise OSError("test-owned evidence file must not be a symlink")
+    if evidence_path.exists() and not evidence_path.is_file():
+        raise OSError("test-owned evidence path is not a regular file")
+    return evidence_path
+
+
+def _append_r02_evidence_record(evidence_path, initial_cwd, evidence):
+    """Append one stage record only to the anchored test-owned JSONL file."""
+    if evidence_path is None:
+        return
+    root = Path(initial_cwd).resolve(strict=True)
+    evidence_dir = root / "test-results"
+    expected_path = evidence_dir / _R02_EVIDENCE_FILENAME
+    if evidence_path != expected_path:
+        raise ValueError("diagnostic evidence path escaped the test-owned directory")
+    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
+        raise OSError("test-owned evidence directory unavailable")
+    if evidence_dir.resolve(strict=True) != evidence_dir:
+        raise OSError("test-owned evidence directory changed identity")
+    if evidence_path.is_symlink():
+        raise OSError("test-owned evidence file must not be a symlink")
+    if evidence_path.exists() and not evidence_path.is_file():
+        raise OSError("test-owned evidence path is not a regular file")
+    with evidence_path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(evidence, ensure_ascii=True, sort_keys=True, default=str))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _owned_job_parser_preflight_evidence(
@@ -2669,9 +2873,9 @@ def test_native_input_reply_sequence_does_not_ack_unread_output(tmp_path):
             )
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
-def test_native_conpty_input_execution_path_comparison(
-        tmp_path, monkeypatch, record_property):
+def _run_native_conpty_input_execution_comparison(
+        tmp_path, monkeypatch, record_property, *, scenario_names,
+        path_selection=("direct", "worker"), diagnostic_only=False):
     """Compare steady-state commands in one direct and one JTT-owned shell."""
     import ju0_terminal_tower  # noqa: F401 - installs the guarded namespace
     import pyte
@@ -2690,6 +2894,10 @@ def test_native_conpty_input_execution_path_comparison(
     nonce = uuid.uuid4().hex[:10]
     direct_home = root / "direct-home"
     worker_home = root / "worker-home"
+    path_change_labels = {
+        "PATH_CHANGE", "SHORT_PATH_CHANGE", "SCRIPT_PATH_CHANGE",
+    }
+    script_path = start / f"path-change-{nonce}.ps1"
     direct_home.mkdir()
     worker_home.mkdir()
 
@@ -2703,6 +2911,8 @@ def test_native_conpty_input_execution_path_comparison(
             "UNICODE_INPUT": start / f"u-{nonce}.txt",
             "UNICODE_OUTPUT_ONLY": start / f"unicode-output-{nonce}.marker",
             "PATH_CHANGE": start / f"path-change-{nonce}.marker",
+            "SHORT_PATH_CHANGE": destination / f"short-path-{nonce}.marker",
+            "SCRIPT_PATH_CHANGE": destination / f"script-path-{nonce}.marker",
         }
         marker_file = marker_files.get(
             label,
@@ -2713,6 +2923,14 @@ def test_native_conpty_input_execution_path_comparison(
         )
         marker_value = nonce
         unicode_output_marker = None
+        path_output_marker = None
+
+        def path_output_line():
+            return (
+                "[Console]::WriteLine('JTT_PATH_OUTPUT_' + $PWD.Path + '_' + '"
+                + nonce + "' + '_END')"
+            )
+
         if label == "SHORT_ASCII":
             commands = [(
                 "[System.IO.File]::WriteAllText('" + marker_path + "','"
@@ -2788,22 +3006,62 @@ def test_native_conpty_input_execution_path_comparison(
             )]
         elif label == "PATH_CHANGE":
             expected_path = str(destination)
+            path_output_marker = f"JTT_PATH_OUTPUT_{expected_path}_{nonce}_END"
             commands = [(
                 "Set-Location '" + ps_quote(destination) + "'; "
                 "$__jtt_actual=$PWD.Path; "
                 "[System.IO.File]::WriteAllText('" + marker_path
                 + "',$__jtt_actual); "
+                + path_output_line() + "; "
                 "[Console]::WriteLine('JTT_EXEC_'+'PATH_CHANGE_'+"
                 + "'" + nonce + "'+'_END')",
                 marker,
                 expected_path,
             )]
+        elif label == "SHORT_PATH_CHANGE":
+            expected_path = str(destination)
+            path_output_marker = f"JTT_PATH_OUTPUT_{expected_path}_{nonce}_END"
+            commands = [(
+                "Set-Location 'dest'; "
+                "[IO.File]::WriteAllText('" + marker_path + "',$PWD.Path); "
+                + path_output_line() + "; "
+                "[Console]::WriteLine('JTT_EXEC_'+'SHORT_PATH_CHANGE_'+"
+                + "'" + nonce + "'+'_END')",
+                marker,
+                expected_path,
+            )]
+        elif label == "SCRIPT_PATH_CHANGE":
+            expected_path = str(destination)
+            path_output_marker = f"JTT_PATH_OUTPUT_{expected_path}_{nonce}_END"
+            script_marker = (
+                "JTT_EXEC_SCRIPT_PATH_CHANGE_" + nonce + "_END"
+            )
+            script_contents = (
+                "Set-Location 'dest'; "
+                "[IO.File]::WriteAllText('" + marker_path + "',$PWD.Path); "
+                + path_output_line() + "; "
+                "[Console]::WriteLine('JTT_EXEC_'+'SCRIPT_PATH_CHANGE_'+"
+                + "'" + nonce + "'+'_END')"
+            )
+            assert script_marker not in script_contents
+            assert path_output_marker not in script_contents
+            script_path.write_text(script_contents, encoding="utf-8")
+            command = "& '.\\" + script_path.name + "'"
+            commands = [(command, marker, expected_path)]
         else:
             raise AssertionError("unknown ConPTY comparison case")
         if label != "MULTI_STEP":
             commands = [(*command, marker_file) for command in commands]
         assert all(
             expected not in command
+            and (
+                unicode_output_marker is None
+                or unicode_output_marker not in command
+            )
+            and (
+                path_output_marker is None
+                or path_output_marker not in command
+            )
             for command, expected, _value, _command_marker_file in commands
         )
         per_key_scenarios = {
@@ -2818,13 +3076,16 @@ def test_native_conpty_input_execution_path_comparison(
         return [
             (
                 command, expected, expected_value, delivery_mode,
-                command_marker_file, unicode_output_marker,
+                command_marker_file, unicode_output_marker, path_output_marker,
             )
             for command, expected, expected_value, command_marker_file in commands
         ]
 
     def compact(value):
-        return value.replace("\r", "").replace("\n", "")
+        return "".join(
+            line.rstrip()
+            for line in value.replace("\r", "\n").split("\n")
+        )
 
     def prompt_seen(text):
         return any(
@@ -2838,21 +3099,7 @@ def test_native_conpty_input_execution_path_comparison(
         except (OSError, UnicodeError):
             return None
 
-    case_plans = {
-        "baseline": (
-            "SHORT_ASCII", "LONG_ASCII", "MULTI_STEP",
-            "UNICODE_INPUT", "PATH_CHANGE",
-        ),
-        "unicode_first": ("UNICODE_INPUT",),
-        "ascii_then_unicode": ("SHORT_ASCII", "UNICODE_INPUT"),
-        "ascii_then_unicode_per_key": ("SHORT_ASCII", "UNICODE_INPUT"),
-        "ascii_then_unicode_crlf": ("SHORT_ASCII", "UNICODE_INPUT"),
-        "unicode_output_only": ("UNICODE_OUTPUT_ONLY",),
-        "path_standalone_single_write": ("PATH_CHANGE",),
-        "path_standalone_single_write_crlf": ("PATH_CHANGE",),
-        "path_after_ascii_single_write": ("SHORT_ASCII", "PATH_CHANGE"),
-        "path_after_ascii_per_key": ("SHORT_ASCII", "PATH_CHANGE"),
-    }
+    case_plans = _R02_INPUT_CASE_PLANS
 
     def input_terminator(label, scenario):
         if (
@@ -2936,7 +3183,7 @@ def test_native_conpty_input_execution_path_comparison(
                 worker_raw_bytes.extend(latest.output)
                 raw_text = worker_raw_bytes.decode("utf-8", errors="replace")
                 screen_text = (
-                    _compact_screen_text(latest.screen)
+                    _screen_text(latest.screen)
                     if latest.screen is not None else ""
                 )
             return raw_text, screen_text
@@ -3099,7 +3346,7 @@ def test_native_conpty_input_execution_path_comparison(
                 result["cases"].append(case_result)
                 for step_index, (
                     command, expected, expected_file_value, delivery_mode,
-                    marker_file, unicode_output_marker,
+                    marker_file, unicode_output_marker, path_output_marker,
                 ) in enumerate(steps):
                     try:
                         marker_file.unlink(missing_ok=True)
@@ -3117,6 +3364,7 @@ def test_native_conpty_input_execution_path_comparison(
                         "screen_prompt_returned_after_execution": False,
                         "expected_path_output_in_pty_or_poll": None,
                         "expected_path_output_in_screen": None,
+                        "expected_path_output_marker": path_output_marker,
                         "side_effect_file_present": False,
                         "side_effect_file_matches": False,
                         "output_marker_in_pty_or_poll": False,
@@ -3131,11 +3379,60 @@ def test_native_conpty_input_execution_path_comparison(
                         ),
                         "working_directory_before_command": str(start),
                         "expected_working_directory_after_command": (
-                            str(destination) if label == "PATH_CHANGE" else str(start)
+                            str(destination)
+                            if label in path_change_labels else str(start)
                         ),
+                        "command_file": None,
+                        "command_body_characters": len(command),
+                        "command_body_utf8_bytes": len(command.encode("utf-8")),
+                        "command_body_is_ascii": command.isascii(),
+                        "command_uses_test_owned_relative_destination": (
+                            "Set-Location 'dest'" in command
+                        ),
+                        "command_invokes_test_owned_script": (
+                            label == "SCRIPT_PATH_CHANGE"
+                            and command.startswith("& '.\\")
+                        ),
+                        "unicode_input_echo_in_pty_or_poll": None,
+                        "unicode_input_echo_in_screen": None,
                         "prompt_returned_after_execution": False,
                         "prompt_returned_before_next_command": False,
+                        "execution_status": "NOT_OBSERVED",
+                        "output_observation_status": "NOT_OBSERVED",
+                        "prompt_status": "NOT_OBSERVED",
                     }
+                    if label == "SCRIPT_PATH_CHANGE":
+                        script_bytes = script_path.read_bytes()
+                        step["command_file"] = {
+                            "test_owned_relative_name": script_path.name,
+                            "present": True,
+                            "bytes": len(script_bytes),
+                            "sha256": hashlib.sha256(script_bytes).hexdigest(),
+                            "input_invocation_contains_full_marker": (
+                                expected in command
+                                or (
+                                    unicode_output_marker is not None
+                                    and unicode_output_marker in command
+                                )
+                                or (
+                                    path_output_marker is not None
+                                    and path_output_marker in command
+                                )
+                            ),
+                            "script_body_contains_full_markers": (
+                                expected in script_bytes.decode("utf-8")
+                                or (
+                                    unicode_output_marker is not None
+                                    and unicode_output_marker
+                                    in script_bytes.decode("utf-8")
+                                )
+                                or (
+                                    path_output_marker is not None
+                                    and path_output_marker
+                                    in script_bytes.decode("utf-8")
+                                )
+                            ),
+                        }
                     case_result["steps"].append(step)
                     result["last_observation_stage"] = "pre_input_drain"
                     raw_before, _screen_before = observe()
@@ -3204,6 +3501,9 @@ def test_native_conpty_input_execution_path_comparison(
                         "reported_return": reported_total,
                         "utf8_payload_bytes": len(payload.encode("utf-8")),
                         "python_characters": len(payload),
+                        "command_body_utf8_bytes": len(command.encode("utf-8")),
+                        "command_body_characters": len(command),
+                        "command_body_is_ascii": command.isascii(),
                         "equals_byte_count": (
                             reported_total == len(payload.encode("utf-8"))
                         ),
@@ -3217,10 +3517,14 @@ def test_native_conpty_input_execution_path_comparison(
                             payload.encode("utf-8")
                         ).hexdigest(),
                         "payload_template_sha256": hashlib.sha256(
-                            payload.replace(nonce, "<NONCE>").encode("utf-8")
+                            _conpty_command_template(
+                                payload, start, nonce
+                            ).encode("utf-8")
                         ).hexdigest(),
                         "command_body_template_sha256": hashlib.sha256(
-                            command.replace(nonce, "<NONCE>").encode("utf-8")
+                            _conpty_command_template(
+                                command, start, nonce
+                            ).encode("utf-8")
                         ).hexdigest(),
                         "nonce_length": len(nonce),
                         "api": api,
@@ -3246,12 +3550,46 @@ def test_native_conpty_input_execution_path_comparison(
                             step["command_echo_in_pty_or_poll"]
                             or step["command_echo_in_screen"]
                         )
-                        step["screen_prompt_returned_after_execution"] = (
-                            _conpty_prompt_returned_after_marker(
-                                screen_text, expected
+                        if label == "UNICODE_INPUT":
+                            step["unicode_input_echo_in_pty_or_poll"] = (
+                                step["command_echo_in_pty_or_poll"]
                             )
+                            step["unicode_input_echo_in_screen"] = (
+                                step["command_echo_in_screen"]
+                            )
+                        raw_prompt_returned = _conpty_prompt_seen(raw_delta)
+                        step["prompt_returned_after_execution"] = raw_prompt_returned
+                        step["screen_prompt_present_in_snapshot"] = (
+                            _conpty_prompt_seen(screen_text)
                         )
-                        if label == "PATH_CHANGE":
+                        screen_prompt_visible = _conpty_prompt_seen_after_marker(
+                            screen_text, expected
+                        )
+                        step["screen_prompt_visible_after_input"] = screen_prompt_visible
+                        step["screen_prompt_returned_after_execution"] = (
+                            screen_prompt_visible
+                        )
+                        step["prompt_returned_after_expected_marker"] = (
+                            _conpty_prompt_returned_after_marker(raw_delta, expected)
+                        )
+                        step["screen_prompt_returned_after_expected_marker"] = (
+                            screen_prompt_visible
+                        )
+                        if label in path_change_labels:
+                            raw_path_marker = (
+                                path_output_marker.casefold()
+                                in compact(raw_delta).casefold()
+                            )
+                            screen_path_marker = (
+                                path_output_marker.casefold()
+                                in compact(screen_text).casefold()
+                            )
+                            step["expected_path_output_marker_in_pty_or_poll"] = (
+                                raw_path_marker
+                            )
+                            step["expected_path_output_marker_in_screen"] = (
+                                screen_path_marker
+                            )
                             step["expected_path_output_in_pty_or_poll"] = (
                                 expected_file_value.casefold()
                                 in compact(raw_delta).casefold()
@@ -3263,19 +3601,115 @@ def test_native_conpty_input_execution_path_comparison(
                         step["side_effect_file_present"] = value is not None
                         step["side_effect_file_matches"] = (
                             value == expected_file_value
-                            if label != "PATH_CHANGE"
+                            if label not in path_change_labels
                             else bool(value) and os.path.normcase(value)
                             == os.path.normcase(expected_file_value)
                         )
+                        step["command_execution_proven"] = bool(
+                            step["side_effect_file_matches"]
+                        )
+                        step["execution_status"] = (
+                            "EXECUTION_PROVEN"
+                            if step["command_execution_proven"]
+                            else "EXECUTION_UNPROVEN"
+                        )
                         step["output_marker_in_pty_or_poll"] = raw_marker
                         step["output_marker_in_pyte_or_worker_screen"] = screen_marker
+                        worker_raw_delta = (
+                            bytes(worker_raw_bytes[worker_byte_offset:])
+                            if not direct else None
+                        )
+                        step["worker_raw_output_delta_bytes"] = (
+                            len(worker_raw_delta)
+                            if worker_raw_delta is not None else None
+                        )
+                        step["worker_raw_output_delta_sha256"] = (
+                            hashlib.sha256(worker_raw_delta).hexdigest()
+                            if worker_raw_delta is not None else None
+                        )
+                        step["execution_marker_utf8_bytes_seen_in_worker_raw"] = (
+                            expected.encode("utf-8") in worker_raw_delta
+                            if worker_raw_delta is not None else None
+                        )
+                        step["raw_output_representation"] = (
+                            "pywinpty.PTY.read() Python str; native ConPTY bytes unavailable"
+                            if direct else
+                            "TerminalClient.poll() bytes; decoded as UTF-8 with replacement"
+                        )
+                        step["raw_output_decode"] = (
+                            "pywinpty returned Python str; byte encoding unavailable"
+                            if direct else "UTF-8 errors=replace"
+                        )
+                        step["raw_output_source_encoding"] = (
+                            "NOT_EXPOSED_BY_PYWINPTY_STR_API"
+                            if direct else "NOT_INFERRED_FROM_POLL_BYTES"
+                        )
+                        step["raw_output_replacement_character_count"] = (
+                            raw_delta.count("\ufffd")
+                        )
+                        step["screen_output_replacement_character_count"] = (
+                            screen_text.count("\ufffd")
+                        )
                         if unicode_output_marker is not None:
-                            step["unicode_output_marker_in_pty_or_poll"] = (
+                            unicode_raw_seen = (
                                 unicode_output_marker in compact(raw_delta)
                             )
-                            step["unicode_output_marker_in_screen"] = (
+                            unicode_screen_seen = (
                                 unicode_output_marker in compact(screen_text)
                             )
+                            expected_unicode_bytes = unicode_output_marker.encode(
+                                "utf-8"
+                            )
+                            step["unicode_output_marker_in_pty_or_poll"] = (
+                                unicode_raw_seen
+                            )
+                            step["unicode_output_marker_in_screen"] = (
+                                unicode_screen_seen
+                            )
+                            step["unicode_marker_utf8_bytes_seen_in_worker_raw"] = (
+                                expected_unicode_bytes in worker_raw_delta
+                                if worker_raw_delta is not None else None
+                            )
+                            step["unicode_output_marker_utf8_bytes"] = len(
+                                expected_unicode_bytes
+                            )
+                            step["unicode_output_marker_utf8_sha256"] = (
+                                hashlib.sha256(expected_unicode_bytes).hexdigest()
+                            )
+                            step["unicode_output_marker_contains_non_ascii"] = any(
+                                byte > 0x7f for byte in expected_unicode_bytes
+                            )
+                            step["unicode_output_raw_status"] = (
+                                "OBSERVED" if unicode_raw_seen else "UNOBSERVED"
+                            )
+                            step["unicode_output_screen_status"] = (
+                                "OBSERVED" if unicode_screen_seen else "UNOBSERVED"
+                            )
+                        output_observed = bool(raw_marker and screen_marker)
+                        if label in path_change_labels:
+                            output_observed = bool(
+                                output_observed
+                                and step["expected_path_output_marker_in_pty_or_poll"]
+                                and step["expected_path_output_marker_in_screen"]
+                            )
+                        if unicode_output_marker is not None:
+                            output_observed = bool(
+                                output_observed
+                                and step["unicode_output_marker_in_pty_or_poll"]
+                                and step["unicode_output_marker_in_screen"]
+                            )
+                        step["output_observation_status"] = (
+                            "OUTPUT_PROVEN" if output_observed
+                            else "OUTPUT_OBSERVATION_UNPROVEN"
+                        )
+                        step["prompt_status"] = (
+                            "PROMPT_RETURNED" if raw_prompt_returned
+                            else "PROMPT_RETURN_UNOBSERVED"
+                        )
+                        step["screen_prompt_status"] = (
+                            "SCREEN_PROMPT_VISIBLE" if screen_prompt_visible
+                            else "SCREEN_PROMPT_UNOBSERVED"
+                        )
                         step["powershell_error_categories"] = (
                             _conpty_powershell_error_categories(raw_delta)
                         )
@@ -3284,24 +3718,43 @@ def test_native_conpty_input_execution_path_comparison(
                             screen_unicode_count = screen_text.count("한글")
                             step["unicode_output_raw_occurrences"] = raw_unicode_count
                             step["unicode_output_screen_occurrences"] = screen_unicode_count
-                        return (
-                            step["side_effect_file_matches"]
-                            and raw_marker and screen_marker
+                        return bool(
+                            step["command_execution_proven"]
+                            and step["output_observation_status"] == "OUTPUT_PROVEN"
+                            and step["prompt_status"] == "PROMPT_RETURNED"
+                            and step["screen_prompt_status"] == "SCREEN_PROMPT_VISIBLE"
+                            and step["prompt_returned_after_expected_marker"]
                         )
 
                     result["last_observation_stage"] = "observe_input_echo_and_execution"
                     raw_text, screen_text = wait_for(
-                        lambda raw, screen: (
-                            complete(raw, screen)
-                            and _conpty_prompt_returned_after_marker(
-                                raw[raw_offset:], expected
-                            )
-                        ),
+                        lambda raw, screen: complete(raw, screen),
                         8,
                     )
-                    execution_proven = complete(raw_text, screen_text)
-                    prompt_returned = _conpty_prompt_returned_after_marker(
-                        raw_text[raw_offset:], expected
+                    complete(raw_text, screen_text)
+                    execution_proven = bool(step["command_execution_proven"])
+                    output_proven = (
+                        step["output_observation_status"] == "OUTPUT_PROVEN"
+                    )
+                    raw_delta = raw_text[raw_offset:]
+                    prompt_returned = _conpty_prompt_seen(raw_delta)
+                    step["prompt_returned_after_expected_marker"] = (
+                        _conpty_prompt_returned_after_marker(raw_delta, expected)
+                    )
+                    step["prompt_status"] = (
+                        "PROMPT_RETURNED" if prompt_returned
+                        else "PROMPT_RETURN_UNOBSERVED"
+                    )
+                    step["screen_prompt_status"] = (
+                        "SCREEN_PROMPT_VISIBLE"
+                        if _conpty_prompt_seen_after_marker(screen_text, expected)
+                        else "SCREEN_PROMPT_UNOBSERVED"
+                    )
+                    step["screen_prompt_present_in_snapshot"] = (
+                        _conpty_prompt_seen(screen_text)
+                    )
+                    step["screen_prompt_visible_after_input"] = (
+                        step["screen_prompt_status"] == "SCREEN_PROMPT_VISIBLE"
                     )
                     step["prompt_returned_after_execution"] = prompt_returned
                     step["prompt_returned_before_next_command"] = prompt_returned
@@ -3357,27 +3810,29 @@ def test_native_conpty_input_execution_path_comparison(
                             getattr(latest, "state", None) if latest is not None
                             else "unknown"
                         )
-                    step["status"] = (
-                        "EXECUTION_PROVEN" if execution_proven
-                        else "EXECUTION_UNPROVEN"
-                    )
+                    if not execution_proven:
+                        step["status"] = "EXECUTION_UNPROVEN"
+                    elif not prompt_returned:
+                        step["status"] = "PROMPT_RETURN_UNOBSERVED"
+                    elif not step["screen_prompt_visible_after_input"]:
+                        step["status"] = "SCREEN_PROMPT_UNOBSERVED"
+                    elif not output_proven:
+                        step["status"] = "OUTPUT_OBSERVATION_UNPROVEN"
+                    else:
+                        step["status"] = "COMPLETE"
                     if label == "SHORT_ASCII" and step_index == 0:
-                        baseline_proven = step["status"] == "EXECUTION_PROVEN"
+                        baseline_proven = step["execution_status"] == "EXECUTION_PROVEN"
                         result["short_ascii_execution_proven"] = baseline_proven
-                    if step["status"] != "EXECUTION_PROVEN" or not prompt_returned:
-                        case_result["status"] = (
-                            "EXECUTION_UNPROVEN"
-                            if step["status"] != "EXECUTION_PROVEN"
-                            else "PROMPT_RETURN_UNOBSERVED"
-                        )
+                    if step["status"] != "COMPLETE":
+                        case_result["status"] = step["status"]
                         stop_cases = True
                         break
                 else:
-                    case_result["status"] = "EXECUTION_PROVEN"
+                    case_result["status"] = "COMPLETE"
             result["status"] = (
                 "DIAGNOSTIC_TOOL_ERROR" if result.get("diagnostic_error_stage")
                 else "COMPLETE" if not stop_cases
-                else "EXECUTION_UNPROVEN"
+                else case_result.get("status", "EXECUTION_UNPROVEN")
             )
         except _ConptyPathAbort:
             # Preserve the status set at the abort point while still running
@@ -3461,39 +3916,47 @@ def test_native_conpty_input_execution_path_comparison(
 
         return _finalize_conpty_path_result(result)
 
-    scenarios = tuple(case_plans)
+    scenarios = tuple(scenario_names)
+    if not scenarios or any(scenario not in case_plans for scenario in scenarios):
+        raise ValueError("invalid ConPTY diagnostic scenario selection")
+    path_selection = frozenset(path_selection)
+    if not path_selection or not path_selection.issubset({"direct", "worker"}):
+        raise ValueError("invalid ConPTY diagnostic path selection")
     direct_runs = {}
-    for index, scenario in enumerate(scenarios):
-        previous = direct_runs.get(scenarios[index - 1]) if index else None
-        if previous is not None and not _conpty_path_allows_followup(previous):
-            direct_runs[scenario] = {
-                "path": "direct_pywinpty",
-                "scenario": scenario,
-                "status": "NOT_RUN_PREVIOUS_CLEANUP_UNCONFIRMED",
-                "cleanup_confirmed": False,
-                "cases": [],
-            }
-        else:
-            direct_runs[scenario] = run_path(direct=True, scenario=scenario)
+    if "direct" in path_selection:
+        for index, scenario in enumerate(scenarios):
+            previous = direct_runs.get(scenarios[index - 1]) if index else None
+            if previous is not None and not _conpty_path_allows_followup(previous):
+                direct_runs[scenario] = {
+                    "path": "direct_pywinpty",
+                    "scenario": scenario,
+                    "status": "NOT_RUN_PREVIOUS_CLEANUP_UNCONFIRMED",
+                    "cleanup_confirmed": False,
+                    "cases": [],
+                }
+            else:
+                direct_runs[scenario] = run_path(direct=True, scenario=scenario)
     worker_runs = {}
-    for index, scenario in enumerate(scenarios):
-        direct_run = direct_runs[scenario]
-        previous_worker = worker_runs.get(scenarios[index - 1]) if index else None
-        skip_status = _conpty_worker_scenario_skip_status(
-            direct_run, previous_worker
-        )
-        if skip_status is None:
-            worker_runs[scenario] = run_path(direct=False, scenario=scenario)
-        else:
-            worker_runs[scenario] = {
-                "path": "jtt_worker",
-                "scenario": scenario,
-                "status": skip_status,
-                "cleanup_confirmed": False,
-                "cases": [],
-            }
-    direct = direct_runs["baseline"]
-    worker = worker_runs["baseline"]
+    if "worker" in path_selection:
+        for index, scenario in enumerate(scenarios):
+            direct_run = direct_runs.get(scenario)
+            previous_worker = worker_runs.get(scenarios[index - 1]) if index else None
+            skip_status = (
+                _conpty_worker_scenario_skip_status(direct_run, previous_worker)
+                if "direct" in path_selection else None
+            )
+            if skip_status is None:
+                worker_runs[scenario] = run_path(direct=False, scenario=scenario)
+            else:
+                worker_runs[scenario] = {
+                    "path": "jtt_worker",
+                    "scenario": scenario,
+                    "status": skip_status,
+                    "cleanup_confirmed": False,
+                    "cases": [],
+                }
+    direct = direct_runs.get("baseline", {})
+    worker = worker_runs.get("baseline", {})
     evidence = {
         "direct": direct,
         "worker": worker,
@@ -3511,155 +3974,54 @@ def test_native_conpty_input_execution_path_comparison(
     print("CONPTY_INPUT_EXECUTION_COMPARISON "
           + json.dumps(evidence, ensure_ascii=True, sort_keys=True))
 
-    worker_cases = {
-        item.get("case"): item for item in worker.get("cases", [])
-        if item.get("case")
-    }
-    worker_short = worker_cases.get("SHORT_ASCII", {})
-    worker_short_steps = worker_short.get("steps", [])
-    assert (
-        worker_short.get("status") == "EXECUTION_PROVEN"
-        and worker_short_steps
-        and worker_short_steps[0].get("status") == "EXECUTION_PROVEN"
-    ), "PRODUCT_WORKER_SHORT_ASCII_EXECUTION_UNPROVEN; see structured evidence"
-    for label in (
-        "LONG_ASCII", "MULTI_STEP", "UNICODE_INPUT", "PATH_CHANGE",
-    ):
-        case = worker_cases.get(label, {})
-        assert case.get("status") == "EXECUTION_PROVEN", (
-            f"PRODUCT_WORKER_{label}_EXECUTION_UNPROVEN; see structured evidence"
+    if diagnostic_only:
+        if len(path_selection) != 1:
+            raise ValueError("diagnostic entry points must run one path per job")
+        if len(scenarios) != 1:
+            raise ValueError("each added control must use an independent session")
+        selected_runs = direct_runs if "direct" in path_selection else worker_runs
+        scenario = scenarios[0]
+        run = selected_runs[scenario]
+        path_name = next(iter(path_selection)).upper()
+        assert run.get("status") == "COMPLETE", (
+            f"{path_name}_{scenario.upper()}_INCOMPLETE; see structured evidence"
         )
-        assert all(
-            step.get("prompt_returned_before_next_command") is True
-            for step in case.get("steps", [])
-        ), f"PRODUCT_WORKER_{label}_PROMPT_RETURN_UNOBSERVED; see structured evidence"
-    if direct.get("status") == "DIAGNOSTIC_TOOL_ERROR":
-        raise AssertionError(
-            "DIAGNOSTIC_TOOL_ERROR at "
-            f"{direct.get('diagnostic_error_stage')}: "
-            f"{direct.get('diagnostic_error_category')}"
+        case = run.get("cases", [{}])[0]
+        expected_case = {
+            "short_path_change_standalone": "SHORT_PATH_CHANGE",
+            "script_path_change_standalone": "SCRIPT_PATH_CHANGE",
+        }[scenario]
+        assert case.get("case") == expected_case
+        assert case.get("status") == "COMPLETE", (
+            f"{path_name}_{scenario.upper()}_{expected_case}_INCOMPLETE; "
+            "see structured evidence"
         )
-    direct_cases = {
-        item.get("case"): item for item in direct.get("cases", [])
-        if item.get("case")
-    }
-    assert direct_cases.get("SHORT_ASCII", {}).get("status") == "EXECUTION_PROVEN", (
-        "DIRECT_REFERENCE_SHORT_ASCII_EXECUTION_UNPROVEN; see structured evidence"
-    )
-    for label in (
-        "LONG_ASCII", "MULTI_STEP", "UNICODE_INPUT", "PATH_CHANGE",
-    ):
-        case = direct_cases.get(label, {})
-        assert case.get("status") == "EXECUTION_PROVEN", (
-            f"DIRECT_REFERENCE_{label}_EXECUTION_UNPROVEN; see structured evidence"
+        step = case.get("steps", [{}])[0]
+        assert (
+            step.get("execution_status") == "EXECUTION_PROVEN"
+            and step.get("output_observation_status") == "OUTPUT_PROVEN"
+            and step.get("prompt_status") == "PROMPT_RETURNED"
+            and step.get("screen_prompt_status") == "SCREEN_PROMPT_VISIBLE"
+        ), (
+            f"{path_name}_{scenario.upper()}_BOUNDARY_UNPROVEN; "
+            "see structured evidence"
         )
-        assert all(
-            step.get("prompt_returned_before_next_command") is True
-            for step in case.get("steps", [])
-        ), f"DIRECT_REFERENCE_{label}_PROMPT_RETURN_UNOBSERVED; see structured evidence"
-
-    for path_name, runs in (
-        ("DIRECT_REFERENCE", direct_runs), ("PRODUCT_WORKER", worker_runs),
-    ):
-        for scenario in (
-            "unicode_first", "ascii_then_unicode",
-            "ascii_then_unicode_per_key", "ascii_then_unicode_crlf",
-            "unicode_output_only",
-            "path_standalone_single_write",
-            "path_standalone_single_write_crlf",
-            "path_after_ascii_single_write", "path_after_ascii_per_key",
-        ):
-            run = runs[scenario]
-            assert run.get("status") == "COMPLETE", (
-                f"{path_name}_{scenario.upper()}_INCOMPLETE; see structured evidence"
-            )
-            case_results = {
-                item.get("case"): item for item in run.get("cases", [])
-                if item.get("case")
-            }
-            expected_labels = {
-                "unicode_first": ("UNICODE_INPUT",),
-                "ascii_then_unicode": ("SHORT_ASCII", "UNICODE_INPUT"),
-                "ascii_then_unicode_per_key": (
-                    "SHORT_ASCII", "UNICODE_INPUT",
-                ),
-                "ascii_then_unicode_crlf": (
-                    "SHORT_ASCII", "UNICODE_INPUT",
-                ),
-                "unicode_output_only": ("UNICODE_OUTPUT_ONLY",),
-                "path_standalone_single_write": ("PATH_CHANGE",),
-                "path_standalone_single_write_crlf": ("PATH_CHANGE",),
-                "path_after_ascii_single_write": (
-                    "SHORT_ASCII", "PATH_CHANGE",
-                ),
-                "path_after_ascii_per_key": (
-                    "SHORT_ASCII", "PATH_CHANGE",
-                ),
-            }[scenario]
-            for label in expected_labels:
-                case = case_results.get(label, {})
-                assert case.get("status") == "EXECUTION_PROVEN", (
-                    f"{path_name}_{scenario.upper()}_{label}_UNPROVEN; "
-                    "see structured evidence"
-                )
-                assert all(
-                    step.get("prompt_returned_before_next_command") is True
-                    for step in case.get("steps", [])
-                ), (
-                    f"{path_name}_{scenario.upper()}_{label}_PROMPT_UNOBSERVED; "
-                    "see structured evidence"
-                )
-        after_ascii_case = {
-            item.get("case"): item for item in runs["path_after_ascii_per_key"].get(
-                "cases", []
-            ) if item.get("case")
-        }.get("PATH_CHANGE", {})
-        assert after_ascii_case.get("steps", [{}])[0].get("input_mode") == "per_key"
-        after_ascii_single_write_case = {
-            item.get("case"): item for item in runs[
-                "path_after_ascii_single_write"
-            ].get("cases", []) if item.get("case")
-        }.get("PATH_CHANGE", {})
-        assert after_ascii_single_write_case.get("steps", [{}])[0].get(
-            "input_mode"
-        ) == "single_write"
-        standalone_case = {
-            item.get("case"): item for item in runs[
-                "path_standalone_single_write"
-            ].get("cases", []) if item.get("case")
-        }.get("PATH_CHANGE", {})
-        assert standalone_case.get("steps", [{}])[0].get("input_mode") == "single_write"
-        standalone_crlf_case = {
-            item.get("case"): item for item in runs[
-                "path_standalone_single_write_crlf"
-            ].get("cases", []) if item.get("case")
-        }.get("PATH_CHANGE", {})
-        assert standalone_crlf_case.get("steps", [{}])[0].get(
-            "input_terminator"
-        ) == "CRLF"
-        unicode_after_ascii_single = {
-            item.get("case"): item for item in runs[
-                "ascii_then_unicode"
-            ].get("cases", []) if item.get("case")
-        }.get("UNICODE_INPUT", {}).get("steps", [{}])[0]
-        unicode_after_ascii_per_key = {
-            item.get("case"): item for item in runs[
-                "ascii_then_unicode_per_key"
-            ].get("cases", []) if item.get("case")
-        }.get("UNICODE_INPUT", {}).get("steps", [{}])[0]
-        assert unicode_after_ascii_single.get("input_mode") == "single_write"
-        assert unicode_after_ascii_per_key.get("input_mode") == "per_key"
-        unicode_after_ascii_crlf = {
-            item.get("case"): item for item in runs[
-                "ascii_then_unicode_crlf"
-            ].get("cases", []) if item.get("case")
-        }.get("UNICODE_INPUT", {}).get("steps", [{}])[0]
-        assert unicode_after_ascii_crlf.get("input_terminator") == "CRLF"
+        assert run.get("cleanup_confirmed") is True, (
+            f"{path_name}_{scenario.upper()}_CLEANUP_UNCONFIRMED"
+        )
+        if scenario == "short_path_change_standalone":
+            assert step["command_uses_test_owned_relative_destination"]
+        if scenario == "script_path_change_standalone":
+            assert step["command_invokes_test_owned_script"]
+            script_info = step["command_file"]
+            assert not script_info["input_invocation_contains_full_marker"]
+            assert not script_info["script_body_contains_full_markers"]
+        return
 
     def input_step(runs, scenario, label):
+        run = runs[scenario]
         case = next(
-            item for item in runs[scenario].get("cases", [])
-            if item.get("case") == label
+            item for item in run.get("cases", []) if item.get("case") == label
         )
         return case["steps"][0]
 
@@ -3673,63 +4035,193 @@ def test_native_conpty_input_execution_path_comparison(
             "terminator factor"
         )
 
-    for runs in (direct_runs, worker_runs):
-        unicode_first = input_step(runs, "unicode_first", "UNICODE_INPUT")
-        unicode_single = input_step(runs, "ascii_then_unicode", "UNICODE_INPUT")
-        unicode_per_key = input_step(
-            runs, "ascii_then_unicode_per_key", "UNICODE_INPUT"
-        )
-        unicode_crlf = input_step(
-            runs, "ascii_then_unicode_crlf", "UNICODE_INPUT"
-        )
-        assert_same_command_body(
-            unicode_first, unicode_single, unicode_per_key, unicode_crlf
-        )
-        assert unicode_single["input_ack"]["payload_template_sha256"] == (
-            unicode_per_key["input_ack"]["payload_template_sha256"]
-        )
-        assert unicode_crlf["input_ack"]["utf8_payload_bytes"] == (
-            unicode_single["input_ack"]["utf8_payload_bytes"] + 1
-        )
-        assert unicode_crlf["input_ack"]["terminator"] == "CRLF"
+    selected = set(scenarios)
+    assert len(selected) == len(scenarios), "duplicate scenario selector"
+    expected_group = next(
+        (name for name, members in _R02_BASELINE_INPUT_GROUPS
+         if tuple(scenarios) == tuple(members)),
+        None,
+    )
+    assert expected_group is not None, (
+        "selector must match exactly one frozen baseline, unicode, or path group"
+    )
+    assert expected_group in {"baseline", "unicode", "path"}
 
-        path_standalone = input_step(
-            runs, "path_standalone_single_write", "PATH_CHANGE"
-        )
-        path_standalone_crlf = input_step(
-            runs, "path_standalone_single_write_crlf", "PATH_CHANGE"
-        )
-        path_after_ascii = input_step(
-            runs, "path_after_ascii_single_write", "PATH_CHANGE"
-        )
-        path_after_ascii_per_key = input_step(
-            runs, "path_after_ascii_per_key", "PATH_CHANGE"
-        )
-        assert_same_command_body(
-            path_standalone, path_standalone_crlf,
-            path_after_ascii, path_after_ascii_per_key,
-        )
-        assert path_standalone["input_ack"]["payload_template_sha256"] == (
-            path_after_ascii["input_ack"]["payload_template_sha256"]
-        )
-        assert path_after_ascii["input_ack"]["payload_template_sha256"] == (
-            path_after_ascii_per_key["input_ack"]["payload_template_sha256"]
-        )
-        assert path_standalone_crlf["input_ack"]["utf8_payload_bytes"] == (
-            path_standalone["input_ack"]["utf8_payload_bytes"] + 1
-        )
-
-    for scenario, label in (
-        ("unicode_first", "UNICODE_INPUT"),
-        ("ascii_then_unicode", "UNICODE_INPUT"),
-        ("unicode_output_only", "UNICODE_OUTPUT_ONLY"),
-        ("path_standalone_single_write", "PATH_CHANGE"),
+    for path_name, runs in (
+        ("DIRECT_REFERENCE", direct_runs), ("PRODUCT_WORKER", worker_runs),
     ):
-        direct_step = input_step(direct_runs, scenario, label)
-        worker_step = input_step(worker_runs, scenario, label)
-        assert direct_step["input_ack"]["payload_template_sha256"] == (
-            worker_step["input_ack"]["payload_template_sha256"]
-        ), "Direct and Worker comparison payloads differ unexpectedly"
+        if path_name == "DIRECT_REFERENCE" and "direct" not in path_selection:
+            continue
+        if path_name == "PRODUCT_WORKER" and "worker" not in path_selection:
+            continue
+        assert set(runs) == selected, (
+            f"{path_name}_SCENARIO_SET_MISMATCH; expected={sorted(selected)} "
+            f"actual={sorted(runs)}"
+        )
+        for scenario in scenarios:
+            run = runs[scenario]
+            assert run.get("status") == "COMPLETE", (
+                f"{path_name}_{scenario.upper()}_INCOMPLETE; see structured evidence"
+            )
+            assert _conpty_path_allows_followup(run), (
+                f"{path_name}_{scenario.upper()}_CLEANUP_UNCONFIRMED"
+            )
+            expected_labels = tuple(case_plans[scenario])
+            actual_cases = [
+                item.get("case") for item in run.get("cases", [])
+            ]
+            assert actual_cases == list(expected_labels), (
+                f"{path_name}_{scenario.upper()}_CASE_SET_MISMATCH; "
+                f"expected={expected_labels} actual={actual_cases}"
+            )
+            for case in run["cases"]:
+                assert case.get("status") == "COMPLETE", (
+                    f"{path_name}_{scenario.upper()}_{case.get('case')}_NOT_COMPLETE"
+                )
+                steps = case.get("steps", [])
+                assert steps, (
+                    f"{path_name}_{scenario.upper()}_{case.get('case')}_NO_STEPS"
+                )
+                assert all(
+                    step.get("execution_status") == "EXECUTION_PROVEN"
+                    and step.get("output_observation_status") == "OUTPUT_PROVEN"
+                    and step.get("prompt_status") == "PROMPT_RETURNED"
+                    and step.get("screen_prompt_status") == "SCREEN_PROMPT_VISIBLE"
+                    and step.get("prompt_returned_before_next_command") is True
+                    for step in steps
+                ), (
+                    f"{path_name}_{scenario.upper()}_{case.get('case')}_"
+                    "BOUNDARY_UNPROVEN; see structured evidence"
+                )
+
+    def assert_group_contains(required, label):
+        assert set(required).issubset(selected), (
+            f"{expected_group}_MISSING_{label}_FACTOR_SCENARIO"
+        )
+
+    if _R02_UNICODE_FACTOR_SCENARIOS[0] in selected:
+        assert_group_contains(_R02_UNICODE_FACTOR_SCENARIOS, "UNICODE")
+        for runs in (direct_runs, worker_runs):
+            for scenario in _R02_UNICODE_FACTOR_SCENARIOS:
+                assert scenario in runs, f"missing Unicode factor {scenario}"
+            unicode_first = input_step(runs, "unicode_first", "UNICODE_INPUT")
+            unicode_single = input_step(runs, "ascii_then_unicode", "UNICODE_INPUT")
+            unicode_per_key = input_step(
+                runs, "ascii_then_unicode_per_key", "UNICODE_INPUT"
+            )
+            unicode_crlf = input_step(
+                runs, "ascii_then_unicode_crlf", "UNICODE_INPUT"
+            )
+            assert_same_command_body(
+                unicode_first, unicode_single, unicode_per_key, unicode_crlf
+            )
+            assert unicode_single["input_ack"]["payload_template_sha256"] == (
+                unicode_per_key["input_ack"]["payload_template_sha256"]
+            )
+            assert unicode_crlf["input_ack"]["utf8_payload_bytes"] == (
+                unicode_single["input_ack"]["utf8_payload_bytes"] + 1
+            )
+            assert unicode_crlf["input_ack"]["terminator"] == "CRLF"
+            assert input_step(
+                runs, "ascii_then_unicode", "UNICODE_INPUT"
+            )["input_ack"]["terminator"] == "CR"
+            assert input_step(
+                runs, "ascii_then_unicode_per_key", "UNICODE_INPUT"
+            )["input_mode"] == "per_key"
+            assert input_step(
+                runs, "ascii_then_unicode", "UNICODE_INPUT"
+            )["input_mode"] == "single_write"
+
+    if _R02_PATH_FACTOR_SCENARIOS[0] in selected:
+        assert_group_contains(_R02_PATH_FACTOR_SCENARIOS, "PATH")
+        for runs in (direct_runs, worker_runs):
+            path_standalone = input_step(
+                runs, "path_standalone_single_write", "PATH_CHANGE"
+            )
+            path_standalone_crlf = input_step(
+                runs, "path_standalone_single_write_crlf", "PATH_CHANGE"
+            )
+            path_after_ascii = input_step(
+                runs, "path_after_ascii_single_write", "PATH_CHANGE"
+            )
+            path_after_ascii_per_key = input_step(
+                runs, "path_after_ascii_per_key", "PATH_CHANGE"
+            )
+            assert_same_command_body(
+                path_standalone, path_standalone_crlf,
+                path_after_ascii, path_after_ascii_per_key,
+            )
+            assert path_standalone["input_ack"]["payload_template_sha256"] == (
+                path_after_ascii["input_ack"]["payload_template_sha256"]
+            )
+            assert path_after_ascii["input_ack"]["payload_template_sha256"] == (
+                path_after_ascii_per_key["input_ack"]["payload_template_sha256"]
+            )
+            assert path_standalone_crlf["input_ack"]["utf8_payload_bytes"] == (
+                path_standalone["input_ack"]["utf8_payload_bytes"] + 1
+            )
+            assert path_standalone["input_mode"] == "single_write"
+            assert path_standalone["input_terminator"] == "CR"
+            assert path_standalone_crlf["input_terminator"] == "CRLF"
+            assert path_after_ascii["input_mode"] == "single_write"
+            assert path_after_ascii_per_key["input_mode"] == "per_key"
+
+    paired_scenarios = {
+        scenario for scenario, _label in _R02_DIRECT_WORKER_COMPARE_SCENARIOS
+    }
+    if paired_scenarios.intersection(selected):
+        assert "direct" in path_selection and "worker" in path_selection, (
+            "cross-path payload assertions require Direct and Worker in one job"
+        )
+        for scenario, label in _R02_DIRECT_WORKER_COMPARE_SCENARIOS:
+            if scenario not in selected:
+                continue
+            direct_step = input_step(direct_runs, scenario, label)
+            worker_step = input_step(worker_runs, scenario, label)
+            assert direct_step["input_ack"]["payload_template_sha256"] == (
+                worker_step["input_ack"]["payload_template_sha256"]
+            ), "Direct and Worker comparison payloads differ unexpectedly"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
+@pytest.mark.parametrize(
+    "group_name,scenario_names",
+    _R02_BASELINE_INPUT_GROUPS,
+    ids=[name for name, _scenarios in _R02_BASELINE_INPUT_GROUPS],
+)
+def test_native_conpty_input_execution_path_comparison(
+        tmp_path, monkeypatch, record_property, group_name, scenario_names):
+    """Compare one complete Direct/Worker group with its factor assertions."""
+    record_property("comparison_group", group_name)
+    record_property("comparison_scenarios", json.dumps(scenario_names))
+    _run_native_conpty_input_execution_comparison(
+        tmp_path, monkeypatch, record_property,
+        scenario_names=scenario_names,
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
+@pytest.mark.parametrize("scenario", _R02_ADDITIONAL_AB_SCENARIOS)
+def test_native_conpty_added_input_cases_direct(
+        tmp_path, monkeypatch, record_property, scenario):
+    """Run one added D02 control in its own Direct ConPTY session."""
+    _run_native_conpty_input_execution_comparison(
+        tmp_path, monkeypatch, record_property,
+        scenario_names=(scenario,),
+        path_selection=("direct",), diagnostic_only=True,
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="native ConPTY required")
+@pytest.mark.parametrize("scenario", _R02_ADDITIONAL_AB_SCENARIOS)
+def test_native_conpty_added_input_cases_worker(
+        tmp_path, monkeypatch, record_property, scenario):
+    """Run one added D02 control in its own JTT Worker session."""
+    _run_native_conpty_input_execution_comparison(
+        tmp_path, monkeypatch, record_property,
+        scenario_names=(scenario,),
+        path_selection=("worker",), diagnostic_only=True,
+    )
 
 
 @pytest.mark.parametrize("columns,lines", [(80, 24), (160, 44)])
@@ -3746,6 +4238,17 @@ def test_r02_product_worker_post_resize_input_factor_diagnostic(
     )
     results = []
     evidence_setting = os.environ.get("JTT_R02_EVIDENCE_PATH")
+    evidence_root = None
+    evidence_path = None
+    evidence_setup_error_category = None
+    if evidence_setting:
+        try:
+            evidence_root = Path.cwd().resolve(strict=True)
+            evidence_path = _resolve_r02_evidence_path(
+                evidence_setting, evidence_root
+            )
+        except Exception as exc:
+            evidence_setup_error_category = type(exc).__name__
 
     def observe_until(
             client, marker, expected_prompt, *, expected_path=None,
@@ -3898,11 +4401,30 @@ def test_r02_product_worker_post_resize_input_factor_diagnostic(
             "error_stage": None,
             "error_category": None,
             "evidence_file_error_category": None,
+            "input_attempted": False,
+            "input_status": "NOT_ATTEMPTED",
+            "product_command_failure_category": None,
+            "diagnostic_evidence_failure_category": None,
+            "cleanup_failure_category": None,
+            "failure_categories": _r02_failure_categories(),
+            "command_execution_status": "NOT_OBSERVED",
+            "raw_output_observation_status": "NOT_OBSERVED",
+            "screen_output_observation_status": "NOT_OBSERVED",
+            "output_observation_status": "NOT_OBSERVED",
+            "prompt_status": "NOT_OBSERVED",
+            "screen_prompt_status": "NOT_OBSERVED",
+            "resize_sync_status": "NOT_OBSERVED",
+            "output_observation_stage_recorded": False,
             "cleanup": "NOT_ATTEMPTED",
         }
 
         def emit_stage(stage):
             result["stage"] = stage
+            result["failure_categories"] = _r02_failure_categories(
+                result.get("product_command_failure_category"),
+                result.get("diagnostic_evidence_failure_category"),
+                result.get("cleanup_failure_category"),
+            )
             evidence = {
                 "scenario": result["scenario"],
                 "variant": result["variant"],
@@ -3910,25 +4432,35 @@ def test_r02_product_worker_post_resize_input_factor_diagnostic(
                 **result,
             }
             if evidence_setting:
-                try:
-                    expected_relative = Path("test-results") / "r02-input-factor.jsonl"
-                    if Path(evidence_setting) != expected_relative:
-                        raise ValueError("unexpected diagnostic evidence path")
-                    evidence_dir = Path("test-results")
-                    if evidence_dir.is_symlink() or not evidence_dir.is_dir():
-                        raise OSError("test-owned evidence directory unavailable")
-                    evidence_path = evidence_dir / "r02-input-factor.jsonl"
-                    if evidence_path.is_symlink():
-                        raise OSError("test-owned evidence file must not be a symlink")
-                    with evidence_path.open("a", encoding="utf-8", newline="\n") as stream:
-                        stream.write(json.dumps(
-                            evidence, ensure_ascii=True, sort_keys=True, default=str
-                        ))
-                        stream.write("\n")
-                        stream.flush()
-                except Exception as exc:
-                    result["evidence_file_error_category"] = type(exc).__name__
-                    evidence["evidence_file_error_category"] = type(exc).__name__
+                error_category = None
+                if evidence_setup_error_category:
+                    error_category = evidence_setup_error_category
+                    result["evidence_file_error_category"] = error_category
+                    result["diagnostic_evidence_failure_category"] = error_category
+                    evidence["evidence_file_error_category"] = error_category
+                    evidence["diagnostic_evidence_failure_category"] = error_category
+                else:
+                    try:
+                        _append_r02_evidence_record(
+                            evidence_path, evidence_root, evidence
+                        )
+                    except Exception as exc:
+                        error_category = type(exc).__name__
+                        result["evidence_file_error_category"] = error_category
+                        result["diagnostic_evidence_failure_category"] = error_category
+                        evidence["evidence_file_error_category"] = error_category
+                        evidence["diagnostic_evidence_failure_category"] = error_category
+                result["failure_categories"] = _r02_failure_categories(
+                    result.get("product_command_failure_category"),
+                    result.get("diagnostic_evidence_failure_category"),
+                    result.get("cleanup_failure_category"),
+                )
+                evidence["failure_categories"] = result["failure_categories"]
+                if not result.get("failure_category") and error_category:
+                    result["failure_category"] = "diagnostic_evidence"
+                    result["failure_stage"] = "evidence_write"
+                    evidence["failure_category"] = result["failure_category"]
+                    evidence["failure_stage"] = result["failure_stage"]
             print(
                 "R02_POST_RESIZE_INPUT_FACTOR "
                 + json.dumps(
@@ -4042,6 +4574,7 @@ def test_r02_product_worker_post_resize_input_factor_diagnostic(
                 "Set-Location 'dest'" in command
             )
             result["input_attempted"] = True
+            result["input_status"] = "SENDING"
             result["input_echo_raw_seen"] = None
             result["input_echo_screen_seen"] = None
             result["input_acknowledged_bytes"] = 0
@@ -4098,6 +4631,7 @@ def test_r02_product_worker_post_resize_input_factor_diagnostic(
                 "ACK_COMPLETE"
                 if result["all_input_writes_complete"] else "ACK_INCOMPLETE"
             )
+            result["input_status"] = result["input_delivery"]
             emit_stage("target_input_acknowledged")
             if result["all_input_writes_complete"]:
                 result["status"] = "WAITING_FOR_EXECUTION_EVIDENCE"
@@ -4142,22 +4676,72 @@ def test_r02_product_worker_post_resize_input_factor_diagnostic(
                 result["powershell_error_categories"] = observation[
                     "powershell_error_categories"
                 ]
+                result["command_execution_status"] = (
+                    "EXECUTION_PROVEN"
+                    if result.get("execution_side_effect_matches") else
+                    "EXECUTION_UNPROVEN"
+                )
+                result["raw_output_observation_status"] = (
+                    "RAW_MARKER_OBSERVED"
+                    if result.get("raw_marker_seen") else "RAW_MARKER_UNOBSERVED"
+                )
+                result["screen_output_observation_status"] = (
+                    "SCREEN_MARKER_OBSERVED"
+                    if result.get("screen_marker_seen")
+                    else "SCREEN_MARKER_UNOBSERVED"
+                )
+                result["output_observation_status"] = (
+                    "RAW_AND_SCREEN_MARKERS_OBSERVED"
+                    if result.get("raw_marker_seen")
+                    and result.get("screen_marker_seen")
+                    else "OUTPUT_MARKER_OBSERVATION_UNPROVEN"
+                )
+                result["prompt_status"] = (
+                    "PROMPT_RETURNED"
+                    if result.get("raw_expected_prompt_after_marker")
+                    else "PROMPT_RETURN_UNOBSERVED"
+                )
+                result["screen_prompt_status"] = (
+                    "SCREEN_PROMPT_VISIBLE"
+                    if result.get("screen_expected_prompt_after_marker")
+                    else "SCREEN_PROMPT_UNOBSERVED"
+                )
+                result["resize_sync_status"] = (
+                    "SHELL_AND_SCREEN_SIZE_OBSERVED"
+                    if result.get("raw_expected_size_seen")
+                    and result.get("screen_expected_size_seen")
+                    else "RESIZE_SIZE_OBSERVATION_UNPROVEN"
+                )
             else:
                 result["status"] = "INPUT_ACK_INCOMPLETE"
                 result["failure_category"] = "input_delivery"
                 result["failure_stage"] = current_stage
+                result["command_execution_status"] = "NOT_OBSERVED_ACK_INCOMPLETE"
+                result["raw_output_observation_status"] = "NOT_OBSERVED_ACK_INCOMPLETE"
+                result["screen_output_observation_status"] = "NOT_OBSERVED_ACK_INCOMPLETE"
+                result["output_observation_status"] = "NOT_OBSERVED_ACK_INCOMPLETE"
+                result["prompt_status"] = "NOT_OBSERVED_ACK_INCOMPLETE"
+                result["screen_prompt_status"] = "NOT_OBSERVED_ACK_INCOMPLETE"
+                result["resize_sync_status"] = "ALREADY_OBSERVED_BEFORE_INPUT"
+                result["output_observation_stage_recorded"] = True
+                emit_stage("target_output_not_observed_after_incomplete_ack")
             if result.get("all_input_writes_complete"):
-                result["status"] = (
-                    "EXECUTION_AND_OUTPUT_PROVEN"
-                    if result.get("execution_side_effect_matches")
-                    and result.get("raw_marker_seen")
-                    and result.get("screen_marker_seen")
-                    and result.get("raw_expected_size_seen")
-                    and result.get("screen_expected_size_seen")
-                    and result.get("raw_expected_prompt_after_marker")
-                    and result.get("screen_expected_prompt_after_marker")
-                    else "EXECUTION_OR_OUTPUT_UNPROVEN"
-                )
+                if not result.get("execution_side_effect_matches"):
+                    result["status"] = "EXECUTION_UNPROVEN"
+                elif not result.get("raw_marker_seen"):
+                    result["status"] = "RAW_OUTPUT_MARKER_UNOBSERVED"
+                elif not result.get("screen_marker_seen"):
+                    result["status"] = "SCREEN_OUTPUT_MARKER_UNOBSERVED"
+                elif not result.get("raw_expected_size_seen"):
+                    result["status"] = "SHELL_RESIZE_OUTPUT_UNOBSERVED"
+                elif not result.get("screen_expected_size_seen"):
+                    result["status"] = "SCREEN_RESIZE_OUTPUT_UNOBSERVED"
+                elif not result.get("raw_expected_prompt_after_marker"):
+                    result["status"] = "PROMPT_RETURN_UNOBSERVED"
+                elif not result.get("screen_expected_prompt_after_marker"):
+                    result["status"] = "SCREEN_PROMPT_UNOBSERVED"
+                else:
+                    result["status"] = "EXECUTION_AND_OUTPUT_PROVEN"
                 if result["status"] != "EXECUTION_AND_OUTPUT_PROVEN":
                     result["failure_stage"] = current_stage
                     if result.get("side_effect_read_error"):
@@ -4168,16 +4752,23 @@ def test_r02_product_worker_post_resize_input_factor_diagnostic(
                             if result.get("powershell_error_categories")
                             else "command_execution_unproven"
                         )
-                    elif not result.get("raw_marker_seen"):
+                        result["product_command_failure_category"] = (
+                            "powershell_command_error:"
+                            + ",".join(result.get("powershell_error_categories", []))
+                            if result.get("powershell_error_categories")
+                            else "command_execution_unproven"
+                        )
+                    elif result["status"] == "RAW_OUTPUT_MARKER_UNOBSERVED":
                         result["failure_category"] = "raw_output_observation"
-                    elif not result.get("screen_marker_seen"):
+                    elif result["status"] == "SCREEN_OUTPUT_MARKER_UNOBSERVED":
                         result["failure_category"] = "screen_render_observation"
-                    elif not result.get("raw_expected_size_seen"):
+                    elif result["status"] == "SHELL_RESIZE_OUTPUT_UNOBSERVED":
                         result["failure_category"] = "shell_resize_observation"
-                    elif not result.get("screen_expected_size_seen"):
+                    elif result["status"] == "SCREEN_RESIZE_OUTPUT_UNOBSERVED":
                         result["failure_category"] = "screen_resize_observation"
                     else:
                         result["failure_category"] = "prompt_observation"
+                result["output_observation_stage_recorded"] = True
                 emit_stage("target_output_observed")
         except _ConptyPathAbort:
             if not result.get("failure_category"):
@@ -4195,11 +4786,20 @@ def test_r02_product_worker_post_resize_input_factor_diagnostic(
             }.get(current_stage, "diagnostic_apparatus")
         finally:
             current_stage = "cleanup"
+            if not result.get("input_attempted"):
+                result["input_status"] = "NOT_ATTEMPTED"
+                emit_stage("target_input_not_attempted")
+            if not result.get("output_observation_stage_recorded"):
+                result["output_observation_stage_recorded"] = True
+                emit_stage("target_output_observation_not_completed")
             if client is not None:
                 try:
                     client.close()
                 except Exception as exc:
                     result["client_close_error_category"] = type(exc).__name__
+                    result["cleanup_failure_category"] = (
+                        "client_close:" + type(exc).__name__
+                    )
             if registry is not None and identity is not None:
                 try:
                     registry.stop(
@@ -4217,6 +4817,9 @@ def test_r02_product_worker_post_resize_input_factor_diagnostic(
                 except Exception as exc:
                     result["cleanup"] = "STOP_ERROR"
                     result["cleanup_error_category"] = type(exc).__name__
+                    result["cleanup_failure_category"] = (
+                        "registry_stop:" + type(exc).__name__
+                    )
                 finally:
                     if shell_handle is not None:
                         try:
@@ -4225,12 +4828,30 @@ def test_r02_product_worker_post_resize_input_factor_diagnostic(
                             result["cleanup_handle_close_error_category"] = (
                                 type(exc).__name__
                             )
+                            result["cleanup_failure_category"] = (
+                                "retained_handle_close:" + type(exc).__name__
+                            )
             if identity is not None and result["cleanup"] != "CONFIRMED":
-                result["failure_category"] = "cleanup"
-                result["failure_stage"] = "cleanup"
+                result["cleanup_failure_category"] = (
+                    result.get("cleanup_failure_category")
+                    or result.get("cleanup_error_category")
+                    or result["cleanup"]
+                )
+                if not result.get("failure_category"):
+                    result["failure_category"] = "cleanup"
+                    result["failure_stage"] = "cleanup"
             if result.get("evidence_file_error_category"):
-                result["failure_category"] = "diagnostic_evidence"
-                result["failure_stage"] = "evidence_write"
+                result["diagnostic_evidence_failure_category"] = (
+                    result["evidence_file_error_category"]
+                )
+                if not result.get("failure_category"):
+                    result["failure_category"] = "diagnostic_evidence"
+                    result["failure_stage"] = "evidence_write"
+            result["failure_categories"] = _r02_failure_categories(
+                result.get("product_command_failure_category"),
+                result.get("diagnostic_evidence_failure_category"),
+                result.get("cleanup_failure_category"),
+            )
             emit_stage("cleanup_complete")
         results.append(result)
 
