@@ -1,0 +1,260 @@
+name: JTT R02 PowerShell semantic probe
+
+on:
+  push:
+    branches:
+      - jtt/win-rc14-semantic-01
+
+permissions:
+  contents: read
+
+jobs:
+  semantic-probe:
+    name: Windows Server 2025 PowerShell path semantics
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - name: Checkout isolated probe branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Capture environment and verify probe inputs
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resultDir = Join-Path $env:GITHUB_WORKSPACE 'semantic-results'
+          New-Item -ItemType Directory -Path $resultDir -ErrorAction Stop | Out-Null
+          $probeDir = Join-Path $env:GITHUB_WORKSPACE 'experiments/windows_native/r02_semantic_probe'
+          $scripts = [ordered]@{
+            B1 = Join-Path $probeDir 'B1-minimal-path.ps1'
+            B2 = Join-Path $probeDir 'B2-instrumented-path.ps1'
+          }
+          foreach ($entry in $scripts.GetEnumerator()) {
+            if (-not (Test-Path -LiteralPath $entry.Value -PathType Leaf)) { throw "PROBE_SCRIPT_MISSING_$($entry.Key)" }
+          }
+          $nonceB1 = [Guid]::NewGuid().ToString('N').Substring(0, 10)
+          $nonceB2 = [Guid]::NewGuid().ToString('N').Substring(0, 10)
+          $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
+          $roots = [ordered]@{
+            B1 = Join-Path $tempRoot "jtt-r02-semantic-$nonceB1-B1"
+            B2 = Join-Path $tempRoot "jtt-r02-semantic-$nonceB2-B2"
+          }
+          foreach ($entry in $roots.GetEnumerator()) {
+            if (Test-Path -LiteralPath $entry.Value) { throw "TEST_ROOT_COLLISION_$($entry.Key)" }
+          }
+          $productPowerShellExe = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+          $shellPowerShellExe = [IO.Path]::GetFullPath((Join-Path $PSHOME 'powershell.exe'))
+          if (-not [String]::Equals($productPowerShellExe, $shellPowerShellExe, [StringComparison]::OrdinalIgnoreCase)) { throw 'RUNNER_SHELL_DIFFERS_FROM_PRODUCT_POWERSHELL' }
+          if (-not (Test-Path -LiteralPath $productPowerShellExe -PathType Leaf)) { throw 'PRODUCT_POWERSHELL_MISSING' }
+          $powershellExe = $productPowerShellExe
+          $os = Get-CimInstance -ClassName Win32_OperatingSystem
+          $scriptInfo = [ordered]@{}
+          foreach ($entry in $scripts.GetEnumerator()) {
+            $file = Get-Item -LiteralPath $entry.Value
+            $scriptInfo[$entry.Key] = [ordered]@{
+              path = $file.FullName
+              sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              bytes = $file.Length
+            }
+          }
+          $environment = [ordered]@{
+            status = 'PREFLIGHT_READY'
+            runId = $env:GITHUB_RUN_ID
+            commit = $env:GITHUB_SHA
+            branch = $env:GITHUB_REF_NAME
+            runnerOS = $env:RUNNER_OS
+            osCaption = $os.Caption
+            osVersion = $os.Version
+            osBuild = $os.BuildNumber
+            osArchitecture = $os.OSArchitecture
+            powershellPath = $powershellExe
+            shellInvocationPowerShellPath = $shellPowerShellExe
+            productPowerShellPath = $productPowerShellExe
+            powershellVersion = $PSVersionTable.PSVersion.ToString()
+            powershellEdition = $PSVersionTable.PSEdition
+            effectiveExecutionPolicy = (Get-ExecutionPolicy).ToString()
+            probeArguments = '-NoLogo -NoProfile -NonInteractive -File <script> -Nonce <nonce>'
+            processStartDirectory = $PWD.Path
+            workflowWorkspace = $env:GITHUB_WORKSPACE
+            tempRoot = $tempRoot
+            nonceB1 = $nonceB1
+            nonceB2 = $nonceB2
+            expectedRootB1 = $roots.B1
+            expectedRootB2 = $roots.B2
+            expectedDestinationB1 = Join-Path (Join-Path $roots.B1 'work') 'destination'
+            expectedDestinationB2 = Join-Path (Join-Path $roots.B2 'work') 'destination'
+            scripts = $scriptInfo
+          }
+          $environment | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $resultDir 'environment.json') -Encoding UTF8
+          $inputs = [ordered]@{
+            powershellPath = $powershellExe
+            workspace = $env:GITHUB_WORKSPACE
+            resultDir = $resultDir
+            nonceB1 = $nonceB1
+            nonceB2 = $nonceB2
+            roots = $roots
+            expectedDestinationB1 = $environment.expectedDestinationB1
+            expectedDestinationB2 = $environment.expectedDestinationB2
+          }
+          $inputs | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $resultDir 'probe-input.json') -Encoding UTF8
+
+      - name: Run B1 and B2 once and record outcomes
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resultDir = Join-Path $env:GITHUB_WORKSPACE 'semantic-results'
+          $inputPath = Join-Path $resultDir 'probe-input.json'
+          if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) { throw 'PROBE_PREFLIGHT_INPUT_MISSING' }
+          $inputs = Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json
+          $cases = @(
+            [pscustomobject]@{ name = 'B1'; nonce = $inputs.nonceB1; script = Join-Path $env:GITHUB_WORKSPACE 'experiments/windows_native/r02_semantic_probe/B1-minimal-path.ps1' }
+            [pscustomobject]@{ name = 'B2'; nonce = $inputs.nonceB2; script = Join-Path $env:GITHUB_WORKSPACE 'experiments/windows_native/r02_semantic_probe/B2-instrumented-path.ps1' }
+          )
+          $records = @()
+          foreach ($case in $cases) {
+            $expectedDestination = if ($case.name -eq 'B1') { $inputs.expectedDestinationB1 } else { $inputs.expectedDestinationB2 }
+            $stdoutPath = Join-Path $resultDir ($case.name + '.stdout.txt')
+            $stderrPath = Join-Path $resultDir ($case.name + '.stderr.txt')
+            $process = $null
+            $startError = $null
+            try {
+              $quotedScript = '"' + $case.script + '"'
+              $process = Start-Process -FilePath $inputs.powershellPath -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $quotedScript, '-Nonce', $case.nonce) -WorkingDirectory $inputs.workspace -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Wait -PassThru
+            } catch {
+              $startError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+            }
+            $exitCode = if ($null -ne $process) { $process.ExitCode } else { $null }
+            if ($null -ne $process) { $process.Dispose() }
+            $stdout = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) { Get-Content -LiteralPath $stdoutPath -Raw } else { '' }
+            $stderr = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
+            $summary = $null
+            foreach ($line in @($stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+              try { $summary = $line | ConvertFrom-Json -ErrorAction Stop } catch { }
+            }
+            $semanticPass = $false
+            if ($null -ne $summary -and $case.name -eq 'B1') {
+              $semanticPass = ($exitCode -eq 0 -and $summary.exitCode -eq 0 -and $null -eq $summary.error -and [System.String]::Equals($summary.destination, $expectedDestination, [System.StringComparison]::OrdinalIgnoreCase) -and $summary.expectedLocationVerified -eq $true -and $summary.sideEffectContentMatchesExpectedPath -eq $true -and $stdout.Contains($summary.outputMarker))
+            } elseif ($null -ne $summary -and $case.name -eq 'B2') {
+              $states = $summary.markerStates
+              $childOutput = [string]$summary.stdout
+              $pathOutput = 'JTT_PATH_OUTPUT_' + $summary.destination + '_' + $case.nonce + '_END'
+              $execOutput = 'JTT_EXEC_SCRIPT_PATH_CHANGE_' + $case.nonce + '_END'
+              $semanticPass = ($exitCode -eq 0 -and $null -eq $summary.launchError -and $summary.childExitCode -eq 0 -and [System.String]::Equals($summary.destination, $expectedDestination, [System.StringComparison]::OrdinalIgnoreCase) -and $summary.sideEffectContentMatchesExpectedPath -eq $true -and $states.COMMAND_ENTRY.state -eq 'OBSERVED' -and $states.BEFORE_LOCATION.state -eq 'OBSERVED' -and $states.AFTER_LOCATION.state -eq 'OBSERVED' -and $states.AFTER_OUTPUT.state -eq 'OBSERVED' -and $states.ERROR.state -eq 'UNKNOWN' -and $childOutput.Contains($pathOutput) -and $childOutput.Contains($execOutput))
+            }
+            $evidenceUnknown = $false
+            $positiveScriptFailure = $false
+            if ($null -ne $summary -and $case.name -eq 'B1') {
+              $pathFailurePhases = @('SET_LOCATION', 'VERIFY_LOCATION')
+              $positiveScriptFailure = ($summary.failurePhase -in $pathFailurePhases -or ($null -ne $summary.actualPath -and $summary.expectedLocationVerified -eq $false))
+              $evidenceUnknown = ($null -ne $summary.error -and $summary.failurePhase -notin $pathFailurePhases)
+            } elseif ($null -ne $summary -and $case.name -eq 'B2' -and $null -ne $summary.markerStates) {
+              $requiredStates = @('COMMAND_ENTRY', 'BEFORE_LOCATION', 'AFTER_LOCATION', 'AFTER_OUTPUT')
+              $evidenceUnknown = ($null -ne $summary.launchError -or $null -eq $summary.childExitCode)
+              foreach ($stage in $requiredStates) {
+                $stageState = $summary.markerStates.$stage.state
+                if ($stageState -eq 'UNKNOWN' -or $stageState -eq 'EVIDENCE_READ_ERROR' -or $stageState -eq 'EVIDENCE_WRITE_ERROR') { $evidenceUnknown = $true }
+              }
+              $errorState = $summary.markerStates.ERROR
+              if ($errorState.state -eq 'EVIDENCE_READ_ERROR' -or $errorState.state -eq 'EVIDENCE_WRITE_ERROR') { $evidenceUnknown = $true }
+              $pathFailurePhases = @('SET_LOCATION', 'VERIFY_LOCATION')
+              $positiveScriptFailure = ($errorState.state -eq 'OBSERVED' -and $errorState.failurePhase -in $pathFailurePhases)
+              if ($errorState.state -eq 'OBSERVED' -and -not $positiveScriptFailure) { $evidenceUnknown = $true }
+            }
+            $classification = if ($null -ne $startError -or $null -eq $summary -or $null -eq $exitCode) { 'INCONCLUSIVE' } elseif ($positiveScriptFailure) { 'SCRIPT_SEMANTIC_FAILED' } elseif ($evidenceUnknown) { 'INCONCLUSIVE' } elseif ($semanticPass) { 'SCRIPT_SEMANTIC_PASS' } else { 'INCONCLUSIVE' }
+            $records += [pscustomobject]@{
+              name = $case.name
+              nonce = $case.nonce
+              scriptPath = $case.script
+              processStartedAndExited = ($null -ne $process)
+              processExitCode = $exitCode
+              startError = $startError
+              stdoutPath = $stdoutPath
+              stderrPath = $stderrPath
+              stdout = $stdout
+              stderr = $stderr
+              summary = $summary
+              classification = $classification
+            }
+          }
+          $final = if (@($records | Where-Object { $_.classification -eq 'SCRIPT_SEMANTIC_FAILED' }).Count -gt 0) { 'SCRIPT_SEMANTIC_FAILED' } elseif (@($records | Where-Object { $_.classification -eq 'INCONCLUSIVE' }).Count -gt 0) { 'INCONCLUSIVE' } else { 'SCRIPT_SEMANTIC_PASS' }
+          [ordered]@{ verdict = $final; cases = $records } | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $resultDir 'probe-run.json') -Encoding UTF8
+          Write-Output "SEMANTIC_PROBE_VERDICT=$final"
+          if ($final -ne 'SCRIPT_SEMANTIC_PASS') { exit 1 }
+
+      - name: Snapshot and clean only the two test-owned roots
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $resultDir = Join-Path $env:GITHUB_WORKSPACE 'semantic-results'
+          $inputPath = Join-Path $resultDir 'probe-input.json'
+          $evidenceDir = Join-Path $resultDir 'test-owned-evidence'
+          $cleanup = @()
+          $cleanupFailed = $false
+          $evidenceDirReady = $false
+          try {
+            New-Item -ItemType Directory -Path $evidenceDir -Force -ErrorAction Stop | Out-Null
+            $evidenceDirReady = $true
+          } catch {
+            $cleanupFailed = $true
+            $cleanup += [pscustomobject]@{ status = 'EVIDENCE_DIRECTORY_ERROR'; errorType = $_.Exception.GetType().FullName; error = $_.Exception.Message }
+          }
+          if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) {
+            $cleanup += [pscustomobject]@{ status = 'NOT_RUN'; reason = 'preflight inputs missing' }
+            $cleanupFailed = $true
+          } else {
+            $inputs = Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json
+            $tempRoot = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
+            foreach ($case in @(@{ name = 'B1'; nonce = $inputs.nonceB1 }, @{ name = 'B2'; nonce = $inputs.nonceB2 })) {
+              $expectedLeaf = "jtt-r02-semantic-$($case.nonce)-$($case.name)"
+              $root = Join-Path $tempRoot $expectedLeaf
+              if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+                $cleanup += [pscustomobject]@{ name = $case.name; root = $root; status = 'NOT_CREATED' }
+                continue
+              }
+              try {
+                $rootFull = [IO.Path]::GetFullPath($root).TrimEnd('\')
+                $parent = [IO.Path]::GetDirectoryName($rootFull).TrimEnd('\')
+                $leaf = [IO.Path]::GetFileName($rootFull)
+                if (-not [String]::Equals($parent, $tempRoot, [StringComparison]::OrdinalIgnoreCase) -or -not [String]::Equals($leaf, $expectedLeaf, [StringComparison]::OrdinalIgnoreCase)) { throw 'ROOT_OUTSIDE_EXACT_TEST_OWNED_TEMP_PATH' }
+                $rootAttrs = [IO.File]::GetAttributes($rootFull)
+                if (($rootAttrs -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'TEST_ROOT_REPARSE_POINT' }
+                $directoriesToCheck = [System.Collections.Generic.Stack[string]]::new()
+                $directoriesToCheck.Push($rootFull)
+                while ($directoriesToCheck.Count -gt 0) {
+                  $currentDirectory = $directoriesToCheck.Pop()
+                  foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries($currentDirectory)) {
+                    $entryAttributes = [IO.File]::GetAttributes($entryPath)
+                    if (($entryAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'TEST_ROOT_CONTAINS_REPARSE_POINT' }
+                    if (($entryAttributes -band [IO.FileAttributes]::Directory) -ne 0) { $directoriesToCheck.Push($entryPath) }
+                  }
+                }
+                $ownerMarker = Join-Path $rootFull ('.jtt-owned-' + $case.nonce + '.marker')
+                if (-not (Test-Path -LiteralPath $ownerMarker -PathType Leaf)) { throw 'TEST_OWNERSHIP_MARKER_MISSING' }
+                $ownerAttributes = [IO.File]::GetAttributes($ownerMarker)
+                if (($ownerAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'TEST_OWNERSHIP_MARKER_REPARSE_POINT' }
+                if ([IO.File]::ReadAllText($ownerMarker) -ne ('JTT_R02_TEST_OWNED_' + $case.nonce)) { throw 'TEST_OWNERSHIP_MARKER_MISMATCH' }
+                if (-not $evidenceDirReady) { throw 'EVIDENCE_DIRECTORY_UNAVAILABLE_ROOT_PRESERVED' }
+                $caseEvidence = Join-Path $evidenceDir $case.name
+                if (Test-Path -LiteralPath $caseEvidence) { throw 'EVIDENCE_DESTINATION_ALREADY_EXISTS' }
+                New-Item -ItemType Directory -Path $caseEvidence | Out-Null
+                Get-ChildItem -LiteralPath $rootFull -Force | Copy-Item -Destination $caseEvidence -Recurse -Force -ErrorAction Stop
+                Remove-Item -LiteralPath $rootFull -Recurse -Force -ErrorAction Stop
+                $cleanup += [pscustomobject]@{ name = $case.name; root = $rootFull; status = 'SNAPSHOTTED_AND_REMOVED'; evidencePath = $caseEvidence }
+              } catch {
+                $cleanupFailed = $true
+                $cleanup += [pscustomobject]@{ name = $case.name; root = $root; status = 'CLEANUP_ERROR'; errorType = $_.Exception.GetType().FullName; error = $_.Exception.Message }
+              }
+            }
+          }
+          [ordered]@{ cleanup = $cleanup; failed = $cleanupFailed } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $resultDir 'cleanup.json') -Encoding UTF8 -ErrorAction Stop
+          if ($cleanupFailed) { Write-Error 'TEST_OWNED_CLEANUP_NOT_CONFIRMED'; exit 1 }
+
+      - name: Preserve probe evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-r02-semantic-${{ github.run_id }}
+          path: semantic-results/
+          if-no-files-found: error
