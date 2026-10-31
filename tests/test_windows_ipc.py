@@ -1422,7 +1422,14 @@ def test_native_synthetic_pipe_server_silence_times_out_and_cancels():
     try:
         with pytest.raises(windows_ipc.PipeIoTimeout, match="read") as caught:
             transport.exchange(b"request")
-        assert caught.value.cancel_state.endswith(("completed", "completion_pending"))
+        cancel_request_state, io_completion_state = caught.value.cancel_state.rsplit(":", 1)
+        assert cancel_request_state in {"requested", "not_found"}, caught.value.cancel_state
+        assert io_completion_state in {
+            "completed", "completed_aborted", "completion_pending",
+        }, caught.value.cancel_state
+        assert transport.poisoned
+        with pytest.raises(windows_ipc.PipeIoError, match="poisoned"):
+            transport.exchange(b"next request")
     finally:
         release_server.set()
         transport.close()
