@@ -1,0 +1,54 @@
+name: WIN-RC12 IPC Native Verification
+
+on:
+  push:
+    branches:
+      - jtt/win-rc12-ipc-native-01
+
+permissions:
+  contents: read
+
+jobs:
+  windows-ipc-native:
+    name: Windows Server 2025 / Python 3.13 IPC tests
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install pinned Windows test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -r experiments/windows_native/requirements.txt
+          python -m pip install --disable-pip-version-check --no-deps -e .
+
+      - name: Verify runtime and checkout import identity
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force test-results | Out-Null
+          $env:PYTHONDONTWRITEBYTECODE = "1"
+          python --version
+          python -c "import json, os, platform, sys, pywintypes, win32api, win32file, win32pipe, win32security; from pathlib import Path; import tmux_agent_tower.terminal.windows_ipc as ipc; import tmux_agent_tower.terminal.windows_manager as manager; expected = (Path(os.environ['GITHUB_WORKSPACE']) / 'src').resolve(); modules = {'windows_ipc': ipc, 'windows_manager': manager}; paths = {name: str(Path(module.__file__).resolve()) for name, module in modules.items()}; [Path(path).relative_to(expected) for path in paths.values()]; from importlib.metadata import version; data = {'python': sys.version, 'platform': platform.platform(), 'pywin32': version('pywin32'), 'pywinpty': version('pywinpty'), 'source_root': str(expected), 'imports': paths, 'native_api_modules': [win32api.__name__, win32file.__name__, win32pipe.__name__, win32security.__name__, pywintypes.__name__]}; print(json.dumps(data, sort_keys=True)); Path('test-results/environment.json').write_text(json.dumps(data, indent=2, sort_keys=True), encoding='utf-8')"
+
+      - name: Run the complete IPC synthetic and native test module
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+        shell: pwsh
+        run: |
+          python -m pytest --noconftest -p no:cacheprovider -q -s tests/test_windows_ipc.py --junitxml=test-results/windows-ipc-native.xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Preserve IPC JUnit and runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-rc12-ipc-native-${{ github.run_id }}
+          path: test-results/
+          if-no-files-found: warn
