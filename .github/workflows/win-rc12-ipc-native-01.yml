@@ -13,6 +13,10 @@ jobs:
     name: Windows Server 2025 / Python 3.13 IPC tests
     runs-on: windows-2025
     timeout-minutes: 15
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,18 +36,114 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force test-results | Out-Null
-          $env:PYTHONDONTWRITEBYTECODE = "1"
-          python --version
-          python -c "import json, os, platform, sys, pywintypes, win32api, win32file, win32pipe, win32security; from pathlib import Path; import tmux_agent_tower.terminal.windows_ipc as ipc; import tmux_agent_tower.terminal.windows_manager as manager; expected = (Path(os.environ['GITHUB_WORKSPACE']) / 'src').resolve(); modules = {'windows_ipc': ipc, 'windows_manager': manager}; paths = {name: str(Path(module.__file__).resolve()) for name, module in modules.items()}; [Path(path).relative_to(expected) for path in paths.values()]; from importlib.metadata import version; data = {'python': sys.version, 'platform': platform.platform(), 'pywin32': version('pywin32'), 'pywinpty': version('pywinpty'), 'source_root': str(expected), 'imports': paths, 'native_api_modules': [win32api.__name__, win32file.__name__, win32pipe.__name__, win32security.__name__, pywintypes.__name__]}; print(json.dumps(data, sort_keys=True)); Path('test-results/environment.json').write_text(json.dumps(data, indent=2, sort_keys=True), encoding='utf-8')"
+          $sourceRoot = [System.IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE "src"))
+          $evidencePath = Join-Path $env:GITHUB_WORKSPACE "test-results/environment.json"
+          $evidence = [ordered]@{
+            stage = "preflight_entered"
+            platform = [System.Environment]::OSVersion.VersionString
+            workspace = $env:GITHUB_WORKSPACE
+            expected_source_root = $sourceRoot
+            configured_pythonpath = $env:PYTHONPATH
+          }
+          [System.IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+          $preflight = @'
+          import importlib.metadata as metadata
+          import json
+          import os
+          import platform
+          import sys
+          from pathlib import Path
+
+          report = Path("test-results/environment.json")
+          evidence = json.loads(report.read_text(encoding="utf-8"))
+          evidence["stage"] = "import_identity_started"
+          report.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+          try:
+              import pywintypes
+              import win32api
+              import win32file
+              import win32pipe
+              import win32security
+
+              import ju0_terminal_tower as jtt
+              import tmux_agent_tower as legacy_alias
+              import tmux_agent_tower.terminal.windows_ipc as ipc
+              import tmux_agent_tower.terminal.windows_manager as manager
+
+              expected = (Path(os.environ["GITHUB_WORKSPACE"]) / "src").resolve(strict=True)
+              configured = Path(os.environ["PYTHONPATH"]).resolve(strict=True)
+              jtt_path = Path(jtt.__file__).resolve(strict=True)
+              legacy_path = Path(legacy_alias.__file__).resolve(strict=True)
+              if configured != expected:
+                  raise AssertionError("PYTHONPATH is not the checkout src directory")
+              if jtt_path != legacy_path:
+                  raise AssertionError("JTT namespace alias does not share its source file")
+              jtt_path.relative_to(expected)
+              modules = {"windows_ipc": ipc, "windows_manager": manager}
+              imports = {name: str(Path(module.__file__).resolve(strict=True)) for name, module in modules.items()}
+              for module_path in imports.values():
+                  Path(module_path).relative_to(expected)
+              data = {
+                  "stage": "import_identity_verified",
+                  "python": sys.version,
+                  "platform": platform.platform(),
+                  "pywin32": metadata.version("pywin32"),
+                  "pywinpty": metadata.version("pywinpty"),
+                  "jtt_distribution": metadata.version("ju0-terminal-tower"),
+                  "source_root": str(expected),
+                  "pythonpath": str(configured),
+                  "jtt_namespace_path": str(jtt_path),
+                  "legacy_alias_path": str(legacy_path),
+                  "alias_same_source_file": True,
+                  "imports": imports,
+                  "native_api_modules": [win32api.__name__, win32file.__name__, win32pipe.__name__, win32security.__name__, pywintypes.__name__],
+              }
+          except Exception as exc:
+              evidence.update({
+                  "stage": "import_identity_failed",
+                  "error_category": type(exc).__name__,
+                  "error_message": str(exc)[:300],
+              })
+              report.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+              raise
+          report.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+          print(json.dumps(data, sort_keys=True))
+          '@
+          $preflightPath = Join-Path $env:RUNNER_TEMP "jtt-ipc-native-preflight.py"
+          [System.IO.File]::WriteAllText($preflightPath, $preflight, [System.Text.UTF8Encoding]::new($false))
+          python $preflightPath
+          $preflightExit = $LASTEXITCODE
+          if ($preflightExit -ne 0) { exit $preflightExit }
+
+      - name: Collect and require the fixed 41 IPC test cases
+        shell: pwsh
+        run: |
+          $collectionOutput = python -m pytest --noconftest -p no:cacheprovider --collect-only -q tests/test_windows_ipc.py 2>&1
+          $collectionExit = $LASTEXITCODE
+          $collectionText = ($collectionOutput | ForEach-Object { "$_" }) -join "`n"
+          [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "test-results/collection.log"), $collectionText, [System.Text.UTF8Encoding]::new($false))
+          $collectedCount = @($collectionOutput | Where-Object { "$_" -match '^tests/test_windows_ipc\.py::' }).Count
+          $evidencePath = Join-Path $env:GITHUB_WORKSPACE "test-results/environment.json"
+          $evidence = Get-Content -Raw $evidencePath | ConvertFrom-Json
+          $evidence | Add-Member -NotePropertyName collection_exit_code -NotePropertyValue $collectionExit -Force
+          $evidence | Add-Member -NotePropertyName collection_count -NotePropertyValue $collectedCount -Force
+          $evidence | Add-Member -NotePropertyName stage -NotePropertyValue $(if ($collectionExit -eq 0 -and $collectedCount -eq 41) { "collection_verified" } else { "collection_failed" }) -Force
+          [System.IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+          Write-Output $collectionText
+          if ($collectionExit -ne 0) { exit $collectionExit }
+          if ($collectedCount -ne 41) { throw "Expected 41 IPC test cases, collected $collectedCount" }
 
       - name: Run the complete IPC synthetic and native test module
-        env:
-          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-          PYTHONDONTWRITEBYTECODE: "1"
         shell: pwsh
         run: |
           python -m pytest --noconftest -p no:cacheprovider -q -s tests/test_windows_ipc.py --junitxml=test-results/windows-ipc-native.xml
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $pytestExit = $LASTEXITCODE
+          $evidencePath = Join-Path $env:GITHUB_WORKSPACE "test-results/environment.json"
+          $evidence = Get-Content -Raw $evidencePath | ConvertFrom-Json
+          $evidence | Add-Member -NotePropertyName pytest_exit_code -NotePropertyValue $pytestExit -Force
+          $evidence | Add-Member -NotePropertyName stage -NotePropertyValue $(if ($pytestExit -eq 0) { "pytest_completed" } else { "pytest_failed" }) -Force
+          [System.IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+          if ($pytestExit -ne 0) { exit $pytestExit }
 
       - name: Preserve IPC JUnit and runtime evidence
         if: always()
