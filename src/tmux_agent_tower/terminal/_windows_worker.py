@@ -32,12 +32,29 @@ MAX_PIPE_INSTANCES = MAX_PIPE_CLIENTS + 1  # connected clients plus one listener
 MAX_COLUMNS = 300
 MAX_LINES = 120
 BOOTSTRAP_WAIT_MS = 30_000
+JOB_PROCESS_EXIT_TIMEOUT = 2.0
+JOB_PROCESS_EXIT_POLL_INTERVAL = 0.025
 _STAGE = "worker_import"
 
 
 def _set_stage(value):
     global _STAGE
     _STAGE = value
+
+
+class _InputDeliveryUnconfirmed(RuntimeError):
+    """A PTY write did not confirm the complete UTF-8 request payload."""
+
+
+def _write_terminal_input(terminal, text, expected_bytes):
+    """Return only a verified PTY byte count; never retry an ambiguous write."""
+    try:
+        written = terminal.write(text)
+    except Exception as exc:
+        raise _InputDeliveryUnconfirmed from exc
+    if type(written) is not int or written != expected_bytes:
+        raise _InputDeliveryUnconfirmed
+    return written
 
 
 def _load_runtime():
@@ -170,11 +187,42 @@ def _identity_data(session_id, generation, supervisor_pid, supervisor_start,
     }
 
 
+def _wait_for_job_empty(query_active_processes, *, timeout,
+                        poll_interval=JOB_PROCESS_EXIT_POLL_INTERVAL,
+                        clock=time.monotonic, sleep=time.sleep):
+    """Return only after the owned Job reports zero active processes.
+
+    Query errors and malformed counts are not interpreted as process exit.
+    The caller keeps the session record and reports Stop failure on either.
+    """
+    deadline = clock() + timeout
+    while True:
+        try:
+            active = query_active_processes()
+        except Exception as exc:
+            raise RuntimeError("owned Job process count is unavailable") from exc
+        if isinstance(active, bool) or not isinstance(active, int) or active < 0:
+            raise RuntimeError("owned Job process count is invalid")
+        if active == 0:
+            return True
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        sleep(min(poll_interval, remaining))
+
+
+def _owned_stop_state_is_retryable(state: str) -> bool:
+    """Allow only an identity-bound retry after an explicit Stop failure."""
+    return state in ("running", "exited", "stopping")
+
+
 def assign_owned_job(job, process_handle, win32job, win32api, win32event,
                      win32con):
     """Assign only the retained child handle; fail closed on any error."""
     try:
         win32job.AssignProcessToJobObject(job, process_handle)
+        if not win32job.IsProcessInJob(process_handle, job):
+            raise RuntimeError("PowerShell Job membership was not confirmed")
     except Exception:
         win32api.TerminateProcess(process_handle, 1)
         if win32event.WaitForSingleObject(process_handle, 5000) != win32con.WAIT_OBJECT_0:
@@ -198,7 +246,19 @@ def _bootstrap_script(release_name, abort_name):
         "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
         "$OutputEncoding=[Console]::OutputEncoding; "
         "Remove-Module PSReadLine -ErrorAction SilentlyContinue; "
-        "function prompt { 'JTT> ' }"
+        "function global:prompt { "
+        "$path=$ExecutionContext.SessionState.Path.CurrentLocation.Path; "
+        "$width=120; try { $width=[int]$Host.UI.RawUI.WindowSize.Width } catch {}; "
+        # Leave about 30 columns for command entry when the path is abbreviated.
+        "$limit=[Math]::Max(12,$width-36); "
+        "if ($path.Length -gt $limit) { "
+        "$root=[System.IO.Path]::GetPathRoot($path); "
+        "if ($null -eq $root) { $root='' }; "
+        "if ($root.Length -gt ($limit-5)) { $root=$root.Substring(0,$limit-5) }; "
+        "$tailCount=[Math]::Max(1,$limit-$root.Length-4); "
+        "$tailStart=[Math]::Max($root.Length,$path.Length-$tailCount); "
+        "$path=$root+'...\\'+$path.Substring($tailStart) "
+        "}; 'PS '+$path+'> ' }"
     )
 
 
@@ -394,6 +454,9 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
             _set_stage("job_assignment")
             assign_owned_job(job, shell_handle, win32job, win32api,
                              win32event, win32con)
+            # The retained shell handle is verified as a Job member before
+            # PowerShell's bootstrap gate is released. Descendants inherit
+            # membership because neither breakaway flag is enabled.
             shell_in_job = True
             _set_stage("publish_running_gate")
             win32event.SetEvent(gate)
@@ -638,9 +701,18 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                             return base(error="invalid_input")
                         if not data or len(data) > 8192:
                             return base(error="invalid_input")
-                        terminal.write(text)
+                        try:
+                            written = _write_terminal_input(terminal, text, len(data))
+                        except _InputDeliveryUnconfirmed:
+                            # A failed or partial PTY write may already have
+                            # delivered a prefix. Releasing the exclusive
+                            # lease fails closed; retransmitting could duplicate
+                            # shell input, so the request is never retried here.
+                            lease_owner = None
+                            lease_deadline = 0.0
+                            return base(error="input_delivery_unconfirmed")
                         lease_deadline = now + LEASE_SECONDS
-                        return base(ok=True, written=len(data), lease=True)
+                        return base(ok=True, written=written, lease=True)
                     columns, lines = request.get("columns"), request.get("lines")
                     if (isinstance(columns, bool) or isinstance(lines, bool)
                             or not isinstance(columns, int) or not isinstance(lines, int)
@@ -654,7 +726,7 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                         runtime._atomic_metadata(metadata_path, metadata)
                     return base(ok=True, lease=True, columns=columns, lines=lines)
                 if op == "stop":
-                    if state not in ("running", "exited"):
+                    if not _owned_stop_state_is_retryable(state):
                         return base(error="session_unavailable")
                     with state_lock:
                         state = "stopping"
@@ -666,11 +738,23 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                         return base(error="owned_job_termination_failed")
                     if win32event.WaitForSingleObject(shell_handle, 5000) != win32con.WAIT_OBJECT_0:
                         return base(error="owned_process_exit_timeout")
+                    try:
+                        job_empty = _wait_for_job_empty(
+                            lambda: win32job.QueryInformationJobObject(
+                                job, win32job.JobObjectBasicAccountingInformation
+                            )["ActiveProcesses"],
+                            timeout=JOB_PROCESS_EXIT_TIMEOUT,
+                        )
+                    except Exception:
+                        return base(error="owned_job_exit_unverified")
+                    if not job_empty:
+                        return base(error="owned_job_processes_remain")
                     with state_lock:
                         exit_code = int(win32process.GetExitCodeProcess(shell_handle))
                         state = "exited"
                         metadata.update({"state": state, "exit_code": exit_code,
-                                         "termination": "requested"})
+                                         "termination": "requested",
+                                         "job_processes_empty": True})
                         runtime._atomic_metadata(metadata_path, metadata)
                     response = base(ok=True, state="exited", stopping=True)
                     return response
@@ -859,7 +943,15 @@ def _run(session_dir_text, session_id, generation, name, runtime=None):
                             # user input or child commands; terminate only its
                             # retained process handle instead of signaling a PID.
                             win32api.TerminateProcess(shell_handle, 1)
-                        win32event.WaitForSingleObject(shell_handle, 5000)
+                        result = win32event.WaitForSingleObject(shell_handle, 5000)
+                        if result != win32con.WAIT_OBJECT_0:
+                            raise RuntimeError("owned PowerShell cleanup timed out")
+                        if shell_in_job and not _wait_for_job_empty(
+                                lambda: win32job.QueryInformationJobObject(
+                                    job, win32job.JobObjectBasicAccountingInformation
+                                )["ActiveProcesses"],
+                                timeout=JOB_PROCESS_EXIT_TIMEOUT):
+                            raise RuntimeError("owned Job children remain after cleanup")
             finally:
                 if shell_handle is not None:
                     shell_handle.Close()

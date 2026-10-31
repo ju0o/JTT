@@ -9,6 +9,7 @@ import random
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -124,8 +125,14 @@ def test_supervisor_early_exit_is_not_reported_as_stale_identity(tmp_path, monke
         return original_popen(args, **kwargs)
 
     monkeypatch.setattr(manager.subprocess, "Popen", exit_worker)
-    with pytest.raises(TerminalError, match="exited during startup.*23"):
+    with pytest.raises(
+        TerminalError,
+        match="exited during startup.*23.*cleanup could not be verified.*evidence retained",
+    ):
         registry.create("early exit fixture")
+    retained = registry.list_sessions()
+    assert len(retained) == 1
+    assert retained[0].state == "orphaned"
 
 
 @pytest.mark.skipif(not renderer_available(), reason="worker identity test requires pyte")
@@ -149,11 +156,16 @@ def test_live_supervisor_argv_mismatch_is_reported_separately(tmp_path, monkeypa
         return process
 
     monkeypatch.setattr(manager.subprocess, "Popen", record_worker)
-    with pytest.raises(TerminalError, match="argv identity could not be verified"):
+    with pytest.raises(
+        TerminalError,
+        match="argv identity could not be verified.*cleanup could not be verified.*evidence retained",
+    ):
         registry.create("identity mismatch fixture")
     assert len(worker_processes) == 1
     assert worker_processes[0].poll() is not None
-    assert registry.list_sessions() == ()
+    retained = registry.list_sessions()
+    assert len(retained) == 1
+    assert retained[0].state == "identity_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -337,6 +349,9 @@ def _stop_transition_session(tmp_path, *, generation="stop-generation"):
         "name": "stop transition fixture",
         "state": "running",
     }
+    socket_path = manager._planned_socket_path(session_dir, session_id)
+    if socket_path.parent != session_dir:
+        metadata["socket_path"] = str(socket_path)
     manager._atomic_metadata(session_dir / manager.SESSION_META, metadata)
     return manager, root, session_id, session_dir, metadata
 
@@ -370,7 +385,10 @@ def test_registry_stop_waits_for_same_worker_to_commit_shell_exit(
 
     def publish_exit_on_wait(_seconds):
         updated = dict(metadata)
-        updated.update(state="exited", exit_code=0, exit_signal=None)
+        updated.update(
+            state="exited", exit_code=0, exit_signal=None,
+            termination="requested", process_tree_cleanup_verified=True,
+        )
         manager._atomic_metadata(session_dir / manager.SESSION_META, updated)
         metadata.clear()
         metadata.update(updated)
@@ -392,7 +410,7 @@ def test_registry_stop_waits_for_same_worker_to_commit_shell_exit(
             close=lambda: None,
         )
 
-    monkeypatch.setattr(registry, "connect", connect_after_commit)
+    monkeypatch.setattr(registry, "_connect_for_stop", connect_after_commit)
     monkeypatch.setattr(
         manager, "_worker_is_same_process", lambda *_args: worker_alive[0]
     )
@@ -917,6 +935,16 @@ def _proc_session_and_group(pid):
         return None
 
 
+def _proc_state_and_start(pid):
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(
+            encoding="ascii"
+        ).rsplit(")", 1)[1].split()
+        return fields[0], fields[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 @pytest.mark.skipif(not renderer_available(), reason="supervisor crash test requires pyte")
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux process identities are required")
 def test_supervisor_crash_makes_session_stale_and_shell_exits(tmp_path, monkeypatch):
@@ -936,6 +964,7 @@ def test_supervisor_crash_makes_session_stale_and_shell_exits(tmp_path, monkeypa
     client = registry.create("crashed supervisor fixture")
     session_id = client.identity.session_id
     shell_pid = client.identity.shell_pid
+    shell_start = client.identity.shell_start
     supervisor_pid = client.identity.supervisor_pid
     assert len(worker_processes) == 1
     assert worker_processes[0].pid == supervisor_pid
@@ -967,34 +996,701 @@ def test_supervisor_crash_makes_session_stale_and_shell_exits(tmp_path, monkeypa
             registry.connect(session_id)
     finally:
         if _proc_start(shell_pid) is not None:
-            _worker._signal_session_processes(shell_pid, signal.SIGKILL)
+            _worker._signal_owned_process_tree(
+                shell_pid, shell_start, signal.SIGKILL, owner_pid=None,
+            )
 
 
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux process identities are required")
 @pytest.mark.parametrize("unsupported_call", ["pidfd_open", "pidfd_send_signal"])
-def test_pidfd_syscall_unavailable_falls_back_to_checked_pid_signal(
+def test_pidfd_syscall_unavailable_fails_closed_without_signaling_pid(
         monkeypatch, unsupported_call):
-    if unsupported_call == "pidfd_send_signal" and not hasattr(signal, "pidfd_send_signal"):
-        pytest.skip("Python does not expose pidfd_send_signal")
+    from tmux_agent_tower.terminal import TerminalError
+
     child = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+    child_start = _proc_start(child.pid)
+    assert child_start
     try:
         if unsupported_call == "pidfd_open":
             def unavailable(*_args, **_kwargs):
                 raise OSError(_worker.errno.ENOSYS, "pidfd_open unavailable")
 
-            monkeypatch.setattr(_worker.os, "pidfd_open", unavailable)
+            monkeypatch.setattr(_worker.os, "pidfd_open", unavailable, raising=False)
         else:
             def unavailable(*_args, **_kwargs):
                 raise OSError(_worker.errno.ENOSYS, "pidfd_send_signal unavailable")
 
-            monkeypatch.setattr(signal, "pidfd_send_signal", unavailable)
+            monkeypatch.setattr(signal, "pidfd_send_signal", unavailable, raising=False)
 
-        _worker._signal_session_processes(child.pid, signal.SIGTERM)
-        assert child.wait(timeout=3) == -signal.SIGTERM
+        with pytest.raises(TerminalError, match="pidfd"):
+            _worker._signal_owned_process_tree(
+                child.pid, child_start, signal.SIGTERM,
+                owner_pid=os.getpid(), include_adopted=False,
+            )
+        assert child.poll() is None
     finally:
         if child.poll() is None:
             child.kill()
             child.wait(timeout=3)
+
+
+def test_windows_job_stop_requires_confirmed_empty_job_without_native_processes():
+    from tmux_agent_tower.terminal._windows_worker import _wait_for_job_empty
+
+    class Clock:
+        def __init__(self):
+            self.now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+    observations = iter((2, 1, 0))
+    assert _wait_for_job_empty(
+        lambda: next(observations), timeout=1.0, poll_interval=0.1,
+        clock=clock.monotonic, sleep=clock.sleep,
+    )
+
+    clock = Clock()
+    assert not _wait_for_job_empty(
+        lambda: 1, timeout=0.2, poll_interval=0.1,
+        clock=clock.monotonic, sleep=clock.sleep,
+    )
+
+    with pytest.raises(RuntimeError, match="count is unavailable"):
+        _wait_for_job_empty(
+            lambda: (_ for _ in ()).throw(OSError("query denied")), timeout=1.0,
+            clock=clock.monotonic, sleep=clock.sleep,
+        )
+
+    with pytest.raises(RuntimeError, match="count is invalid"):
+        _wait_for_job_empty(
+            lambda: True, timeout=1.0, clock=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+
+def test_windows_job_assignment_verifies_membership_and_uses_only_owned_handle():
+    from tmux_agent_tower.terminal._windows_worker import assign_owned_job
+
+    class JobApi:
+        calls = []
+        member = False
+
+        @classmethod
+        def AssignProcessToJobObject(cls, job, process_handle):
+            cls.calls.append(("assign", job, process_handle))
+
+        @classmethod
+        def IsProcessInJob(cls, process_handle, job):
+            cls.calls.append(("verify", process_handle, job))
+            return cls.member
+
+    class ProcessApi:
+        calls = []
+
+        @classmethod
+        def TerminateProcess(cls, handle, code):
+            cls.calls.append((handle, code))
+
+    class EventApi:
+        @staticmethod
+        def WaitForSingleObject(_handle, _timeout):
+            return 0
+
+    class Constants:
+        WAIT_OBJECT_0 = 0
+
+    JobApi.member = True
+    assert assign_owned_job(
+        "job", "retained-shell-handle", JobApi,
+        ProcessApi, EventApi, Constants,
+    ) is None
+    assert JobApi.calls == [
+        ("assign", "job", "retained-shell-handle"),
+        ("verify", "retained-shell-handle", "job"),
+    ]
+    assert ProcessApi.calls == []
+
+    JobApi.calls.clear()
+    JobApi.member = False
+    with pytest.raises(RuntimeError, match="membership was not confirmed"):
+        assign_owned_job(
+            "job", "retained-shell-handle", JobApi,
+            ProcessApi, EventApi, Constants,
+        )
+    assert ProcessApi.calls == [("retained-shell-handle", 1)]
+
+
+def test_owned_stop_retry_keeps_stopping_record_and_retries_only_terminate():
+    from tmux_agent_tower.terminal import _worker
+
+    owner = object.__new__(_worker.PtyOwner)
+    owner.metadata = {"state": "running"}
+    owner.child = object()
+    owner._check_child = lambda: None
+    owner._store_state = lambda state, **extra: owner.metadata.update(
+        {"state": state, **extra}
+    )
+    attempts = []
+
+    def fail_once_then_terminate():
+        attempts.append("terminate")
+        if len(attempts) == 1:
+            raise TerminalError("owned cleanup is unverified")
+        owner.metadata["state"] = "exited"
+
+    owner._terminate_child = fail_once_then_terminate
+    owner._state = lambda: owner.metadata["state"]
+    owner._base = lambda **extra: {"ok": True, **extra}
+    client = {"client_id": "a" * 32}
+    request = {"op": "stop", "client_id": "a" * 32}
+
+    with pytest.raises(TerminalError, match="owned cleanup is unverified"):
+        owner._dispatch(client, request)
+    assert owner.metadata["state"] == "stopping"
+
+    response, stop_after = owner._dispatch(client, request)
+    assert response["ok"] is True
+    assert response["state"] == "exited"
+    assert stop_after is True
+    assert attempts == ["terminate", "terminate"]
+
+
+def test_registry_stop_retries_stopping_session_without_enabling_connect(
+        tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.manager as manager
+
+    session_id, generation = "a" * 32, "b" * 32
+    root = tmp_path / "registry"
+    root.mkdir(mode=0o700)
+    session_dir = root / session_id
+    session_dir.mkdir(mode=0o700)
+    socket_path = session_dir / manager.SOCKET_NAME
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(socket_path))
+    os.chmod(socket_path, 0o600)
+    metadata = {
+        "protocol": manager.PROTOCOL,
+        "session_id": session_id,
+        "generation": generation,
+        "supervisor_pid": os.getpid(),
+        "supervisor_start": "worker-start",
+        "shell_pid": os.getpid() + 1,
+        "shell_start": "shell-start",
+        "shell_path": "/bin/bash",
+        "name": "retry fixture",
+        "state": "stopping",
+    }
+    manager._atomic_metadata(session_dir / manager.SESSION_META, metadata)
+    operations = []
+
+    class FakeClient:
+        def __init__(self, _session_dir, identity, **_kwargs):
+            self.identity = identity
+
+        def _request(self, operation, **_fields):
+            operations.append(operation)
+
+        def close(self):
+            pass
+
+    removed = []
+    monkeypatch.setattr(
+        manager, "_validate_identity",
+        lambda _root, requested: (session_dir, metadata)
+        if requested == session_id else (_ for _ in ()).throw(AssertionError()),
+    )
+    monkeypatch.setattr(manager, "TerminalClient", FakeClient)
+    monkeypatch.setattr(manager, "_worker_is_same_process", lambda *_args: False)
+    monkeypatch.setattr(
+        manager, "_remove_private_session",
+        lambda path, **_kwargs: removed.append(path),
+    )
+    registry = TerminalRegistry(root=root)
+    try:
+        with pytest.raises(TerminalError, match="not ready"):
+            registry.connect(session_id)
+
+        registry.stop(
+            session_id, expected_generation=generation,
+            expected_shell_pid=metadata["shell_pid"],
+        )
+        assert operations == ["stop"]
+        assert removed == [session_dir]
+    finally:
+        server.close()
+
+
+def test_partial_stop_cleanup_restores_exact_session_metadata_on_directory_failure(
+        tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.manager as manager
+
+    session_id, generation = "e" * 32, "f" * 32
+    session_dir = tmp_path / session_id
+    session_dir.mkdir(mode=0o700)
+    session_dir.chmod(0o700)
+    metadata = {
+        "protocol": manager.PROTOCOL,
+        "session_id": session_id,
+        "generation": generation,
+        "supervisor_pid": 123,
+        "supervisor_start": "worker-start",
+        "shell_pid": 456,
+        "shell_start": "shell-start",
+        "shell_path": "/bin/bash",
+        "name": "cleanup evidence fixture",
+        "state": "exited",
+        "exit_code": 0,
+        "termination": "requested",
+        "process_tree_cleanup_verified": True,
+    }
+    metadata_bytes = json.dumps(metadata, separators=(",", ":"), sort_keys=True).encode()
+    metadata_path = session_dir / manager.SESSION_META
+    metadata_path.write_bytes(metadata_bytes)
+    metadata_path.chmod(0o600)
+    missing_root = tmp_path / "missing-metadata-root"
+    missing_root.mkdir(mode=0o700)
+    missing_session_dir = missing_root / session_id
+    missing_session_dir.mkdir(mode=0o700)
+    missing_session_dir.chmod(0o700)
+    with pytest.raises(TerminalError, match="identity evidence is unavailable"):
+        manager._remove_private_session(
+            missing_session_dir, expected_session_id=session_id,
+            expected_generation=generation,
+            expected_identity=manager._identity(metadata),
+        )
+    assert missing_session_dir.is_dir()
+    assert not tuple(missing_session_dir.iterdir())
+    missing_session_dir.rmdir()
+    missing_root.rmdir()
+
+    unexpected_evidence = session_dir / "unexpected-evidence.txt"
+    unexpected_evidence.write_bytes(b"preserve this unclassified evidence")
+    unexpected_evidence.chmod(0o600)
+    expected_identity = manager._identity(metadata)
+    with pytest.raises(TerminalError, match="unexpected session artifact"):
+        manager._remove_private_session(
+            session_dir, expected_session_id=session_id,
+            expected_generation=generation,
+            expected_identity=expected_identity,
+        )
+    assert metadata_path.read_bytes() == metadata_bytes
+    assert unexpected_evidence.read_bytes() == b"preserve this unclassified evidence"
+    assert not (tmp_path / f".stop-evidence-{session_id}-{generation}.json").exists()
+
+    # The test now supplies only artifacts the product is allowed to remove.
+    unexpected_evidence.unlink()
+    socket_path = session_dir / manager.SOCKET_NAME
+    owned_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    owned_socket.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    original_rmdir = Path.rmdir
+    failures = []
+
+    def fail_target_rmdir(path):
+        if path == session_dir and not failures:
+            failures.append(path)
+            raise OSError("injected directory cleanup failure")
+        return original_rmdir(path)
+
+    try:
+        monkeypatch.setattr(Path, "rmdir", fail_target_rmdir)
+        with pytest.raises(TerminalError, match="registry evidence retained"):
+            manager._remove_private_session(
+                session_dir, expected_session_id=session_id,
+                expected_generation=generation,
+                expected_identity=expected_identity,
+            )
+
+        assert failures == [session_dir]
+        assert not socket_path.exists()
+        assert metadata_path.read_bytes() == metadata_bytes
+        assert metadata_path.stat().st_nlink == 1
+        assert stat.S_IMODE(metadata_path.stat().st_mode) == 0o600
+        assert not (tmp_path / f".stop-evidence-{session_id}-{generation}.json").exists()
+
+        monkeypatch.setattr(Path, "rmdir", original_rmdir)
+        monkeypatch.setattr(manager, "_owned_process_liveness",
+                            lambda _pid, _start: "absent")
+        assert manager._retry_confirmed_stop_cleanup(
+            tmp_path, session_id, expected_generation=generation,
+            expected_shell_pid=metadata["shell_pid"],
+        ) is True
+        assert not session_dir.exists()
+    finally:
+        owned_socket.close()
+
+
+def test_durable_stop_evidence_recovers_after_metadata_restore_failure(
+        tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.manager as manager
+
+    session_id, generation = "8" * 32, "9" * 32
+    session_dir = tmp_path / session_id
+    session_dir.mkdir(mode=0o700)
+    session_dir.chmod(0o700)
+    metadata = {
+        "protocol": manager.PROTOCOL,
+        "session_id": session_id,
+        "generation": generation,
+        "supervisor_pid": 123,
+        "supervisor_start": "worker-start",
+        "shell_pid": 456,
+        "shell_start": "shell-start",
+        "shell_path": "/bin/bash",
+        "name": "durable stop evidence fixture",
+        "state": "stopped",
+        "termination": "requested",
+        "process_tree_cleanup_verified": True,
+    }
+    metadata_bytes = json.dumps(metadata, separators=(",", ":"), sort_keys=True).encode()
+    metadata_path = session_dir / manager.SESSION_META
+    metadata_path.write_bytes(metadata_bytes)
+    metadata_path.chmod(0o600)
+    expected_identity = manager._identity(metadata)
+    original_rmdir = Path.rmdir
+    original_restore = manager._restore_private_metadata_from_backup
+    failures = []
+
+    def fail_target_rmdir(path):
+        if path == session_dir and not failures:
+            failures.append(path)
+            raise OSError("injected directory cleanup failure")
+        return original_rmdir(path)
+
+    def fail_restore(*_args):
+        raise OSError("injected metadata restore failure")
+
+    monkeypatch.setattr(Path, "rmdir", fail_target_rmdir)
+    monkeypatch.setattr(manager, "_restore_private_metadata_from_backup", fail_restore)
+    with pytest.raises(TerminalError, match="durable stop evidence was retained"):
+        manager._remove_private_session(
+            session_dir, expected_session_id=session_id,
+            expected_generation=generation, expected_identity=expected_identity,
+        )
+
+    backup = tmp_path / f".stop-evidence-{session_id}-{generation}.json"
+    assert backup.read_bytes() == metadata_bytes
+    assert not metadata_path.exists()
+    assert session_dir.is_dir()
+
+    monkeypatch.setattr(Path, "rmdir", original_rmdir)
+    monkeypatch.setattr(manager, "_restore_private_metadata_from_backup", original_restore)
+    monkeypatch.setattr(manager, "_owned_process_liveness",
+                        lambda _pid, _start: "absent")
+    assert manager._retry_confirmed_stop_cleanup(
+        tmp_path, session_id, expected_generation=generation,
+        expected_shell_pid=metadata["shell_pid"],
+    ) is True
+    assert not session_dir.exists()
+    assert not backup.exists()
+
+
+def test_windows_confirmed_stop_cleanup_retry_rejects_pid_reuse_then_cleans(
+        tmp_path, monkeypatch):
+    from contextlib import nullcontext
+
+    import tmux_agent_tower.terminal.windows_manager as windows_manager
+
+    session_id, generation = "a" * 32, "b" * 32
+    shell_path = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    root = tmp_path / "registry"
+    root.mkdir(mode=0o700)
+    session_dir = root / session_id
+    session_dir.mkdir(mode=0o700)
+    session_dir.chmod(0o700)
+    metadata = {
+        "protocol": windows_manager.PROTOCOL,
+        "session_id": session_id,
+        "generation": generation,
+        "supervisor_pid": 123,
+        "supervisor_start": "worker-start",
+        "shell_pid": 456,
+        "shell_start": "shell-start",
+        "shell_path": shell_path,
+        "name": "Windows cleanup retry fixture",
+        "state": "exited",
+        "termination": "requested",
+        "job_processes_empty": True,
+    }
+    metadata_path = session_dir / windows_manager.SESSION_META
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    metadata_path.chmod(0o600)
+    monkeypatch.setattr(windows_manager, "_private_acl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(windows_manager, "_require_windows", lambda: None)
+    monkeypatch.setattr(windows_manager, "_is_reparse", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(windows_manager, "_session_metadata_lock",
+                        lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(windows_manager, "_powershell_executable", lambda: Path(shell_path))
+
+    def pid_reused(pid, *, expected_start=None, verify_image=True):
+        if pid == metadata["supervisor_pid"]:
+            return "replacement-start", "", True
+        return "", "", False
+
+    monkeypatch.setattr(windows_manager, "_process_facts", pid_reused)
+    with pytest.raises(TerminalError, match="supervisor identity changed"):
+        windows_manager._retry_confirmed_stop_cleanup(
+            root, session_id, expected_generation=generation,
+            expected_shell_pid=metadata["shell_pid"],
+        )
+    assert metadata_path.exists()
+    assert session_dir.is_dir()
+
+    monkeypatch.setattr(
+        windows_manager, "_process_facts",
+        lambda *_args, **_kwargs: ("", "", False),
+    )
+    assert windows_manager._retry_confirmed_stop_cleanup(
+        root, session_id, expected_generation=generation,
+        expected_shell_pid=metadata["shell_pid"],
+    ) is True
+    assert not session_dir.exists()
+    assert not tuple(root.glob(".stop-evidence-*.json"))
+
+
+def test_windows_stop_evidence_reuses_only_exact_private_backup(tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.windows_manager as windows_manager
+
+    session_id, generation = "c" * 32, "d" * 32
+    content = json.dumps({
+        "protocol": windows_manager.PROTOCOL,
+        "session_id": session_id,
+        "generation": generation,
+    }, sort_keys=True).encode("utf-8")
+    monkeypatch.setattr(windows_manager, "_private_acl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(windows_manager, "_is_reparse", lambda _path: False)
+
+    backup = windows_manager._preserve_stop_evidence(
+        tmp_path, session_id, generation, content
+    )
+    assert windows_manager._preserve_stop_evidence(
+        tmp_path, session_id, generation, content
+    ) == backup
+    assert backup.read_bytes() == content
+
+    with pytest.raises(TerminalError, match="conflicting terminal stop evidence"):
+        windows_manager._preserve_stop_evidence(
+            tmp_path, session_id, generation, content + b"different"
+        )
+    assert backup.read_bytes() == content
+
+
+def test_session_cleanup_refuses_metadata_from_replacement_generation(tmp_path):
+    import tmux_agent_tower.terminal.manager as manager
+
+    session_id, generation = "1" * 32, "2" * 32
+    session_dir = tmp_path / session_id
+    session_dir.mkdir(mode=0o700)
+    session_dir.chmod(0o700)
+    metadata_path = session_dir / manager.SESSION_META
+    metadata_path.write_text(json.dumps({
+        "protocol": manager.PROTOCOL,
+        "session_id": session_id,
+        "generation": "3" * 32,
+    }))
+    metadata_path.chmod(0o600)
+
+    with pytest.raises(TerminalError, match="identity changed before cleanup"):
+        manager._remove_private_session(
+            session_dir, expected_session_id=session_id,
+            expected_generation=generation,
+        )
+
+    assert metadata_path.exists()
+
+
+def test_windows_stopping_state_allows_only_internal_stop_retry(
+        tmp_path, monkeypatch):
+    import tmux_agent_tower.terminal.windows_manager as windows_manager
+    from tmux_agent_tower.terminal import _windows_worker
+
+    assert _windows_worker._owned_stop_state_is_retryable("running")
+    assert _windows_worker._owned_stop_state_is_retryable("exited")
+    assert _windows_worker._owned_stop_state_is_retryable("stopping")
+    assert not _windows_worker._owned_stop_state_is_retryable("starting")
+    assert not _windows_worker._owned_stop_state_is_retryable("orphaned")
+
+    session_id, generation = "c" * 32, "d" * 32
+    root = tmp_path / "registry"
+    root.mkdir(mode=0o700)
+    session_dir = root / session_id
+    session_dir.mkdir(mode=0o700)
+    metadata = {
+        "protocol": windows_manager.PROTOCOL,
+        "session_id": session_id,
+        "generation": generation,
+        "supervisor_pid": 101,
+        "supervisor_start": "worker-start",
+        "shell_pid": 202,
+        "shell_start": "shell-start",
+        "shell_path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "name": "retry fixture",
+        "state": "stopping",
+        "pipe_name": windows_manager._planned_socket_path(session_dir, session_id),
+    }
+    metadata_path = session_dir / windows_manager.SESSION_META
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    metadata_path.chmod(0o600)
+    operations = []
+
+    class FakeClient:
+        def __init__(self, _root, _session_dir, identity, _pipe, *, timeout):
+            self.identity = identity
+            self.timeout = timeout
+
+        def _request(self, operation, **_fields):
+            operations.append(operation)
+
+        def close(self):
+            pass
+
+    removed = []
+    monkeypatch.setattr(windows_manager, "_require_windows", lambda: None)
+    monkeypatch.setattr(windows_manager, "_private_acl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(windows_manager, "_is_reparse", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        windows_manager, "_validate_identity",
+        lambda _root, requested: (session_dir, metadata)
+        if requested == session_id else (_ for _ in ()).throw(AssertionError()),
+    )
+    monkeypatch.setattr(windows_manager, "TerminalClient", FakeClient)
+    monkeypatch.setattr(windows_manager, "_process_facts", lambda *_a, **_kw: ("", "", False))
+    monkeypatch.setattr(windows_manager, "_remove_session_files", lambda *a, **kw: removed.append((a, kw)))
+    registry = windows_manager.TerminalRegistry(root=root)
+
+    with pytest.raises(TerminalError, match="not ready"):
+        registry.connect(session_id)
+    registry.stop(session_id, expected_generation=generation,
+                  expected_shell_pid=metadata["shell_pid"])
+    assert operations == ["stop"]
+    assert removed
+
+
+@pytest.mark.skipif(not renderer_available(), reason="process cleanup requires optional pyte renderer")
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="Linux process identities are required")
+@pytest.mark.skipif(not Path("/bin/bash").exists(), reason="bash is not available")
+@pytest.mark.parametrize("exit_shell_first", [False, True])
+def test_explicit_stop_reaps_multilevel_child_in_separate_session(
+        tmp_path, monkeypatch, exit_shell_first):
+    account_shell = Path(pwd.getpwuid(os.getuid()).pw_shell).resolve()
+    if account_shell != Path("/bin/bash").resolve():
+        pytest.skip("test contract deliberately uses the account's /bin/bash login shell")
+    _safe_test_home(monkeypatch, tmp_path)
+    registry = TerminalRegistry(root=tmp_path / "r")
+    client = registry.create("detached session cleanup")
+    identity = client.identity
+    other = None
+    other_client = None
+    detached_pid = None
+    detached_start = None
+    try:
+        other = registry.create("unrelated terminal")
+        other_client = registry.connect(other.identity.session_id)
+        assert client.acquire()
+
+        marker = "JTT_DETACHED_" + os.urandom(6).hex() + "_"
+        script = (
+            "import os,signal,time\n"
+            "first=os.fork()\n"
+            "if first: os._exit(0)\n"
+            "os.setsid()\n"
+            "session_id=os.getsid(0)\n"
+            "second=os.fork()\n"
+            "if second: os._exit(0)\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            f"print({marker!r}+str(os.getpid())+'_'+str(session_id),flush=True)\n"
+            "while True: time.sleep(1)\n"
+        )
+        encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        assert marker not in encoded
+        command = (
+            "python3 -c 'import base64;exec(base64.b64decode(\""
+            + encoded + "\"))' &\n"
+        )
+        client.send(command.encode("ascii"))
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            text = _screen_text(client.poll())
+            match = re.search(re.escape(marker) + r"(\d+)_(\d+)", text)
+            if match:
+                detached_pid = int(match.group(1))
+                detached_session = int(match.group(2))
+                break
+            time.sleep(0.03)
+        assert detached_pid is not None, "detached descendant marker was not rendered"
+        detached_start = _proc_start(detached_pid)
+        assert detached_start
+        assert _proc_session_and_group(detached_pid) == (
+            detached_session, detached_session
+        )
+        assert detached_session != identity.shell_pid
+        assert _proc_start(other.identity.shell_pid) is not None
+
+        if exit_shell_first:
+            client.send(b"disown -a\nexit\n")
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                client.poll()
+                if client.state == "exited":
+                    break
+                time.sleep(0.03)
+            assert client.state == "exited"
+            assert _proc_start(detached_pid) == detached_start
+
+        # Detach must leave the owned process tree intact. Reconnect preserves
+        # the same generation and must not acquire the input lease implicitly.
+        client.close()
+        client = registry.connect(identity.session_id)
+        assert client.identity.generation == identity.generation
+        assert _proc_start(detached_pid) == detached_start
+        assert not client.lease
+
+        registry.stop(
+            identity.session_id, expected_generation=identity.generation,
+            expected_shell_pid=identity.shell_pid,
+        )
+        client.close()
+        client = None
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            status = _proc_state_and_start(detached_pid)
+            if status is None or status[1] != detached_start:
+                break
+            time.sleep(0.02)
+        final_status = _proc_state_and_start(detached_pid)
+        assert final_status != ("Z", detached_start), (
+            "terminal stop left a zombie descendant owned by its worker"
+        )
+        assert final_status is None or final_status[1] != detached_start, (
+            "terminal stop left the detached process alive"
+        )
+        assert _proc_start(other.identity.shell_pid) is not None, (
+            "stopping one terminal affected a different JTT session"
+        )
+    finally:
+        if client is not None:
+            client.close()
+        if (tmp_path / "r" / identity.session_id).exists():
+            registry.stop(
+                identity.session_id, expected_generation=identity.generation,
+                expected_shell_pid=identity.shell_pid,
+            )
+        if other_client is not None:
+            other_client.close()
+        if other is not None:
+            other.close()
+            if (tmp_path / "r" / other.identity.session_id).exists():
+                registry.stop(
+                    other.identity.session_id,
+                    expected_generation=other.identity.generation,
+                    expected_shell_pid=other.identity.shell_pid,
+                )
 
 
 @pytest.mark.skipif(not renderer_available(), reason="process cleanup requires optional pyte renderer")

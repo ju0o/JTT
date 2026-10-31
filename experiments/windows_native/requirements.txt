@@ -1,5 +1,5 @@
 # Feasibility-only dependencies, NOT production package dependencies.
-pywinpty==3.1.0
+pywinpty==3.1.1
 pywin32==312
 pyte==0.8.2
 textual==8.2.8

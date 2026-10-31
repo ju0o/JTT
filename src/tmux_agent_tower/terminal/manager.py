@@ -516,6 +516,58 @@ def _stop_shell_process_status(pid: int) -> Tuple[str, Optional[str]]:
     return "live", start
 
 
+def _owned_process_liveness(pid: int, expected_start: str) -> str:
+    """Classify one recorded process without conflating absence and denial."""
+    if pid <= 0 or not expected_start:
+        return "unknown"
+    try:
+        raw = Path("/proc/{}/stat".format(pid)).read_text(encoding="ascii")
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unknown"
+    try:
+        fields = raw.rsplit(")", 1)[1].split()
+        state, start = fields[0], fields[19]
+    except (IndexError, ValueError):
+        return "unknown"
+    if start != expected_start:
+        return "identity_mismatch"
+    return "exited" if state in ("Z", "X") else "live"
+
+
+def _confirmed_stop_metadata(metadata: Dict[str, Any], session_id: str,
+                             generation: Optional[str],
+                             shell_pid: Optional[int]) -> Optional[TerminalIdentity]:
+    """Return an identity only for an already verified, fully stopped tree."""
+    if (metadata.get("protocol") != PROTOCOL
+            or metadata.get("session_id") != session_id
+            or not isinstance(metadata.get("generation"), str)
+            or (generation is not None
+                and metadata.get("generation") != str(generation))):
+        raise TerminalError("terminal identity changed before cleanup retry")
+    identity = _identity(metadata)
+    if shell_pid is not None and identity.shell_pid != int(shell_pid):
+        raise TerminalError("terminal identity changed before cleanup retry")
+    if (identity.supervisor_pid <= 0 or not identity.supervisor_start
+            or identity.shell_pid <= 0 or not identity.shell_start):
+        raise TerminalError("terminal process identity is incomplete")
+    if (metadata.get("state") not in {"stopped", "exited"}
+            or metadata.get("termination") != "requested"
+            or metadata.get("process_tree_cleanup_verified") is not True):
+        return None
+    for pid, start in ((identity.supervisor_pid, identity.supervisor_start),
+                       (identity.shell_pid, identity.shell_start)):
+        status = _owned_process_liveness(pid, start)
+        if status == "identity_mismatch":
+            raise TerminalError("terminal process identity changed before cleanup retry")
+        if status == "unknown":
+            raise TerminalError("terminal process exit state is unavailable")
+        if status == "live":
+            return None
+    return identity
+
+
 def _verified_stop_snapshot(root: Path, session_id: str
                             ) -> Tuple[Path, Dict[str, Any], TerminalIdentity]:
     """Read one private session snapshot with the same strict worker identity."""
@@ -750,7 +802,10 @@ class TerminalRegistry:
         try:
             _atomic_metadata(session_dir / SESSION_META, initial)
         except Exception:
-            _remove_private_session(session_dir)
+            _remove_private_session(
+                session_dir, expected_session_id=session_id,
+                expected_generation=generation,
+            )
             raise
         args = [sys.executable, str(WORKER), str(session_dir), session_id, generation]
         try:
@@ -764,7 +819,10 @@ class TerminalRegistry:
                 shell=False,
             )
         except OSError as exc:
-            _remove_private_session(session_dir)
+            _remove_private_session(
+                session_dir, expected_session_id=session_id,
+                expected_generation=generation,
+            )
             raise TerminalError("cannot start local terminal supervisor") from exc
         deadline = time.monotonic() + SUPERVISOR_STARTUP_TIMEOUT
         while time.monotonic() < deadline:
@@ -823,16 +881,24 @@ class TerminalRegistry:
                         diagnostic = {"stage": stage, "exception": exception}
             except TerminalError:
                 pass
-        _remove_private_session(session_dir)
+        try:
+            cleanup_metadata = _read_metadata(session_dir / SESSION_META)
+            cleanup_verified = (
+                cleanup_metadata.get("session_id") == session_id
+                and cleanup_metadata.get("generation") == generation
+                and cleanup_metadata.get("supervisor_pid") == process.pid
+                and isinstance(cleanup_metadata.get("supervisor_start"), str)
+                and bool(cleanup_metadata.get("supervisor_start"))
+                and cleanup_metadata.get("process_tree_cleanup_verified") is True
+                and cleanup_metadata.get("state") in {"stopped", "exited"}
+            )
+        except TerminalError:
+            cleanup_verified = False
         if diagnostic is not None:
             detail = "terminal supervisor startup failed (stage={}, exception={})".format(
                 diagnostic["stage"], diagnostic["exception"]
             )
-            raise TerminalError(
-                detail,
-                diagnostic=diagnostic,
-            )
-        if not timed_out:
+        elif not timed_out:
             detail = "terminal supervisor exited during startup (exit_code={})".format(
                 exit_code
             )
@@ -852,12 +918,34 @@ class TerminalRegistry:
             detail = "terminal supervisor startup timed out (stage={})".format(startup_stage)
         else:
             detail = "terminal supervisor startup timed out"
+        if not cleanup_verified:
+            raise TerminalError(
+                "{}; terminal startup cleanup could not be verified; "
+                "registry evidence retained".format(detail),
+                diagnostic=diagnostic,
+            )
+        _remove_private_session(
+            session_dir, expected_session_id=session_id,
+            expected_generation=generation,
+        )
         raise TerminalError(detail)
 
     def connect(self, session_id: str, *, timeout: float = 3.0) -> "TerminalClient":
+        return self._connect(session_id, timeout=timeout, allow_stopping=False)
+
+    def _connect_for_stop(self, session_id: str, *, timeout: float = 3.0
+                          ) -> "TerminalClient":
+        """Open an identity-checked control channel for explicit Stop retry only."""
+        return self._connect(session_id, timeout=timeout, allow_stopping=True)
+
+    def _connect(self, session_id: str, *, timeout: float,
+                 allow_stopping: bool) -> "TerminalClient":
         session_dir, metadata = _validate_identity(self.root, session_id)
         identity = _identity(metadata)
-        if identity.state not in ("running", "exited"):
+        ready_states = {"running", "exited"}
+        if allow_stopping:
+            ready_states.add("stopping")
+        if identity.state not in ready_states:
             raise TerminalError("terminal session is not ready")
         sock_path = _session_socket_path(session_dir, metadata)
         if sock_path.parent != session_dir:
@@ -888,6 +976,18 @@ class TerminalRegistry:
         session id while a confirmation dialog was open.
         """
 
+        # A prior explicit Stop may have verified the complete owned process
+        # tree, then failed only while deleting its private registry files.
+        # Permit that exact generation to retry cleanup without reconnecting
+        # to a supervisor that has already exited. This path never signals a
+        # process and requires the worker's durable cleanup proof plus fresh
+        # PID/start-time checks for both recorded processes.
+        if _retry_confirmed_stop_cleanup(
+                self.root, session_id,
+                expected_generation=expected_generation,
+                expected_shell_pid=expected_shell_pid):
+            return
+
         try:
             session_dir, metadata = _validate_identity(self.root, session_id)
         except TerminalError as exc:
@@ -917,7 +1017,7 @@ class TerminalRegistry:
             raise TerminalError("terminal identity changed before stop")
 
         try:
-            client = self.connect(session_id)
+            client = self._connect_for_stop(session_id)
         except TerminalError as exc:
             if str(exc) != "terminal shell identity is stale":
                 raise
@@ -928,7 +1028,7 @@ class TerminalRegistry:
                 expected_shell_pid=expected_shell_pid,
                 baseline=ident,
             )
-            client = self.connect(session_id)
+            client = self._connect_for_stop(session_id)
         try:
             if _terminal_identity_key(client.identity) != _terminal_identity_key(ident):
                 raise TerminalError("terminal identity changed before stop")
@@ -950,7 +1050,11 @@ class TerminalRegistry:
             time.sleep(0.02)
         else:
             raise TerminalError("terminal supervisor did not stop cleanly")
-        _remove_private_session(session_dir)
+        _remove_private_session(
+            session_dir, expected_session_id=ident.session_id,
+            expected_generation=ident.generation,
+            expected_identity=ident,
+        )
 
 
 def _validate_name(name: Optional[str]) -> str:
@@ -965,17 +1069,303 @@ def _validate_name(name: Optional[str]) -> str:
     return clean
 
 
-def _remove_private_session(path: Path) -> None:
-    _private_stat(path, directory=True)
+def _private_metadata_bytes(path: Path) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        for entry in tuple(path.iterdir()):
-            info = entry.lstat()
-            if info.st_uid != os.getuid() or info.st_nlink != 1 or stat.S_ISDIR(info.st_mode):
-                raise TerminalError("refusing to remove an unexpected session artifact")
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise TerminalError("terminal metadata is unavailable") from exc
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_nlink != 1
+                or info.st_size > 16 * 1024):
+            raise TerminalError("terminal metadata is not private")
+        chunks = []
+        remaining = 16 * 1024 + 1
+        while remaining:
+            chunk = os.read(fd, min(4096, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > 16 * 1024:
+            raise TerminalError("terminal metadata exceeds the allowed size")
+        return data
+    finally:
+        os.close(fd)
+
+
+def _retry_confirmed_stop_cleanup(root: Path, session_id: str, *,
+                                  expected_generation: Optional[str],
+                                  expected_shell_pid: Optional[int]) -> bool:
+    if not SESSION_ID_RE.fullmatch(str(session_id)):
+        raise TerminalError("invalid terminal session id")
+    _check_root_components(root, require_leaf=True)
+    session_dir = root / session_id
+    if not os.path.lexists(session_dir):
+        if expected_generation is None:
+            return False
+        backup = root / f".stop-evidence-{session_id}-{expected_generation}.json"
+        if not os.path.lexists(backup):
+            return False
+        metadata = json.loads(_private_metadata_bytes(backup).decode("utf-8"))
+        identity = _confirmed_stop_metadata(
+            metadata, session_id, expected_generation, expected_shell_pid
+        )
+        if identity is None:
+            return False
+        backup.unlink()
+        _fsync_directory(root)
+        return True
+    _private_stat(session_dir, directory=True)
+    metadata_path = session_dir / SESSION_META
+    if not os.path.lexists(metadata_path):
+        if expected_generation is None:
+            raise TerminalError("terminal identity evidence is unavailable")
+        backup = root / f".stop-evidence-{session_id}-{expected_generation}.json"
+        if not os.path.lexists(backup):
+            raise TerminalError("terminal identity evidence is unavailable")
+        data = _private_metadata_bytes(backup)
+        try:
+            metadata_from_backup = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeError) as exc:
+            raise TerminalError("terminal stop evidence is invalid") from exc
+        identity_from_backup = _confirmed_stop_metadata(
+            metadata_from_backup, session_id, expected_generation,
+            expected_shell_pid,
+        )
+        if identity_from_backup is None:
+            return False
+        _restore_private_metadata(session_dir, data)
+        _fsync_directory(session_dir)
+    metadata = _read_metadata(session_dir / SESSION_META)
+    identity = _confirmed_stop_metadata(
+        metadata, session_id, expected_generation, expected_shell_pid
+    )
+    if identity is None:
+        return False
+    _remove_private_session(
+        session_dir, expected_session_id=session_id,
+        expected_generation=identity.generation, expected_identity=identity,
+    )
+    return True
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _preserve_private_stop_metadata(root: Path, session_id: str,
+                                    generation: str, data: bytes) -> Path:
+    """Create a durable, exact-generation copy outside the directory removed."""
+    _private_stat(root, directory=True)
+    backup = root / f".stop-evidence-{session_id}-{generation}.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(backup), flags, 0o600)
+    except FileExistsError:
+        if _private_metadata_bytes(backup) != data:
+            raise TerminalError("conflicting stop evidence is already present")
+        _fsync_directory(root)
+        return backup
+    except OSError as exc:
+        raise TerminalError("terminal stop evidence could not be preserved") from exc
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("stop evidence write made no progress")
+            view = view[written:]
+        os.fsync(fd)
+    except OSError as exc:
+        # Keep a partial file for inspection. The canonical metadata remains
+        # untouched, so a partial backup made by this attempt can be removed.
+        try:
+            backup.unlink()
+            _fsync_directory(root)
+        except OSError:
+            pass
+        raise TerminalError("terminal stop evidence could not be preserved") from exc
+    finally:
+        os.close(fd)
+    _private_metadata_bytes(backup)
+    _fsync_directory(root)
+    return backup
+
+
+def _restore_private_metadata_from_backup(path: Path, backup: Path,
+                                          data: bytes) -> None:
+    _private_stat(path, directory=True)
+    if _private_metadata_bytes(backup) != data:
+        raise TerminalError("terminal stop evidence changed during cleanup")
+    metadata_path = path / SESSION_META
+    if os.path.lexists(metadata_path):
+        if _private_metadata_bytes(metadata_path) != data:
+            raise TerminalError("terminal metadata changed during cleanup")
+        return
+    _restore_private_metadata(path, data)
+    if _private_metadata_bytes(metadata_path) != data:
+        raise TerminalError("terminal metadata restoration did not verify")
+    _fsync_directory(path)
+
+
+def _restore_private_metadata(path: Path, data: bytes) -> None:
+    _private_stat(path, directory=True)
+    metadata_path = path / SESSION_META
+    if os.path.lexists(metadata_path):
+        if _private_metadata_bytes(metadata_path) != data:
+            raise TerminalError("terminal metadata changed during cleanup")
+        return
+    temp = path / (".meta-restore-" + uuid.uuid4().hex)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(temp), flags, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("metadata restore made no progress")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        # link() creates the metadata name only if it is still absent; unlike
+        # replace(), it cannot overwrite a different generation that appeared.
+        os.link(str(temp), str(metadata_path), follow_symlinks=False)
+    except OSError as exc:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise TerminalError("terminal metadata could not be restored") from exc
+    temp.unlink()
+    _private_stat(metadata_path, directory=False)
+    directory_fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _remove_private_session(path: Path, *, expected_session_id: Optional[str] = None,
+                            expected_generation: Optional[str] = None,
+                            expected_identity: Optional[TerminalIdentity] = None) -> None:
+    _private_stat(path, directory=True)
+    metadata_path = path / SESSION_META
+    metadata_bytes = None
+    if os.path.lexists(metadata_path):
+        metadata_bytes = _private_metadata_bytes(metadata_path)
+        try:
+            metadata = json.loads(metadata_bytes.decode("utf-8"))
+        except (ValueError, UnicodeError) as exc:
+            raise TerminalError("terminal metadata is invalid; registry retained") from exc
+        if (not isinstance(metadata, dict)
+                or (expected_session_id is not None
+                    and metadata.get("session_id") != expected_session_id)
+                or (expected_generation is not None
+                    and metadata.get("generation") != expected_generation)):
+            raise TerminalError("terminal session identity changed before cleanup")
+        if (expected_identity is not None
+                and _terminal_identity_key(_identity(metadata))
+                != _terminal_identity_key(expected_identity)):
+            raise TerminalError("terminal session identity changed before cleanup")
+        if (expected_identity is not None
+                and (metadata.get("state") not in {"stopped", "exited"}
+                     or metadata.get("termination") != "requested"
+                     or metadata.get("process_tree_cleanup_verified") is not True)):
+            raise TerminalError("terminal process-tree exit is not confirmed")
+    elif expected_identity is not None or tuple(path.iterdir()):
+        raise TerminalError("terminal identity evidence is unavailable; registry retained")
+
+    entries = tuple(path.iterdir())
+    socket_path = None
+    expected_entries = {metadata_path}
+    if metadata_bytes is not None:
+        socket_path = _session_socket_path(path, metadata)
+        if socket_path.parent == path:
+            expected_entries.add(socket_path)
+    for entry in entries:
+        if entry not in expected_entries:
+            raise TerminalError(
+                "refusing to remove an unexpected session artifact; registry retained"
+            )
+        info = entry.lstat()
+        if (info.st_uid != os.getuid() or info.st_nlink != 1
+                or stat.S_ISDIR(info.st_mode)):
+            raise TerminalError(
+                "refusing to remove an unexpected session artifact; registry retained"
+            )
+        if entry == metadata_path:
+            if not stat.S_ISREG(info.st_mode):
+                raise TerminalError("terminal metadata is not a private regular file")
+            if _private_metadata_bytes(entry) != metadata_bytes:
+                raise TerminalError("terminal session identity changed before cleanup")
+        elif (entry == socket_path
+              and (not stat.S_ISSOCK(info.st_mode) or info.st_mode & 0o077)):
+            raise TerminalError(
+                "refusing to remove an unexpected session artifact; registry retained"
+            )
+
+    backup = None
+    if expected_identity is not None and metadata_bytes is not None:
+        backup = _preserve_private_stop_metadata(
+            path.parent, expected_identity.session_id,
+            expected_identity.generation, metadata_bytes,
+        )
+
+    try:
+        entries = tuple(sorted(entries, key=lambda entry: entry.name == SESSION_META))
+        for entry in entries:
+            if entry == metadata_path and metadata_bytes is not None:
+                if _private_metadata_bytes(entry) != metadata_bytes:
+                    raise TerminalError("terminal session identity changed before cleanup")
             entry.unlink()
         path.rmdir()
-    except OSError as exc:
-        raise TerminalError("cannot clean terminal session files") from exc
+        _fsync_directory(path.parent)
+    except (OSError, TerminalError) as exc:
+        if (backup is not None and metadata_bytes is not None
+                and not os.path.lexists(metadata_path)):
+            try:
+                _restore_private_metadata_from_backup(path, backup, metadata_bytes)
+            except (OSError, TerminalError) as restore_exc:
+                raise TerminalError(
+                    "terminal cleanup failed; durable stop evidence was retained"
+                ) from restore_exc
+        if backup is not None:
+            try:
+                backup.unlink()
+                _fsync_directory(path.parent)
+            except OSError as backup_exc:
+                raise TerminalError(
+                    "terminal cleanup failed; stop evidence backup was retained"
+                ) from backup_exc
+        if isinstance(exc, TerminalError):
+            raise
+        raise TerminalError("cannot clean terminal session files; registry evidence retained") from exc
+    if backup is not None:
+        try:
+            backup.unlink()
+            _fsync_directory(path.parent)
+        except OSError as exc:
+            # The terminal directory is already gone; retain the verified
+            # backup as durable evidence for an explicit cleanup retry.
+            raise TerminalError(
+                "terminal stopped; durable stop evidence cleanup is pending"
+            ) from exc
 
 
 class TerminalClient:

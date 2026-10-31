@@ -36,6 +36,645 @@ jobs:
       - name: Native Windows JTT workspace and layout persistence
         run: python -m pytest -q -s tests/test_windows_jtt_state.py
 
+  windows-owned-stop:
+    name: Windows Draft - Owned Stop, Job Object, identity
+    if: github.event.pull_request.draft == true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install isolated test dependencies
+        run: |
+          python -m pip install -r experiments/windows_native/requirements.txt
+          python -m pip install --no-deps -e .
+      - name: Record Windows Python and dependency versions
+        run: |
+          python --version
+          python -m pip freeze
+          python -c "import platform; print(platform.platform())"
+      - name: Prepare test-owned result directory
+        run: New-Item -ItemType Directory -Force test-results | Out-Null
+      - name: Run owned Stop, Job Object, and identity tests
+        run: python -m pytest -q -s tests/test_windows_terminal_backend.py::test_native_shell_exit_remains_listed_until_explicit_owned_cleanup tests/test_windows_terminal_backend.py::test_native_stop_terminates_nested_children_in_the_owned_job tests/test_windows_terminal_backend.py::test_job_assignment_failure_terminates_only_retained_child_handle tests/test_windows_terminal_backend.py::test_process_access_denied_preserves_session_registry tests/test_windows_terminal_backend.py::test_process_image_query_race_fails_closed_unless_handle_is_signaled tests/test_windows_terminal_backend.py::test_process_facts_skips_image_query_for_reused_pid tests/test_windows_terminal_backend.py::test_stop_cleanup_requires_exact_final_generation_and_requested_exit tests/test_windows_terminal_backend.py::test_stop_cleanup_rejects_changed_shell_image_record tests/test_windows_terminal_backend.py::test_stop_cleanup_requires_confirmed_requested_exit --junitxml=test-results/owned-stop.xml
+      - name: Preserve owned Stop result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-owned-stop-${{ github.run_id }}
+          path: test-results/owned-stop.xml
+          if-no-files-found: ignore
+
+  windows-mutex-acl-probe:
+    name: Windows Draft - Native Mutex ACL probe
+    if: github.event.pull_request.draft == true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install isolated probe dependencies
+        run: |
+          python -m pip install -r experiments/windows_native/requirements.txt
+          python -m pip install --no-deps -e .
+      - name: Record Windows Python and platform
+        run: |
+          python --version
+          python -c "import platform; print(platform.platform())"
+      - name: Prepare test-owned result directory
+        run: New-Item -ItemType Directory -Force test-results | Out-Null
+      - name: Run test-owned native mutex ACL probe
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: python -m pytest --noconftest -p no:cacheprovider -q -s tests/test_windows_mutex_acl_policy.py::test_native_mutex_acl_probe_records_only_safe_fields --junitxml=test-results/mutex-acl-probe.xml
+      - name: Preserve native mutex ACL result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-mutex-acl-probe-${{ github.run_id }}
+          path: test-results/mutex-acl-probe.xml
+          if-no-files-found: ignore
+
+  windows-native-ui:
+    name: Windows Draft - Native UI, Window, Work Kit, focus
+    if: github.event.pull_request.draft == true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install isolated test dependencies
+        run: |
+          python -m pip install -r experiments/windows_native/requirements.txt
+          python -m pip install --no-deps -e .
+      - name: Record Windows Python and dependency versions
+        run: |
+          python --version
+          python -m pip freeze
+          python -c "import platform; print(platform.platform())"
+      - name: Prepare test-owned result directory
+        run: New-Item -ItemType Directory -Force test-results | Out-Null
+      - name: Run Windows UI, Window, Work Kit, and focus tests
+        run: python -m pytest -q -s tests/test_windows_jtt_ui.py tests/test_windows_jtt_state.py --junitxml=test-results/native-ui.xml
+      - name: Preserve native UI result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-ui-${{ github.run_id }}
+          path: test-results/native-ui.xml
+          if-no-files-found: ignore
+
+  windows-r02-original-prompt:
+    name: Windows Draft - R02 original PowerShell prompt E2E
+    if: github.event.pull_request.draft == true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install isolated test dependencies
+        run: |
+          python -m pip install -r experiments/windows_native/requirements.txt
+          python -m pip install --no-deps -e .
+      - name: Record Windows Python and dependency versions
+        run: |
+          python --version
+          python -m pip freeze
+          python -c "import platform; print(platform.platform())"
+      - name: Prepare test-owned result directory
+        run: New-Item -ItemType Directory -Force test-results | Out-Null
+      - name: Run strict original prompt/path E2E and startup diagnostic
+        run: python -m pytest -q -s tests/test_windows_terminal_backend.py::test_native_powershell_prompt_tracks_long_current_location tests/test_windows_terminal_backend.py::test_r02_startup_stage_diagnostic_separates_original_and_instrumented_copy --junitxml=test-results/r02-original-prompt.xml
+      - name: Preserve R02 result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-r02-original-prompt-${{ github.run_id }}
+          path: test-results/r02-original-prompt.xml
+          if-no-files-found: ignore
+
+  windows-r02-input-comparison:
+    name: Windows Draft - R02 Direct/Worker ${{ matrix.group }} comparison
+    if: github.event.pull_request.draft == true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        group:
+          - baseline
+          - unicode
+          - path
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install isolated diagnostic dependencies
+        run: |
+          python -m pip install -r experiments/windows_native/requirements.txt
+          python -m pip install --no-deps -e .
+      - name: Record Windows Python and dependency versions
+        run: |
+          python --version
+          python -m pip freeze
+          python -c "import platform; print(platform.platform())"
+      - name: Prepare test-owned comparison result directory
+        run: New-Item -ItemType Directory -Force test-results | Out-Null
+      - name: Run one Direct/Worker comparison group
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+          R02_COMPARISON_GROUP: ${{ matrix.group }}
+        run: >-
+          python -m pytest --noconftest -p no:cacheprovider -q -s
+          "tests/test_windows_terminal_backend.py::test_native_conpty_input_execution_path_comparison[${env:R02_COMPARISON_GROUP}]"
+          "--junitxml=test-results/r02-input-comparison-${env:R02_COMPARISON_GROUP}.xml"
+      - name: Preserve Direct/Worker comparison group result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-r02-input-comparison-${{ matrix.group }}-${{ github.run_id }}
+          path: test-results/r02-input-comparison-${{ matrix.group }}.xml
+          if-no-files-found: error
+
+  windows-r02-input-comparison-summary:
+    name: Windows Draft - R02 comparison evidence coverage
+    if: always() && github.event.pull_request.draft == true
+    needs:
+      - windows-r02-input-comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Download per-group JUnit artifacts
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-r02-input-comparison-*-${{ github.run_id }}
+          path: group-results
+          merge-multiple: false
+      - name: Require all group evidence and passing outcomes
+        if: always()
+        env:
+          MATRIX_RESULT: ${{ needs.windows-r02-input-comparison.result }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          import xml.etree.ElementTree as ET
+
+          expected = {
+              "baseline": ["baseline"],
+              "unicode": [
+                  "unicode_first", "ascii_then_unicode",
+                  "ascii_then_unicode_per_key", "ascii_then_unicode_crlf",
+                  "unicode_output_only",
+              ],
+              "path": [
+                  "path_standalone_single_write",
+                  "path_standalone_single_write_crlf",
+                  "path_after_ascii_single_write",
+                  "path_after_ascii_per_key",
+              ],
+          }
+          errors = []
+          if os.environ.get("MATRIX_RESULT") != "success":
+              errors.append("matrix result is not success")
+          if os.environ.get("DOWNLOAD_OUTCOME") != "success":
+              errors.append("artifact download did not complete successfully")
+          files = list(Path("group-results").glob("**/r02-input-comparison-*.xml"))
+          if len(files) != len(expected):
+              errors.append(f"expected 3 group JUnit files; found {len(files)}")
+          seen = set()
+          for path in files:
+              group = path.stem.removeprefix("r02-input-comparison-")
+              if group not in expected or group in seen:
+                  errors.append(f"unexpected or duplicate group artifact: {path}")
+                  continue
+              seen.add(group)
+              try:
+                  root = ET.parse(path).getroot()
+              except (OSError, ET.ParseError) as exc:
+                  errors.append(f"{group}: invalid JUnit XML ({type(exc).__name__})")
+                  continue
+              cases = root.findall(".//testcase")
+              if len(cases) != 1:
+                  errors.append(f"{group}: expected one collected testcase; found {len(cases)}")
+                  continue
+              case = cases[0]
+              if not case.attrib.get("name", "").endswith(f"[{group}]"):
+                  errors.append(f"{group}: JUnit testcase name does not match group")
+              properties = {
+                  item.attrib.get("name"): item.attrib.get("value")
+                  for item in case.findall("./properties/property")
+              }
+              if properties.get("comparison_group") != group:
+                  errors.append(f"{group}: missing or mismatched group property")
+              try:
+                  scenarios = json.loads(properties.get("comparison_scenarios", "null"))
+              except json.JSONDecodeError:
+                  scenarios = None
+              if scenarios != expected[group]:
+                  errors.append(f"{group}: scenario coverage does not match contract")
+              if any(case.find(tag) is not None for tag in ("failure", "error", "skipped")):
+                  errors.append(f"{group}: JUnit reports failure, error, or skip")
+          if seen != set(expected):
+              errors.append(f"group coverage incomplete: {sorted(seen)}")
+          if errors:
+              for error in errors:
+                  print(f"R02_COMPARISON_EVIDENCE_FAIL: {error}")
+              sys.exit(1)
+          print("R02_COMPARISON_EVIDENCE_COMPLETE: baseline, unicode, path")
+          PY
+
+  windows-r02-input-ab-direct:
+    name: Windows Draft - R02 added input controls (Direct ConPTY)
+    if: github.event.pull_request.draft == true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install isolated diagnostic dependencies
+        run: |
+          python -m pip install -r experiments/windows_native/requirements.txt
+          python -m pip install --no-deps -e .
+      - name: Record Windows Python and dependency versions
+        run: |
+          python --version
+          python -m pip freeze
+          python -c "import platform; print(platform.platform())"
+      - name: Prepare test-owned Direct result directory
+        run: New-Item -ItemType Directory -Force test-results | Out-Null
+      - name: Run only added Direct input controls
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: python -m pytest --noconftest -p no:cacheprovider -q -s tests/test_windows_terminal_backend.py::test_native_conpty_added_input_cases_direct --junitxml=test-results/r02-input-ab-direct.xml
+      - name: Preserve Direct input-control result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-r02-input-ab-direct-${{ github.run_id }}
+          path: test-results/r02-input-ab-direct.xml
+          if-no-files-found: ignore
+
+  windows-r02-input-ab-worker:
+    name: Windows Draft - R02 added input controls (JTT Worker)
+    if: github.event.pull_request.draft == true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install isolated diagnostic dependencies
+        run: |
+          python -m pip install -r experiments/windows_native/requirements.txt
+          python -m pip install --no-deps -e .
+      - name: Record Windows Python and dependency versions
+        run: |
+          python --version
+          python -m pip freeze
+          python -c "import platform; print(platform.platform())"
+      - name: Prepare test-owned Worker result directory
+        run: New-Item -ItemType Directory -Force test-results | Out-Null
+      - name: Run only added Worker input controls
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+        run: python -m pytest --noconftest -p no:cacheprovider -q -s tests/test_windows_terminal_backend.py::test_native_conpty_added_input_cases_worker --junitxml=test-results/r02-input-ab-worker.xml
+      - name: Preserve Worker input-control result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-r02-input-ab-worker-${{ github.run_id }}
+          path: test-results/r02-input-ab-worker.xml
+          if-no-files-found: ignore
+
+  windows-r02-input-factor-diagnostic:
+    name: Windows Draft - R02 post-resize input factor diagnostic
+    if: github.event.pull_request.draft == true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install isolated diagnostic dependencies
+        run: |
+          python -m pip install -r experiments/windows_native/requirements.txt
+          python -m pip install --no-deps -e .
+      - name: Record Windows Python and dependency versions
+        run: |
+          python --version
+          python -m pip freeze
+          python -c "import platform; print(platform.platform())"
+      - name: Prepare test-owned diagnostic result directory
+        run: |
+          New-Item -ItemType Directory -Force test-results | Out-Null
+          if (Test-Path -LiteralPath 'test-results/r02-input-factor.xml') { throw 'R02 JUnit path already exists' }
+          if (Test-Path -LiteralPath 'test-results/r02-input-factor.jsonl') { throw 'R02 evidence path already exists' }
+      - name: Run isolated post-resize input-factor matrix
+        env:
+          JTT_R02_EVIDENCE_PATH: test-results/r02-input-factor.jsonl
+        run: python -m pytest -q -s tests/test_windows_terminal_backend.py::test_r02_product_worker_post_resize_input_factor_diagnostic --junitxml=test-results/r02-input-factor.xml
+      - name: Preserve R02 per-stage JSON evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-r02-input-factor-jsonl-${{ github.run_id }}
+          path: test-results/r02-input-factor.jsonl
+          if-no-files-found: error
+      - name: Preserve R02 input-factor JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-r02-input-factor-junit-${{ github.run_id }}
+          path: test-results/r02-input-factor.xml
+          if-no-files-found: error
+
+  windows-worker-lifecycle:
+    name: Windows Draft - worker lifecycle, Resize, Reconnect
+    if: github.event.pull_request.draft == true
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install isolated test dependencies
+        run: |
+          python -m pip install -r experiments/windows_native/requirements.txt
+          python -m pip install --no-deps -e .
+      - name: Record Windows Python and dependency versions
+        run: |
+          python --version
+          python -m pip freeze
+          python -c "import platform; print(platform.platform())"
+      - name: Prepare test-owned result directory
+        run: New-Item -ItemType Directory -Force test-results | Out-Null
+      - name: Run worker lifecycle and native Resize/Reconnect tests
+        run: python -m pytest -q -s tests/test_windows_worker_threads.py tests/test_windows_terminal_backend.py::test_native_powershell_create_io_resize_detach_reconnect_stop --junitxml=test-results/worker-lifecycle.xml
+      - name: Preserve worker lifecycle result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-worker-lifecycle-${{ github.run_id }}
+          path: test-results/worker-lifecycle.xml
+          if-no-files-found: ignore
+
+  windows-ipc-integration:
+    name: Windows Draft - IPC synthetic and native integration
+    if: github.event.pull_request.draft == true
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize IPC evidence as inconclusive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force test-results | Out-Null
+          $evidence = [ordered]@{
+            status = "INCONCLUSIVE"
+            stage = "runner_entered"
+            run_id = $env:GITHUB_RUN_ID
+            commit_sha = $env:GITHUB_SHA
+            runner_os = [System.Environment]::OSVersion.VersionString
+            expected_source_root = [System.IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE "src"))
+            configured_pythonpath = $env:PYTHONPATH
+            expected_test_count = 46
+            initialized_utc = [DateTimeOffset]::UtcNow.ToString("o")
+          }
+          [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "test-results/environment.json"), ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install isolated Windows IPC test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check -r experiments/windows_native/requirements.txt
+          python -m pip install --disable-pip-version-check --no-deps -e .
+
+      - name: Verify Windows API and current checkout import identity
+        id: ipc-preflight
+        shell: pwsh
+        run: |
+          $preflight = @'
+          import importlib.metadata as metadata
+          import json
+          import os
+          import platform
+          import sys
+          from pathlib import Path
+
+          report = Path("test-results/environment.json")
+          evidence = json.loads(report.read_text(encoding="utf-8"))
+          evidence["stage"] = "import_identity_started"
+          report.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+          try:
+              import pywintypes
+              import win32api
+              import win32file
+              import win32pipe
+              import win32security
+
+              import ju0_terminal_tower as jtt
+              import tmux_agent_tower as legacy_alias
+              import tmux_agent_tower.terminal.windows_ipc as ipc
+              import tmux_agent_tower.terminal.windows_manager as manager
+
+              expected = (Path(os.environ["GITHUB_WORKSPACE"]) / "src").resolve(strict=True)
+              configured = Path(os.environ["PYTHONPATH"]).resolve(strict=True)
+              jtt_path = Path(jtt.__file__).resolve(strict=True)
+              legacy_path = Path(legacy_alias.__file__).resolve(strict=True)
+              if configured != expected:
+                  raise AssertionError("PYTHONPATH is not the current checkout src directory")
+              if jtt_path != legacy_path:
+                  raise AssertionError("JTT namespace and legacy alias do not share a source file")
+              jtt_path.relative_to(expected)
+              imports = {
+                  "windows_ipc": str(Path(ipc.__file__).resolve(strict=True)),
+                  "windows_manager": str(Path(manager.__file__).resolve(strict=True)),
+              }
+              for module_path in imports.values():
+                  Path(module_path).relative_to(expected)
+              data = {
+                  "status": "IMPORT_READY",
+                  "stage": "import_identity_verified",
+                  "python": sys.version,
+                  "platform": platform.platform(),
+                  "pywin32": metadata.version("pywin32"),
+                  "pywinpty": metadata.version("pywinpty"),
+                  "pytest": metadata.version("pytest"),
+                  "pyte": metadata.version("pyte"),
+                  "jtt_distribution": metadata.version("ju0-terminal-tower"),
+                  "source_root": str(expected),
+                  "pythonpath": str(configured),
+                  "jtt_namespace_path": str(jtt_path),
+                  "legacy_alias_path": str(legacy_path),
+                  "alias_same_source_file": True,
+                  "imports": imports,
+                  "native_api_modules": [win32api.__name__, win32file.__name__, win32pipe.__name__, win32security.__name__, pywintypes.__name__],
+                  "expected_test_count": 46,
+              }
+          except Exception as exc:
+              evidence.update({
+                  "status": "INCONCLUSIVE",
+                  "stage": "import_identity_failed",
+                  "error_category": type(exc).__name__,
+              })
+              report.write_text(json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+              raise
+          report.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+          print(json.dumps(data, sort_keys=True))
+          '@
+          $preflightPath = Join-Path $env:RUNNER_TEMP "jtt-ipc-integration-preflight.py"
+          [System.IO.File]::WriteAllText($preflightPath, $preflight, [System.Text.UTF8Encoding]::new($false))
+          python $preflightPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect and require exactly 46 IPC test selectors
+        id: ipc-collection
+        shell: pwsh
+        run: |
+          $collectionOutput = & python -m pytest --noconftest -p no:cacheprovider --collect-only -q tests/test_windows_ipc.py 2>&1
+          $collectionExit = $LASTEXITCODE
+          $collectionText = ($collectionOutput | ForEach-Object { "$_" }) -join "`n"
+          $collectionPath = Join-Path $env:GITHUB_WORKSPACE "test-results/collection.log"
+          [System.IO.File]::WriteAllText($collectionPath, $collectionText, [System.Text.UTF8Encoding]::new($false))
+          $nodeIds = @($collectionText -split "`r?`n" | Where-Object { $_ -match '^tests/test_windows_ipc\.py::' })
+          $uniqueNodeIds = @($nodeIds | Select-Object -Unique)
+          $evidencePath = Join-Path $env:GITHUB_WORKSPACE "test-results/environment.json"
+          $evidence = Get-Content -Raw $evidencePath | ConvertFrom-Json
+          $evidence | Add-Member -NotePropertyName collection_exit_code -NotePropertyValue $collectionExit -Force
+          $evidence | Add-Member -NotePropertyName collection_count -NotePropertyValue $nodeIds.Count -Force
+          $evidence | Add-Member -NotePropertyName collection_unique_count -NotePropertyValue $uniqueNodeIds.Count -Force
+          $evidence | Add-Member -NotePropertyName collection_node_ids -NotePropertyValue @($nodeIds) -Force
+          $collectionReady = ($collectionExit -eq 0 -and $nodeIds.Count -eq 46 -and $uniqueNodeIds.Count -eq 46)
+          $evidence | Add-Member -NotePropertyName status -NotePropertyValue $(if ($collectionReady) { "COLLECTION_READY" } else { "INCONCLUSIVE" }) -Force
+          $evidence | Add-Member -NotePropertyName stage -NotePropertyValue $(if ($collectionReady) { "collection_verified" } else { "collection_failed" }) -Force
+          [System.IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+          Write-Output $collectionText
+          if (-not $collectionReady) { throw "Expected 46 unique IPC test selectors; collected $($nodeIds.Count) with $($uniqueNodeIds.Count) unique (exit $collectionExit)" }
+
+      - name: Run all IPC synthetic and native tests
+        id: ipc-tests
+        shell: pwsh
+        run: |
+          $evidencePath = Join-Path $env:GITHUB_WORKSPACE "test-results/environment.json"
+          $evidence = Get-Content -Raw $evidencePath | ConvertFrom-Json
+          if ($evidence.status -ne "COLLECTION_READY") { throw "IPC collection was not verified" }
+          $evidence.status = "INCONCLUSIVE"
+          $evidence.stage = "test_started"
+          $evidence | Add-Member -NotePropertyName test_started_utc -NotePropertyValue ([DateTimeOffset]::UtcNow.ToString("o")) -Force
+          [System.IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+          & python -m pytest --noconftest -p no:cacheprovider -q -s tests/test_windows_ipc.py --junitxml=test-results/windows-ipc-integration.xml
+          $pytestExit = $LASTEXITCODE
+          $evidence = Get-Content -Raw $evidencePath | ConvertFrom-Json
+          $evidence | Add-Member -NotePropertyName pytest_exit_code -NotePropertyValue $pytestExit -Force
+          $evidence | Add-Member -NotePropertyName pytest_completed_utc -NotePropertyValue ([DateTimeOffset]::UtcNow.ToString("o")) -Force
+          $evidence | Add-Member -NotePropertyName stage -NotePropertyValue "pytest_returned" -Force
+          if ($pytestExit -ne 0) { $evidence | Add-Member -NotePropertyName status -NotePropertyValue "TEST_FAILED" -Force }
+          [System.IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+          if ($pytestExit -ne 0) { exit $pytestExit }
+
+      - name: Require 46 executed tests with zero skips and finalize status
+        if: always()
+        shell: pwsh
+        env:
+          TEST_STEP_OUTCOME: ${{ steps.ipc-tests.outcome }}
+        run: |
+          $evidencePath = Join-Path $env:GITHUB_WORKSPACE "test-results/environment.json"
+          if (-not (Test-Path -LiteralPath $evidencePath -PathType Leaf)) { throw "IPC environment evidence is missing" }
+          $evidence = Get-Content -Raw $evidencePath | ConvertFrom-Json
+          $collectionPath = Join-Path $env:GITHUB_WORKSPACE "test-results/collection.log"
+          $junitPath = Join-Path $env:GITHUB_WORKSPACE "test-results/windows-ipc-integration.xml"
+          $status = "INCONCLUSIVE"
+          $collectionEvidenceReady = ((Test-Path -LiteralPath $collectionPath -PathType Leaf) -and (Get-Item -LiteralPath $collectionPath).Length -gt 0 -and $evidence.collection_exit_code -eq 0 -and $evidence.collection_count -eq 46 -and $evidence.collection_unique_count -eq 46)
+          $junitEvidenceReady = ((Test-Path -LiteralPath $junitPath -PathType Leaf) -and (Get-Item -LiteralPath $junitPath).Length -gt 0)
+          if (-not $collectionEvidenceReady) {
+            $evidence | Add-Member -NotePropertyName evidence_error_category -NotePropertyValue "CollectionEvidenceMissingOrInvalid" -Force
+          }
+          if ($junitEvidenceReady) {
+            try {
+              [xml]$junit = Get-Content -Raw $junitPath
+              $cases = @($junit.SelectNodes("//testcase"))
+              $failures = @($junit.SelectNodes("//testcase/failure")).Count
+              $errors = @($junit.SelectNodes("//testcase/error")).Count
+              $skips = @($junit.SelectNodes("//testcase/skipped")).Count
+              $evidence | Add-Member -NotePropertyName junit_test_count -NotePropertyValue $cases.Count -Force
+              $evidence | Add-Member -NotePropertyName junit_failure_count -NotePropertyValue $failures -Force
+              $evidence | Add-Member -NotePropertyName junit_error_count -NotePropertyValue $errors -Force
+              $evidence | Add-Member -NotePropertyName junit_skip_count -NotePropertyValue $skips -Force
+              if ($cases.Count -eq 46 -and ($failures -gt 0 -or $errors -gt 0 -or $skips -gt 0)) {
+                $status = "TEST_FAILED"
+              } elseif ($collectionEvidenceReady -and $cases.Count -eq 46 -and $failures -eq 0 -and $errors -eq 0 -and $skips -eq 0 -and $env:TEST_STEP_OUTCOME -eq "success" -and $evidence.pytest_exit_code -eq 0) {
+                $status = "TEST_PASSED"
+              }
+            } catch {
+              $evidence | Add-Member -NotePropertyName junit_error_category -NotePropertyValue $_.Exception.GetType().Name -Force
+            }
+          } else {
+            $evidence | Add-Member -NotePropertyName junit_error_category -NotePropertyValue "JunitEvidenceMissing" -Force
+          }
+          $evidence | Add-Member -NotePropertyName collection_evidence_verified -NotePropertyValue $collectionEvidenceReady -Force
+          $evidence | Add-Member -NotePropertyName junit_evidence_verified -NotePropertyValue $junitEvidenceReady -Force
+          $evidence | Add-Member -NotePropertyName status -NotePropertyValue $status -Force
+          $evidence | Add-Member -NotePropertyName finalized_utc -NotePropertyValue ([DateTimeOffset]::UtcNow.ToString("o")) -Force
+          [System.IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+          if ($status -ne "TEST_PASSED") { throw "IPC integration status is $status; test outcome=$env:TEST_STEP_OUTCOME" }
+
+      - name: Preserve IPC integration JUnit and environment evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ipc-integration-${{ github.run_id }}
+          path: test-results/
+          if-no-files-found: error
+
   candidate-gate:
     name: ${{ github.event.pull_request.draft && 'Windows draft validation (NOT RUN)' || 'Windows candidate verification status' }}
     if: always()

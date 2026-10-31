@@ -118,6 +118,27 @@ def _screen_text(screen: TerminalScreen | None, columns: int, lines: int) -> Tex
     return output
 
 
+def _screen_clipboard_text(screen: TerminalScreen) -> str:
+    """Return plain visible cells, preserving lines and Unicode for an explicit copy."""
+
+    rows = ["".join(cell.text for cell in row).rstrip() for row in screen.rows]
+    return "\r\n".join(rows).strip("\r\n")
+
+
+def _write_windows_clipboard(text: str) -> None:
+    """Write Unicode text only for a direct user copy command; never read clipboard."""
+
+    import win32clipboard
+    import win32con
+
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+    finally:
+        win32clipboard.CloseClipboard()
+
+
 def _same_identity(left: Any, right: Any) -> bool:
     fields = (
         "session_id", "generation", "supervisor_pid", "supervisor_start",
@@ -150,6 +171,11 @@ class TerminalView(Static):
     can_focus = True
 
     async def on_click(self, event) -> None:
+        # Windows Terminal uses Shift+drag for host-side text selection while
+        # a TUI is active. Do not turn the initial shifted click into an input
+        # lease request; let the host/Textual selection handling continue.
+        if event.shift:
+            return
         event.stop()
         await self.app.enter_input_mode()
 
@@ -470,11 +496,13 @@ class WindowsJTTApp(App[None]):
     .panel { height: 1fr; border: round #24515a; padding: 0 1; }
     #left { width: 22%; min-width: 15; }
     #center { width: 34%; min-width: 21; }
-    #right { width: 44%; min-width: 26; }
+    #right { width: 44%; min-width: 26; padding: 0; }
     .panel-title { height: 1; color: #75d9d0; text-style: bold; }
-    #brand { height: 2; color: #91ece2; text-style: bold; }
-    #workspace-picker { width: 100%; height: 3; margin-top: 1; }
+    #brand { height: 1; color: #91ece2; text-style: bold; }
+    #workspace-context { height: 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    #workspace-picker { width: 100%; height: 3; }
     #window-list { height: 1fr; margin-top: 1; }
+    #left Button { min-width: 0; }
     .window-item { width: 100%; height: 3; margin-bottom: 1; }
     .window-item.selected { border: round #35cbbd; background: #102a35; }
     #new-window { width: 100%; height: 3; }
@@ -487,7 +515,7 @@ class WindowsJTTApp(App[None]):
                      text-wrap: nowrap; text-overflow: ellipsis; }
     .terminal-card.selected { border: round #35cbbd; background: #102a35; }
     #live { height: 1fr; width: 100%; overflow-x: hidden; overflow-y: hidden;
-            border: round #294550; padding: 0 1; background: #050b13; }
+            border: round #294550; padding: 0; background: #050b13; }
     #terminal-status { height: 1; color: #96aab5; }
     #statusline { height: 1; color: #c4d2d8; background: #10212a; padding: 0 1; }
     """
@@ -515,16 +543,23 @@ class WindowsJTTApp(App[None]):
         self.sessions: dict[str, TerminalIdentity] = {}
         self.selected_id: str | None = None
         self.selected_identity: TerminalIdentity | None = None
+        self._selection_requires_explicit = False
         self.client = None
         self.input_mode = False
         self.prefix_pending = False
         self._prefix_generation = 0
         self._panel_index = 1
         self._io_lock = asyncio.Lock()
+        self._sessions_refresh_lock = asyncio.Lock()
         self._busy = False
         self._notice = ""
         self._notice_until = 0.0
         self._card_signature = None
+        self._card_structure = None
+        self._rendered_card_identities: dict[str, tuple] = {}
+        self._focus_intent_epoch = 0
+        self._window_signature = None
+        self._windows_render_lock = asyncio.Lock()
         self._cards_render_lock = asyncio.Lock()
         self._mini_sampler: WindowsMiniLiveSampler | None = None
         self._refresh_timers: list[Any] = []
@@ -537,12 +572,12 @@ class WindowsJTTApp(App[None]):
         with Horizontal(id="panels"):
             with Vertical(id="left", classes="panel"):
                 yield Static("JTT · JU0 TERMINAL TOWER", id="brand")
-                yield Static("작업공간", classes="panel-title")
-                yield Button("내 작업공간\n보관함 · 작업 불러오기", id="workspace-picker")
+                yield Static("내 작업공간", id="workspace-context")
                 yield Static("Windows", classes="panel-title")
                 with ScrollableContainer(id="window-list"):
                     yield Static("Window 목록을 불러오는 중", id="empty-windows", classes="dim")
                 yield Button("+ 새 Window", id="new-window")
+                yield Button("보관함", id="workspace-picker")
             with Vertical(id="center", classes="panel"):
                 yield Static("기본 Window", id="current-window", classes="panel-title")
                 yield Static("세션을 불러오는 중", id="terminal-summary")
@@ -614,11 +649,20 @@ class WindowsJTTApp(App[None]):
         if self._notice and asyncio.get_running_loop().time() < self._notice_until:
             message = self._notice
         elif self.prefix_pending:
-            message = "명령 대기 · n 새 터미널 · h/l 카드 · w 공간 · d 분리 · x 종료 · Esc 취소"
+            if self.size.width < 100:
+                message = "명령 대기 · n 새 터미널 · c 복사 · h/l 카드 · d 분리 · Esc 취소"
+            else:
+                message = "명령 대기 · n 새 터미널 · h/l 카드 · c RIGHT 복사 · w 공간 · d 분리 · x 종료 · Esc 취소"
         elif self.input_mode:
-            message = "RIGHT 입력 중 · Ctrl+] 탐색 복귀 · Ctrl+G 명령 · Ctrl+G Ctrl+G 전달"
+            if self.size.width < 100:
+                message = "RIGHT 입력 · Ctrl+] 탐색 · Ctrl+G c 복사 · Shift+드래그 선택"
+            else:
+                message = "RIGHT 입력 중 · Ctrl+] 탐색 · Ctrl+G c 화면 복사 · Ctrl+Shift+C 복사 · Ctrl+G Ctrl+G 전달"
         else:
-            message = "탐색 · Ctrl+G n 새 터미널 · Tab 패널 이동 · Enter 입력 · Ctrl+G d 분리"
+            if self.size.width < 100:
+                message = "탐색 · ←/→ 작업 · ↑/↓ Window · Ctrl+G n 생성 · Ctrl+G c 복사 · Enter 입력"
+            else:
+                message = "탐색 · ←/→ 작업 · ↑/↓ Window · Tab 패널 · Ctrl+G n 생성 · Ctrl+G c RIGHT 복사 · Enter 입력 · Ctrl+G d 분리"
         self.query_one("#statusline", Static).update(message)
         status = "입력 권한 보유" if self.input_mode else "관찰 중"
         if self.selected_identity is None:
@@ -635,6 +679,10 @@ class WindowsJTTApp(App[None]):
         }.get(str(state), "상태 확인 필요")
 
     async def _refresh_sessions(self) -> None:
+        async with self._sessions_refresh_lock:
+            await self._refresh_sessions_serial()
+
+    async def _refresh_sessions_serial(self) -> None:
         # Session refresh updates widgets on the base screen. Like LIVE
         # refresh, defer it while a modal owns the active screen so polling
         # cannot query or mutate the hidden widget tree.
@@ -693,21 +741,29 @@ class WindowsJTTApp(App[None]):
             current = self.sessions.get(self.selected_id)
             if current is None or (self.selected_identity is not None
                                    and not _same_identity(self.selected_identity, current)):
-                await self._close_selected_client()
+                invalidated_id = self.selected_id
+                # Invalidation lasts until a verified, explicit card selection.
+                # A later refresh must not silently reconnect the replacement
+                # generation or clear this warning through automatic selection.
+                self._selection_requires_explicit = True
                 self.selected_id = None
                 self.selected_identity = None
                 self.input_mode = False
+                self._right_observation = None
+                self._mini_cache.pop(invalidated_id, None)
                 selection_invalidated = True
+                await self._close_selected_client()
                 self._clear_live("선택 세션 신원이 바뀌었습니다. 다시 선택하세요.")
                 self._set_notice("세션 신원 변경 · 입력을 차단했습니다.")
             elif current is not None:
                 self.selected_identity = current
 
-        if self.selected_id is None and self.auto_select and not selection_invalidated:
+        if (self.selected_id is None and self.auto_select and not selection_invalidated
+                and not self._selection_requires_explicit):
             candidate = next((item for item in self.sessions.values()
                               if item.state == "running"), None)
             if candidate is not None:
-                await self._select_session(candidate, focus=False)
+                await self._select_session(candidate, focus=False, automatic=True)
 
         await self._render_windows()
         await self._render_cards()
@@ -783,37 +839,64 @@ class WindowsJTTApp(App[None]):
         }
 
     async def _render_windows(self) -> None:
+        async with self._windows_render_lock:
+            await self._render_windows_serial()
+
+    def _window_render_signature(self) -> tuple:
+        return (self.workspace_name, self.selected_window_id, tuple(
+            (window["id"], window["name"], len(window["terminal_ids"]))
+            for window in self.windows
+        ))
+
+    async def _render_windows_serial(self) -> None:
         if not self._base_widgets_available():
             return
         container = self.query_one("#window-list", ScrollableContainer)
-        await container.remove_children()
-        if not self._base_widgets_available() or not container.is_attached:
+        signature = self._window_render_signature()
+        if signature == self._window_signature:
             return
-        if not self.windows:
-            await self._mount_if_active(
-                container, Static("Window가 없습니다.", id="empty-windows")
-            )
-            return
-        self.query_one("#workspace-picker", Button).label = (
-            f"{self.workspace_name}\n보관함 · 작업 불러오기"
-        )
-        for window in self.windows:
-            selected = window["id"] == self.selected_window_id
-            label = Text(f"{window['name']}\n터미널 {len(window['terminal_ids'])}개")
-            button = Button(
-                label,
-                id="window-" + window["id"],
-                classes="window-item selected" if selected else "window-item",
-                variant="primary" if selected else "default",
-            )
-            if not await self._mount_if_active(container, button):
+        self._window_signature = None
+        workspace_name, selected_window_id, windows = signature
+        context = self.query_one("#workspace-context", Static)
+        context.update(Text(workspace_name, no_wrap=True, overflow="ellipsis"))
+        context.tooltip = f"현재 작업공간: {workspace_name}"
+        desired_ids = {"window-" + window_id for window_id, _name, _count in windows}
+        for child in tuple(container.children):
+            if child.id not in desired_ids:
+                await child.remove()
+                if (not self._widget_render_active(container)
+                        or signature != self._window_render_signature()):
+                    return
+        if not windows:
+            if not await self._mount_if_active(
+                    container, Static("Window가 없습니다.", id="empty-windows")):
                 return
+            if signature == self._window_render_signature():
+                self._window_signature = signature
+            return
+        for index, (window_id, name, terminal_count) in enumerate(windows):
+            selected = window_id == selected_window_id
+            label = Text(f"{name}\n터미널 {terminal_count}개")
+            button = next((child for child in container.children
+                           if child.id == "window-" + window_id), None)
+            if button is None:
+                button = Button(label, id="window-" + window_id, classes="window-item")
+                if not await self._mount_if_active(container, button):
+                    return
+                if signature != self._window_render_signature():
+                    return
+            button.label = label
+            button.set_class(selected, "selected")
+            button.variant = "primary" if selected else "default"
+            if container.children[index] is not button:
+                container.move_child(button, before=container.children[index])
         if not self._base_widgets_available() or not container.is_attached:
             return
         self.query_one("#current-window", Static).update(
-            next(item["name"] for item in self.windows
-                 if item["id"] == self.selected_window_id)
+            next(name for window_id, name, _count in windows
+                 if window_id == selected_window_id)
         )
+        self._window_signature = signature
 
     async def _render_cards(self) -> None:
         # Session refresh and Mini LIVE sampling can complete in the same UI
@@ -850,18 +933,56 @@ class WindowsJTTApp(App[None]):
         if not self._widget_render_active(container):
             return
         values = list(self.sessions.values())
+        scope = self._card_render_scope()
         now = time.monotonic()
         signature = tuple(
             (item.session_id, item.generation, item.shell_pid, item.state, item.name,
              item.session_id == self.selected_id,
              self._mini_signature(item, now))
             for item in values
-        ) + (("window", self.selected_window_id, self.size.width, self.size.height),)
+        ) + (("window", self.selected_window_id, self.size.width, self.size.height,
+              container.size.width, len(self._missing_terminal_refs)),)
         if signature == self._card_signature:
             return
-        self._card_signature = signature
+        compact = self.size.height < 30
+        preview_lines = 1 if compact else 2
+        card_height = preview_lines + 4
+        cards_per_row = self._cards_per_row(container.size.width)
+        card_columns = max(8, (container.size.width - 4) // cards_per_row)
+        # A reused session id may refer to a different generation or process.
+        # Treat every verified process identity as part of the card structure
+        # so a focused widget from an old incarnation is never silently reused.
+        structure = (tuple(_mini_identity_key(item) for item in values), cards_per_row)
+        if values and structure == self._card_structure:
+            try:
+                buttons = [container.query_one("#terminal-" + item.session_id, Button)
+                           for item in values]
+            except NoMatches:
+                self._card_structure = None
+            else:
+                # Mini LIVE and state changes update existing widgets instead
+                # of detaching the focused card on every output sequence.
+                for identity, button in zip(values, buttons):
+                    selected = identity.session_id == self.selected_id
+                    button.label = self._card_label(identity, now, card_columns, preview_lines)
+                    button.set_class(selected, "selected")
+                    button.variant = "primary" if selected else "default"
+                    button.styles.height = card_height
+                    if button.parent is not None:
+                        button.parent.styles.height = card_height
+                self._rendered_card_identities = {
+                    item.session_id: _mini_identity_key(item) for item in values
+                }
+                self._update_terminal_summary(len(values))
+                self._card_signature = signature
+                return
+        focus_snapshot = self._focused_card_snapshot()
+        self._card_structure = None
+        self._card_signature = None
+        self._rendered_card_identities = {}
         await container.remove_children()
-        if not self._widget_render_active(container):
+        if not self._widget_render_active(container) or self._card_render_scope() != scope:
+            self._restore_card_focus(focus_snapshot, container)
             return
         if not values:
             empty_message = (
@@ -871,46 +992,30 @@ class WindowsJTTApp(App[None]):
                 "이 Window에는 터미널이 없습니다.\n"
                 "새 터미널을 선택하면 PTY가 생성됩니다."
             )
-            await self._mount_if_active(
-                container,
-                Static(empty_message),
-            )
-            if not self._widget_render_active(container):
+            if not await self._mount_if_active(container, Static(empty_message)):
                 return
-            missing = len(self._missing_terminal_refs)
-            summary = "터미널 0개" if not missing else f"사용 불가 참조 {missing}개"
-            self.query_one("#terminal-summary", Static).update(summary)
+            if not self._widget_render_active(container) or self._card_render_scope() != scope:
+                self._restore_card_focus(focus_snapshot, container)
+                return
+            self._update_terminal_summary(0)
+            self._card_signature = signature
+            self._card_structure = ((), cards_per_row)
+            self._restore_card_focus(focus_snapshot, container)
             return
-        summary = f"터미널 {len(values)}개"
-        if self._missing_terminal_refs:
-            summary += f" · 연결 불가 {len(self._missing_terminal_refs)}개"
-        self.query_one("#terminal-summary", Static).update(summary)
-        compact = self.size.height < 30
-        preview_lines = 1 if compact else 2
-        card_height = preview_lines + 4
-        card_columns = max(8, (container.size.width - 4) // 2)
-        for start in range(0, len(values), 2):
+        self._update_terminal_summary(len(values))
+        rendered_identities: dict[str, tuple] = {}
+        for start in range(0, len(values), cards_per_row):
             row = Horizontal(classes="card-row")
             row.styles.height = card_height
             if not await self._mount_if_active(container, row):
                 return
-            for identity in values[start:start + 2]:
+            if self._card_render_scope() != scope:
+                self._restore_card_focus(focus_snapshot, container)
+                return
+            for identity in values[start:start + cards_per_row]:
                 selected = identity.session_id == self.selected_id
-                state = self._state_label(identity.state)
-                # Keep identity metadata on two clipped lines in narrow cards;
-                # wrapping pushes the Mini LIVE preview and status out of view.
-                label = Text(
-                    f"{identity.name}\n{state} · PID {identity.shell_pid}",
-                    no_wrap=True, overflow="ellipsis",
-                )
-                cached = self._fresh_mini_screen(identity, now)
-                if cached is None:
-                    label.append("\n미니 화면 대기 중", style="dim")
-                else:
-                    label.append("\n")
-                    label.append(_screen_text(cached[3], card_columns, preview_lines))
                 button = Button(
-                    label,
+                    self._card_label(identity, now, card_columns, preview_lines),
                     id="terminal-" + identity.session_id,
                     classes="terminal-card selected" if selected else "terminal-card",
                     variant="primary" if selected else "default",
@@ -918,6 +1023,91 @@ class WindowsJTTApp(App[None]):
                 button.styles.height = card_height
                 if not await self._mount_if_active(row, button):
                     return
+                if self._card_render_scope() != scope:
+                    self._restore_card_focus(focus_snapshot, container)
+                    return
+                rendered_identities[identity.session_id] = _mini_identity_key(identity)
+        if (not self._widget_render_active(container)
+                or self._card_render_scope() != scope):
+            self._restore_card_focus(focus_snapshot, container)
+            return
+        self._card_structure = structure
+        self._card_signature = signature
+        self._rendered_card_identities = rendered_identities
+        self._restore_card_focus(focus_snapshot, container)
+
+    def _focused_card_snapshot(self) -> tuple[Button, str, tuple | None, int, Any] | None:
+        """Capture actual card focus, independently of the selected session."""
+        focused = self.focused
+        button_id = getattr(focused, "id", None)
+        if not isinstance(focused, Button) or not button_id or not button_id.startswith("terminal-"):
+            return None
+        session_id = button_id[len("terminal-"):]
+        return (
+            focused,
+            session_id,
+            self._rendered_card_identities.get(session_id),
+            self._focus_intent_epoch,
+            self.screen,
+        )
+
+    def _restore_card_focus(
+        self,
+        snapshot: tuple[Button, str, tuple | None, int, Any] | None,
+        container: ScrollableContainer,
+    ) -> None:
+        """Restore only an unchanged card focus request; never steal newer focus."""
+        if snapshot is None or not self._widget_render_active(container):
+            return
+        _old_button, session_id, old_identity, focus_epoch, old_screen = snapshot
+        if (self.screen is not old_screen or isinstance(self.screen, ModalScreen)
+                or self._focus_intent_epoch != focus_epoch):
+            return
+        current = self.sessions.get(session_id)
+        current_identity = _mini_identity_key(current) if current is not None else None
+        new_button = None
+        if current_identity is not None and current_identity == old_identity:
+            try:
+                candidate = container.query_one("#terminal-" + session_id, Button)
+            except NoMatches:
+                candidate = None
+            if (candidate is not None and candidate.is_attached
+                    and self._rendered_card_identities.get(session_id) == old_identity):
+                new_button = candidate
+        if new_button is not None:
+            self._focus_visible_target(new_button)
+            self._panel_index = 1
+            return
+        # The previously focused identity disappeared or changed. Move to a
+        # neutral CENTER action rather than focusing a stale/reused card.
+        # Focusing the button only exposes an explicit action; it creates no PTY.
+        try:
+            target = self.query_one("#new-terminal", Button)
+        except NoMatches:
+            return
+        if target.is_attached:
+            self._focus_visible_target(target)
+            self._panel_index = 1
+
+    def _update_terminal_summary(self, count: int) -> None:
+        missing = len(self._missing_terminal_refs)
+        summary = f"터미널 {count}개" if count or not missing else f"사용 불가 참조 {missing}개"
+        if count and missing:
+            summary += f" · 연결 불가 {missing}개"
+        self.query_one("#terminal-summary", Static).update(summary)
+
+    def _card_label(self, identity: TerminalIdentity, now: float,
+                    columns: int, preview_lines: int) -> Text:
+        state = self._state_label(identity.state)
+        label = Text(f"{identity.name}\n{state} · PID {identity.shell_pid}",
+                     no_wrap=True, overflow="ellipsis")
+        cached = self._fresh_mini_screen(identity, now)
+        if cached is None:
+            label.append("\n미니 화면 대기 중", style="dim")
+        else:
+            label.append("\n")
+            label.append(_screen_text(cached[3], columns, preview_lines))
+        return label
 
     def _mini_signature(self, identity: TerminalIdentity, now: float) -> tuple:
         entry = self._mini_cache.get(identity.session_id)
@@ -956,6 +1146,12 @@ class WindowsJTTApp(App[None]):
             # on_unmount. Only this expected missing-widget case is ignored.
             return None
 
+    @staticmethod
+    def _cards_per_row(width: int) -> int:
+        # Keep enough content width for a useful name, status and PID on
+        # small terminals, while retaining the two-card grid on wide screens.
+        return 1 if width < 40 else 2
+
     def _visible_mini_targets(self) -> tuple[TerminalIdentity, ...] | None:
         container = self._mini_cards_container()
         if container is None:
@@ -968,7 +1164,8 @@ class WindowsJTTApp(App[None]):
         last_row = max(first_row + 1,
                        (int(container.scroll_y) + viewport_height + row_pitch - 1)
                        // row_pitch)
-        visible = values[first_row * 2:last_row * 2]
+        cards_per_row = self._cards_per_row(container.size.width)
+        visible = values[first_row * cards_per_row:last_row * cards_per_row]
         return tuple(item for item in visible
                      if item.state == "running" and item.session_id != self.selected_id)[:16]
 
@@ -1021,12 +1218,20 @@ class WindowsJTTApp(App[None]):
         return (self.workspace_id, self.selected_window_id,
                 tuple(_mini_identity_key(item) for item in self.sessions.values()))
 
-    async def _select_session(self, identity: TerminalIdentity, *, focus: bool = True) -> None:
-        if self._busy:
+    def _card_render_scope(self) -> tuple:
+        return (self._mini_scope(), self.selected_id, tuple(
+            (item.state, item.name) for item in self.sessions.values()
+        ))
+
+    async def _select_session(self, identity: TerminalIdentity, *, focus: bool = True,
+                              automatic: bool = False) -> None:
+        if self._busy or (automatic and self._selection_requires_explicit):
             return
         self._busy = True
         try:
             await self._close_selected_client()
+            if automatic and self._selection_requires_explicit:
+                return
             self.input_mode = False
             self.selected_id = None
             self.selected_identity = None
@@ -1039,11 +1244,14 @@ class WindowsJTTApp(App[None]):
                             if item.session_id == identity.session_id), None)
             if current is None or not _same_identity(identity, current):
                 raise TerminalError("terminal identity changed before selection")
+            if automatic and self._selection_requires_explicit:
+                return
             self.selected_id = identity.session_id
             self.selected_identity = current
             if current.state == "running":
                 client = await self._backend_call(self.registry.connect, identity.session_id)
                 if not _same_identity(current, client.identity):
+                    self._selection_requires_explicit = True
                     await self._backend_call(client.close)
                     self.selected_id = None
                     self.selected_identity = None
@@ -1054,6 +1262,8 @@ class WindowsJTTApp(App[None]):
                 await self._refresh_live()
             else:
                 self._clear_live(self._state_label(identity.state))
+            if not automatic:
+                self._selection_requires_explicit = False
         except Exception as exc:
             self.client = None
             self.input_mode = False
@@ -1617,6 +1827,53 @@ class WindowsJTTApp(App[None]):
             return
         await self._send_bytes(data)
 
+    async def _copy_right_screen(self) -> None:
+        """Copy the latest verified RIGHT snapshot only after an explicit command."""
+        client = self.client
+        identity = self.selected_identity
+        current = (self.sessions.get(identity.session_id)
+                   if identity is not None else None)
+
+        def target_is_current() -> bool:
+            visible = (self.sessions.get(identity.session_id)
+                       if identity is not None else None)
+            return (
+                identity is not None and client is not None
+                and client is self.client and self._selection_matches(identity)
+                and identity.state == "running" and visible is not None
+                and visible.state == "running" and _same_identity(identity, visible)
+                and _same_identity(identity, client.identity)
+            )
+
+        if self._busy or current is None or not target_is_current():
+            self._set_notice("복사할 실행 중 터미널을 확인할 수 없습니다.")
+            return
+
+        self._busy = True
+        try:
+            observation = await self._backend_call(client.observe)
+            if (not target_is_current() or not observation.synced
+                    or observation.screen is None
+                    or observation.state != "running"
+                    or observation.session_id != identity.session_id
+                    or observation.generation != identity.generation
+                    or observation.shell_pid != identity.shell_pid):
+                self._set_notice("터미널 신원 또는 화면 동기화를 확인할 수 없어 복사를 차단했습니다.")
+                return
+            text = _screen_clipboard_text(observation.screen)
+            if not text:
+                self._set_notice("복사할 화면 텍스트가 없습니다.")
+                return
+            # Clipboard access is isolated from the UI thread and happens only
+            # after Ctrl+Shift+C or Ctrl+G c. No clipboard read is performed.
+            await asyncio.to_thread(_write_windows_clipboard, text)
+            self._set_notice("선택한 RIGHT 터미널 화면을 클립보드에 복사했습니다.")
+        except Exception:
+            self._set_notice("복사 실패 · Windows 클립보드가 사용 중인지 확인하세요.", 8.0)
+        finally:
+            self._busy = False
+            self._update_status()
+
     async def _close_selected_client(self) -> None:
         client, self.client = self.client, None
         if client is None:
@@ -1639,26 +1896,40 @@ class WindowsJTTApp(App[None]):
     def _focus_panel(self, index: int) -> None:
         if not self.is_mounted:
             return
+        self._focus_intent_epoch += 1
         self._panel_index = index % 3
         try:
             if self._panel_index == 0:
                 target = (self.query_one("#window-" + self.selected_window_id, Button)
                           if self.windows else self.query_one("#new-window", Button))
-                target.focus()
+                self._focus_visible_target(target)
             elif self._panel_index == 1:
                 target = (self.query_one("#terminal-" + self.selected_id, Button)
                           if self.selected_id else self.query_one("#new-terminal", Button))
-                target.focus()
+                self._focus_visible_target(target)
             else:
-                self.query_one("#live", TerminalView).focus()
+                self._focus_visible_target(self.query_one("#live", TerminalView))
         except Exception:
             self.query_one("#live", TerminalView).focus()
+
+    @staticmethod
+    def _focus_visible_target(target: Widget) -> None:
+        """Reveal a panel target in its nearest scrollable ancestor, then focus it."""
+        ancestor = target.parent
+        while isinstance(ancestor, Widget):
+            if isinstance(ancestor, ScrollableContainer):
+                ancestor.scroll_to_widget(target, animate=False, immediate=True)
+                break
+            ancestor = ancestor.parent
+        target.focus()
 
     async def _handle_prefix_key(self, key: str, character: str | None) -> None:
         self._clear_prefix()
         token = (character or "").lower()
         if token == "n":
             await self.create_terminal()
+        elif token == "c":
+            await self._copy_right_screen()
         elif token in ("h", "l"):
             values = list(self.sessions.values())
             if not values:
@@ -1677,7 +1948,7 @@ class WindowsJTTApp(App[None]):
         elif token == "x":
             await self._stop_selected()
         elif token == "?":
-            self._set_notice("Ctrl+G n 새 터미널 · h/l 카드 · w 공간 · x 종료 확인 · d 분리")
+            self._set_notice("Ctrl+G n 새 터미널 · c RIGHT 화면 복사 · h/l 카드 · w 공간 · x 종료 확인 · d 분리")
         elif key.lower() == "escape":
             self._set_notice("JTT 명령을 취소했습니다.")
         else:
@@ -1751,11 +2022,20 @@ class WindowsJTTApp(App[None]):
 
     async def action_enter(self) -> None:
         if isinstance(self.screen, CreateWindowScreen):
-            self.screen.dismiss(self.screen.query_one("#window-name", Input).value)
+            if getattr(self.focused, "id", "") == "cancel-window":
+                self.screen.dismiss(None)
+            else:
+                self.screen.dismiss(self.screen.query_one("#window-name", Input).value)
             return
         if isinstance(self.screen, ConfirmStopScreen):
             focused_id = getattr(self.focused, "id", "")
             self.screen.dismiss(focused_id == "confirm-stop")
+            return
+        if isinstance(self.screen, SavedWorkspaceScreen):
+            # The app's priority Enter binding runs before Button's normal
+            # binding, so explicitly dispatch the focused archive action.
+            if isinstance(self.focused, Button):
+                self.focused.press()
             return
         if isinstance(self.screen, ModalScreen):
             return
@@ -1785,8 +2065,17 @@ class WindowsJTTApp(App[None]):
             await self._send_bytes(b"\x7f")
 
     async def on_key(self, event) -> None:
+        # Any user key arriving while an async card rebuild is suspended is a
+        # newer focus/navigation intent than the renderer's saved snapshot.
+        self._focus_intent_epoch += 1
+        if isinstance(self.screen, ModalScreen):
+            return
         key = str(event.key).lower()
         character = getattr(event, "character", None)
+        if key == "ctrl+shift+c":
+            event.stop()
+            await self._copy_right_screen()
+            return
         if self.prefix_pending:
             event.stop()
             await self._handle_prefix_key(key, character)
@@ -1797,7 +2086,10 @@ class WindowsJTTApp(App[None]):
                 event.stop()
                 await self._send_bytes(data)
             return
-        if key in ("up", "down") and self._panel_index == 0:
+        if key in ("left", "right") and self._panel_index == 0:
+            event.stop()
+            self._move_left_action(-1 if key == "left" else 1)
+        elif key in ("up", "down") and self._panel_index == 0:
             event.stop()
             await self._move_window(-1 if key == "up" else 1)
         elif key in ("up", "left") and self._panel_index == 1:
@@ -1808,6 +2100,19 @@ class WindowsJTTApp(App[None]):
             await self._move_card(1)
         elif key == "escape":
             event.stop()
+
+    def on_mouse_down(self, event) -> None:
+        # Mouse focus is user intent too; a completed mount must not take it
+        # back after a card has been detached during the click.
+        self._focus_intent_epoch += 1
+
+    def _move_left_action(self, offset: int) -> None:
+        """Navigate LEFT actions without changing the selected Window or lease."""
+        choices = (["window-" + self.selected_window_id] if self.windows else [])
+        choices.extend(["new-window", "workspace-picker"])
+        focused = getattr(self.focused, "id", None)
+        index = choices.index(focused) if focused in choices else 0
+        self.query_one("#" + choices[(index + offset) % len(choices)], Button).focus()
 
     async def _move_card(self, offset: int) -> None:
         values = list(self.sessions.values())
