@@ -484,7 +484,7 @@ jobs:
             runner_os = [System.Environment]::OSVersion.VersionString
             expected_source_root = [System.IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE "src"))
             configured_pythonpath = $env:PYTHONPATH
-            expected_test_count = 41
+            expected_test_count = 46
             initialized_utc = [DateTimeOffset]::UtcNow.ToString("o")
           }
           [System.IO.File]::WriteAllText((Join-Path $env:GITHUB_WORKSPACE "test-results/environment.json"), ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
@@ -558,7 +558,7 @@ jobs:
                   "alias_same_source_file": True,
                   "imports": imports,
                   "native_api_modules": [win32api.__name__, win32file.__name__, win32pipe.__name__, win32security.__name__, pywintypes.__name__],
-                  "expected_test_count": 41,
+                  "expected_test_count": 46,
               }
           except Exception as exc:
               evidence.update({
@@ -576,7 +576,7 @@ jobs:
           python $preflightPath
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Collect and require exactly 41 IPC test selectors
+      - name: Collect and require exactly 46 IPC test selectors
         id: ipc-collection
         shell: pwsh
         run: |
@@ -593,12 +593,12 @@ jobs:
           $evidence | Add-Member -NotePropertyName collection_count -NotePropertyValue $nodeIds.Count -Force
           $evidence | Add-Member -NotePropertyName collection_unique_count -NotePropertyValue $uniqueNodeIds.Count -Force
           $evidence | Add-Member -NotePropertyName collection_node_ids -NotePropertyValue @($nodeIds) -Force
-          $collectionReady = ($collectionExit -eq 0 -and $nodeIds.Count -eq 41 -and $uniqueNodeIds.Count -eq 41)
+          $collectionReady = ($collectionExit -eq 0 -and $nodeIds.Count -eq 46 -and $uniqueNodeIds.Count -eq 46)
           $evidence | Add-Member -NotePropertyName status -NotePropertyValue $(if ($collectionReady) { "COLLECTION_READY" } else { "INCONCLUSIVE" }) -Force
           $evidence | Add-Member -NotePropertyName stage -NotePropertyValue $(if ($collectionReady) { "collection_verified" } else { "collection_failed" }) -Force
           [System.IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
           Write-Output $collectionText
-          if (-not $collectionReady) { throw "Expected 41 unique IPC test selectors; collected $($nodeIds.Count) with $($uniqueNodeIds.Count) unique (exit $collectionExit)" }
+          if (-not $collectionReady) { throw "Expected 46 unique IPC test selectors; collected $($nodeIds.Count) with $($uniqueNodeIds.Count) unique (exit $collectionExit)" }
 
       - name: Run all IPC synthetic and native tests
         id: ipc-tests
@@ -609,7 +609,7 @@ jobs:
           if ($evidence.status -ne "COLLECTION_READY") { throw "IPC collection was not verified" }
           $evidence.status = "INCONCLUSIVE"
           $evidence.stage = "test_started"
-          $evidence.test_started_utc = [DateTimeOffset]::UtcNow.ToString("o")
+          $evidence | Add-Member -NotePropertyName test_started_utc -NotePropertyValue ([DateTimeOffset]::UtcNow.ToString("o")) -Force
           [System.IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
           & python -m pytest --noconftest -p no:cacheprovider -q -s tests/test_windows_ipc.py --junitxml=test-results/windows-ipc-integration.xml
           $pytestExit = $LASTEXITCODE
@@ -621,7 +621,7 @@ jobs:
           [System.IO.File]::WriteAllText($evidencePath, ($evidence | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
           if ($pytestExit -ne 0) { exit $pytestExit }
 
-      - name: Require 41 executed tests with zero skips and finalize status
+      - name: Require 46 executed tests with zero skips and finalize status
         if: always()
         shell: pwsh
         env:
@@ -633,7 +633,7 @@ jobs:
           $collectionPath = Join-Path $env:GITHUB_WORKSPACE "test-results/collection.log"
           $junitPath = Join-Path $env:GITHUB_WORKSPACE "test-results/windows-ipc-integration.xml"
           $status = "INCONCLUSIVE"
-          $collectionEvidenceReady = ((Test-Path -LiteralPath $collectionPath -PathType Leaf) -and (Get-Item -LiteralPath $collectionPath).Length -gt 0 -and $evidence.collection_exit_code -eq 0 -and $evidence.collection_count -eq 41 -and $evidence.collection_unique_count -eq 41)
+          $collectionEvidenceReady = ((Test-Path -LiteralPath $collectionPath -PathType Leaf) -and (Get-Item -LiteralPath $collectionPath).Length -gt 0 -and $evidence.collection_exit_code -eq 0 -and $evidence.collection_count -eq 46 -and $evidence.collection_unique_count -eq 46)
           $junitEvidenceReady = ((Test-Path -LiteralPath $junitPath -PathType Leaf) -and (Get-Item -LiteralPath $junitPath).Length -gt 0)
           if (-not $collectionEvidenceReady) {
             $evidence | Add-Member -NotePropertyName evidence_error_category -NotePropertyValue "CollectionEvidenceMissingOrInvalid" -Force
@@ -649,9 +649,9 @@ jobs:
               $evidence | Add-Member -NotePropertyName junit_failure_count -NotePropertyValue $failures -Force
               $evidence | Add-Member -NotePropertyName junit_error_count -NotePropertyValue $errors -Force
               $evidence | Add-Member -NotePropertyName junit_skip_count -NotePropertyValue $skips -Force
-              if ($cases.Count -eq 41 -and ($failures -gt 0 -or $errors -gt 0 -or $skips -gt 0)) {
+              if ($cases.Count -eq 46 -and ($failures -gt 0 -or $errors -gt 0 -or $skips -gt 0)) {
                 $status = "TEST_FAILED"
-              } elseif ($collectionEvidenceReady -and $cases.Count -eq 41 -and $failures -eq 0 -and $errors -eq 0 -and $skips -eq 0 -and $env:TEST_STEP_OUTCOME -eq "success" -and $evidence.pytest_exit_code -eq 0) {
+              } elseif ($collectionEvidenceReady -and $cases.Count -eq 46 -and $failures -eq 0 -and $errors -eq 0 -and $skips -eq 0 -and $env:TEST_STEP_OUTCOME -eq "success" -and $evidence.pytest_exit_code -eq 0) {
                 $status = "TEST_PASSED"
               }
             } catch {

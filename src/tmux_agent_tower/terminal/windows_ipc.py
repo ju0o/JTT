@@ -90,7 +90,7 @@ class _Overlapped(ctypes.Structure):
 class _NativeOperation:
     __slots__ = ("direction", "handle", "event", "overlapped", "buffer",
                  "pending", "transferred", "closed", "cancel_state",
-                 "reaper_owned", "reaper_completed")
+                 "reaper_owned", "reaper_completed", "dispose_attempted")
 
     def __init__(self, direction: str, handle: int, event: int,
                  overlapped: _Overlapped, buffer: Any):
@@ -105,6 +105,7 @@ class _NativeOperation:
         self.cancel_state = "not_requested"
         self.reaper_owned = False
         self.reaper_completed = False
+        self.dispose_attempted = False
 
 
 class _NativeApi:
@@ -287,13 +288,14 @@ class _Reservation:
     def __init__(self, reaper: "_PendingIoReaper"):
         self._reaper = reaper
         self._released = False
+        self._release_state = "reserved"
         self._operation = None
         self._lock = threading.Lock()
 
     def _claim(self, operation: Any) -> bool:
         """Bind this capacity token to one operation exactly once."""
         with self._lock:
-            if self._released:
+            if self._release_state != "reserved":
                 return False
             if self._operation is None:
                 self._operation = operation
@@ -305,30 +307,37 @@ class _Reservation:
         with self._lock:
             if self._released:
                 return False
+            if self._release_state != "reserved":
+                return False
             if self._operation is operation and operation is not None:
                 return False
             if self._operation is not None:
                 raise RuntimeError("pending I/O reservation belongs to another operation")
-            self._released = True
-        self._reaper._release()
         return True
 
     def _release_owned(self, operation: Any) -> None:
-        with self._lock:
-            if self._released or self._operation is not operation:
-                raise RuntimeError("pending I/O reservation ownership changed")
-            self._released = True
-            self._operation = None
-        self._reaper._release()
+        self._release(operation)
 
     def release(self) -> None:
+        self._release(None)
+
+    def _release(self, operation: Any) -> None:
         with self._lock:
             if self._released:
                 return
-            if self._operation is not None:
-                raise RuntimeError("pending I/O reservation is owned by its reaper")
-            self._released = True
-        self._reaper._release()
+            if self._release_state != "reserved":
+                raise RuntimeError("pending I/O reservation release state is unknown")
+            if self._operation is not operation:
+                if operation is None and self._operation is not None:
+                    raise RuntimeError("pending I/O reservation is owned by its reaper")
+                raise RuntimeError("pending I/O reservation ownership changed")
+        try:
+            self._reaper._release(self, operation)
+        except BaseException:
+            with self._lock:
+                if self._release_state != "released":
+                    self._release_state = "unknown"
+            raise
 
 
 class _ReaperRecord:
@@ -375,9 +384,27 @@ class _PendingIoReaper:
         with self._lock:
             return len(self._unreaped)
 
-    def _release(self) -> None:
+    def _release(self, reservation: _Reservation, operation: Any = None) -> bool:
         with self._lock:
-            self._reserved = max(0, self._reserved - 1)
+            with reservation._lock:
+                if reservation._reaper is not self:
+                    raise RuntimeError("pending I/O reservation belongs to another reaper")
+                if reservation._release_state == "released":
+                    return False
+                if reservation._release_state != "reserved":
+                    raise RuntimeError("pending I/O reservation release state is unknown")
+                if reservation._operation is not operation:
+                    if operation is None and reservation._operation is not None:
+                        raise RuntimeError("pending I/O reservation is owned by its reaper")
+                    raise RuntimeError("pending I/O reservation ownership changed")
+                if self._reserved <= 0:
+                    raise RuntimeError("pending I/O reservation count underflow")
+                reservation._release_state = "releasing"
+                self._reserved -= 1
+                reservation._released = True
+                reservation._operation = None
+                reservation._release_state = "released"
+        return True
 
     def _start_record_locked(self, key: int, record: _ReaperRecord) -> bool:
         """Start the sole worker while ownership is still globally locked."""
@@ -502,9 +529,8 @@ class _PendingIoReaper:
                 return started
 
         if release_duplicate:
-            # _release_if_unbound marks the token released while the global
-            # ownership lock is held; return its capacity after leaving it.
-            reservation._reaper._release()
+            # Release duplicate capacity after leaving the global ownership lock.
+            reservation.release()
         return False
 
     def retry_start_failed(self, operation: Any) -> bool:
@@ -583,10 +609,7 @@ class OverlappedPipeTransport:
                 try:
                     return self._api.result(operation)
                 finally:
-                    try:
-                        self._api.dispose(operation)
-                    finally:
-                        reservation.release()
+                    self._dispose_and_release(operation, reservation)
             remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             try:
                 completed = remaining_ms > 0 and self._api.wait(operation, remaining_ms)
@@ -595,7 +618,7 @@ class OverlappedPipeTransport:
                 raise
             if completed:
                 try:
-                    return self._api.result(operation)
+                    result = self._api.result(operation)
                 except _IoUnresolved as unresolved:
                     self._cancel_or_reap(operation, reservation)
                     if isinstance(unresolved, _IoIncomplete):
@@ -608,16 +631,11 @@ class OverlappedPipeTransport:
                 except BaseException:
                     # Other errors after a signaled event are terminal I/O
                     # statuses; unresolved results take the reaper path above.
-                    try:
-                        self._api.dispose(operation)
-                    finally:
-                        reservation.release()
+                    self._dispose_and_release(operation, reservation)
                     raise
                 else:
-                    try:
-                        self._api.dispose(operation)
-                    finally:
-                        reservation.release()
+                    self._dispose_and_release(operation, reservation)
+                    return result
             self._cancel_or_reap(operation, reservation)
             raise PipeIoTimeout(direction, getattr(operation, "cancel_state", "unknown"))
         except PipeIoTimeout:
@@ -625,12 +643,80 @@ class OverlappedPipeTransport:
         except BaseException:
             if operation is None:
                 reservation.release()
-            elif not operation.pending and not getattr(operation, "closed", False):
-                try:
-                    self._api.dispose(operation)
-                finally:
-                    reservation.release()
+            elif (not operation.pending
+                  and not getattr(operation, "closed", False)
+                  and not getattr(operation, "dispose_attempted", False)):
+                self._dispose_and_release(operation, reservation)
             raise
+
+    def _dispose_and_release(self, operation: Any,
+                             reservation: _Reservation) -> None:
+        """Attempt disposal once, return its reservation, and report uncertainty."""
+        if getattr(operation, "dispose_attempted", False):
+            raise PipeIoError("named pipe operation disposal was already attempted")
+        operation.dispose_attempted = True
+
+        try:
+            self._api.dispose(operation)
+        except BaseException as dispose_error:
+            release_error = None
+            try:
+                reservation.release()
+            except BaseException as exc:
+                release_error = exc
+            self._attach_cleanup_state(
+                dispose_error, operation, reservation,
+                dispose_error=dispose_error, release_error=release_error,
+            )
+            if release_error is not None and hasattr(dispose_error, "add_note"):
+                dispose_error.add_note(
+                    "reservation release also failed ({})".format(
+                        type(release_error).__name__
+                    )
+                )
+            raise
+
+        try:
+            reservation.release()
+        except BaseException as release_error:
+            self._attach_cleanup_state(
+                release_error, operation, reservation,
+                release_error=release_error,
+            )
+            raise
+
+    @staticmethod
+    def _attach_cleanup_state(error: BaseException, operation: Any,
+                              reservation: _Reservation, *,
+                              dispose_error: BaseException | None = None,
+                              release_error: BaseException | None = None) -> None:
+        reaper = reservation._reaper
+        lock = getattr(reaper, "_lock", None)
+        if lock is None:
+            reserved_slots = getattr(reaper, "_reserved", None)
+        else:
+            with lock:
+                reserved_slots = getattr(reaper, "_reserved", None)
+        state = {
+            "direction": getattr(operation, "direction", "unknown"),
+            "io_completion": "unknown" if getattr(operation, "pending", True) else "confirmed",
+            "dispose_attempted": bool(getattr(operation, "dispose_attempted", False)),
+            "operation_closed": bool(getattr(operation, "closed", False)),
+            "event_handle_state": "closed" if getattr(operation, "closed", False) else "unknown",
+            "reservation_release_attempted": True,
+            "reservation_release_state": getattr(reservation, "_release_state", "unknown"),
+            "reservation_token_consumed": getattr(reservation, "_release_state", "unknown") != "reserved",
+            "reserved_slots": reserved_slots,
+            "dispose_error_category": (type(dispose_error).__name__
+                                       if dispose_error is not None else None),
+            "reservation_error_category": (type(release_error).__name__
+                                           if release_error is not None else None),
+        }
+        try:
+            error.cleanup_state = state
+        except BaseException:
+            # Preserve the original cleanup exception if it cannot carry metadata.
+            pass
 
     def _cancel_or_reap(self, operation: Any, reservation: _Reservation) -> None:
         try:
@@ -657,10 +743,7 @@ class OverlappedPipeTransport:
                     operation.cancel_state = operation.cancel_state + ":completed_with_error"
             else:
                 operation.cancel_state = operation.cancel_state + ":completed"
-            try:
-                self._api.dispose(operation)
-            finally:
-                reservation.release()
+            self._dispose_and_release(operation, reservation)
             return
         operation.cancel_state = operation.cancel_state + ":completion_pending"
         self._adopt_pending(operation, reservation)

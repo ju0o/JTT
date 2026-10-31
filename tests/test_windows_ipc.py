@@ -197,6 +197,53 @@ class _LifecycleApi:
         self.dispose(operation)
 
 
+class _SuccessfulPendingOperation:
+    """A pending operation whose completion is reported by the API result."""
+
+    def __init__(self, direction, value):
+        self.direction = direction
+        self.value = value
+        self.pending = True
+        self.closed = False
+        self.dispose_count = 0
+        self.dispose_attempted = False
+        self.result_calls = 0
+
+
+class _SuccessfulPendingApi:
+    """Synthetic pending API for normal-completion transport regressions."""
+
+    def __init__(self, response=b"reply", *, dispose_failures=0):
+        self.response = response
+        self.dispose_failures = dispose_failures
+        self.operations = []
+
+    def begin(self, _handle, direction, value):
+        result = len(value) if direction == "write" else self.response
+        operation = _SuccessfulPendingOperation(direction, result)
+        self.operations.append(operation)
+        return operation
+
+    def wait(self, operation, timeout_ms):
+        assert operation.pending
+        assert timeout_ms > 0
+        return True
+
+    def result(self, operation):
+        operation.result_calls += 1
+        operation.pending = False
+        return operation.value
+
+    def dispose(self, operation):
+        operation.dispose_count += 1
+        if operation.dispose_count <= self.dispose_failures:
+            raise OSError("synthetic dispose failure")
+        operation.closed = True
+
+    def cancel(self, _operation):
+        raise AssertionError("normal completion must not request cancellation")
+
+
 def _wait_for_reaper(reaper, *, pending_count, reserved_count=None, timeout=3.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -207,6 +254,191 @@ def _wait_for_reaper(reaper, *, pending_count, reserved_count=None, timeout=3.0)
             return
         time.sleep(0.005)
     raise AssertionError("synthetic reaper state did not reach the expected value")
+
+
+def _assert_reaper_reservations(reaper, expected):
+    with reaper._lock:
+        assert reaper._reserved == expected
+        assert len(reaper._unreaped) == 0
+
+
+def _count_reservation_releases(reaper):
+    calls = []
+    original_release = reaper._release
+
+    def counted_release(reservation, operation=None):
+        calls.append(1)
+        return original_release(reservation, operation)
+
+    reaper._release = counted_release
+    return calls
+
+
+def test_pending_write_success_disposes_and_releases_reservation():
+    reaper = windows_ipc._PendingIoReaper(limit=windows_ipc.MAX_PENDING_PIPE_IO)
+    release_calls = _count_reservation_releases(reaper)
+    api = _SuccessfulPendingApi()
+    handle = _Handle()
+    transport = windows_ipc.OverlappedPipeTransport(
+        handle, timeout=1.0, api=api, reaper=reaper
+    )
+
+    assert transport._perform("write", b"request", time.monotonic() + 1.0) == 7
+    assert len(api.operations) == 1
+    operation = api.operations[0]
+    assert operation.result_calls == 1
+    assert operation.dispose_count == 1
+    assert operation.closed
+    _assert_reaper_reservations(reaper, 0)
+    assert len(release_calls) == 1
+    assert not transport.poisoned
+    assert handle.close_count == 0
+
+
+def test_pending_read_success_disposes_and_releases_reservation():
+    reaper = windows_ipc._PendingIoReaper(limit=windows_ipc.MAX_PENDING_PIPE_IO)
+    release_calls = _count_reservation_releases(reaper)
+    api = _SuccessfulPendingApi(response=b"response")
+    handle = _Handle()
+    transport = windows_ipc.OverlappedPipeTransport(
+        handle, timeout=1.0, api=api, reaper=reaper
+    )
+
+    assert transport._perform("read", 896 * 1024,
+                               time.monotonic() + 1.0) == b"response"
+    assert len(api.operations) == 1
+    operation = api.operations[0]
+    assert operation.result_calls == 1
+    assert operation.dispose_count == 1
+    assert operation.closed
+    _assert_reaper_reservations(reaper, 0)
+    assert len(release_calls) == 1
+    assert not transport.poisoned
+    assert handle.close_count == 0
+
+
+def test_repeated_pending_requests_release_slots_below_reaper_capacity():
+    reaper = windows_ipc._PendingIoReaper(limit=windows_ipc.MAX_PENDING_PIPE_IO)
+    release_calls = _count_reservation_releases(reaper)
+    api = _SuccessfulPendingApi(response=b"response")
+    handle = _Handle()
+    transport = windows_ipc.OverlappedPipeTransport(
+        handle, timeout=1.0, api=api, reaper=reaper
+    )
+
+    responses = [
+        transport.exchange("request-{}".format(index).encode("ascii"))
+        for index in range(40)
+    ]
+
+    assert responses == [b"response"] * 40
+    _assert_reaper_reservations(reaper, 0)
+    assert not transport.poisoned
+
+    assert len(api.operations) == 80
+    assert len(release_calls) == 80
+    assert all(operation.result_calls == 1 for operation in api.operations)
+    assert all(operation.dispose_count == 1 for operation in api.operations)
+    assert all(operation.closed and not operation.pending for operation in api.operations)
+    assert handle.close_count == 0
+
+
+def test_pending_dispose_failure_is_not_retried_and_poisons_transport():
+    reaper = windows_ipc._PendingIoReaper(limit=windows_ipc.MAX_PENDING_PIPE_IO)
+    release_calls = _count_reservation_releases(reaper)
+    api = _SuccessfulPendingApi(dispose_failures=1)
+    handle = _Handle()
+    transport = windows_ipc.OverlappedPipeTransport(
+        handle, timeout=1.0, api=api, reaper=reaper
+    )
+
+    with pytest.raises(OSError, match="synthetic dispose failure") as caught:
+        transport.exchange(b"request")
+
+    assert len(api.operations) == 1
+    operation = api.operations[0]
+    assert operation.result_calls == 1
+    assert operation.dispose_count == 1
+    assert operation.dispose_attempted
+    assert not operation.pending
+    assert not operation.closed
+    assert transport.poisoned
+    assert handle.close_count == 1
+    assert len(release_calls) == 1
+    _assert_reaper_reservations(reaper, 0)
+    cleanup_state = getattr(caught.value, "cleanup_state", None)
+    assert cleanup_state == {
+        "direction": "write",
+        "io_completion": "confirmed",
+        "dispose_attempted": True,
+        "operation_closed": False,
+        "event_handle_state": "unknown",
+        "reservation_release_attempted": True,
+        "reservation_release_state": "released",
+        "reservation_token_consumed": True,
+        "reserved_slots": 0,
+        "dispose_error_category": "OSError",
+        "reservation_error_category": None,
+    }
+
+    with pytest.raises(windows_ipc.PipeIoError, match="poisoned"):
+        transport.exchange(b"must-not-be-sent")
+    assert len(api.operations) == 1
+    assert operation.dispose_count == 1
+
+
+def test_reservation_release_failure_is_reported_and_fails_closed(monkeypatch):
+    reaper = windows_ipc._PendingIoReaper(limit=windows_ipc.MAX_PENDING_PIPE_IO)
+    api = _SuccessfulPendingApi()
+    handle = _Handle()
+    transport = windows_ipc.OverlappedPipeTransport(
+        handle, timeout=1.0, api=api, reaper=reaper
+    )
+    reservations = []
+    original_reserve = reaper.reserve
+
+    def capture_reservation():
+        reservation = original_reserve()
+        reservations.append(reservation)
+        return reservation
+
+    release_attempts = []
+
+    def fail_before_reaper_decrement(_reservation, _operation=None):
+        release_attempts.append(1)
+        raise OSError("synthetic reservation release failure")
+
+    monkeypatch.setattr(reaper, "reserve", capture_reservation)
+    monkeypatch.setattr(reaper, "_release", fail_before_reaper_decrement)
+    with pytest.raises(OSError, match="synthetic reservation release failure") as caught:
+        transport.exchange(b"request")
+
+    operation = api.operations[0]
+    assert operation.dispose_count == 1 and operation.closed
+    assert operation.dispose_attempted
+    assert len(release_attempts) == 1
+    assert reservations[0]._release_state == "unknown"
+    assert not reservations[0]._released
+    assert reaper._reserved == 1
+    assert transport.poisoned
+    cleanup_state = getattr(caught.value, "cleanup_state", None)
+    assert cleanup_state == {
+        "direction": "write",
+        "io_completion": "confirmed",
+        "dispose_attempted": True,
+        "operation_closed": True,
+        "event_handle_state": "closed",
+        "reservation_release_attempted": True,
+        "reservation_release_state": "unknown",
+        "reservation_token_consumed": True,
+        "reserved_slots": 1,
+        "dispose_error_category": None,
+        "reservation_error_category": "OSError",
+    }
+
+    with pytest.raises(windows_ipc.PipeIoError, match="poisoned"):
+        transport.exchange(b"must-not-be-sent")
+    assert len(api.operations) == 1
 
 
 def _count_reaper_worker_starts(monkeypatch, *, fail_before_start=0,
@@ -619,10 +851,10 @@ def test_real_reaper_sequential_duplicate_adopt_has_one_owner_and_one_close(monk
     release_calls = 0
     release = reaper._release
 
-    def counted_release():
+    def counted_release(reservation, operation=None):
         nonlocal release_calls
         release_calls += 1
-        release()
+        return release(reservation, operation)
 
     monkeypatch.setattr(reaper, "_release", counted_release)
 
