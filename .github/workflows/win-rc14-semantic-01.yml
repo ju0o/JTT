@@ -107,6 +107,38 @@ jobs:
           $inputPath = Join-Path $resultDir 'probe-input.json'
           if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) { throw 'PROBE_PREFLIGHT_INPUT_MISSING' }
           $inputs = Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json
+          $script:evidenceWriteErrors = @()
+          function Write-StageEvidence([string]$CaseName, [string]$StageName, [object]$Record) {
+            $path = Join-Path $resultDir ($CaseName + '-' + $StageName + '.json')
+            $temporaryPath = $path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+            try {
+              if ([IO.File]::Exists($path)) { throw 'EVIDENCE_RECORD_ALREADY_EXISTS' }
+              $json = $Record | ConvertTo-Json -Compress -Depth 14
+              [IO.File]::WriteAllText($temporaryPath, $json, [Text.UTF8Encoding]::new($false))
+              [IO.File]::Move($temporaryPath, $path)
+              return $true
+            } catch {
+              $script:evidenceWriteErrors += [ordered]@{ path = $path; category = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+              [Console]::Error.WriteLine('EVIDENCE_WRITE_ERROR_' + $CaseName + '_' + $StageName + '_' + $_.Exception.GetType().FullName)
+              return $false
+            }
+          }
+          function Get-OwnedProcessIdentity([System.Diagnostics.Process]$Process, [string]$ExpectedPath) {
+            $startTimeUtc = $null
+            $actualPath = $null
+            $identityErrors = @()
+            try { $startTimeUtc = $Process.StartTime.ToUniversalTime().ToString('o') } catch { $identityErrors += ('START_TIME_' + $_.Exception.GetType().FullName) }
+            try { $actualPath = [IO.Path]::GetFullPath($Process.MainModule.FileName) } catch { $identityErrors += ('IMAGE_PATH_' + $_.Exception.GetType().FullName) }
+            $expectedFullPath = [IO.Path]::GetFullPath($ExpectedPath)
+            return [ordered]@{
+              pid = $Process.Id
+              startTimeUtc = $startTimeUtc
+              expectedExecutablePath = $expectedFullPath
+              actualExecutablePath = $actualPath
+              executablePathMatches = ($null -ne $actualPath -and [String]::Equals($actualPath, $expectedFullPath, [StringComparison]::OrdinalIgnoreCase))
+              identityReadErrors = @($identityErrors)
+            }
+          }
           $cases = @(
             [pscustomobject]@{ name = 'B1'; nonce = $inputs.nonceB1; script = Join-Path $env:GITHUB_WORKSPACE 'experiments/windows_native/r02_semantic_probe/B1-minimal-path.ps1' }
             [pscustomobject]@{ name = 'B2'; nonce = $inputs.nonceB2; script = Join-Path $env:GITHUB_WORKSPACE 'experiments/windows_native/r02_semantic_probe/B2-instrumented-path.ps1' }
@@ -118,29 +150,86 @@ jobs:
             $stderrPath = Join-Path $resultDir ($case.name + '.stderr.txt')
             $process = $null
             $startError = $null
-            try {
-              $quotedScript = '"' + $case.script + '"'
-              $process = Start-Process -FilePath $inputs.powershellPath -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $quotedScript, '-Nonce', $case.nonce) -WorkingDirectory $inputs.workspace -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Wait -PassThru
-            } catch {
-              $startError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+            $processIdentity = $null
+            $processExitState = 'PROCESS_START_FAILED'
+            $exitCode = $null
+            $waitMilliseconds = if ($case.name -eq 'B1') { 30000 } else { 60000 }
+            $waitError = $null
+            $disposeError = $null
+            $identityError = $null
+            $outputReadError = $null
+            $scriptSha256 = $null
+            $stdout = ''
+            $stderr = ''
+            $outputReadState = 'NOT_READ_PROCESS_NOT_CONFIRMED_EXITED'
+            try { $scriptSha256 = (Get-FileHash -LiteralPath $case.script -Algorithm SHA256 -ErrorAction Stop).Hash } catch {
+              $startError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message; phase = 'HASH_SCRIPT' }
             }
-            $exitCode = if ($null -ne $process) { $process.ExitCode } else { $null }
-            if ($null -ne $process) { $process.Dispose() }
-            $stdout = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) { Get-Content -LiteralPath $stdoutPath -Raw } else { '' }
-            $stderr = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
+            [void](Write-StageEvidence $case.name 'start' ([ordered]@{ name = $case.name; nonce = $case.nonce; state = 'PROCESS_START_REQUESTED'; utc = [DateTime]::UtcNow.ToString('o'); scriptPath = $case.script; scriptSha256 = $scriptSha256; executablePath = $inputs.powershellPath; workingDirectory = $inputs.workspace; expectedDestination = $expectedDestination; waitLimitMilliseconds = $waitMilliseconds; prelaunchError = $startError }))
+            if ($null -eq $startError) {
+              try {
+                $quotedScript = '"' + $case.script + '"'
+                $argumentList = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $quotedScript, '-Nonce', $case.nonce)
+                if ($case.name -eq 'B2') { $argumentList += @('-EvidenceDirectory', ('"' + $resultDir + '"')) }
+                $process = Start-Process -FilePath $inputs.powershellPath -ArgumentList $argumentList -WorkingDirectory $inputs.workspace -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+              } catch {
+                $startError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message; phase = 'START_PROCESS' }
+              }
+            }
+            if ($null -ne $process) {
+              try { $processIdentity = Get-OwnedProcessIdentity $process $inputs.powershellPath } catch { $identityError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message } }
+              [void](Write-StageEvidence $case.name 'process-started' ([ordered]@{ name = $case.name; nonce = $case.nonce; state = 'PROCESS_STARTED'; utc = [DateTime]::UtcNow.ToString('o'); process = $processIdentity; identityError = $identityError; waitLimitMilliseconds = $waitMilliseconds }))
+              try {
+                $exited = $process.WaitForExit([int]$waitMilliseconds)
+                if ($exited) {
+                  try {
+                    $exitCode = [int]$process.ExitCode
+                    $processExitState = 'EXIT_CONFIRMED'
+                  } catch {
+                    $processExitState = 'PROCESS_EXIT_UNCONFIRMED'
+                    $waitError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message; phase = 'READ_EXIT_CODE' }
+                  }
+                } else {
+                  $processExitState = 'PROCESS_EXIT_UNCONFIRMED'
+                }
+              } catch {
+                $processExitState = 'PROCESS_EXIT_UNCONFIRMED'
+                $waitError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message; phase = 'WAIT_FOR_EXIT' }
+              } finally {
+                try { $process.Dispose() } catch { $disposeError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message } }
+              }
+            }
+            if ($processExitState -eq 'EXIT_CONFIRMED') {
+              try {
+                $stdout = if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) { Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction Stop } else { '' }
+                $stderr = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction Stop } else { '' }
+                $outputReadState = 'READ_AFTER_EXIT_CONFIRMED'
+              } catch {
+                $outputReadError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+                $outputReadState = 'EVIDENCE_READ_ERROR'
+                $stdout = ''
+                $stderr = ''
+              }
+            }
+            [void](Write-StageEvidence $case.name 'process-result' ([ordered]@{ name = $case.name; nonce = $case.nonce; state = $processExitState; utc = [DateTime]::UtcNow.ToString('o'); process = $processIdentity; exitCode = $exitCode; waitLimitMilliseconds = $waitMilliseconds; startError = $startError; waitError = $waitError; disposeError = $disposeError; outputReadState = $outputReadState; outputReadError = $outputReadError; stdoutPath = $stdoutPath; stderrPath = $stderrPath }))
             $summary = $null
             foreach ($line in @($stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
               try { $summary = $line | ConvertFrom-Json -ErrorAction Stop } catch { }
             }
+            if ($case.name -eq 'B2') {
+              $capturedEvidenceErrors = [string]$stderr
+              if ($null -ne $summary) { $capturedEvidenceErrors += "`n" + [string]$summary.stderr }
+              if ($capturedEvidenceErrors.Contains('EVIDENCE_WRITE_ERROR_')) { [Console]::Error.WriteLine('B2_EVIDENCE_WRITE_ERROR_CAPTURED') }
+            }
             $semanticPass = $false
-            if ($null -ne $summary -and $case.name -eq 'B1') {
-              $semanticPass = ($exitCode -eq 0 -and $summary.exitCode -eq 0 -and $null -eq $summary.error -and [System.String]::Equals($summary.destination, $expectedDestination, [System.StringComparison]::OrdinalIgnoreCase) -and $summary.expectedLocationVerified -eq $true -and $summary.sideEffectContentMatchesExpectedPath -eq $true -and $stdout.Contains($summary.outputMarker))
+            if ($processExitState -eq 'EXIT_CONFIRMED' -and $null -ne $summary -and $case.name -eq 'B1') {
+              $semanticPass = ($exitCode -eq 0 -and $processIdentity.executablePathMatches -eq $true -and $null -ne $processIdentity.startTimeUtc -and $summary.exitCode -eq 0 -and $null -eq $summary.error -and [System.String]::Equals($summary.destination, $expectedDestination, [System.StringComparison]::OrdinalIgnoreCase) -and $summary.expectedLocationVerified -eq $true -and $summary.sideEffectContentMatchesExpectedPath -eq $true -and $stdout.Contains($summary.outputMarker))
             } elseif ($null -ne $summary -and $case.name -eq 'B2') {
               $states = $summary.markerStates
               $childOutput = [string]$summary.stdout
               $pathOutput = 'JTT_PATH_OUTPUT_' + $summary.destination + '_' + $case.nonce + '_END'
               $execOutput = 'JTT_EXEC_SCRIPT_PATH_CHANGE_' + $case.nonce + '_END'
-              $semanticPass = ($exitCode -eq 0 -and $null -eq $summary.launchError -and $summary.childExitCode -eq 0 -and [System.String]::Equals($summary.destination, $expectedDestination, [System.StringComparison]::OrdinalIgnoreCase) -and $summary.sideEffectContentMatchesExpectedPath -eq $true -and $states.COMMAND_ENTRY.state -eq 'OBSERVED' -and $states.BEFORE_LOCATION.state -eq 'OBSERVED' -and $states.AFTER_LOCATION.state -eq 'OBSERVED' -and $states.AFTER_OUTPUT.state -eq 'OBSERVED' -and $states.ERROR.state -eq 'UNKNOWN' -and $childOutput.Contains($pathOutput) -and $childOutput.Contains($execOutput))
+              $semanticPass = ($processExitState -eq 'EXIT_CONFIRMED' -and $exitCode -eq 0 -and $processIdentity.executablePathMatches -eq $true -and $null -ne $processIdentity.startTimeUtc -and $null -eq $summary.launchError -and $summary.childExitState -eq 'EXIT_CONFIRMED' -and $summary.childProcessIdentity.executablePathMatches -eq $true -and $null -ne $summary.childProcessIdentity.startTimeUtc -and @($summary.processDisposeErrors).Count -eq 0 -and @($summary.evidenceWriteErrors).Count -eq 0 -and $summary.childExitCode -eq 0 -and [System.String]::Equals($summary.destination, $expectedDestination, [System.StringComparison]::OrdinalIgnoreCase) -and $summary.sideEffectContentMatchesExpectedPath -eq $true -and $states.COMMAND_ENTRY.state -eq 'OBSERVED' -and $states.BEFORE_LOCATION.state -eq 'OBSERVED' -and $states.AFTER_LOCATION.state -eq 'OBSERVED' -and $states.AFTER_OUTPUT.state -eq 'OBSERVED' -and $states.ERROR.state -eq 'UNKNOWN' -and $childOutput.Contains($pathOutput) -and $childOutput.Contains($execOutput))
             }
             $evidenceUnknown = $false
             $positiveScriptFailure = $false
@@ -150,7 +239,7 @@ jobs:
               $evidenceUnknown = ($null -ne $summary.error -and $summary.failurePhase -notin $pathFailurePhases)
             } elseif ($null -ne $summary -and $case.name -eq 'B2' -and $null -ne $summary.markerStates) {
               $requiredStates = @('COMMAND_ENTRY', 'BEFORE_LOCATION', 'AFTER_LOCATION', 'AFTER_OUTPUT')
-              $evidenceUnknown = ($null -ne $summary.launchError -or $null -eq $summary.childExitCode)
+              $evidenceUnknown = ($null -ne $summary.launchError -or $null -ne $summary.childWaitError -or $summary.outputReadState -ne 'READ_AFTER_EXIT_CONFIRMED' -or $null -ne $summary.outputReadError -or $null -eq $summary.childExitCode -or @($summary.processDisposeErrors).Count -gt 0 -or @($summary.evidenceWriteErrors).Count -gt 0)
               foreach ($stage in $requiredStates) {
                 $stageState = $summary.markerStates.$stage.state
                 if ($stageState -eq 'UNKNOWN' -or $stageState -eq 'EVIDENCE_READ_ERROR' -or $stageState -eq 'EVIDENCE_WRITE_ERROR') { $evidenceUnknown = $true }
@@ -161,13 +250,21 @@ jobs:
               $positiveScriptFailure = ($errorState.state -eq 'OBSERVED' -and $errorState.failurePhase -in $pathFailurePhases)
               if ($errorState.state -eq 'OBSERVED' -and -not $positiveScriptFailure) { $evidenceUnknown = $true }
             }
-            $classification = if ($null -ne $startError -or $null -eq $summary -or $null -eq $exitCode) { 'INCONCLUSIVE' } elseif ($positiveScriptFailure) { 'SCRIPT_SEMANTIC_FAILED' } elseif ($evidenceUnknown) { 'INCONCLUSIVE' } elseif ($semanticPass) { 'SCRIPT_SEMANTIC_PASS' } else { 'INCONCLUSIVE' }
+            $classification = if ($processExitState -ne 'EXIT_CONFIRMED' -or $null -ne $startError -or $null -ne $waitError -or $null -ne $disposeError -or $null -ne $identityError -or $null -ne $outputReadError -or $null -eq $summary -or $null -eq $exitCode -or @($script:evidenceWriteErrors).Count -gt 0) { 'INCONCLUSIVE' } elseif ($positiveScriptFailure) { 'SCRIPT_SEMANTIC_FAILED' } elseif ($evidenceUnknown) { 'INCONCLUSIVE' } elseif ($semanticPass) { 'SCRIPT_SEMANTIC_PASS' } else { 'INCONCLUSIVE' }
             $records += [pscustomobject]@{
               name = $case.name
               nonce = $case.nonce
               scriptPath = $case.script
-              processStartedAndExited = ($null -ne $process)
+              process = $processIdentity
+              processExitState = $processExitState
+              processStartedAndExited = ($processExitState -eq 'EXIT_CONFIRMED')
               processExitCode = $exitCode
+              waitLimitMilliseconds = $waitMilliseconds
+              waitError = $waitError
+              disposeError = $disposeError
+              identityError = $identityError
+              outputReadError = $outputReadError
+              outputReadState = $outputReadState
               startError = $startError
               stdoutPath = $stdoutPath
               stderrPath = $stderrPath
@@ -176,9 +273,23 @@ jobs:
               summary = $summary
               classification = $classification
             }
+            [void](Write-StageEvidence $case.name 'result' $records[-1])
           }
           $final = if (@($records | Where-Object { $_.classification -eq 'SCRIPT_SEMANTIC_FAILED' }).Count -gt 0) { 'SCRIPT_SEMANTIC_FAILED' } elseif (@($records | Where-Object { $_.classification -eq 'INCONCLUSIVE' }).Count -gt 0) { 'INCONCLUSIVE' } else { 'SCRIPT_SEMANTIC_PASS' }
-          [ordered]@{ verdict = $final; cases = $records } | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath (Join-Path $resultDir 'probe-run.json') -Encoding UTF8
+          if (@($script:evidenceWriteErrors).Count -gt 0) { $final = 'INCONCLUSIVE' }
+          $finalRecord = [ordered]@{ verdict = $final; utc = [DateTime]::UtcNow.ToString('o'); cases = $records; evidenceWriteErrors = @($script:evidenceWriteErrors) }
+          try {
+            $probeRunPath = Join-Path $resultDir 'probe-run.json'
+            $probeRunTemporaryPath = $probeRunPath + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+            [IO.File]::WriteAllText($probeRunTemporaryPath, ($finalRecord | ConvertTo-Json -Depth 14), [Text.UTF8Encoding]::new($false))
+            [IO.File]::Move($probeRunTemporaryPath, $probeRunPath)
+          } catch {
+            $script:evidenceWriteErrors += [ordered]@{ path = (Join-Path $resultDir 'probe-run.json'); category = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+            Write-Output ('EVIDENCE_WRITE_ERROR_FINAL_' + $_.Exception.GetType().FullName)
+            $final = 'INCONCLUSIVE'
+            $fallbackRecord = [ordered]@{ verdict = $final; utc = [DateTime]::UtcNow.ToString('o'); cases = $records; evidenceWriteErrors = @($script:evidenceWriteErrors); probeRunState = 'WRITE_FAILED' }
+            [void](Write-StageEvidence 'run' 'final-verdict-fallback' $fallbackRecord)
+          }
           Write-Output "SEMANTIC_PROBE_VERDICT=$final"
           if ($final -ne 'SCRIPT_SEMANTIC_PASS') { exit 1 }
 
@@ -210,7 +321,42 @@ jobs:
               $expectedLeaf = "jtt-r02-semantic-$($case.nonce)-$($case.name)"
               $root = Join-Path $tempRoot $expectedLeaf
               if (-not (Test-Path -LiteralPath $root -PathType Container)) {
-                $cleanup += [pscustomobject]@{ name = $case.name; root = $root; status = 'NOT_CREATED' }
+                $unconfirmedReason = $null
+                try {
+                  $caseStartPath = Join-Path $resultDir ($case.name + '-start.json')
+                  $caseResultPath = Join-Path $resultDir ($case.name + '-result.json')
+                  if ((Test-Path -LiteralPath $caseStartPath -PathType Leaf) -and -not (Test-Path -LiteralPath $caseResultPath -PathType Leaf)) {
+                    $unconfirmedReason = 'CASE_RESULT_MISSING_PROCESS_EXIT_UNKNOWN'
+                  } elseif (Test-Path -LiteralPath $caseResultPath -PathType Leaf) {
+                    $caseResult = Get-Content -LiteralPath $caseResultPath -Raw | ConvertFrom-Json
+                    if ($caseResult.processExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $caseResult.processExitState) { $unconfirmedReason = 'OUTER_PROCESS_EXIT_UNCONFIRMED' }
+                    if ($case.name -eq 'B2' -and $caseResult.processExitState -ne 'PROCESS_START_FAILED' -and -not $unconfirmedReason) {
+                      if ($null -eq $caseResult.summary) { $unconfirmedReason = 'B2_CHILD_EXIT_STATUS_UNKNOWN' }
+                      elseif ($caseResult.summary.childExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $caseResult.summary.childExitState) { $unconfirmedReason = 'CHILD_PROCESS_EXIT_UNCONFIRMED' }
+                    }
+                  }
+                  if ($case.name -eq 'B2') {
+                    $childStartedPath = Join-Path $resultDir 'B2-child-started.json'
+                    $childLaunchPath = Join-Path $resultDir 'B2-child-launch-started.json'
+                    $childResultPath = Join-Path $resultDir 'B2-child-result.json'
+                    if ((Test-Path -LiteralPath $childStartedPath -PathType Leaf) -or (Test-Path -LiteralPath $childLaunchPath -PathType Leaf)) {
+                      if (-not (Test-Path -LiteralPath $childResultPath -PathType Leaf)) {
+                        $unconfirmedReason = 'CHILD_RESULT_MISSING_PROCESS_EXIT_UNKNOWN'
+                      } else {
+                        $childResult = Get-Content -LiteralPath $childResultPath -Raw | ConvertFrom-Json
+                        if ($childResult.state -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $childResult.state) { $unconfirmedReason = 'CHILD_PROCESS_EXIT_UNCONFIRMED' }
+                      }
+                    }
+                  }
+                } catch {
+                  $unconfirmedReason = 'PROCESS_STATE_EVIDENCE_INVALID_' + $_.Exception.GetType().FullName
+                }
+                if ($unconfirmedReason) {
+                  $cleanup += [pscustomobject]@{ name = $case.name; root = $root; status = 'PROCESS_EXIT_UNCONFIRMED_ROOT_NOT_PRESENT_AT_SNAPSHOT'; reason = $unconfirmedReason }
+                  $cleanupFailed = $true
+                } else {
+                  $cleanup += [pscustomobject]@{ name = $case.name; root = $root; status = 'NOT_CREATED' }
+                }
                 continue
               }
               try {
@@ -220,6 +366,49 @@ jobs:
                 if (-not [String]::Equals($parent, $tempRoot, [StringComparison]::OrdinalIgnoreCase) -or -not [String]::Equals($leaf, $expectedLeaf, [StringComparison]::OrdinalIgnoreCase)) { throw 'ROOT_OUTSIDE_EXACT_TEST_OWNED_TEMP_PATH' }
                 $rootAttrs = [IO.File]::GetAttributes($rootFull)
                 if (($rootAttrs -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'TEST_ROOT_REPARSE_POINT' }
+                $preserveReason = $null
+                $caseResultPath = Join-Path $resultDir ($case.name + '-result.json')
+                if (-not (Test-Path -LiteralPath $caseResultPath -PathType Leaf)) {
+                  $preserveReason = 'CASE_RESULT_MISSING_PROCESS_EXIT_UNKNOWN'
+                } else {
+                  $caseResult = Get-Content -LiteralPath $caseResultPath -Raw | ConvertFrom-Json
+                  if ($caseResult.processExitState -ne 'EXIT_CONFIRMED') {
+                    if ($caseResult.processExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $caseResult.processExitState) { $preserveReason = 'OUTER_PROCESS_EXIT_UNCONFIRMED' }
+                    else { $preserveReason = 'PROCESS_NOT_CONFIRMED_AS_CREATOR_ROOT_PRESERVED' }
+                  } elseif ($case.name -eq 'B2') {
+                    $childStartedPath = Join-Path $resultDir 'B2-child-started.json'
+                    $childResultPath = Join-Path $resultDir 'B2-child-result.json'
+                    $scriptResultPath = Join-Path $resultDir 'B2-script-result.json'
+                    if ($null -eq $caseResult.summary) {
+                      $preserveReason = 'B2_CHILD_EXIT_STATUS_UNKNOWN'
+                    } elseif ($caseResult.summary.childExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $caseResult.summary.childExitState) {
+                      $preserveReason = 'CHILD_PROCESS_EXIT_UNCONFIRMED'
+                    } elseif (Test-Path -LiteralPath $childStartedPath -PathType Leaf) {
+                      if (-not (Test-Path -LiteralPath $childResultPath -PathType Leaf)) {
+                        $preserveReason = 'CHILD_RESULT_MISSING_PROCESS_EXIT_UNKNOWN'
+                      } else {
+                        $childResult = Get-Content -LiteralPath $childResultPath -Raw | ConvertFrom-Json
+                        if ($childResult.state -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $childResult.state) { $preserveReason = 'CHILD_PROCESS_EXIT_UNCONFIRMED' }
+                      }
+                    } elseif (Test-Path -LiteralPath (Join-Path $resultDir 'B2-child-launch-started.json') -PathType Leaf) {
+                      if (-not (Test-Path -LiteralPath $childResultPath -PathType Leaf)) {
+                        $preserveReason = 'CHILD_LAUNCH_RESULT_UNKNOWN'
+                      } else {
+                        $childResult = Get-Content -LiteralPath $childResultPath -Raw | ConvertFrom-Json
+                        if ($childResult.state -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $childResult.state) { $preserveReason = 'CHILD_PROCESS_EXIT_UNCONFIRMED' }
+                      }
+                    }
+                    if (-not $preserveReason -and (Test-Path -LiteralPath $scriptResultPath -PathType Leaf)) {
+                      $scriptResult = Get-Content -LiteralPath $scriptResultPath -Raw | ConvertFrom-Json
+                      if ($scriptResult.childExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $scriptResult.childExitState) { $preserveReason = 'SCRIPT_CHILD_EXIT_UNCONFIRMED' }
+                    }
+                  }
+                }
+                if ($preserveReason) {
+                  $cleanup += [pscustomobject]@{ name = $case.name; root = $rootFull; status = 'PROCESS_EXIT_UNCONFIRMED_PRESERVED'; reason = $preserveReason }
+                  $cleanupFailed = $true
+                  continue
+                }
                 $directoriesToCheck = [System.Collections.Generic.Stack[string]]::new()
                 $directoriesToCheck.Push($rootFull)
                 while ($directoriesToCheck.Count -gt 0) {

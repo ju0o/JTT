@@ -2,7 +2,9 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9a-f]{10}$')]
-    [string]$Nonce
+    [string]$Nonce,
+    [Parameter(Mandatory = $true)]
+    [string]$EvidenceDirectory
 )
 $ErrorActionPreference = 'Continue'
 $nonce = $Nonce
@@ -38,6 +40,27 @@ try { $relativeCommandSha256 = [System.BitConverter]::ToString($sha256.ComputeHa
 $stdoutPath = Join-Path $root 'child.stdout.txt'
 $stderrPath = Join-Path $root 'child.stderr.txt'
 $summaryPath = Join-Path $root 'result.json'
+$evidenceDirectoryFull = [System.IO.Path]::GetFullPath($EvidenceDirectory)
+if (-not [System.String]::Equals($evidenceDirectoryFull.TrimEnd('\'), ([System.IO.Path]::GetFullPath((Join-Path $env:GITHUB_WORKSPACE 'semantic-results'))).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) { throw 'EVIDENCE_DIRECTORY_NOT_SEMANTIC_RESULTS' }
+$evidenceAttributes = [System.IO.File]::GetAttributes($evidenceDirectoryFull)
+if (($evidenceAttributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'EVIDENCE_DIRECTORY_REPARSE_POINT' }
+$script:evidenceWriteErrors = @()
+$script:processDisposeErrors = @()
+function Write-EvidenceRecord([string]$Name, [object]$Record) {
+    $path = Join-Path $evidenceDirectoryFull $Name
+    $temporaryPath = $path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        if ([System.IO.File]::Exists($path)) { throw 'EVIDENCE_RECORD_ALREADY_EXISTS' }
+        $json = $Record | ConvertTo-Json -Compress -Depth 12
+        [System.IO.File]::WriteAllText($temporaryPath, $json, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::Move($temporaryPath, $path)
+        return $true
+    } catch {
+        $script:evidenceWriteErrors += [ordered]@{ path = $path; category = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+        [System.Console]::Error.WriteLine('EVIDENCE_WRITE_ERROR_' + $Name + '_' + $_.Exception.GetType().FullName)
+        return $false
+    }
+}
 $scriptBodyTemplate = @'
 $ErrorActionPreference = 'Continue'
 $nonce = '__NONCE__'
@@ -101,26 +124,74 @@ $scriptBody = $scriptBodyTemplate.Replace('__NONCE__', $nonce).Replace('__RELATI
 [System.IO.File]::WriteAllText($scriptPath, $scriptBody, [System.Text.Encoding]::UTF8)
 $scriptBodySha256 = (Get-FileHash -LiteralPath $scriptPath -Algorithm SHA256).Hash
 $scriptBodyBytes = (Get-Item -LiteralPath $scriptPath).Length
-$ps = Join-Path $PSHOME 'powershell.exe'
+$ps = [System.IO.Path]::GetFullPath((Join-Path $PSHOME 'powershell.exe'))
 $childArguments = '-NoLogo -NoProfile -NonInteractive -File <generated-script>'
 $quotedScript = '"' + $scriptPath + '"'
 $process = $null
 $launchError = $null
+$childProcessIdentity = [ordered]@{ pid = $null; startTimeUtc = $null; expectedExecutablePath = $ps; actualExecutablePath = $null; executablePathMatches = $false; identityReadError = $null }
+$childExitState = 'NOT_STARTED'
+$childExitCode = $null
+$childWaitError = $null
+$stdout = ''
+$stderr = ''
+$outputReadState = 'NOT_READ'
+$outputReadError = $null
+$childWaitMilliseconds = 30000
+Write-EvidenceRecord 'B2-child-launch-started.json' ([ordered]@{ scenario = 'B2'; nonce = $nonce; state = 'LAUNCH_STARTED'; utc = [DateTime]::UtcNow.ToString('o'); executablePath = $ps; scriptPath = $scriptPath; scriptSha256 = $scriptBodySha256; workingDirectory = $work; waitLimitMilliseconds = $childWaitMilliseconds }) | Out-Null
 try {
-    $process = Start-Process -FilePath $ps -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $quotedScript) -WorkingDirectory $work -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Wait -PassThru
+    $process = Start-Process -FilePath $ps -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $quotedScript) -WorkingDirectory $work -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
 } catch {
     $launchError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message }
 }
-$childExitCode = $null
-try {
-    $stdout = if ([System.IO.File]::Exists($stdoutPath)) { [System.IO.File]::ReadAllText($stdoutPath) } else { '' }
-    $stderr = if ([System.IO.File]::Exists($stderrPath)) { [System.IO.File]::ReadAllText($stderrPath) } else { '' }
-    $childExitCode = if ($null -ne $process) { $process.ExitCode } else { $null }
-} finally {
-    if ($null -ne $process) { $process.Dispose() }
+if ($null -eq $process) {
+    $childExitState = 'PROCESS_START_FAILED'
+} else {
+    $childProcessIdentity.pid = $process.Id
+    try { $childProcessIdentity.startTimeUtc = $process.StartTime.ToUniversalTime().ToString('o') } catch { $childProcessIdentity.identityReadError = $_.Exception.GetType().FullName }
+    try {
+        $childProcessIdentity.actualExecutablePath = [System.IO.Path]::GetFullPath($process.MainModule.FileName)
+        $childProcessIdentity.executablePathMatches = [System.String]::Equals($childProcessIdentity.actualExecutablePath, $childProcessIdentity.expectedExecutablePath, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { if (-not $childProcessIdentity.identityReadError) { $childProcessIdentity.identityReadError = $_.Exception.GetType().FullName } }
+    Write-EvidenceRecord 'B2-child-started.json' ([ordered]@{ scenario = 'B2'; nonce = $nonce; state = 'PROCESS_STARTED'; utc = [DateTime]::UtcNow.ToString('o'); process = $childProcessIdentity; scriptPath = $scriptPath; scriptSha256 = $scriptBodySha256; workingDirectory = $work; waitLimitMilliseconds = $childWaitMilliseconds }) | Out-Null
+    try {
+        $childExited = $process.WaitForExit($childWaitMilliseconds)
+        if ($childExited) {
+            try {
+                $childExitCode = [int]$process.ExitCode
+                $childExitState = 'EXIT_CONFIRMED'
+            } catch {
+                $childExitState = 'PROCESS_EXIT_UNCONFIRMED'
+                $childWaitError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message; phase = 'READ_EXIT_CODE' }
+            }
+        } else {
+            $childExitState = 'PROCESS_EXIT_UNCONFIRMED'
+        }
+    } catch {
+        $childExitState = 'PROCESS_EXIT_UNCONFIRMED'
+        $childWaitError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message; phase = 'WAIT_FOR_EXIT' }
+    } finally {
+        try { $process.Dispose() } catch { $script:processDisposeErrors += [ordered]@{ category = $_.Exception.GetType().FullName; message = $_.Exception.Message } }
+    }
 }
+if ($childExitState -eq 'EXIT_CONFIRMED') {
+    try {
+        $stdout = if ([System.IO.File]::Exists($stdoutPath)) { [System.IO.File]::ReadAllText($stdoutPath) } else { '' }
+        $stderr = if ([System.IO.File]::Exists($stderrPath)) { [System.IO.File]::ReadAllText($stderrPath) } else { '' }
+        $outputReadState = 'READ_AFTER_EXIT_CONFIRMED'
+    } catch {
+        $outputReadState = 'EVIDENCE_READ_ERROR'
+        $outputReadError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+        $stdout = ''
+        $stderr = ''
+    }
+} else {
+    $outputReadState = 'NOT_READ_PROCESS_EXIT_UNCONFIRMED'
+}
+Write-EvidenceRecord 'B2-child-result.json' ([ordered]@{ scenario = 'B2'; nonce = $nonce; state = $childExitState; utc = [DateTime]::UtcNow.ToString('o'); process = $childProcessIdentity; childExitCode = $childExitCode; waitLimitMilliseconds = $childWaitMilliseconds; launchError = $launchError; childWaitError = $childWaitError; stdoutPath = $stdoutPath; stderrPath = $stderrPath; outputReadState = $outputReadState; outputReadError = $outputReadError; processDisposeErrors = @($script:processDisposeErrors); evidenceWriteErrors = @($script:evidenceWriteErrors) }) | Out-Null
 $markerStates = [ordered]@{}
-foreach ($stage in @('COMMAND_ENTRY', 'BEFORE_LOCATION', 'AFTER_LOCATION', 'AFTER_OUTPUT', 'ERROR')) {
+if ($childExitState -eq 'EXIT_CONFIRMED') {
+  foreach ($stage in @('COMMAND_ENTRY', 'BEFORE_LOCATION', 'AFTER_LOCATION', 'AFTER_OUTPUT', 'ERROR')) {
     $path = Join-Path $checkpointRoot ($label.ToLowerInvariant() + '-' + $stage.ToLowerInvariant() + '-' + $nonce + '.marker')
     $expectedContent = 'JTT_R02_' + $label + '_' + $stage + '_' + $nonce
     $stream = $null
@@ -165,9 +236,15 @@ foreach ($stage in @('COMMAND_ENTRY', 'BEFORE_LOCATION', 'AFTER_LOCATION', 'AFTE
         $markerState.failurePhase = $parts[3]
     }
     $markerStates[$stage] = $markerState
+  }
+} else {
+  foreach ($stage in @('COMMAND_ENTRY', 'BEFORE_LOCATION', 'AFTER_LOCATION', 'AFTER_OUTPUT', 'ERROR')) {
+    $markerStates[$stage] = [ordered]@{ state = 'UNKNOWN'; path = (Join-Path $checkpointRoot ($label.ToLowerInvariant() + '-' + $stage.ToLowerInvariant() + '-' + $nonce + '.marker')); meaning = $stage; reason = 'PROCESS_EXIT_UNCONFIRMED' }
+  }
 }
-$sideEffectContent = if ([System.IO.File]::Exists($sideEffect)) { [System.IO.File]::ReadAllText($sideEffect) } else { $null }
-$sideEffectMatches = $null -ne $sideEffectContent -and [System.String]::Equals($sideEffectContent, $expected, [System.StringComparison]::OrdinalIgnoreCase)
+$sideEffectContent = if ($childExitState -eq 'EXIT_CONFIRMED' -and [System.IO.File]::Exists($sideEffect)) { [System.IO.File]::ReadAllText($sideEffect) } else { $null }
+$sideEffectObserved = if ($childExitState -eq 'EXIT_CONFIRMED') { [System.IO.File]::Exists($sideEffect) } else { $null }
+$sideEffectMatches = $childExitState -eq 'EXIT_CONFIRMED' -and $null -ne $sideEffectContent -and [System.String]::Equals($sideEffectContent, $expected, [System.StringComparison]::OrdinalIgnoreCase)
 $result = [ordered]@{
     scenario = 'B2_INSTRUMENTED_SCRIPT_PATH_CHANGE'
     nonce = $nonce
@@ -183,10 +260,17 @@ $result = [ordered]@{
     scriptBodyBytes = $scriptBodyBytes
     childPowerShellPath = $ps
     childArguments = $childArguments
+    childProcessIdentity = $childProcessIdentity
+    childExitState = $childExitState
+    childWaitLimitMilliseconds = $childWaitMilliseconds
+    outputReadState = $outputReadState
+    outputReadError = $outputReadError
+    childWaitError = $childWaitError
+    processDisposeErrors = @($script:processDisposeErrors)
     sideEffectContent = $sideEffectContent
     sideEffectContentMatchesExpectedPath = $sideEffectMatches
     sideEffectPath = $sideEffect
-    sideEffectObserved = [System.IO.File]::Exists($sideEffect)
+    sideEffectObserved = $sideEffectObserved
     childExitCode = $childExitCode
     launchError = $launchError
     stdoutPath = $stdoutPath
@@ -194,8 +278,10 @@ $result = [ordered]@{
     stdout = $stdout
     stderr = $stderr
     markerStates = $markerStates
+    evidenceWriteErrors = @($script:evidenceWriteErrors)
 }
 $result | ConvertTo-Json -Compress -Depth 8 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+[void](Write-EvidenceRecord 'B2-script-result.json' $result)
 [Console]::Out.WriteLine([System.IO.File]::ReadAllText($summaryPath))
-if ($null -eq $process -or $process.ExitCode -ne 0) { exit 1 }
+if ($childExitState -ne 'EXIT_CONFIRMED' -or $null -eq $childExitCode -or $childExitCode -ne 0 -or @($script:evidenceWriteErrors).Count -gt 0 -or @($script:processDisposeErrors).Count -gt 0) { exit 1 }
 exit 0
