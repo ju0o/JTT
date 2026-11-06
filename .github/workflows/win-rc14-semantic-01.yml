@@ -213,8 +213,29 @@ jobs:
             }
             [void](Write-StageEvidence $case.name 'process-result' ([ordered]@{ name = $case.name; nonce = $case.nonce; state = $processExitState; utc = [DateTime]::UtcNow.ToString('o'); process = $processIdentity; exitCode = $exitCode; waitLimitMilliseconds = $waitMilliseconds; startError = $startError; waitError = $waitError; disposeError = $disposeError; outputReadState = $outputReadState; outputReadError = $outputReadError; stdoutPath = $stdoutPath; stderrPath = $stderrPath }))
             $summary = $null
-            foreach ($line in @($stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
-              try { $summary = $line | ConvertFrom-Json -ErrorAction Stop } catch { }
+            $summaryLineCount = 0
+            $summaryParseFailures = @()
+            $summaryParseState = if ($outputReadState -eq 'READ_AFTER_EXIT_CONFIRMED') { 'NO_VALID_JSON_SUMMARY' } else { 'OUTPUT_READ_UNCONFIRMED' }
+            if ($outputReadState -eq 'READ_AFTER_EXIT_CONFIRMED') {
+              try {
+                foreach ($line in @($stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+                  $summaryLineCount++
+                  try {
+                    $candidateSummary = $line | ConvertFrom-Json -ErrorAction Stop
+                    if ($null -ne $candidateSummary) { $summary = $candidateSummary }
+                  } catch {
+                    $summaryParseFailures += [ordered]@{ line = $summaryLineCount; errorType = $_.Exception.GetType().FullName }
+                  }
+                }
+                if ($null -ne $summary) { $summaryParseState = 'PARSED' }
+                elseif ($summaryLineCount -eq 0) { $summaryParseState = 'NO_OUTPUT' }
+              } catch {
+                $summaryParseState = 'PARSE_STAGE_ERROR'
+                $summaryParseFailures += [ordered]@{ line = $summaryLineCount; errorType = $_.Exception.GetType().FullName }
+              }
+            }
+            if ($case.name -eq 'B1') {
+              [void](Write-StageEvidence $case.name 'summary-parse' ([ordered]@{ name = $case.name; nonce = $case.nonce; state = $summaryParseState; nonEmptyLineCount = $summaryLineCount; validSummaryFound = ($null -ne $summary); parseFailureCount = @($summaryParseFailures).Count; parseFailures = @($summaryParseFailures); utc = [DateTime]::UtcNow.ToString('o') }))
             }
             if ($case.name -eq 'B2') {
               $capturedEvidenceErrors = [string]$stderr
@@ -222,7 +243,7 @@ jobs:
               if ($capturedEvidenceErrors.Contains('EVIDENCE_WRITE_ERROR_')) { [Console]::Error.WriteLine('B2_EVIDENCE_WRITE_ERROR_CAPTURED') }
             }
             $semanticPass = $false
-            if ($processExitState -eq 'EXIT_CONFIRMED' -and $null -ne $summary -and $case.name -eq 'B1') {
+            if ($processExitState -eq 'EXIT_CONFIRMED' -and $summaryParseState -eq 'PARSED' -and $null -ne $summary -and $case.name -eq 'B1') {
               $semanticPass = ($exitCode -eq 0 -and $processIdentity.executablePathMatches -eq $true -and $null -ne $processIdentity.startTimeUtc -and $summary.exitCode -eq 0 -and $null -eq $summary.error -and [System.String]::Equals($summary.destination, $expectedDestination, [System.StringComparison]::OrdinalIgnoreCase) -and $summary.expectedLocationVerified -eq $true -and $summary.sideEffectContentMatchesExpectedPath -eq $true -and $stdout.Contains($summary.outputMarker))
             } elseif ($null -ne $summary -and $case.name -eq 'B2') {
               $states = $summary.markerStates
@@ -250,7 +271,11 @@ jobs:
               $positiveScriptFailure = ($errorState.state -eq 'OBSERVED' -and $errorState.failurePhase -in $pathFailurePhases)
               if ($errorState.state -eq 'OBSERVED' -and -not $positiveScriptFailure) { $evidenceUnknown = $true }
             }
-            $classification = if ($processExitState -ne 'EXIT_CONFIRMED' -or $null -ne $startError -or $null -ne $waitError -or $null -ne $disposeError -or $null -ne $identityError -or $null -ne $outputReadError -or $null -eq $summary -or $null -eq $exitCode -or @($script:evidenceWriteErrors).Count -gt 0) { 'INCONCLUSIVE' } elseif ($positiveScriptFailure) { 'SCRIPT_SEMANTIC_FAILED' } elseif ($evidenceUnknown) { 'INCONCLUSIVE' } elseif ($semanticPass) { 'SCRIPT_SEMANTIC_PASS' } else { 'INCONCLUSIVE' }
+            $classification = if ($processExitState -ne 'EXIT_CONFIRMED' -or ($case.name -eq 'B1' -and $summaryParseState -ne 'PARSED') -or $null -ne $startError -or $null -ne $waitError -or $null -ne $disposeError -or $null -ne $identityError -or $null -ne $outputReadError -or $null -eq $summary -or $null -eq $exitCode -or @($script:evidenceWriteErrors).Count -gt 0) { 'INCONCLUSIVE' } elseif ($positiveScriptFailure) { 'SCRIPT_SEMANTIC_FAILED' } elseif ($evidenceUnknown) { 'INCONCLUSIVE' } elseif ($semanticPass) { 'SCRIPT_SEMANTIC_PASS' } else { 'INCONCLUSIVE' }
+            if ($case.name -eq 'B1') {
+              $classificationEvidenceWritten = Write-StageEvidence $case.name 'classification' ([ordered]@{ name = $case.name; nonce = $case.nonce; classification = $classification; processExitState = $processExitState; summaryParseState = $summaryParseState; positiveScriptFailure = $positiveScriptFailure; evidenceUnknown = $evidenceUnknown; utc = [DateTime]::UtcNow.ToString('o') })
+              if (-not $classificationEvidenceWritten) { $classification = 'INCONCLUSIVE' }
+            }
             $records += [pscustomobject]@{
               name = $case.name
               nonce = $case.nonce
@@ -324,15 +349,28 @@ jobs:
                 $unconfirmedReason = $null
                 try {
                   $caseStartPath = Join-Path $resultDir ($case.name + '-start.json')
-                  $caseResultPath = Join-Path $resultDir ($case.name + '-result.json')
-                  if ((Test-Path -LiteralPath $caseStartPath -PathType Leaf) -and -not (Test-Path -LiteralPath $caseResultPath -PathType Leaf)) {
-                    $unconfirmedReason = 'CASE_RESULT_MISSING_PROCESS_EXIT_UNKNOWN'
-                  } elseif (Test-Path -LiteralPath $caseResultPath -PathType Leaf) {
-                    $caseResult = Get-Content -LiteralPath $caseResultPath -Raw | ConvertFrom-Json
-                    if ($caseResult.processExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $caseResult.processExitState) { $unconfirmedReason = 'OUTER_PROCESS_EXIT_UNCONFIRMED' }
-                    if ($case.name -eq 'B2' -and $caseResult.processExitState -ne 'PROCESS_START_FAILED' -and -not $unconfirmedReason) {
-                      if ($null -eq $caseResult.summary) { $unconfirmedReason = 'B2_CHILD_EXIT_STATUS_UNKNOWN' }
-                      elseif ($caseResult.summary.childExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $caseResult.summary.childExitState) { $unconfirmedReason = 'CHILD_PROCESS_EXIT_UNCONFIRMED' }
+                  if ($case.name -eq 'B1') {
+                    $processResultPath = Join-Path $resultDir 'B1-process-result.json'
+                    if ((Test-Path -LiteralPath $caseStartPath -PathType Leaf) -and -not (Test-Path -LiteralPath $processResultPath -PathType Leaf)) {
+                      $unconfirmedReason = 'B1_PROCESS_RESULT_MISSING'
+                    } elseif (Test-Path -LiteralPath $processResultPath -PathType Leaf) {
+                      $processResult = Get-Content -LiteralPath $processResultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                      if ($processResult.name -ne 'B1') { $unconfirmedReason = 'B1_PROCESS_RESULT_CASE_MISMATCH' }
+                      elseif (-not [String]::Equals([string]$processResult.nonce, [string]$case.nonce, [StringComparison]::Ordinal)) { $unconfirmedReason = 'B1_PROCESS_RESULT_NONCE_MISMATCH' }
+                      elseif ($processResult.state -ne 'EXIT_CONFIRMED' -and $processResult.state -ne 'PROCESS_START_FAILED') { $unconfirmedReason = 'B1_PROCESS_EXIT_UNCONFIRMED' }
+                      elseif ($processResult.state -eq 'EXIT_CONFIRMED' -and $null -eq $processResult.exitCode) { $unconfirmedReason = 'B1_PROCESS_EXIT_CODE_MISSING' }
+                    }
+                  } else {
+                    $caseResultPath = Join-Path $resultDir 'B2-result.json'
+                    if ((Test-Path -LiteralPath $caseStartPath -PathType Leaf) -and -not (Test-Path -LiteralPath $caseResultPath -PathType Leaf)) {
+                      $unconfirmedReason = 'CASE_RESULT_MISSING_PROCESS_EXIT_UNKNOWN'
+                    } elseif (Test-Path -LiteralPath $caseResultPath -PathType Leaf) {
+                      $caseResult = Get-Content -LiteralPath $caseResultPath -Raw | ConvertFrom-Json
+                      if ($caseResult.processExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $caseResult.processExitState) { $unconfirmedReason = 'OUTER_PROCESS_EXIT_UNCONFIRMED' }
+                      if ($caseResult.processExitState -ne 'PROCESS_START_FAILED' -and -not $unconfirmedReason) {
+                        if ($null -eq $caseResult.summary) { $unconfirmedReason = 'B2_CHILD_EXIT_STATUS_UNKNOWN' }
+                        elseif ($caseResult.summary.childExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $caseResult.summary.childExitState) { $unconfirmedReason = 'CHILD_PROCESS_EXIT_UNCONFIRMED' }
+                      }
                     }
                   }
                   if ($case.name -eq 'B2') {
@@ -367,15 +405,33 @@ jobs:
                 $rootAttrs = [IO.File]::GetAttributes($rootFull)
                 if (($rootAttrs -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'TEST_ROOT_REPARSE_POINT' }
                 $preserveReason = $null
-                $caseResultPath = Join-Path $resultDir ($case.name + '-result.json')
-                if (-not (Test-Path -LiteralPath $caseResultPath -PathType Leaf)) {
-                  $preserveReason = 'CASE_RESULT_MISSING_PROCESS_EXIT_UNKNOWN'
-                } else {
-                  $caseResult = Get-Content -LiteralPath $caseResultPath -Raw | ConvertFrom-Json
-                  if ($caseResult.processExitState -ne 'EXIT_CONFIRMED') {
-                    if ($caseResult.processExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $caseResult.processExitState) { $preserveReason = 'OUTER_PROCESS_EXIT_UNCONFIRMED' }
-                    else { $preserveReason = 'PROCESS_NOT_CONFIRMED_AS_CREATOR_ROOT_PRESERVED' }
-                  } elseif ($case.name -eq 'B2') {
+                if ($case.name -eq 'B1') {
+                  $processResultPath = Join-Path $resultDir 'B1-process-result.json'
+                  if (-not (Test-Path -LiteralPath $processResultPath -PathType Leaf)) {
+                    $preserveReason = 'B1_PROCESS_RESULT_MISSING'
+                  } else {
+                    try {
+                      $processResult = Get-Content -LiteralPath $processResultPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                      if ($processResult.name -ne 'B1') { $preserveReason = 'B1_PROCESS_RESULT_CASE_MISMATCH' }
+                      elseif (-not [String]::Equals([string]$processResult.nonce, [string]$case.nonce, [StringComparison]::Ordinal)) { $preserveReason = 'B1_PROCESS_RESULT_NONCE_MISMATCH' }
+                      elseif ($processResult.state -ne 'EXIT_CONFIRMED') { $preserveReason = 'B1_PROCESS_EXIT_UNCONFIRMED' }
+                      elseif ($null -eq $processResult.exitCode) { $preserveReason = 'B1_PROCESS_EXIT_CODE_MISSING' }
+                    } catch {
+                      $preserveReason = 'B1_PROCESS_RESULT_INVALID_' + $_.Exception.GetType().FullName
+                    }
+                  }
+                } elseif ($case.name -eq 'B2') {
+                  $caseResultPath = Join-Path $resultDir 'B2-result.json'
+                  if (-not (Test-Path -LiteralPath $caseResultPath -PathType Leaf)) {
+                    $preserveReason = 'CASE_RESULT_MISSING_PROCESS_EXIT_UNKNOWN'
+                  } else {
+                    $caseResult = Get-Content -LiteralPath $caseResultPath -Raw | ConvertFrom-Json
+                    if ($caseResult.processExitState -ne 'EXIT_CONFIRMED') {
+                      if ($caseResult.processExitState -eq 'PROCESS_EXIT_UNCONFIRMED' -or $null -eq $caseResult.processExitState) { $preserveReason = 'OUTER_PROCESS_EXIT_UNCONFIRMED' }
+                      else { $preserveReason = 'PROCESS_NOT_CONFIRMED_AS_CREATOR_ROOT_PRESERVED' }
+                    }
+                  }
+                  if (-not $preserveReason) {
                     $childStartedPath = Join-Path $resultDir 'B2-child-started.json'
                     $childResultPath = Join-Path $resultDir 'B2-child-result.json'
                     $scriptResultPath = Join-Path $resultDir 'B2-script-result.json'
