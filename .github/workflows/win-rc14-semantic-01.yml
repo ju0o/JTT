@@ -101,6 +101,7 @@ jobs:
 
       - name: Run B1 and B2 once and record outcomes
         shell: powershell
+        timeout-minutes: 3
         run: |
           $ErrorActionPreference = 'Stop'
           $resultDir = Join-Path $env:GITHUB_WORKSPACE 'semantic-results'
@@ -108,35 +109,197 @@ jobs:
           if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) { throw 'PROBE_PREFLIGHT_INPUT_MISSING' }
           $inputs = Get-Content -LiteralPath $inputPath -Raw | ConvertFrom-Json
           $script:evidenceWriteErrors = @()
-          function Write-StageEvidence([string]$CaseName, [string]$StageName, [object]$Record) {
-            $path = Join-Path $resultDir ($CaseName + '-' + $StageName + '.json')
-            $temporaryPath = $path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+          $script:phaseMarkerErrors = @()
+          $script:caseEvidenceWriteErrors = @()
+          $script:phaseTimelineWriter = $null
+          $phaseTimelinePath = Join-Path $resultDir 'execution-timeline.jsonl'
+          try {
+            if ([IO.File]::Exists($phaseTimelinePath)) { throw 'PHASE_TIMELINE_ALREADY_EXISTS' }
+            $script:phaseTimelineWriter = [IO.StreamWriter]::new($phaseTimelinePath, $false, [Text.UTF8Encoding]::new($false))
+            $script:phaseTimelineWriter.AutoFlush = $true
+          } catch {
+            $script:phaseMarkerErrors += [ordered]@{ phase = 'TIMELINE_OPEN'; category = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+            [Console]::Error.WriteLine('PHASE_TIMELINE_OPEN_ERROR|' + $_.Exception.GetType().FullName + '|' + $_.Exception.Message)
+            [Console]::Error.Flush()
+          }
+          function Write-PhaseMarker([string]$Phase, [string]$CaseName, [string]$Nonce, [string]$ErrorCategory = $null) {
+            $utc = [DateTime]::UtcNow.ToString('o')
+            $record = [ordered]@{ phase = $Phase; case = $CaseName; nonce = $Nonce; utc = $utc; errorCategory = $ErrorCategory }
+            [Console]::Out.WriteLine('JTT_WORKFLOW_PHASE|' + $Phase + '|' + $CaseName + '|' + $Nonce + '|' + $utc)
+            [Console]::Out.Flush()
             try {
-              if ([IO.File]::Exists($path)) { throw 'EVIDENCE_RECORD_ALREADY_EXISTS' }
-              $json = $Record | ConvertTo-Json -Compress -Depth 14
-              [IO.File]::WriteAllText($temporaryPath, $json, [Text.UTF8Encoding]::new($false))
-              [IO.File]::Move($temporaryPath, $path)
+              if ($null -eq $script:phaseTimelineWriter) { throw 'PHASE_TIMELINE_UNAVAILABLE' }
+              $json = ConvertTo-Json -InputObject $record -Compress -Depth 3 -ErrorAction Stop
+              $script:phaseTimelineWriter.WriteLine($json)
+              $script:phaseTimelineWriter.Flush()
               return $true
             } catch {
-              $script:evidenceWriteErrors += [ordered]@{ path = $path; category = $_.Exception.GetType().FullName; message = $_.Exception.Message }
-              [Console]::Error.WriteLine('EVIDENCE_WRITE_ERROR_' + $CaseName + '_' + $StageName + '_' + $_.Exception.GetType().FullName)
+              $script:phaseMarkerErrors += [ordered]@{ phase = $Phase; case = $CaseName; nonce = $Nonce; category = $_.Exception.GetType().FullName; message = $_.Exception.Message; utc = $utc }
+              [Console]::Error.WriteLine('PHASE_MARKER_WRITE_ERROR|' + $Phase + '|' + $CaseName + '|' + $Nonce + '|' + $_.Exception.GetType().FullName + '|' + $_.Exception.Message)
+              [Console]::Error.Flush()
               return $false
             }
           }
+          function Write-StageEvidence([string]$CaseName, [string]$StageName, [object]$Record) {
+            $path = Join-Path $resultDir ($CaseName + '-' + $StageName + '.json')
+            $temporaryPath = $path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+            $trackB1Result = ($CaseName -eq 'B1' -and $StageName -eq 'result')
+            try {
+              if ([IO.File]::Exists($path)) { throw 'EVIDENCE_RECORD_ALREADY_EXISTS' }
+              if ($trackB1Result) { [void](Write-PhaseMarker 'B1_RESULT_SERIALIZATION_STARTED' $CaseName $inputs.nonceB1) }
+              $json = ConvertTo-Json -InputObject $Record -Compress -Depth 14 -ErrorAction Stop
+              if ($trackB1Result) { [void](Write-PhaseMarker 'B1_RESULT_SERIALIZATION_COMPLETED' $CaseName $inputs.nonceB1) }
+              if ($trackB1Result) { [void](Write-PhaseMarker 'B1_RESULT_TEMP_WRITE_STARTED' $CaseName $inputs.nonceB1) }
+              [IO.File]::WriteAllText($temporaryPath, $json, [Text.UTF8Encoding]::new($false))
+              if ($trackB1Result) { [void](Write-PhaseMarker 'B1_RESULT_TEMP_WRITE_COMPLETED' $CaseName $inputs.nonceB1) }
+              if ($trackB1Result) { [void](Write-PhaseMarker 'B1_RESULT_ATOMIC_MOVE_STARTED' $CaseName $inputs.nonceB1) }
+              [IO.File]::Move($temporaryPath, $path)
+              if ($trackB1Result) { [void](Write-PhaseMarker 'B1_RESULT_ATOMIC_MOVE_COMPLETED' $CaseName $inputs.nonceB1) }
+              return $true
+            } catch {
+              $writeError = [ordered]@{ case = $CaseName; stage = $StageName; path = $path; category = $_.Exception.GetType().FullName; message = $_.Exception.Message }
+              $script:evidenceWriteErrors += $writeError
+              $script:caseEvidenceWriteErrors += $writeError
+              [Console]::Error.WriteLine('EVIDENCE_WRITE_ERROR_' + $CaseName + '_' + $StageName + '_' + $_.Exception.GetType().FullName)
+              [Console]::Error.WriteLine('EVIDENCE_WRITE_ERROR_DETAIL|' + $CaseName + '|' + $StageName + '|' + $path + '|' + $_.Exception.GetType().FullName + '|' + $_.Exception.Message)
+              [Console]::Error.Flush()
+              return $false
+            }
+          }
+          function Get-IdentityExceptionDetails([System.Exception]$Exception) {
+            $details = @()
+            $current = $Exception
+            $depth = 0
+            while ($null -ne $current -and $depth -lt 8) {
+              $nativeErrorCode = $null
+              if ($current -is [System.ComponentModel.Win32Exception]) { $nativeErrorCode = [int]$current.NativeErrorCode }
+              $details += [ordered]@{ depth = $depth; type = $current.GetType().FullName; message = $current.Message; hResultDecimal = [int]$current.HResult; hResultHex = ('0x' + $current.HResult.ToString('X8')); nativeErrorCode = $nativeErrorCode }
+              $current = $current.InnerException
+              $depth++
+            }
+            return $details
+          }
+          function Get-ProcessExecutablePath([System.Diagnostics.Process]$Process) {
+            return [string]$Process.MainModule.FileName
+          }
           function Get-OwnedProcessIdentity([System.Diagnostics.Process]$Process, [string]$ExpectedPath) {
-            $startTimeUtc = $null
-            $actualPath = $null
-            $identityErrors = @()
-            try { $startTimeUtc = $Process.StartTime.ToUniversalTime().ToString('o') } catch { $identityErrors += ('START_TIME_' + $_.Exception.GetType().FullName) }
-            try { $actualPath = [IO.Path]::GetFullPath($Process.MainModule.FileName) } catch { $identityErrors += ('IMAGE_PATH_' + $_.Exception.GetType().FullName) }
+            $identityStartedUtc = [DateTime]::UtcNow.ToString('o')
             $expectedFullPath = [IO.Path]::GetFullPath($ExpectedPath)
+            $startTimeUtc = $null
+            $startTimeReadError = $null
+            try { $startTimeUtc = $Process.StartTime.ToUniversalTime().ToString('o') } catch { $startTimeReadError = @(Get-IdentityExceptionDetails $_.Exception) }
+            $identityAttempts = @()
+            $actualPath = $null
+            $identityVerificationState = 'INCONCLUSIVE'
+            $lastStableCandidatePath = $null
+            $stableCandidateCount = 0
+            $maxImagePathAttempts = 6
+            $imagePathRetryDelayMilliseconds = 50
+            for ($attemptIndex = 1; $attemptIndex -le $maxImagePathAttempts; $attemptIndex++) {
+              $attempt = [ordered]@{ attempt = $attemptIndex; queryStartedUtc = [DateTime]::UtcNow.ToString('o'); hasExitedBeforeQuery = $null; hasExitedAfterQuery = $null; state = 'NOT_QUERIED'; reportedExecutablePath = $null; actualExecutablePath = $null; exceptionChain = @() }
+              try { $attempt.hasExitedBeforeQuery = [bool]$Process.HasExited } catch {
+                $attempt.state = 'PROCESS_STATE_READ_FAILED'
+                $attempt.exceptionChain = @(Get-IdentityExceptionDetails $_.Exception)
+                $attempt.queryCompletedUtc = [DateTime]::UtcNow.ToString('o')
+                $identityAttempts += $attempt
+                break
+              }
+              if ($attempt.hasExitedBeforeQuery) {
+                $attempt.state = 'PROCESS_EXITED_BEFORE_IMAGE_QUERY'
+                $attempt.queryCompletedUtc = [DateTime]::UtcNow.ToString('o')
+                $identityAttempts += $attempt
+                $identityVerificationState = 'PROCESS_EXITED_BEFORE_IDENTITY_VERIFIED'
+                break
+              }
+              try {
+                $reportedPath = Get-ProcessExecutablePath $Process
+                $attempt.reportedExecutablePath = $reportedPath
+                if ([string]::IsNullOrWhiteSpace($reportedPath)) {
+                  $attempt.state = 'IMAGE_PATH_EMPTY'
+                  $lastStableCandidatePath = $null
+                  $stableCandidateCount = 0
+                  try { $attempt.hasExitedAfterQuery = [bool]$Process.HasExited } catch {
+                    $attempt.stateAfterQueryStateReadError = $_.Exception.GetType().FullName
+                  }
+                  $attempt.queryCompletedUtc = [DateTime]::UtcNow.ToString('o')
+                  $identityAttempts += $attempt
+                  if ($attempt.hasExitedAfterQuery -eq $true) {
+                    $identityVerificationState = 'PROCESS_EXITED_DURING_IDENTITY_QUERY'
+                    break
+                  }
+                  if ($null -eq $attempt.hasExitedAfterQuery) {
+                    $identityVerificationState = 'PROCESS_STATE_UNKNOWN_AFTER_IMAGE_QUERY'
+                    break
+                  }
+                  if ($attemptIndex -lt $maxImagePathAttempts) { Start-Sleep -Milliseconds $imagePathRetryDelayMilliseconds }
+                  continue
+                }
+                $actualPath = [IO.Path]::GetFullPath($reportedPath)
+                $attempt.state = 'IMAGE_PATH_READ'
+                $attempt.actualExecutablePath = $actualPath
+                if ($null -ne $lastStableCandidatePath -and [String]::Equals($actualPath, $lastStableCandidatePath, [StringComparison]::OrdinalIgnoreCase)) {
+                  $stableCandidateCount++
+                } else {
+                  $lastStableCandidatePath = $actualPath
+                  $stableCandidateCount = 1
+                }
+                $attempt.stableConsecutivePathReads = $stableCandidateCount
+                $attempt.queryCompletedUtc = [DateTime]::UtcNow.ToString('o')
+                $identityAttempts += $attempt
+                if ($stableCandidateCount -ge 2) {
+                  if ($null -eq $startTimeUtc) {
+                    $identityVerificationState = 'START_TIME_UNAVAILABLE'
+                  } elseif ([String]::Equals($actualPath, $expectedFullPath, [StringComparison]::OrdinalIgnoreCase)) {
+                    $identityVerificationState = 'VERIFIED_MATCH'
+                  } else {
+                    $identityVerificationState = 'VERIFIED_MISMATCH'
+                  }
+                  break
+                }
+                if ($attemptIndex -lt $maxImagePathAttempts) { Start-Sleep -Milliseconds $imagePathRetryDelayMilliseconds }
+                continue
+              } catch {
+                $attempt.state = 'IMAGE_PATH_READ_FAILED'
+                $attempt.exceptionChain = @(Get-IdentityExceptionDetails $_.Exception)
+                $lastStableCandidatePath = $null
+                $stableCandidateCount = 0
+                try { $attempt.hasExitedAfterQuery = [bool]$Process.HasExited } catch {
+                  $attempt.stateAfterQueryStateReadError = $_.Exception.GetType().FullName
+                }
+                $attempt.queryCompletedUtc = [DateTime]::UtcNow.ToString('o')
+                $identityAttempts += $attempt
+                if ($attempt.hasExitedAfterQuery -eq $true) {
+                  $identityVerificationState = 'PROCESS_EXITED_DURING_IDENTITY_QUERY'
+                  break
+                }
+                if ($null -eq $attempt.hasExitedAfterQuery) {
+                  $identityVerificationState = 'PROCESS_STATE_UNKNOWN_AFTER_IMAGE_ERROR'
+                  break
+                }
+                if ($attemptIndex -lt $maxImagePathAttempts) { Start-Sleep -Milliseconds $imagePathRetryDelayMilliseconds }
+              }
+            }
+            if ($identityVerificationState -eq 'INCONCLUSIVE' -and @($identityAttempts).Count -gt 0) {
+              $lastAttempt = $identityAttempts[-1]
+              if ($lastAttempt.state -in @('IMAGE_PATH_EMPTY', 'IMAGE_PATH_READ_FAILED') -and $lastAttempt.hasExitedAfterQuery -eq $false) { $identityVerificationState = 'IMAGE_PATH_UNAVAILABLE_WHILE_PROCESS_ALIVE' }
+              elseif ($lastAttempt.state -eq 'IMAGE_PATH_READ' -and $lastAttempt.hasExitedBeforeQuery -eq $false) { $identityVerificationState = 'IMAGE_PATH_UNSTABLE_WHILE_PROCESS_ALIVE' }
+              elseif ($lastAttempt.state -eq 'PROCESS_STATE_READ_FAILED') { $identityVerificationState = 'PROCESS_STATE_UNAVAILABLE' }
+            }
+            $identityReadErrors = @($identityAttempts | Where-Object { $_.exceptionChain.Count -gt 0 } | ForEach-Object { $_.state + ':' + $_.exceptionChain[0].type })
             return [ordered]@{
               pid = $Process.Id
               startTimeUtc = $startTimeUtc
+              startTimeReadError = $startTimeReadError
+              identityStartedUtc = $identityStartedUtc
+              identityCompletedUtc = [DateTime]::UtcNow.ToString('o')
               expectedExecutablePath = $expectedFullPath
               actualExecutablePath = $actualPath
-              executablePathMatches = ($null -ne $actualPath -and [String]::Equals($actualPath, $expectedFullPath, [StringComparison]::OrdinalIgnoreCase))
-              identityReadErrors = @($identityErrors)
+              identityVerificationState = $identityVerificationState
+              executablePathMatches = ($identityVerificationState -eq 'VERIFIED_MATCH')
+              identityAttempts = @($identityAttempts)
+              identityReadErrors = @($identityReadErrors)
+              maxImagePathAttempts = $maxImagePathAttempts
+              imagePathRetryDelayMilliseconds = $imagePathRetryDelayMilliseconds
             }
           }
           $cases = @(
@@ -145,6 +308,8 @@ jobs:
           )
           $records = @()
           foreach ($case in $cases) {
+            $script:caseEvidenceWriteErrors = @()
+            if ($case.name -eq 'B2') { [void](Write-PhaseMarker 'B2_LOOP_ENTERED' $case.name $case.nonce) }
             $expectedDestination = if ($case.name -eq 'B1') { $inputs.expectedDestinationB1 } else { $inputs.expectedDestinationB2 }
             $stdoutPath = Join-Path $resultDir ($case.name + '.stdout.txt')
             $stderrPath = Join-Path $resultDir ($case.name + '.stderr.txt')
@@ -153,6 +318,8 @@ jobs:
             $processIdentity = $null
             $processExitState = 'PROCESS_START_FAILED'
             $exitCode = $null
+            $waitReturnedExitedAtUtc = $null
+            $processExitConfirmedAtUtc = $null
             $waitMilliseconds = if ($case.name -eq 'B1') { 30000 } else { 60000 }
             $waitError = $null
             $disposeError = $null
@@ -171,20 +338,23 @@ jobs:
                 $quotedScript = '"' + $case.script + '"'
                 $argumentList = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $quotedScript, '-Nonce', $case.nonce)
                 if ($case.name -eq 'B2') { $argumentList += @('-EvidenceDirectory', ('"' + $resultDir + '"')) }
+                if ($case.name -eq 'B2') { [void](Write-PhaseMarker 'B2_PROCESS_START_REQUESTED' $case.name $case.nonce) }
                 $process = Start-Process -FilePath $inputs.powershellPath -ArgumentList $argumentList -WorkingDirectory $inputs.workspace -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
               } catch {
                 $startError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message; phase = 'START_PROCESS' }
               }
             }
             if ($null -ne $process) {
-              try { $processIdentity = Get-OwnedProcessIdentity $process $inputs.powershellPath } catch { $identityError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message } }
+              try { $processIdentity = Get-OwnedProcessIdentity $process $inputs.powershellPath } catch { $identityError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message; exceptionChain = @(Get-IdentityExceptionDetails $_.Exception) } }
               [void](Write-StageEvidence $case.name 'process-started' ([ordered]@{ name = $case.name; nonce = $case.nonce; state = 'PROCESS_STARTED'; utc = [DateTime]::UtcNow.ToString('o'); process = $processIdentity; identityError = $identityError; waitLimitMilliseconds = $waitMilliseconds }))
               try {
                 $exited = $process.WaitForExit([int]$waitMilliseconds)
                 if ($exited) {
+                  $waitReturnedExitedAtUtc = [DateTime]::UtcNow.ToString('o')
                   try {
                     $exitCode = [int]$process.ExitCode
                     $processExitState = 'EXIT_CONFIRMED'
+                    $processExitConfirmedAtUtc = [DateTime]::UtcNow.ToString('o')
                   } catch {
                     $processExitState = 'PROCESS_EXIT_UNCONFIRMED'
                     $waitError = [ordered]@{ type = $_.Exception.GetType().FullName; message = $_.Exception.Message; phase = 'READ_EXIT_CODE' }
@@ -211,7 +381,7 @@ jobs:
                 $stderr = ''
               }
             }
-            [void](Write-StageEvidence $case.name 'process-result' ([ordered]@{ name = $case.name; nonce = $case.nonce; state = $processExitState; utc = [DateTime]::UtcNow.ToString('o'); process = $processIdentity; exitCode = $exitCode; waitLimitMilliseconds = $waitMilliseconds; startError = $startError; waitError = $waitError; disposeError = $disposeError; outputReadState = $outputReadState; outputReadError = $outputReadError; stdoutPath = $stdoutPath; stderrPath = $stderrPath }))
+            [void](Write-StageEvidence $case.name 'process-result' ([ordered]@{ name = $case.name; nonce = $case.nonce; state = $processExitState; utc = [DateTime]::UtcNow.ToString('o'); waitReturnedExitedAtUtc = $waitReturnedExitedAtUtc; exitConfirmedAtUtc = $processExitConfirmedAtUtc; process = $processIdentity; exitCode = $exitCode; waitLimitMilliseconds = $waitMilliseconds; startError = $startError; waitError = $waitError; disposeError = $disposeError; outputReadState = $outputReadState; outputReadError = $outputReadError; stdoutPath = $stdoutPath; stderrPath = $stderrPath }))
             $summary = $null
             $summaryLineCount = 0
             $summaryParseFailures = @()
@@ -235,6 +405,7 @@ jobs:
               }
             }
             if ($case.name -eq 'B1') {
+              [void](Write-PhaseMarker 'B1_SUMMARY_PARSE_COMPLETED' $case.name $case.nonce)
               [void](Write-StageEvidence $case.name 'summary-parse' ([ordered]@{ name = $case.name; nonce = $case.nonce; state = $summaryParseState; nonEmptyLineCount = $summaryLineCount; validSummaryFound = ($null -ne $summary); parseFailureCount = @($summaryParseFailures).Count; parseFailures = @($summaryParseFailures); utc = [DateTime]::UtcNow.ToString('o') }))
             }
             if ($case.name -eq 'B2') {
@@ -242,6 +413,7 @@ jobs:
               if ($null -ne $summary) { $capturedEvidenceErrors += "`n" + [string]$summary.stderr }
               if ($capturedEvidenceErrors.Contains('EVIDENCE_WRITE_ERROR_')) { [Console]::Error.WriteLine('B2_EVIDENCE_WRITE_ERROR_CAPTURED') }
             }
+            if ($case.name -eq 'B1') { [void](Write-PhaseMarker 'B1_CLASSIFICATION_STARTED' $case.name $case.nonce) }
             $semanticPass = $false
             if ($processExitState -eq 'EXIT_CONFIRMED' -and $summaryParseState -eq 'PARSED' -and $null -ne $summary -and $case.name -eq 'B1') {
               $semanticPass = ($exitCode -eq 0 -and $processIdentity.executablePathMatches -eq $true -and $null -ne $processIdentity.startTimeUtc -and $summary.exitCode -eq 0 -and $null -eq $summary.error -and [System.String]::Equals($summary.destination, $expectedDestination, [System.StringComparison]::OrdinalIgnoreCase) -and $summary.expectedLocationVerified -eq $true -and $summary.sideEffectContentMatchesExpectedPath -eq $true -and $stdout.Contains($summary.outputMarker))
@@ -271,16 +443,28 @@ jobs:
               $positiveScriptFailure = ($errorState.state -eq 'OBSERVED' -and $errorState.failurePhase -in $pathFailurePhases)
               if ($errorState.state -eq 'OBSERVED' -and -not $positiveScriptFailure) { $evidenceUnknown = $true }
             }
-            $classification = if ($processExitState -ne 'EXIT_CONFIRMED' -or ($case.name -eq 'B1' -and $summaryParseState -ne 'PARSED') -or $null -ne $startError -or $null -ne $waitError -or $null -ne $disposeError -or $null -ne $identityError -or $null -ne $outputReadError -or $null -eq $summary -or $null -eq $exitCode -or @($script:evidenceWriteErrors).Count -gt 0) { 'INCONCLUSIVE' } elseif ($positiveScriptFailure) { 'SCRIPT_SEMANTIC_FAILED' } elseif ($evidenceUnknown) { 'INCONCLUSIVE' } elseif ($semanticPass) { 'SCRIPT_SEMANTIC_PASS' } else { 'INCONCLUSIVE' }
+            $identityMismatch = ($null -ne $processIdentity -and $processIdentity.identityVerificationState -eq 'VERIFIED_MISMATCH')
+            $classification = if ($identityMismatch) { 'SCRIPT_SEMANTIC_FAILED' } elseif ($processExitState -ne 'EXIT_CONFIRMED' -or ($case.name -eq 'B1' -and $summaryParseState -ne 'PARSED') -or $null -ne $startError -or $null -ne $waitError -or $null -ne $disposeError -or $null -ne $identityError -or $null -ne $outputReadError -or $null -eq $summary -or $null -eq $exitCode -or @($script:caseEvidenceWriteErrors).Count -gt 0) { 'INCONCLUSIVE' } elseif ($positiveScriptFailure) { 'SCRIPT_SEMANTIC_FAILED' } elseif ($evidenceUnknown) { 'INCONCLUSIVE' } elseif ($semanticPass) { 'SCRIPT_SEMANTIC_PASS' } else { 'INCONCLUSIVE' }
+            if ($case.name -eq 'B1') { [void](Write-PhaseMarker 'B1_CLASSIFICATION_COMPLETED' $case.name $case.nonce) }
             if ($case.name -eq 'B1') {
               $classificationEvidenceWritten = Write-StageEvidence $case.name 'classification' ([ordered]@{ name = $case.name; nonce = $case.nonce; classification = $classification; processExitState = $processExitState; summaryParseState = $summaryParseState; positiveScriptFailure = $positiveScriptFailure; evidenceUnknown = $evidenceUnknown; utc = [DateTime]::UtcNow.ToString('o') })
               if (-not $classificationEvidenceWritten) { $classification = 'INCONCLUSIVE' }
             }
-            $records += [pscustomobject]@{
+            $summaryForEvidence = $null
+            if ($null -ne $summary) {
+              $summaryForEvidence = [ordered]@{}
+              foreach ($summaryProperty in $summary.PSObject.Properties) {
+                if ($summaryProperty.Name -notin @('stdout', 'stderr')) {
+                  $summaryForEvidence[$summaryProperty.Name] = $summaryProperty.Value
+                }
+              }
+            }
+            $caseRecord = [pscustomobject]@{
               name = $case.name
               nonce = $case.nonce
               scriptPath = $case.script
               process = $processIdentity
+              processIdentityFailure = if ($identityMismatch) { 'VERIFIED_EXECUTABLE_PATH_MISMATCH' } else { $null }
               processExitState = $processExitState
               processStartedAndExited = ($processExitState -eq 'EXIT_CONFIRMED')
               processExitCode = $exitCode
@@ -293,16 +477,39 @@ jobs:
               startError = $startError
               stdoutPath = $stdoutPath
               stderrPath = $stderrPath
-              stdout = $stdout
-              stderr = $stderr
-              summary = $summary
+              rawOutputStoredSeparately = $true
+              summary = $summaryForEvidence
               classification = $classification
             }
-            [void](Write-StageEvidence $case.name 'result' $records[-1])
+            $records += $caseRecord
+            if ($case.name -eq 'B1') { [void](Write-PhaseMarker 'B1_CASE_RESULT_SAVE_STARTED' $case.name $case.nonce) }
+            $caseResultSaved = Write-StageEvidence $case.name 'result' $caseRecord
+            if ($case.name -eq 'B1') {
+              if ($caseResultSaved) {
+                [void](Write-PhaseMarker 'B1_CASE_RESULT_SAVE_COMPLETED' $case.name $case.nonce)
+              } else {
+                $saveError = if (@($script:evidenceWriteErrors).Count -gt 0) { $script:evidenceWriteErrors[-1] } else { [ordered]@{ category = 'UNKNOWN'; message = 'save failed without error detail' } }
+                [void](Write-PhaseMarker 'B1_CASE_RESULT_SAVE_FAILED' $case.name $case.nonce ([string]$saveError.category))
+                [Console]::Error.WriteLine('B1_CASE_RESULT_SAVE_ERROR|' + $saveError.category + '|' + $saveError.message)
+                [Console]::Error.Flush()
+              }
+            }
+          }
+          try {
+            if ($null -ne $script:phaseTimelineWriter) {
+              $script:phaseTimelineWriter.Flush()
+              $script:phaseTimelineWriter.Dispose()
+              $script:phaseTimelineWriter = $null
+            }
+          } catch {
+            $script:phaseMarkerErrors += [ordered]@{ phase = 'TIMELINE_CLOSE'; category = $_.Exception.GetType().FullName; message = $_.Exception.Message; utc = [DateTime]::UtcNow.ToString('o') }
+            [Console]::Error.WriteLine('PHASE_TIMELINE_CLOSE_ERROR|' + $_.Exception.GetType().FullName + '|' + $_.Exception.Message)
+            [Console]::Error.Flush()
           }
           $final = if (@($records | Where-Object { $_.classification -eq 'SCRIPT_SEMANTIC_FAILED' }).Count -gt 0) { 'SCRIPT_SEMANTIC_FAILED' } elseif (@($records | Where-Object { $_.classification -eq 'INCONCLUSIVE' }).Count -gt 0) { 'INCONCLUSIVE' } else { 'SCRIPT_SEMANTIC_PASS' }
-          if (@($script:evidenceWriteErrors).Count -gt 0) { $final = 'INCONCLUSIVE' }
-          $finalRecord = [ordered]@{ verdict = $final; utc = [DateTime]::UtcNow.ToString('o'); cases = $records; evidenceWriteErrors = @($script:evidenceWriteErrors) }
+          if (@($script:evidenceWriteErrors).Count -gt 0 -or @($script:phaseMarkerErrors).Count -gt 0) { $final = 'INCONCLUSIVE' }
+          $caseOutcomes = @($records | ForEach-Object { [ordered]@{ name = $_.name; nonce = $_.nonce; processExitState = $_.processExitState; processExitCode = $_.processExitCode; classification = $_.classification; resultPath = (Join-Path $resultDir ($_.name + '-result.json')) } })
+          $finalRecord = [ordered]@{ verdict = $final; utc = [DateTime]::UtcNow.ToString('o'); cases = $caseOutcomes; evidenceWriteErrors = @($script:evidenceWriteErrors); phaseMarkerErrors = @($script:phaseMarkerErrors) }
           try {
             $probeRunPath = Join-Path $resultDir 'probe-run.json'
             $probeRunTemporaryPath = $probeRunPath + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
@@ -312,7 +519,7 @@ jobs:
             $script:evidenceWriteErrors += [ordered]@{ path = (Join-Path $resultDir 'probe-run.json'); category = $_.Exception.GetType().FullName; message = $_.Exception.Message }
             Write-Output ('EVIDENCE_WRITE_ERROR_FINAL_' + $_.Exception.GetType().FullName)
             $final = 'INCONCLUSIVE'
-            $fallbackRecord = [ordered]@{ verdict = $final; utc = [DateTime]::UtcNow.ToString('o'); cases = $records; evidenceWriteErrors = @($script:evidenceWriteErrors); probeRunState = 'WRITE_FAILED' }
+            $fallbackRecord = [ordered]@{ verdict = $final; utc = [DateTime]::UtcNow.ToString('o'); cases = $caseOutcomes; evidenceWriteErrors = @($script:evidenceWriteErrors); phaseMarkerErrors = @($script:phaseMarkerErrors); probeRunState = 'WRITE_FAILED' }
             [void](Write-StageEvidence 'run' 'final-verdict-fallback' $fallbackRecord)
           }
           Write-Output "SEMANTIC_PROBE_VERDICT=$final"
